@@ -143,9 +143,9 @@ Condition (c) is checked FIRST so that terminal exhaustion, `CHANGES_REQUESTED`,
   - Notify user with clear explanation of what's blocking
   - For exhausted inline bot comments: `⚠️ WORKFLOW BLOCKED — N bot review comment(s) could not be addressed automatically. Flagged for human review.`
   - For exhausted feedback: `⚠️ WORKFLOW BLOCKED — N feedback item(s) reached the automatic-attempt limit. Warning replies do not clear the blocker; human review is required.`
-  - For `CHANGES_REQUESTED` and/or unresolved human threads where the roundtrip handoff ran (feedback addressed this session): `⚠️ WORKFLOW BLOCKED — awaiting <reviewer>'s re-review. Roundtrip complete: feedback addressed, every comment replied to, review re-requested, PR reassigned to <reviewer>. Re-invoke /conductor-autonomy after their re-review.`
-  - For `CHANGES_REQUESTED` where the handoff did NOT run (single message; if `unresolved_human_threads > 0` also fires, the CHANGES_REQUESTED message subsumes it — emit ONE message, not both): `⚠️ WORKFLOW BLOCKED — Human reviewer requested changes. Address them and resolve all open inline threads on GitHub, then have the reviewer re-request review; re-invoke /conductor-autonomy afterward.`
-  - For unresolved human threads only (no CHANGES_REQUESTED, handoff did NOT run): `⚠️ WORKFLOW BLOCKED — N unresolved human inline thread(s). Address the comments, then have a human mark the threads as resolved on GitHub. Re-invoke /conductor-autonomy afterward.`
+  - For `CHANGES_REQUESTED` and/or unresolved human threads where the roundtrip handoff ran (feedback addressed this session): `⚠️ WORKFLOW BLOCKED — awaiting <reviewer>'s re-review. Roundtrip complete: feedback addressed, every comment replied to, review re-requested, PR reassigned to <reviewer>. Re-invoke /autonomy after their re-review.`
+  - For `CHANGES_REQUESTED` where the handoff did NOT run (single message; if `unresolved_human_threads > 0` also fires, the CHANGES_REQUESTED message subsumes it — emit ONE message, not both): `⚠️ WORKFLOW BLOCKED — Human reviewer requested changes. Address them and resolve all open inline threads on GitHub, then have the reviewer re-request review; re-invoke /autonomy afterward.`
+  - For unresolved human threads only (no CHANGES_REQUESTED, handoff did NOT run): `⚠️ WORKFLOW BLOCKED — N unresolved human inline thread(s). Address the comments, then have a human mark the threads as resolved on GitHub. Re-invoke /autonomy afterward.`
   - Do NOT keep retrying the same failing approach
   - A successful exhaustion warning post prevents duplicate notifications only; it never satisfies `all_feedback_addressed`.
 
@@ -156,7 +156,7 @@ Condition (c) is checked FIRST so that terminal exhaustion, `CHANGES_REQUESTED`,
     ```text
     ✅ WORKFLOW PAUSED — PR #<number> is clean and marked ready for review.
     All checks passing. Sanity VERIFICATION: unreplied=0 confirmed across 2 clean polls separated by BOT_GRACE_WINDOW.
-    Branch up to date. QA handoff recorded (assignee/reviewer + ticket → QA state). Awaiting human code-review approval. Re-run `/conductor-autonomy` to resume monitoring if needed.
+    Branch up to date. QA handoff recorded (assignee/reviewer + ticket → QA state). Awaiting human code-review approval. Re-run `/autonomy` to resume monitoring if needed.
     ```
   - **End the loop** (do NOT sleep and re-poll)
 

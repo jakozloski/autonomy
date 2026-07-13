@@ -1,5 +1,5 @@
 ---
-name: conductor-autonomy
+name: autonomy
 description: "Full autonomous issue or PR workflow: resolve repo conventions, plan with edge-case review, validate the plan with GPT-5.6 Sol, implement, self-review, verify, ship, and monitor CI/review feedback until clean or explicitly blocked. Use for 'solve this issue,' 'take over this PR,' 'implement autonomously,' or 'full autonomy.'"
 ---
 
@@ -9,13 +9,13 @@ Run the whole scoped workflow: understand → plan → review plan → implement
 
 <!--
 SOURCE OF TRUTH: this entire directory:
-  <repo>/.agents/skills/conductor-autonomy/
+  <repo>/.agents/skills/autonomy/
 
-The project-level `.claude/skills/conductor-autonomy/` path may symlink here.
+The project-level `.claude/skills/autonomy/` path may symlink here.
 Never edit a user-level fallback as the canonical copy. After this package is
 merged, refresh a user-level copy with the complete directory, not SKILL.md alone:
-  rsync -a <repo>/.agents/skills/conductor-autonomy/ ~/.claude/skills/conductor-autonomy/
-  rsync -a <repo>/.agents/skills/conductor-autonomy/ ~/.codex/skills/conductor-autonomy/
+  rsync -a <repo>/.agents/skills/autonomy/ ~/.claude/skills/autonomy/
+  rsync -a <repo>/.agents/skills/autonomy/ ~/.codex/skills/autonomy/
 -->
 
 ## Loading Contract
@@ -47,7 +47,7 @@ These values override defaults in delegated skills and adapters.
 
 ### Claude voices: Fable 5 at max
 
-- Use Claude Fable 5 (`claude-fable-5`, CLI alias `fable`) at `max` effort. Fable 5 supplies the native long-context model; `max` is its deepest model-reasoning setting. Conductor owns orchestration, so do not substitute the separate `ultracode` workflow mode.
+- Use Claude Fable 5 (`claude-fable-5`, CLI alias `fable`) at `max` effort. Fable 5 supplies the native long-context model; `max` is its deepest model-reasoning setting. This skill owns orchestration, so do not substitute the separate `ultracode` workflow mode.
 - Require Claude Code `>= 2.1.170`. Explicit CLI voices clear model/effort/permission overrides and add `--permission-mode plan --allowedTools Read,Glob,Grep --disallowedTools Edit,Write,NotebookEdit,Bash,WebFetch,WebSearch,Agent,Task --disable-slash-commands --no-session-persistence --no-chrome` after the Fable/max flags. Reviewer/explorer voices are read-only even when repository settings pre-authorize mutations.
 - Agent-tool voices may use `model: "fable"` only after confirming the host enforces per-agent model, max effort, and a read-only tool boundary; environment model/effort overrides must also be compatible. Otherwise use the clean-environment, read-only explicit CLI voice.
 - Built-in Explore agents are fixed to a smaller model. Use a read-only general-purpose/custom explorer pinned to Fable, or the explicit Fable CLI path.

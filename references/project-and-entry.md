@@ -365,7 +365,7 @@ Store selections in `gstack_integration` in the state file. See State Tracking f
 gstack skills have their own preambles, setup gates, AskUserQuestion calls, and sibling scripts. The adapters in this workflow implement a **supported subset** of each gstack skill's behavior:
 
 - Each adapter checks a **capability gate** before running
-- Adapters use conductor-autonomy's own state and conventions (resolved base branch, quality checks, dev servers)
+- Adapters use autonomy's own state and conventions (resolved base branch, quality checks, dev servers)
 - **Never run in adapters**: update checks (`gstack-update-check`), telemetry (`gstack-analytics`), install scripts, browser-open flows, `gstack-config`, `gstack-review-log`, or AskUserQuestion prompts
 - **Auto-resolve ASK items** with "fix as recommended" (autonomous mode)
 - Adapter status is logged to `gstack_integration.*` (informational only — `phases.*` remains authoritative)

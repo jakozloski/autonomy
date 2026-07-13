@@ -1,4 +1,4 @@
 interface:
-  display_name: "Conductor Autonomy"
+  display_name: "Autonomy"
   short_description: "Autonomous issue-to-clean-PR workflow"
-  default_prompt: "Use $conductor-autonomy to take this task from repository discovery through a clean, reviewed pull request."
+  default_prompt: "Use $autonomy to take this task from repository discovery through a clean, reviewed pull request."

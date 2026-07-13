@@ -307,7 +307,7 @@ fi
 
 Update the state file after each phase transition. This allows resuming if the session is interrupted.
 
-**On resume after a `phases.<X>: "blocked"` state:** When the user re-invokes `/conductor-autonomy` and the state file shows a phase in `"blocked"` status, the agent MUST ask:
+**On resume after a `phases.<X>: "blocked"` state:** When the user re-invokes `/autonomy` and the state file shows a phase in `"blocked"` status, the agent MUST ask:
 
 > The prior workflow was blocked on `<reason from attempt_log>`. Reset attempt counters and retry, or continue from current state? **(reset / continue)**
 
@@ -335,7 +335,7 @@ Then output:
 
 ```text
 ⚠️ WORKFLOW ABORTED at phase <X>. State preserved at .claude/workflow-state.local.md.
-Re-invoke /conductor-autonomy to resume from this state.
+Re-invoke /autonomy to resume from this state.
 ```
 
 **Stash restore (Entry B only, conditional):** Apply the conditional restore block from State Tracking above. Do NOT auto-restore on abort if the working tree is dirty, `PRE_TAKEOVER_BRANCH` is missing, or `STASH_REF` is empty — print the manual restore instruction instead.
@@ -403,7 +403,7 @@ Bot grace window elapsed — no late feedback detected.
 ```text
 ✅ WORKFLOW PAUSED — PR #<number> is clean.
 All checks passing. No pending feedback. All bot review threads replied to. Branch up to date.
-Awaiting human review/approval. Re-run `/conductor-autonomy` to resume monitoring if needed.
+Awaiting human review/approval. Re-run `/autonomy` to resume monitoring if needed.
 ```
 
 **Bot grace active (approved but waiting for bots):**

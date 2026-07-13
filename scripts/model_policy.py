@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate the mandatory Conductor model policy without making remote calls.
+"""Evaluate the mandatory model policy without making remote calls.
 
 The command reads one JSON object from stdin and writes one JSON object to
 stdout.  Every field in the input is observed by the caller; this module never

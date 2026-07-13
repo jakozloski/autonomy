@@ -24,7 +24,7 @@ def _valid_skill_text() -> str:
     return "\n".join(
         (
             "---",
-            "name: conductor-autonomy",
+            "name: autonomy",
             "description: Run the complete autonomous engineering workflow.",
             "---",
             "",
@@ -32,7 +32,7 @@ def _valid_skill_text() -> str:
             "",
             f"Use `codex exec {EXEC_MODEL_FLAGS}` for Codex execution.",
             f"Use `codex review {REVIEW_MODEL_FLAGS}` for Codex review.",
-            "Conductor owns orchestration; do not substitute the separate ultracode mode.",
+            "This skill owns orchestration; do not substitute the separate ultracode mode.",
             "",
         )
     )
@@ -42,7 +42,7 @@ def _heading_inventory(
     expected_headings: dict[str, tuple[str, ...]] | None = None,
 ) -> str:
     expected = expected_headings or dict(BUILTIN_EXPECTED_HEADINGS)
-    sections = ["# Conductor Autonomy Heading Manifest", ""]
+    sections = ["# Autonomy Heading Manifest", ""]
     for relative_path, headings in expected.items():
         sections.extend(
             (
@@ -98,9 +98,9 @@ class PackageFixture:
             "\n".join(
                 (
                     "interface:",
-                    '  display_name: "Conductor Autonomy"',
+                    '  display_name: "Autonomy"',
                     '  short_description: "Run a full autonomous workflow"',
-                    '  default_prompt: "Use $conductor-autonomy to finish this task."',
+                    '  default_prompt: "Use $autonomy to finish this task."',
                     "",
                 )
             ),
@@ -401,14 +401,14 @@ class ValidatePackageTests(unittest.TestCase):
             errors,
         )
         self.assertIn(
-            "agents/openai.yaml default_prompt must mention $conductor-autonomy", errors
+            "agents/openai.yaml default_prompt must mention $autonomy", errors
         )
 
     def test_openai_yaml_rejects_root_level_interface_fields(self) -> None:
         (self.package.root / "agents" / "openai.yaml").write_text(
-            "display_name: Conductor\n"
+            "display_name: Autonomy\n"
             "short_description: Autonomous workflow\n"
-            "default_prompt: Use $conductor-autonomy.\n",
+            "default_prompt: Use $autonomy.\n",
             encoding="utf-8",
         )
 
@@ -423,9 +423,9 @@ class ValidatePackageTests(unittest.TestCase):
         (self.package.root / "agents" / "openai.yaml").write_text(
             "interface:\n"
             "  nested:\n"
-            "    display_name: Conductor\n"
+            "    display_name: Autonomy\n"
             "    short_description: Autonomous workflow\n"
-            "    default_prompt: Use $conductor-autonomy.\n",
+            "    default_prompt: Use $autonomy.\n",
             encoding="utf-8",
         )
 
@@ -441,7 +441,7 @@ class ValidatePackageTests(unittest.TestCase):
             "interface:\n"
             '  display_name: "unterminated\n'
             "  short_description: Autonomous workflow\n"
-            "  default_prompt: Use $conductor-autonomy.\n",
+            "  default_prompt: Use $autonomy.\n",
             encoding="utf-8",
         )
 

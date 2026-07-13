@@ -234,7 +234,7 @@ For every new/edited known-human inline root, evaluate it under the same untrust
 ⚠️ WORKFLOW BLOCKED — N unresolved human inline thread(s). This workflow does
    not auto-resolve human review feedback. Address the comments, then have the
    reviewer (or any human with write access) mark threads as resolved on GitHub.
-   Re-invoke /conductor-autonomy afterward.
+   Re-invoke /autonomy afterward.
    Affected threads: <list of thread IDs + first-line snippets>
 ```
 
@@ -246,7 +246,7 @@ GitHub marks threads as `isOutdated: true` when the underlying code changes (e.g
 
 #### Compute unreplied inline comment sets (canonical):
 
-1. **Resolve the authenticated actor:** Check `authenticated_actor` in state. If null or missing (first run or resumed session), run `gh api user --jq .login` and persist to state immediately. Refresh once per `/conductor-autonomy` invocation (covers token rotation between sessions). This is needed because the agent replies using the human user's credentials — replies from this actor count as "addressed" even if the login happens to end in `[bot]`.
+1. **Resolve the authenticated actor:** Check `authenticated_actor` in state. If null or missing (first run or resumed session), run `gh api user --jq .login` and persist to state immediately. Refresh once per `/autonomy` invocation (covers token rotation between sessions). This is needed because the agent replies using the human user's credentials — replies from this actor count as "addressed" even if the login happens to end in `[bot]`.
 
 2. **From the REST inline comments** (already fetched via `gh api --paginate`), identify all **root bot comments** — comments where:
    - `in_reply_to_id` is `null` (root comment, not a reply)
@@ -421,7 +421,7 @@ If **merge conflicts** exist, follow the dedicated subsection below instead of t
    if ! git diff --name-only -z --diff-filter=U > "$CONFLICTS_FILE"; then
      rm -f "$CONFLICTS_FILE"
      echo "⚠️ WORKFLOW BLOCKED — could not enumerate conflicted files (git diff failed)."
-     echo "   Resolve manually and re-invoke /conductor-autonomy."
+     echo "   Resolve manually and re-invoke /autonomy."
      exit 1
    fi
    CONFLICT_FILE_COUNT=0
@@ -455,7 +455,7 @@ If **merge conflicts** exist, follow the dedicated subsection below instead of t
      # Only then emit the BLOCKED signal:
      echo "⚠️ WORKFLOW BLOCKED — Merge conflict too complex for autonomous resolution"
      echo "   ($CONFLICT_FILE_COUNT files, $CONFLICT_HUNK_COUNT hunks)."
-     echo "   Resolve manually and re-invoke /conductor-autonomy."
+     echo "   Resolve manually and re-invoke /autonomy."
      exit 1
    fi
    ```

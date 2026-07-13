@@ -1,4 +1,4 @@
-# conductor-autonomy
+# autonomy
 
 A skill for [Claude Code](https://claude.com/claude-code) and Codex that runs a full autonomous engineering workflow: take an issue (or take over an existing PR), resolve the repository's conventions, plan with edge-case review, validate the plan with GPT-5.6 Sol, implement, self-review, open/update the PR, then monitor CI, bot, and human review feedback until the PR is clean, paused for a human decision, or explicitly blocked — never silently stopping partway.
 
@@ -23,18 +23,18 @@ The core `SKILL.md` is intentionally short so its routing rules and invariants s
 Claude Code (user-level):
 
 ```sh
-git clone https://github.com/jakozloski/conductor-autonomy ~/.claude/skills/conductor-autonomy
+git clone https://github.com/jakozloski/autonomy ~/.claude/skills/autonomy
 ```
 
 Codex:
 
 ```sh
-git clone https://github.com/jakozloski/conductor-autonomy ~/.codex/skills/conductor-autonomy
+git clone https://github.com/jakozloski/autonomy ~/.codex/skills/autonomy
 ```
 
-Project-level (shared with a team): vendor this directory into your repo (e.g. `.agents/skills/conductor-autonomy/`) and symlink it from `.claude/skills/conductor-autonomy`.
+Project-level (shared with a team): vendor this directory into your repo (e.g. `.agents/skills/autonomy/`) and symlink it from `.claude/skills/autonomy`.
 
-Invoke with `/conductor-autonomy`, or ask for "solve this issue autonomously" / "take over this PR" / "full autonomy".
+Invoke with `/autonomy`, or ask for "solve this issue autonomously" / "take over this PR" / "full autonomy".
 
 ## Requirements
 

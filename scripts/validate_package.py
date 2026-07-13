@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministically validate the conductor-autonomy skill package.
+"""Deterministically validate the autonomy skill package.
 
 The validator intentionally uses only the Python standard library so it can run
 from Codex, Claude Code, CI, or a freshly cloned repository without installing
@@ -303,8 +303,8 @@ def _parse_frontmatter(skill_text: str) -> tuple[dict[str, str], list[str]]:
     for key in sorted(REQUIRED_FRONTMATTER_KEYS & set(values)):
         if not values[key]:
             errors.append(f"SKILL.md frontmatter key {key!r} must not be empty")
-    if values.get("name") and values["name"] != "conductor-autonomy":
-        errors.append("SKILL.md frontmatter name must be 'conductor-autonomy'")
+    if values.get("name") and values["name"] != "autonomy":
+        errors.append("SKILL.md frontmatter name must be 'autonomy'")
     return values, errors
 
 
@@ -620,9 +620,9 @@ def _validate_openai_yaml(package_dir: Path) -> list[str]:
         errors.append(
             "agents/openai.yaml must contain exactly one non-empty interface.default_prompt"
         )
-    elif "$conductor-autonomy" not in default_prompts[0]:
+    elif "$autonomy" not in default_prompts[0]:
         errors.append(
-            "agents/openai.yaml default_prompt must mention $conductor-autonomy"
+            "agents/openai.yaml default_prompt must mention $autonomy"
         )
     return errors
 
@@ -666,7 +666,7 @@ def validate_package(
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Validate the conductor-autonomy skill package."
+        description="Validate the autonomy skill package."
     )
     parser.add_argument(
         "package_dir",
@@ -695,12 +695,12 @@ def main(argv: Iterable[str] | None = None) -> int:
         return 2
 
     if errors:
-        print(f"conductor-autonomy package validation failed ({len(errors)} error(s)):")
+        print(f"autonomy package validation failed ({len(errors)} error(s)):")
         for error in errors:
             print(f"- {error}")
         return 1
 
-    print("conductor-autonomy package validation passed")
+    print("autonomy package validation passed")
     return 0
 
 
