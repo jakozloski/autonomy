@@ -1,5 +1,7 @@
 # autonomy
 
+[![validate](https://github.com/jakozloski/autonomy/actions/workflows/validate.yml/badge.svg)](https://github.com/jakozloski/autonomy/actions/workflows/validate.yml)
+
 A skill for [Claude Code](https://claude.com/claude-code) and Codex that runs a full autonomous engineering workflow: take an issue (or take over an existing PR), resolve the repository's conventions, plan with edge-case review, validate the plan with GPT-5.6 Sol, implement, self-review, open/update the PR, then monitor CI, bot, and human review feedback until the PR is clean, paused for a human decision, or explicitly blocked — never silently stopping partway.
 
 ```
@@ -34,7 +36,13 @@ The core `SKILL.md` is intentionally short so its routing rules and invariants s
 
 ## Install
 
-Claude Code (user-level):
+Any agent (Claude Code, Codex, Cursor, Copilot, and 70+ others) via the [skills CLI](https://github.com/vercel-labs/skills):
+
+```sh
+npx skills add jakozloski/autonomy
+```
+
+Or clone directly — Claude Code (user-level):
 
 ```sh
 git clone https://github.com/jakozloski/autonomy ~/.claude/skills/autonomy
@@ -59,10 +67,12 @@ The skill enforces a mandatory model policy and BLOCKs (rather than silently dow
 - `gh` CLI authenticated for the target repository
 - Python 3 (standard library only) for the helper scripts
 
+These models are **floors, not pins**: when a newer eligible model appears (in the Codex live catalog, or a newer Fable/Mythos-family model observed in Claude Code), the model gate auto-selects it and records the swap in state and the run's audit trail. Down-tier variants (`-mini`, `-nano`) are never selected, and anything below the floors still blocks.
+
 ## FAQ
 
 **Why does it BLOCK instead of falling back to a cheaper model?**
-The review gates are the product. A plan that GPT-5.6 Sol never approved, or a run on a silently-substituted model, looks identical to a real run right up until the PR is wrong. Blocking loudly keeps the guarantee honest: the skill names the gate that failed and stops, instead of shipping something weaker under the same name.
+The review gates are the product. A plan that the Codex reviewer never approved, or a run on a silently-substituted model, looks identical to a real run right up until the PR is wrong. Blocking loudly keeps the guarantee honest: the skill names the gate that failed and stops, instead of shipping something weaker under the same name. Upgrades are the opposite story — newer models above the floor are adopted automatically and logged (see Requirements).
 
 **Can I run it Claude-only, without Codex?**
 Not out of the box — the cross-vendor gate is deliberate: the model that writes the code is not the model that approves it. If you want a Claude-only variant, the gates are concentrated in the "Mandatory Model Policy" section of `SKILL.md` and in `scripts/model_policy.py`; `scripts/test_model_policy.py` pins the expected decisions, so change both together and the test suite will keep you honest.
