@@ -10,6 +10,7 @@ from pathlib import Path
 
 from validate_package import (
     BUILTIN_EXPECTED_HEADINGS,
+    CODEX_FLOOR_MODEL,
     EXEC_MODEL_FLAGS,
     REQUIRED_REDACTION_PATTERNS,
     REQUIRED_SCRIPT_FILES,
@@ -32,6 +33,7 @@ def _valid_skill_text() -> str:
             "",
             f"Use `codex exec {EXEC_MODEL_FLAGS}` for Codex execution.",
             f"Use `codex review {REVIEW_MODEL_FLAGS}` for Codex review.",
+            f"The codex floor model is {CODEX_FLOOR_MODEL}; newer eligible models auto-forward.",
             "This skill owns orchestration; do not substitute the separate ultracode mode.",
             "",
         )

@@ -41,6 +41,15 @@ The live catalog is a preflight signal.  The first real Codex invocation is
 the authoritative entitlement/quota signal.  A timeout or transport failure
 may retry once with the exact same model and effort; every other Codex failure
 blocks, and no path proposes a downgrade.
+
+Model selection is floor-based, not pinned.  From the observed facts the
+helper selects the newest eligible model at or above each floor: for Codex,
+live-catalog models named ``gpt-<version>[-variant]`` that support the
+required effort, excluding down-tier variants such as ``-mini``; for Claude,
+entries in the optional ``claude.observed_models`` list from the ``fable`` or
+``mythos`` families.  Upgrades are automatic and reported under each
+decision's ``selection`` key; anything below a floor still blocks, and no
+path proposes a downgrade.
 """
 
 from __future__ import annotations
@@ -53,12 +62,16 @@ from typing import Any
 
 SCHEMA_VERSION = 1
 
-CODEX_MODEL = "gpt-5.6-sol"
+CODEX_MODEL = "gpt-5.6-sol"  # floor: newest eligible catalog model >= this wins
+CODEX_FLOOR_VERSION = (5, 6)
 CODEX_EFFORT = "ultra"
 MIN_CODEX_VERSION = (0, 144, 0)
 CODEX_MAX_ATTEMPTS = 2
+# Variant tokens that mark down-tier siblings, never auto-forward targets.
+CODEX_EXCLUDED_VARIANT_TOKENS = ("mini", "nano", "lite", "chat")
 
-CLAUDE_MODEL = "claude-fable-5"
+CLAUDE_MODEL = "claude-fable-5"  # floor: newest observed fable/mythos >= this wins
+CLAUDE_FLOOR_VERSION = (5,)
 CLAUDE_MODEL_ALIAS = "fable"
 CLAUDE_EFFORT = "max"
 MIN_CLAUDE_VERSION = (2, 1, 170)
@@ -82,6 +95,14 @@ CLAUDE_READ_ONLY_ENV_UNSET = (
 _SEMVER = re.compile(
     r"(?<!\d)(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)"
     r"(?:-(?P<prerelease>[0-9A-Za-z.-]+))?"
+)
+
+_GPT_SLUG = re.compile(
+    r"gpt-(?P<major>\d+)(?:\.(?P<minor>\d+))?(?:-(?P<variant>[a-z0-9-]+))?"
+)
+
+_CLAUDE_UPGRADE_SLUG = re.compile(
+    r"claude-(?P<family>fable|mythos)-(?P<version>\d+(?:-\d+)*)"
 )
 
 _CODEX_BLOCKING_FAILURES = {
@@ -203,6 +224,7 @@ def _codex_base(version: Any) -> dict[str, Any]:
         },
         "downgrade_allowed": False,
         "fallback_model": None,
+        "selection": None,
     }
 
 
@@ -222,25 +244,60 @@ def _block_codex(
     return decision
 
 
-def _catalog_has_sol_ultra(catalog: Any) -> bool:
-    if not isinstance(catalog, dict):
+def _supports_required_effort(model: dict[str, Any]) -> bool:
+    levels = model.get("supported_reasoning_levels")
+    if not isinstance(levels, list):
         return False
+    return any(
+        isinstance(level, dict) and level.get("effort") == CODEX_EFFORT
+        for level in levels
+    )
+
+
+def _select_codex_model(catalog: Any) -> str | None:
+    """Return the newest eligible catalog slug at or above the floor, or None.
+
+    Eligibility: GPT-family slug, version >= the floor, required effort
+    supported, and no down-tier variant token.  At exactly the floor version
+    only the known floor slug qualifies (same-version siblings are not proven
+    upgrades).  Ties at newer versions prefer the ``-sol`` lineage, then bare
+    slugs, then lexicographic order — deterministic by construction.
+    """
+
+    if not isinstance(catalog, dict):
+        return None
     models = catalog.get("models")
     if not isinstance(models, list):
-        return False
+        return None
 
+    best: tuple[tuple[Any, ...], str] | None = None
     for model in models:
-        if not isinstance(model, dict) or model.get("slug") != CODEX_MODEL:
+        if not isinstance(model, dict):
             continue
-        levels = model.get("supported_reasoning_levels")
-        if not isinstance(levels, list):
+        slug = model.get("slug")
+        if not isinstance(slug, str):
+            continue
+        match = _GPT_SLUG.fullmatch(slug)
+        if match is None:
+            continue
+        version = (int(match.group("major")), int(match.group("minor") or 0))
+        variant = match.group("variant") or ""
+        if version < CODEX_FLOOR_VERSION:
+            continue
+        if version == CODEX_FLOOR_VERSION and slug != CODEX_MODEL:
             continue
         if any(
-            isinstance(level, dict) and level.get("effort") == CODEX_EFFORT
-            for level in levels
+            token in variant.split("-")
+            for token in CODEX_EXCLUDED_VARIANT_TOKENS
         ):
-            return True
-    return False
+            continue
+        if not _supports_required_effort(model):
+            continue
+        variant_rank = 2 if variant == "sol" else 1 if variant == "" else 0
+        key = (version, variant_rank, slug)
+        if best is None or key > best[0]:
+            best = (key, slug)
+    return None if best is None else best[1]
 
 
 def evaluate_codex(raw: Any) -> dict[str, Any]:
@@ -273,14 +330,32 @@ def evaluate_codex(raw: Any) -> dict[str, Any]:
             "upgrade_codex_cli",
         )
 
-    if not _catalog_has_sol_ultra(config.get("live_catalog")):
+    selected_model = _select_codex_model(config.get("live_catalog"))
+    if selected_model is None:
         return _block_codex(
             decision,
             "live_catalog_missing_capability",
-            "The live Codex catalog lacks GPT-5.6 Sol with ultra reasoning",
+            "The live Codex catalog lacks an eligible model at or above "
+            "GPT-5.6 Sol with ultra reasoning",
             "request_access_or_refresh_live_catalog",
         )
     decision["live_catalog_verified"] = True
+    decision["model"] = selected_model
+    decision["arguments"] = [
+        "-m",
+        selected_model,
+        "-c",
+        'model_reasoning_effort="ultra"',
+    ]
+    decision["selection"] = {
+        "floor_model": CODEX_MODEL,
+        "selected_model": selected_model,
+        "reason": (
+            "floor_model"
+            if selected_model == CODEX_MODEL
+            else "newer_model_auto_selected"
+        ),
+    }
 
     invocation = config.get("first_real_invocation", {})
     if not isinstance(invocation, dict):
@@ -400,7 +475,39 @@ def _claude_base(version: Any) -> dict[str, Any]:
         "waiver_granted": False,
         "downgrade_allowed": False,
         "fallback_model": None,
+        "selection": None,
     }
+
+
+def _select_claude_model(observed_models: Any) -> tuple[str, str]:
+    """Return the newest observed fable/mythos model at or above the floor.
+
+    Falls back to the floor when nothing newer is observed.  Ties on version
+    prefer the ``fable`` family (generally available), then lexicographic
+    order — deterministic by construction.
+    """
+
+    if not isinstance(observed_models, list):
+        return CLAUDE_MODEL, "floor_model"
+
+    best: tuple[tuple[Any, ...], str] | None = None
+    for item in observed_models:
+        if not isinstance(item, str):
+            continue
+        match = _CLAUDE_UPGRADE_SLUG.fullmatch(item)
+        if match is None:
+            continue
+        version = tuple(int(part) for part in match.group("version").split("-"))
+        if version < CLAUDE_FLOOR_VERSION:
+            continue
+        family_rank = 1 if match.group("family") == "fable" else 0
+        key = (version, family_rank, item)
+        if best is None or key > best[0]:
+            best = (key, item)
+
+    if best is None or best[1] == CLAUDE_MODEL:
+        return CLAUDE_MODEL, "floor_model"
+    return best[1], "newer_model_auto_selected"
 
 
 def _waive_or_block_claude(
@@ -453,6 +560,11 @@ def _waive_or_block_claude(
                 "reason": reason,
                 "model": fallback_model,
                 "effort": CLAUDE_EFFORT,
+                "selection": {
+                    "floor_model": CLAUDE_MODEL,
+                    "selected_model": fallback_model,
+                    "reason": "explicit_waiver_fallback",
+                },
                 "execution_path": "explicit_cli",
                 "arguments": [
                     "-p",
@@ -614,8 +726,22 @@ def evaluate_claude(raw: Any) -> dict[str, Any]:
             "invalid_host_capabilities",
             "host_capabilities must be an object",
         )
+    selected_model, selection_reason = _select_claude_model(
+        config.get("observed_models")
+    )
+    at_floor = selected_model == CLAUDE_MODEL
+    model_flag = CLAUDE_MODEL_ALIAS if at_floor else selected_model
+    decision["model"] = selected_model
+    decision["selection"] = {
+        "floor_model": CLAUDE_MODEL,
+        "selected_model": selected_model,
+        "reason": selection_reason,
+    }
+
     exact_override = override if isinstance(override, str) else ""
-    compatible_overrides = {"", CLAUDE_MODEL_ALIAS, CLAUDE_MODEL}
+    compatible_overrides = {"", selected_model}
+    if at_floor:
+        compatible_overrides |= {CLAUDE_MODEL_ALIAS, CLAUDE_MODEL}
     model_conflict = exact_override not in compatible_overrides
     effort_conflict = effort_override not in {None, CLAUDE_EFFORT}
     agent_selection_verified = (
@@ -630,7 +756,7 @@ def evaluate_claude(raw: Any) -> dict[str, Any]:
         arguments = [
             "-p",
             "--model",
-            CLAUDE_MODEL_ALIAS,
+            model_flag,
             "--effort",
             CLAUDE_EFFORT,
             "--permission-mode",
@@ -647,7 +773,7 @@ def evaluate_claude(raw: Any) -> dict[str, Any]:
         environment_unset = list(CLAUDE_READ_ONLY_ENV_UNSET)
     else:
         execution_path = "agent_tool"
-        arguments = ["model=fable", "effort=max"]
+        arguments = [f"model={model_flag}", "effort=max"]
         next_action = "invoke_fable_agent"
         environment_unset = []
 
@@ -658,7 +784,10 @@ def evaluate_claude(raw: Any) -> dict[str, Any]:
             "reason": (
                 "Unverified model/effort/read-only agent selection or a conflicting override requires the explicit read-only Fable CLI path"
                 if conflict
-                else "Claude Fable 5 with max effort is available"
+                else (
+                    f"{selected_model} at max effort is available"
+                    + ("" if at_floor else " (auto-selected above the Fable 5 floor)")
+                )
             ),
             "execution_path": execution_path,
             "arguments": arguments,

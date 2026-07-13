@@ -21,8 +21,9 @@ REQUIRED_FRONTMATTER_KEYS = ALLOWED_FRONTMATTER_KEYS
 MAX_SKILL_LINES_EXCLUSIVE = 500
 MAX_REFERENCE_LINES_EXCLUSIVE = 500
 
-EXEC_MODEL_FLAGS = "-m gpt-5.6-sol -c 'model_reasoning_effort=\"ultra\"'"
-REVIEW_MODEL_FLAGS = "-c 'model=\"gpt-5.6-sol\"' -c 'model_reasoning_effort=\"ultra\"'"
+CODEX_FLOOR_MODEL = "gpt-5.6-sol"
+EXEC_MODEL_FLAGS = "-m <selected> -c 'model_reasoning_effort=\"ultra\"'"
+REVIEW_MODEL_FLAGS = "-c 'model=\"<selected>\"' -c 'model_reasoning_effort=\"ultra\"'"
 
 REQUIRED_REFERENCE_FILES = (
     "references/project-and-entry.md",
@@ -557,6 +558,8 @@ def _validate_policy_text(package_dir: Path) -> list[str]:
         errors.append("missing exact codex exec flags: " + EXEC_MODEL_FLAGS)
     if REVIEW_MODEL_FLAGS not in combined:
         errors.append("missing exact codex review flags: " + REVIEW_MODEL_FLAGS)
+    if CODEX_FLOOR_MODEL not in combined:
+        errors.append("missing documented codex floor model: " + CODEX_FLOOR_MODEL)
     state_path = package_dir / "references" / "state-and-safety.md"
     if state_path.is_file():
         state_text = state_path.read_text(encoding="utf-8")

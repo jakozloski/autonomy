@@ -50,6 +50,9 @@ resolved_conventions:
     max_iterations: 50
     codex_cli_version: { string|null } # Captured from `codex --version` at Phase 2 preflight
   model_runtime:
+    # model = the policy-selected model (floor shown; a newer eligible model
+    # is auto-selected by scripts/model_policy.py and recorded here plus in
+    # policy_decision.selection).
     codex:
       {
         model: "gpt-5.6-sol",
@@ -219,7 +222,7 @@ finding_ledger:
   # 5. Hard cap: pass count at cap with open findings OR files_changed_in_last_pass non-empty → unconditional BLOCK
 phases:
   plan: "{pending|in_progress|complete}"
-  plan_review: "{pending|in_progress|complete|blocked}" # complete requires the mandatory GPT-5.6 Sol/ultra verdict; Fable may supplement but not replace it
+  plan_review: "{pending|in_progress|complete|blocked}" # complete requires the mandatory Codex verdict (selected model, GPT-5.6 Sol floor, ultra); Fable may supplement but not replace it
   implementation: "{pending|in_progress|complete}"
   self_review: "{pending|in_progress|complete|blocked}"
   # "blocked" = review tools unavailable/failed or issues persist after max re-review passes
@@ -438,4 +441,4 @@ Awaiting human review/approval. Re-run `/autonomy` to resume monitoring if neede
 17. **QA handoff at the first clean exit** — exits (a) and (d) both route a mapped PR/ticket to QA; (d) still writes `paused` (never `complete`) and never merges. Preview QA runs in parallel with code review. Whichever exit fires second verifies the recorded handoff postconditions instead of re-asserting assignments. Match exact `nameWithOwner`, replace the complete assignee set through Issues REST, verify GitHub and tracker postconditions, and persist operation results before terminal status. Failures append a warning but never fabricate success.
 18. **Review-roundtrip reassignment requires durable proof** — human feedback must be the sole blocker, every current inline root must have a verified reply, every current review-body action must be evaluated/acknowledged, fixes must be pushed, and the target must be a known non-bot/non-actor account. Re-request each review separately, replace the exact assignee set once, verify, and persist per-operation results before writing blocked. A push alone is insufficient; unknown/deleted identities are never auto-assigned.
 19. **REST account type is identity truth** — never infer bot/human status from a login suffix. Join GraphQL threads to REST comments by database ID, exclude `authenticated_actor`, and fail closed on missing/conflicting identity.
-20. **Exact latest models** — the mandatory plan gate is GPT-5.6 Sol at ultra and Claude voices are Fable 5 at max. Missing access BLOCKs under the core failure policy; never silently downgrade.
+20. **Floor models with auto-forward** — the mandatory plan gate is the policy-selected Codex model (floor GPT-5.6 Sol) at ultra and Claude voices run the selected Fable-lineage model (floor Fable 5) at max. `scripts/model_policy.py` auto-selects newer eligible models above the floors and its `selection` result is recorded in state; below-floor access BLOCKs under the core failure policy; never silently downgrade.

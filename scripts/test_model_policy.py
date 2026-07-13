@@ -478,5 +478,135 @@ class ModelPolicyTest(unittest.TestCase):
         self.assertEqual(json.loads(stdout.getvalue())["state"], "blocked")
 
 
+class AutoForwardSelectionTest(unittest.TestCase):
+    """Floors, not pins: newest eligible model at or above the floor wins."""
+
+    @staticmethod
+    def model(slug: str, *efforts: str) -> dict:
+        return {
+            "slug": slug,
+            "supported_reasoning_levels": [{"effort": effort} for effort in efforts],
+        }
+
+    def codex_with(self, *models: dict) -> dict:
+        codex = valid_codex()
+        codex["live_catalog"] = {
+            "models": [*live_catalog()["models"], *models]
+        }
+        return codex
+
+    def test_floor_only_catalog_selects_the_floor(self) -> None:
+        result = evaluate_model_policy(request())["codex"]
+
+        self.assertEqual(result["model"], CODEX_MODEL)
+        self.assertEqual(result["selection"]["reason"], "floor_model")
+        self.assertEqual(result["selection"]["floor_model"], CODEX_MODEL)
+
+    def test_newer_codex_model_is_auto_selected(self) -> None:
+        codex = self.codex_with(self.model("gpt-5.7", "high", "ultra"))
+
+        result = evaluate_model_policy(request(codex=codex))["codex"]
+
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(result["model"], "gpt-5.7")
+        self.assertEqual(result["arguments"][:2], ["-m", "gpt-5.7"])
+        self.assertEqual(result["selection"]["reason"], "newer_model_auto_selected")
+
+    def test_newest_version_wins_and_sol_lineage_breaks_ties(self) -> None:
+        codex = self.codex_with(
+            self.model("gpt-5.7", "ultra"),
+            self.model("gpt-5.7-sol", "ultra"),
+            self.model("gpt-6", "ultra"),
+        )
+        result = evaluate_model_policy(request(codex=codex))["codex"]
+        self.assertEqual(result["model"], "gpt-6")
+
+        codex = self.codex_with(
+            self.model("gpt-5.7", "ultra"),
+            self.model("gpt-5.7-sol", "ultra"),
+        )
+        result = evaluate_model_policy(request(codex=codex))["codex"]
+        self.assertEqual(result["model"], "gpt-5.7-sol")
+
+    def test_down_tier_variants_and_missing_ultra_are_not_upgrades(self) -> None:
+        codex = self.codex_with(
+            self.model("gpt-6-mini", "ultra"),
+            self.model("gpt-6-nano", "ultra"),
+            self.model("gpt-7", "high"),
+        )
+
+        result = evaluate_model_policy(request(codex=codex))["codex"]
+
+        self.assertEqual(result["model"], CODEX_MODEL)
+        self.assertEqual(result["selection"]["reason"], "floor_model")
+
+    def test_same_version_sibling_is_not_an_upgrade(self) -> None:
+        codex = self.codex_with(self.model("gpt-5.6", "ultra"))
+
+        result = evaluate_model_policy(request(codex=codex))["codex"]
+
+        self.assertEqual(result["model"], CODEX_MODEL)
+
+    def test_catalog_without_any_eligible_model_still_blocks(self) -> None:
+        codex = valid_codex()
+        codex["live_catalog"] = {
+            "models": [
+                self.model("gpt-5.5", "ultra"),
+                self.model("gpt-6-mini", "ultra"),
+                self.model("gpt-7", "high"),
+            ]
+        }
+
+        result = evaluate_model_policy(request(codex=codex))["codex"]
+
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["reason_code"], "live_catalog_missing_capability")
+
+    def test_newer_fable_is_auto_selected_for_agent_and_cli_paths(self) -> None:
+        claude = valid_claude(
+            observed_models=["claude-fable-5", "claude-fable-6", "claude-opus-4-8"]
+        )
+        result = evaluate_model_policy(request(claude=claude))["claude"]
+
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(result["model"], "claude-fable-6")
+        self.assertEqual(result["execution_path"], "agent_tool")
+        self.assertIn("model=claude-fable-6", result["arguments"])
+        self.assertEqual(result["selection"]["reason"], "newer_model_auto_selected")
+
+        claude["host_capabilities"] = {}
+        result = evaluate_model_policy(request(claude=claude))["claude"]
+
+        self.assertEqual(result["execution_path"], "explicit_cli")
+        model_flag = result["arguments"][result["arguments"].index("--model") + 1]
+        self.assertEqual(model_flag, "claude-fable-6")
+
+    def test_fable_family_preferred_over_mythos_on_version_tie(self) -> None:
+        claude = valid_claude(observed_models=["claude-mythos-6", "claude-fable-6"])
+
+        result = evaluate_model_policy(request(claude=claude))["claude"]
+
+        self.assertEqual(result["model"], "claude-fable-6")
+
+    def test_floor_override_conflicts_when_newer_model_selected(self) -> None:
+        claude = valid_claude(
+            observed_models=["claude-fable-6"],
+            environment={"CLAUDE_CODE_SUBAGENT_MODEL": "fable"},
+        )
+
+        result = evaluate_model_policy(request(claude=claude))["claude"]
+
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(result["execution_path"], "explicit_cli")
+
+    def test_malformed_observed_models_fall_back_to_the_floor(self) -> None:
+        for observed in (None, "claude-fable-6", [123, {}, "claude-haiku-4-5"]):
+            with self.subTest(observed=observed):
+                claude = valid_claude(observed_models=observed)
+                result = evaluate_model_policy(request(claude=claude))["claude"]
+                self.assertEqual(result["model"], CLAUDE_MODEL)
+                self.assertEqual(result["selection"]["reason"], "floor_model")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -45,6 +45,8 @@ The [heading manifest](references/heading-manifest.md) maps every heading from t
 
 These values override defaults in delegated skills and adapters.
 
+**Floors, not pins — auto-forward selection.** The models below are floors. At the model gate, `scripts/model_policy.py` selects the newest eligible model at or above each floor from the observed facts: for Codex, live-catalog models supporting `ultra` (down-tier variants like `-mini` excluded); for Claude, observed `fable`/`mythos`-family models. When a newer model ships, it is adopted automatically — persist the helper's `selection` result in state, log it in the Decision Audit Trail, and use the selected model for every invocation in the run. Anything below a floor still BLOCKs: upgrades are automatic, downgrades never are.
+
 ### Claude voices: Fable 5 at max
 
 - Use Claude Fable 5 (`claude-fable-5`, CLI alias `fable`) at `max` effort. Fable 5 supplies the native long-context model; `max` is its deepest model-reasoning setting. This skill owns orchestration, so do not substitute the separate `ultracode` workflow mode.
@@ -55,12 +57,12 @@ These values override defaults in delegated skills and adapters.
 
 ### Codex voices: GPT-5.6 Sol at ultra
 
-- Every Codex call uses GPT-5.6 Sol with ultra reasoning.
-- `codex exec` and `codex exec resume`:
-  `-m gpt-5.6-sol -c 'model_reasoning_effort="ultra"'`
+- Every Codex call uses the policy-selected model (floor: GPT-5.6 Sol) with ultra reasoning.
+- `codex exec` and `codex exec resume`, with `<selected>` = the selected model from state (floor `gpt-5.6-sol`):
+  `-m <selected> -c 'model_reasoning_effort="ultra"'`
 - Standalone `codex review` does not accept `-m` after the subcommand:
-  `codex review -c 'model="gpt-5.6-sol"' -c 'model_reasoning_effort="ultra"' ...`
-- Require Codex CLI `>= 0.144.0`. Query the live catalog, not the bundled catalog, and verify `.models[]` contains slug `gpt-5.6-sol` with `supported_reasoning_levels[].effort == "ultra"`.
+  `codex review -c 'model="<selected>"' -c 'model_reasoning_effort="ultra"' ...`
+- Require Codex CLI `>= 0.144.0`. Query the live catalog, not the bundled catalog; `scripts/model_policy.py` selects the newest eligible `.models[]` entry at or above `gpt-5.6-sol` with `supported_reasoning_levels[].effort == "ultra"`, and BLOCKs when none qualifies.
 - The first real Phase 2 invocation is the authoritative entitlement/quota test. Do not spend a second probe call when the gate itself proves access.
 
 Mandatory Phase 2 failure policy:
@@ -96,7 +98,7 @@ State lives at `.claude/workflow-state.local.md`, with `.cursor/workflow-state.l
 ## Phase State Machine
 
 1. **Plan:** investigate as required, explore with exact-model read-only agents, reuse existing patterns, write success criteria, and challenge all six edge-case dimensions.
-2. **Review plan:** GPT-5.6 Sol at ultra must approve within eight rounds. Runtime failure follows the mandatory model policy above.
+2. **Review plan:** the selected Codex model (floor GPT-5.6 Sol) at ultra must approve within eight rounds. Runtime failure follows the mandatory model policy above.
 3. **Implement:** complete one logical plan item at a time; run correctness checks and commit after each file-changing item; finish with all quality checks.
 4. **Self-review:** use the skill-only/application fallback chain, ledger every finding, fix every real issue, justify false positives, and re-review file-changing fixes until convergence or the documented cap.
    4a. **Security gate:** run only for applicable scopes; critical unresolved findings BLOCK.
@@ -149,7 +151,7 @@ Do not merge the PR. A clean unapproved PR pauses for its requested human review
 
 1. Never skip a mandatory phase or quality command.
 2. Never leave a review comment without a verified reply or written justification.
-3. Never silently downgrade GPT-5.6 Sol/ultra or Fable 5/max.
+3. Never silently downgrade below the GPT-5.6 Sol/ultra or Fable 5/max floors. Newer-model auto-selection is upward only and always recorded in state and the audit trail.
 4. Never assign mapped QA owners in a fork or same-name unrelated repository.
 5. Never persist terminal monitor status before required handoff operations finish or fail durably.
 6. Never treat a bot as a human reviewer or assignment target.
