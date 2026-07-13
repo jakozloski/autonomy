@@ -94,15 +94,15 @@ The first real review invocation is the authoritative entitlement/quota test. Mi
 2. **Direct Codex review** (when `/autoplan` is not selected):
    - Read the `codex-review` skill file from the discovered path above and follow its steps directly (do NOT invoke it as a slash command from inside this skill)
    - Invoke Codex with `-m gpt-5.6-sol -c 'model_reasoning_effort="ultra"'` (the codex-review skill uses `codex exec`, which accepts `-m`) — if its defaults ever differ, Model Configuration wins
-   - Codex and Claude iterate (up to 5 rounds) until Codex approves
+   - Codex and Claude iterate (up to 8 rounds) until Codex approves
    - If Codex raises valid concerns, revise the plan
    - If Codex suggests something contradicting explicit user requirements or repo rules, skip with logged note
-   - If NOT approved after 5 rounds: BLOCK and ask user
+   - If NOT approved after 8 rounds: BLOCK and ask user
    - On approval: set `phases.plan_review: "complete"` in state
 
 3. **Fable adversarial supplement:** when the selected plan-review flow calls for a Claude voice, run Fable 5 at max via the verified Agent-tool or explicit CLI path. It may strengthen or challenge the plan, but it does not replace the mandatory Codex verdict.
 
-4. **BLOCK** — if the required Codex process fails, reaches five rounds without approval, or a required Fable voice cannot run under the core policy. Set `phases.plan_review: "blocked"` in state.
+4. **BLOCK** — if the required Codex process fails, reaches eight rounds without approval, or a required Fable voice cannot run under the core policy. Set `phases.plan_review: "blocked"` in state.
 
 **Runtime failure handling:** Apply the core model failure matrix. Never silently proceed without GPT-5.6 Sol approval.
 
@@ -179,7 +179,7 @@ Review the implementation before creating or updating the PR. (For PR takeovers,
    }
    files_changed_in_last_pass = files changed by initial review fixes (may be empty)
 
-   while review_pass < 5:  # Hard cap: 5 total passes (initial + 4 re-reviews)
+   while review_pass < 8:  # Hard cap: 8 total passes (initial + 7 re-reviews)
      a. Mandatory re-review gate: If files_changed_in_last_pass is non-empty,
         a re-review pass MUST run regardless of current open set.
         If files_changed_in_last_pass is empty AND current open set is empty
@@ -207,7 +207,7 @@ Review the implementation before creating or updating the PR. (For PR takeovers,
      k. Update convergence[session_id]: append open_count to
         pass_actionable_counts, rotate diff hashes
 
-   Rule 5 (hard cap): If review_pass == 5 with open findings
+   Rule 5 (hard cap): If review_pass == 8 with open findings
    OR files_changed_in_last_pass is non-empty → BLOCK unconditionally, notify user.
    Final-pass fixes that changed files cannot be left unreviewed.
    ```
