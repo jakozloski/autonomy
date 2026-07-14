@@ -62,7 +62,7 @@ Invoke with `/autonomy`, or ask for "solve this issue autonomously" / "take over
 The skill checks its model gates up front and blocks with a reason when one is unavailable, instead of quietly downgrading:
 
 - Claude Code `>= 2.1.170` with access to Claude Fable 5 (`claude-fable-5`) at `max` effort
-- Codex CLI `>= 0.144.0` with access to GPT-5.6 Sol at `ultra` reasoning (plan-review and code-review gates)
+- Codex CLI `>= 0.144.0` with access to GPT-5.6 Sol at `xhigh` reasoning (plan-review and code-review gates; `ultra` is a breadth mode reserved for tasks that genuinely decompose into independent parts, so the single-problem gates run depth-mode `xhigh`)
 - `gh` CLI authenticated for the target repository
 - Python 3 (standard library only) for the helper scripts
 

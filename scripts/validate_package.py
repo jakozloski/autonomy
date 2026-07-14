@@ -22,8 +22,8 @@ MAX_SKILL_LINES_EXCLUSIVE = 500
 MAX_REFERENCE_LINES_EXCLUSIVE = 500
 
 CODEX_FLOOR_MODEL = "gpt-5.6-sol"
-EXEC_MODEL_FLAGS = "-m <selected> -c 'model_reasoning_effort=\"ultra\"'"
-REVIEW_MODEL_FLAGS = "-c 'model=\"<selected>\"' -c 'model_reasoning_effort=\"ultra\"'"
+EXEC_MODEL_FLAGS = "-m <selected> -c 'model_reasoning_effort=\"xhigh\"'"
+REVIEW_MODEL_FLAGS = "-c 'model=\"<selected>\"' -c 'model_reasoning_effort=\"xhigh\"'"
 
 REQUIRED_REFERENCE_FILES = (
     "references/project-and-entry.md",
@@ -120,7 +120,7 @@ BUILTIN_EXPECTED_HEADINGS: Mapping[str, tuple[str, ...]] = {
         "## Non-Negotiable Invariants",
         "## Mandatory Model Policy",
         "### Claude voices: Fable 5 at max",
-        "### Codex voices: GPT-5.6 Sol at ultra",
+        "### Codex voices: GPT-5.6 Sol at xhigh",
         "## Authorization and Entry Routing",
         "## Project Profile and State",
         "## Phase State Machine",
@@ -199,11 +199,12 @@ BUILTIN_EXPECTED_HEADINGS: Mapping[str, tuple[str, ...]] = {
 }
 
 # The human-readable heading inventory must retain an explicit old-to-new record
-# for headings renamed during the package split. Unchanged former headings are
-# already covered by BUILTIN_EXPECTED_HEADINGS.
+# for headings renamed during or after the package split. Unchanged former
+# headings are already covered by BUILTIN_EXPECTED_HEADINGS.
 RENAMED_FORMER_HEADINGS = (
     "## Philosophy",
     "## Model Configuration (Mandatory)",
+    "### Codex voices: GPT-5.6 Sol at ultra",
     "### Step 2: Check for Bot Feedback",
     "#### QA handoff (repo-conditional — runs inside terminal-success exits (a) and (d))",
     "#### Review-roundtrip handoff (conditional — runs inside condition (c)'s CHANGES_REQUESTED / unresolved-human-threads exit)",

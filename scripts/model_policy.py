@@ -14,7 +14,7 @@ Expected input shape::
         "live_catalog": {
           "models": [{
             "slug": "gpt-5.6-sol",
-            "supported_reasoning_levels": [{"effort": "ultra"}]
+            "supported_reasoning_levels": [{"effort": "xhigh"}]
           }]
         },
         "first_real_invocation": {"status": "success", "attempts": 1}
@@ -50,6 +50,10 @@ entries in the optional ``claude.observed_models`` list from the ``fable`` or
 ``mythos`` families.  Upgrades are automatic and reported under each
 decision's ``selection`` key; anything below a floor still blocks, and no
 path proposes a downgrade.
+
+``xhigh`` is the depth setting for this workflow's single-problem voices;
+``ultra`` is the breadth mode, reserved for tasks that genuinely decompose
+into independent parts, and is deliberately not part of this gate.
 """
 
 from __future__ import annotations
@@ -64,7 +68,7 @@ SCHEMA_VERSION = 1
 
 CODEX_MODEL = "gpt-5.6-sol"  # floor: newest eligible catalog model >= this wins
 CODEX_FLOOR_VERSION = (5, 6)
-CODEX_EFFORT = "ultra"
+CODEX_EFFORT = "xhigh"
 MIN_CODEX_VERSION = (0, 144, 0)
 CODEX_MAX_ATTEMPTS = 2
 # Variant tokens that mark down-tier siblings, never auto-forward targets.
@@ -214,7 +218,7 @@ def _codex_base(version: Any) -> dict[str, Any]:
             "-m",
             CODEX_MODEL,
             "-c",
-            'model_reasoning_effort="ultra"',
+            'model_reasoning_effort="xhigh"',
         ],
         "next_action": None,
         "retry": {
@@ -336,7 +340,7 @@ def evaluate_codex(raw: Any) -> dict[str, Any]:
             decision,
             "live_catalog_missing_capability",
             "The live Codex catalog lacks an eligible model at or above "
-            "GPT-5.6 Sol with ultra reasoning",
+            "GPT-5.6 Sol with xhigh reasoning",
             "request_access_or_refresh_live_catalog",
         )
     decision["live_catalog_verified"] = True
@@ -345,7 +349,7 @@ def evaluate_codex(raw: Any) -> dict[str, Any]:
         "-m",
         selected_model,
         "-c",
-        'model_reasoning_effort="ultra"',
+        'model_reasoning_effort="xhigh"',
     ]
     decision["selection"] = {
         "floor_model": CODEX_MODEL,
@@ -428,7 +432,7 @@ def evaluate_codex(raw: Any) -> dict[str, Any]:
                     "reason_code": status,
                     "reason": (
                         "Transient Codex failure; retry once with the exact same "
-                        "GPT-5.6 Sol/ultra configuration"
+                        "GPT-5.6 Sol/xhigh configuration"
                     ),
                     "next_action": "retry_same_invocation_once",
                 }

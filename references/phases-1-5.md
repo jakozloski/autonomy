@@ -51,12 +51,12 @@ CODEX_VERSION=$(codex --version 2>/dev/null | awk '{print $2}')
 # delivered by the live catalog and may not exist in the binary's bundled
 # snapshot. Capture the full catalog JSON — scripts/model_policy.py performs
 # the eligibility check and auto-forward selection (newest eligible model at
-# or above the gpt-5.6-sol floor with ultra support; -mini/-nano style
+# or above the gpt-5.6-sol floor with xhigh support; -mini/-nano style
 # variants excluded). A helper result without an eligible model BLOCKs:
 codex debug models > /tmp/codex-live-catalog.json || BLOCK "Could not read the live Codex catalog"
 ```
 
-Build the observed-facts JSON documented by `scripts/model_policy.py` (live catalog for Codex; include observed Claude model ids as `claude.observed_models` when the harness exposes them) and run that helper before the first real invocation. Its Codex result must be `probe_required`; any `blocked` result stops here. The helper's `selection` field names the model every subsequent invocation must use — the floor, or a newer auto-selected model; log a `newer_model_auto_selected` result in the Decision Audit Trail. After the real review invocation, run the helper again with the exact observed status and attempt count. Continue only on `ready`; honor `retry` exactly once with the same selected-model/ultra flags, and persist the complete decision under `resolved_conventions.model_runtime`. The helper makes no vendor calls and does not replace the real invocation.
+Build the observed-facts JSON documented by `scripts/model_policy.py` (live catalog for Codex; include observed Claude model ids as `claude.observed_models` when the harness exposes them) and run that helper before the first real invocation. Its Codex result must be `probe_required`; any `blocked` result stops here. The helper's `selection` field names the model every subsequent invocation must use — the floor, or a newer auto-selected model; log a `newer_model_auto_selected` result in the Decision Audit Trail. After the real review invocation, run the helper again with the exact observed status and attempt count. Continue only on `ready`; honor `retry` exactly once with the same selected-model/xhigh flags, and persist the complete decision under `resolved_conventions.model_runtime`. The helper makes no vendor calls and does not replace the real invocation.
 
 The first real review invocation is the authoritative entitlement/quota test. Missing CLI, old CLI, missing live capability, entitlement denial, or quota exhaustion follows the blocking failure matrix in the core skill. A transient transport failure gets one logged retry; a second failure BLOCKs. Never substitute a lower model or a Claude-only approval.
 
@@ -69,7 +69,7 @@ The first real review invocation is the authoritative entitlement/quota test. Mi
 **Tool selection (capability-gated):**
 
 1. **gstack `/autoplan` adapter** (primary, when gstack available, `change_type != skill_only`, and the mandatory Codex preflight succeeds):
-   - All Codex calls run the policy-selected model (floor GPT-5.6 Sol) at `ultra` reasoning (flag form per subcommand — see Model Configuration); Claude voices run on the selected Fable-lineage model (floor Fable 5)
+   - All Codex calls run the policy-selected model (floor GPT-5.6 Sol) at `xhigh` reasoning (flag form per subcommand — see Model Configuration); Claude voices run on the selected Fable-lineage model (floor Fable 5)
    - Runs the full 4-phase review pipeline with dual voices (Claude subagent + Codex) and auto-decisions:
      - **CEO Review** (Phase 1): Strategy, scope, premises, 6-month regret test, competitive risk. Override mode: COMPLETE WITHIN AUTHORIZED BOUNDARY.
      - **Design Review** (Phase 2, conditional on `scope_frontend`): UX dimensions, design system compliance, 7-dimension rating. Skipped if no frontend scope.
@@ -93,7 +93,7 @@ The first real review invocation is the authoritative entitlement/quota test. Mi
 
 2. **Direct Codex review** (when `/autoplan` is not selected):
    - Read the `codex-review` skill file from the discovered path above and follow its steps directly (do NOT invoke it as a slash command from inside this skill)
-   - Invoke Codex with `-m <selected-codex-model> -c 'model_reasoning_effort="ultra"'` using the policy-selected model from state (floor `gpt-5.6-sol`; the codex-review skill uses `codex exec`, which accepts `-m`) — if its defaults ever differ, Model Configuration wins
+   - Invoke Codex with `-m <selected-codex-model> -c 'model_reasoning_effort="xhigh"'` using the policy-selected model from state (floor `gpt-5.6-sol`; the codex-review skill uses `codex exec`, which accepts `-m`) — if its defaults ever differ, Model Configuration wins
    - Codex and Claude iterate (up to 8 rounds) until Codex approves
    - If Codex raises valid concerns, revise the plan
    - If Codex suggests something contradicting explicit user requirements or repo rules, skip with logged note
@@ -135,7 +135,7 @@ Review the implementation before creating or updating the PR. (For PR takeovers,
      - **Small (<50 lines):** Claude structured review only. No multi-model for small diffs.
      - **Medium (50-199 lines):** + Codex adversarial challenge (if `command -v codex` succeeds) OR Claude adversarial subagent (fallback)
      - **Large (200+ lines):** + Codex structured review (if available) + Claude adversarial subagent + Codex adversarial challenge (if available). If Codex is unavailable, run Claude structured review + two Claude adversarial subagent passes instead.
-   - Every Codex invocation in this adapter runs the policy-selected model (floor GPT-5.6 Sol) at `ultra` reasoning — `codex exec` via `-m <selected>`, `codex review` via `-c 'model="<selected>"'` (it rejects `-m`), both with `-c 'model_reasoning_effort="ultra"'` (see Model Configuration); Claude passes run on the selected Fable-lineage model (floor Fable 5)
+   - Every Codex invocation in this adapter runs the policy-selected model (floor GPT-5.6 Sol) at `xhigh` reasoning — `codex exec` via `-m <selected>`, `codex review` via `-c 'model="<selected>"'` (it rejects `-m`), both with `-c 'model_reasoning_effort="xhigh"'` (see Model Configuration); Claude passes run on the selected Fable-lineage model (floor Fable 5)
    - If `scope_frontend`: include design review lite (check for CSS/spacing/hierarchy issues in the diff)
    - Fix-First workflow: AUTO-FIX items applied automatically, ASK items fixed as recommended (autonomous mode)
    - Set `gstack_integration.review.status: "complete"` and `gstack_integration.review.tier: "small|medium|large"`

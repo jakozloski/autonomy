@@ -16,7 +16,7 @@ from model_policy import (
 )
 
 
-def live_catalog(*, include_sol: bool = True, include_ultra: bool = True) -> dict:
+def live_catalog(*, include_sol: bool = True, include_xhigh: bool = True) -> dict:
     models = [
         {
             "slug": "gpt-5.5-codex",
@@ -24,9 +24,10 @@ def live_catalog(*, include_sol: bool = True, include_ultra: bool = True) -> dic
         }
     ]
     if include_sol:
-        levels = [{"effort": "high"}]
-        if include_ultra:
-            levels.append({"effort": "ultra"})
+        # ultra stays present: the breadth mode never satisfies the xhigh gate.
+        levels = [{"effort": "high"}, {"effort": "ultra"}]
+        if include_xhigh:
+            levels.append({"effort": "xhigh"})
         models.append(
             {
                 "slug": CODEX_MODEL,
@@ -81,7 +82,7 @@ def request(*, codex: dict | None = None, claude: dict | None = None) -> dict:
 
 
 class ModelPolicyTest(unittest.TestCase):
-    def test_ready_policy_pins_sol_ultra_and_fable_max(self) -> None:
+    def test_ready_policy_pins_sol_xhigh_and_fable_max(self) -> None:
         result = evaluate_model_policy(request())
 
         self.assertEqual(result["state"], "ready")
@@ -133,9 +134,9 @@ class ModelPolicyTest(unittest.TestCase):
         self.assertEqual(result["state"], "blocked")
         self.assertEqual(result["reason_code"], "live_catalog_missing_capability")
 
-    def test_codex_live_catalog_missing_ultra_blocks(self) -> None:
+    def test_codex_live_catalog_missing_xhigh_blocks(self) -> None:
         codex = valid_codex()
-        codex["live_catalog"] = live_catalog(include_ultra=False)
+        codex["live_catalog"] = live_catalog(include_xhigh=False)
 
         result = evaluate_model_policy(request(codex=codex))["codex"]
 
@@ -503,7 +504,7 @@ class AutoForwardSelectionTest(unittest.TestCase):
         self.assertEqual(result["selection"]["floor_model"], CODEX_MODEL)
 
     def test_newer_codex_model_is_auto_selected(self) -> None:
-        codex = self.codex_with(self.model("gpt-5.7", "high", "ultra"))
+        codex = self.codex_with(self.model("gpt-5.7", "high", "xhigh"))
 
         result = evaluate_model_policy(request(codex=codex))["codex"]
 
@@ -514,25 +515,26 @@ class AutoForwardSelectionTest(unittest.TestCase):
 
     def test_newest_version_wins_and_sol_lineage_breaks_ties(self) -> None:
         codex = self.codex_with(
-            self.model("gpt-5.7", "ultra"),
-            self.model("gpt-5.7-sol", "ultra"),
-            self.model("gpt-6", "ultra"),
+            self.model("gpt-5.7", "xhigh"),
+            self.model("gpt-5.7-sol", "xhigh"),
+            self.model("gpt-6", "xhigh"),
         )
         result = evaluate_model_policy(request(codex=codex))["codex"]
         self.assertEqual(result["model"], "gpt-6")
 
         codex = self.codex_with(
-            self.model("gpt-5.7", "ultra"),
-            self.model("gpt-5.7-sol", "ultra"),
+            self.model("gpt-5.7", "xhigh"),
+            self.model("gpt-5.7-sol", "xhigh"),
         )
         result = evaluate_model_policy(request(codex=codex))["codex"]
         self.assertEqual(result["model"], "gpt-5.7-sol")
 
-    def test_down_tier_variants_and_missing_ultra_are_not_upgrades(self) -> None:
+    def test_down_tier_variants_and_missing_xhigh_are_not_upgrades(self) -> None:
         codex = self.codex_with(
-            self.model("gpt-6-mini", "ultra"),
-            self.model("gpt-6-nano", "ultra"),
-            self.model("gpt-7", "high"),
+            self.model("gpt-6-mini", "xhigh"),
+            self.model("gpt-6-nano", "xhigh"),
+            # breadth-only sibling: ultra support never satisfies the xhigh gate
+            self.model("gpt-7", "high", "ultra"),
         )
 
         result = evaluate_model_policy(request(codex=codex))["codex"]
@@ -541,7 +543,7 @@ class AutoForwardSelectionTest(unittest.TestCase):
         self.assertEqual(result["selection"]["reason"], "floor_model")
 
     def test_same_version_sibling_is_not_an_upgrade(self) -> None:
-        codex = self.codex_with(self.model("gpt-5.6", "ultra"))
+        codex = self.codex_with(self.model("gpt-5.6", "xhigh"))
 
         result = evaluate_model_policy(request(codex=codex))["codex"]
 
@@ -551,9 +553,9 @@ class AutoForwardSelectionTest(unittest.TestCase):
         codex = valid_codex()
         codex["live_catalog"] = {
             "models": [
-                self.model("gpt-5.5", "ultra"),
-                self.model("gpt-6-mini", "ultra"),
-                self.model("gpt-7", "high"),
+                self.model("gpt-5.5", "xhigh"),
+                self.model("gpt-6-mini", "xhigh"),
+                self.model("gpt-7", "high", "ultra"),
             ]
         }
 

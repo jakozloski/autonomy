@@ -43,26 +43,26 @@ The [heading manifest](references/heading-manifest.md) maps every heading from t
 
 ## Mandatory Model Policy
 
-These values override defaults in delegated skills and adapters.
+These values override defaults in delegated skills and adapters. Match compute shape to task shape: `ultra` reasoning (GPT) and the `ultracode` workflow mode (Fable) are breadth modes, justified only when a task genuinely decomposes into independent parts; `xhigh` (GPT) and `max` effort (Fable) are depth modes for one hard problem. Every mandatory voice in this workflow is one hard problem — review one plan, review one diff — so the floors below are depth floors.
 
-**Floors, not pins — auto-forward selection.** The models below are floors. At the model gate, `scripts/model_policy.py` selects the newest eligible model at or above each floor from the observed facts: for Codex, live-catalog models supporting `ultra` (down-tier variants like `-mini` excluded); for Claude, observed `fable`/`mythos`-family models. When a newer model ships, it is adopted automatically — persist the helper's `selection` result in state, log it in the Decision Audit Trail, and use the selected model for every invocation in the run. Anything below a floor still BLOCKs: upgrades are automatic, downgrades never are.
+**Floors, not pins — auto-forward selection.** The models below are floors. At the model gate, `scripts/model_policy.py` selects the newest eligible model at or above each floor from the observed facts: for Codex, live-catalog models supporting `xhigh` (down-tier variants like `-mini` excluded); for Claude, observed `fable`/`mythos`-family models. When a newer model ships, it is adopted automatically — persist the helper's `selection` result in state, log it in the Decision Audit Trail, and use the selected model for every invocation in the run. Anything below a floor still BLOCKs: upgrades are automatic, downgrades never are.
 
 ### Claude voices: Fable 5 at max
 
-- Use Claude Fable 5 (`claude-fable-5`, CLI alias `fable`) at `max` effort. Fable 5 supplies the native long-context model; `max` is its deepest model-reasoning setting. This skill owns orchestration, so do not substitute the separate `ultracode` workflow mode.
+- Use Claude Fable 5 (`claude-fable-5`, CLI alias `fable`) at `max` effort. Fable 5 supplies the native long-context model; `max` is its deepest model-reasoning setting — the right shape for a voice's single hard problem. Do not substitute the separate `ultracode` workflow mode: it is a breadth mode for work that genuinely decomposes into independent parts, and this skill already owns that decomposition by dispatching its own voices.
 - Require Claude Code `>= 2.1.170`. Explicit CLI voices clear model/effort/permission overrides and add `--permission-mode plan --allowedTools Read,Glob,Grep --disallowedTools Edit,Write,NotebookEdit,Bash,WebFetch,WebSearch,Agent,Task --disable-slash-commands --no-session-persistence --no-chrome` after the Fable/max flags. Reviewer/explorer voices are read-only even when repository settings pre-authorize mutations.
 - Agent-tool voices may use `model: "fable"` only after confirming the host enforces per-agent model, max effort, and a read-only tool boundary; environment model/effort overrides must also be compatible. Otherwise use the clean-environment, read-only explicit CLI voice.
 - Built-in Explore agents are fixed to a smaller model. Use a read-only general-purpose/custom explorer pinned to Fable, or the explicit Fable CLI path.
 - If Fable is unavailable because of version, entitlement, provider policy, or zero-data-retention policy, BLOCK with the exact reason. An explicit user waiver must also name an observed, available, versioned Opus model and authorize it at max effort; never continue by dropping the Claude voice or by claiming the provider-dependent `opus` alias is a particular version.
 
-### Codex voices: GPT-5.6 Sol at ultra
+### Codex voices: GPT-5.6 Sol at xhigh
 
-- Every Codex call uses the policy-selected model (floor: GPT-5.6 Sol) with ultra reasoning.
+- Every Codex call uses the policy-selected model (floor: GPT-5.6 Sol) with `xhigh` reasoning: each voice is one hard problem that needs depth (review one plan, review one diff). Reserve `ultra` — the breadth mode — for a task that genuinely decomposes into independent parts; no mandatory voice here does, and breadth is never a substitute for depth on a single problem.
 - `codex exec` and `codex exec resume`, with `<selected>` = the selected model from state (floor `gpt-5.6-sol`):
-  `-m <selected> -c 'model_reasoning_effort="ultra"'`
+  `-m <selected> -c 'model_reasoning_effort="xhigh"'`
 - Standalone `codex review` does not accept `-m` after the subcommand:
-  `codex review -c 'model="<selected>"' -c 'model_reasoning_effort="ultra"' ...`
-- Require Codex CLI `>= 0.144.0`. Query the live catalog, not the bundled catalog; `scripts/model_policy.py` selects the newest eligible `.models[]` entry at or above `gpt-5.6-sol` with `supported_reasoning_levels[].effort == "ultra"`, and BLOCKs when none qualifies.
+  `codex review -c 'model="<selected>"' -c 'model_reasoning_effort="xhigh"' ...`
+- Require Codex CLI `>= 0.144.0`. Query the live catalog, not the bundled catalog; `scripts/model_policy.py` selects the newest eligible `.models[]` entry at or above `gpt-5.6-sol` with `supported_reasoning_levels[].effort == "xhigh"`, and BLOCKs when none qualifies.
 - The first real Phase 2 invocation is the authoritative entitlement/quota test. Do not spend a second probe call when the gate itself proves access.
 
 Mandatory Phase 2 failure policy:
@@ -71,7 +71,7 @@ Mandatory Phase 2 failure policy:
 | ----------------------------------------------------- | --------------------------------------------------------- |
 | CLI missing                                           | BLOCK with install instructions                           |
 | CLI older than 0.144.0                                | BLOCK with upgrade instructions                           |
-| Live catalog lacks Sol/ultra or entitlement is denied | BLOCK with access guidance                                |
+| Live catalog lacks Sol/xhigh or entitlement is denied | BLOCK with access guidance                                |
 | Usage quota exhausted                                 | BLOCK until the reported reset or the user changes access |
 | Timeout or transient transport error                  | Log one retry; a second failure BLOCKs                    |
 
@@ -98,7 +98,7 @@ State lives at `.claude/workflow-state.local.md`, with `.cursor/workflow-state.l
 ## Phase State Machine
 
 1. **Plan:** investigate as required, explore with exact-model read-only agents, reuse existing patterns, write success criteria, and challenge all six edge-case dimensions.
-2. **Review plan:** the selected Codex model (floor GPT-5.6 Sol) at ultra must approve within eight rounds. Runtime failure follows the mandatory model policy above.
+2. **Review plan:** the selected Codex model (floor GPT-5.6 Sol) at xhigh must approve within eight rounds. Runtime failure follows the mandatory model policy above.
 3. **Implement:** complete one logical plan item at a time; run correctness checks and commit after each file-changing item; finish with all quality checks.
 4. **Self-review:** use the skill-only/application fallback chain, ledger every finding, fix every real issue, justify false positives, and re-review file-changing fixes until convergence or the documented cap.
    4a. **Security gate:** run only for applicable scopes; critical unresolved findings BLOCK.
@@ -151,7 +151,7 @@ Do not merge the PR. A clean unapproved PR pauses for its requested human review
 
 1. Never skip a mandatory phase or quality command.
 2. Never leave a review comment without a verified reply or written justification.
-3. Never silently downgrade below the GPT-5.6 Sol/ultra or Fable 5/max floors. Newer-model auto-selection is upward only and always recorded in state and the audit trail.
+3. Never silently downgrade below the GPT-5.6 Sol/xhigh or Fable 5/max floors. Newer-model auto-selection is upward only and always recorded in state and the audit trail; `ultra` and `ultracode` are breadth modes for genuinely decomposable tasks, never an upgrade for one hard problem.
 4. Never assign mapped QA owners in a fork or same-name unrelated repository.
 5. Never persist terminal monitor status before required handoff operations finish or fail durably.
 6. Never treat a bot as a human reviewer or assignment target.
