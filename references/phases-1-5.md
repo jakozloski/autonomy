@@ -86,7 +86,7 @@ The first real review invocation is the authoritative entitlement/quota test. Mi
      1. Premise confirmation (CEO phase) — auto-confirmed in autonomous mode with logged rationale
      2. User challenges (final gate) — when BOTH models disagree with stated direction. In autonomous mode: if security/feasibility blocker → BLOCK and notify user. Otherwise → accept models' recommendation with logged rationale.
    - **Taste decisions:** Close approaches, borderline scope, and Codex disagreements are logged in the Decision Audit Trail and auto-decided using the 6 principles above.
-   - All decisions logged to the `decision_audit_trail` state field FIRST (it is the authoritative trail; on divergence it wins), then copied into the plan file's readable trail section
+   - All decisions logged to the `decision_audit_trail` state field FIRST (it is the authoritative trail; on divergence it wins), then copied into the plan file's readable trail section when a plan file exists
    - Set `gstack_integration.autoplan.status: "complete"` in state
    - On success: set `phases.plan_review: "complete"` in state
    - A failed Claude voice may use the explicit Fable CLI path. A failed Codex voice follows the core blocking matrix; it may not degrade to a different model or Claude-only approval.
