@@ -185,7 +185,7 @@ KNOWN_TOP_LEVEL_KEYS = frozenset(
 
 MINIMAL_REQUIRED = ("state_schema_version", "workflow_id", "description", "current_phase")
 TAKEOVER_REQUIRED = MINIMAL_REQUIRED + ("pr_number", "base_branch")
-FULL_REQUIRED = tuple(sorted(KNOWN_TOP_LEVEL_KEYS - {"decision_audit_trail"}))
+FULL_REQUIRED = tuple(sorted(KNOWN_TOP_LEVEL_KEYS))
 
 # Conservative instruction-pattern heuristics.  Advisory: a tainted string is
 # surfaced (path + truncated digest), never echoed and never obeyed; taint
@@ -629,6 +629,14 @@ class _Validator:
             self.validate_gstack(state.get("gstack_integration"), tier_name)
         if "clean_poll_timestamps" in state:
             self.validate_clean_polls(state.get("clean_poll_timestamps"))
+        if "decision_audit_trail" in state:
+            trail = state.get("decision_audit_trail")
+            if not isinstance(trail, list) or any(
+                not isinstance(item, str) or not item for item in trail
+            ):
+                self.error(
+                    "decision_audit_trail: must be a list of non-empty strings"
+                )
         return tier_name
 
     # -- sections ----------------------------------------------------------
