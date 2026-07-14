@@ -266,7 +266,7 @@ phases:
   # "paused" = PR is clean (checks passing, no feedback, branch up to date) but not yet approved.
   # "blocked" = condition (c) fired (3-strike CI/conflict, exhausted/unknown feedback, or CHANGES_REQUESTED) OR prompt-trail sync failure at an otherwise-eligible flip/clean-exit pass (attempt_log: prompt-trail:stale).
   # The agent exited the monitor loop. Re-invoke to resume monitoring (paused) or after human fixes (blocked).
-decision_audit_trail: [] # append-only strings: the DURABLE Decision Audit Trail (model selections, gate decisions, pivots); plan-file trail sections are working copies that mirror here — this field is authoritative when no plan file exists (e.g. Entry B)
+decision_audit_trail: [] # append-only strings: THE authoritative Decision Audit Trail (model selections, gate decisions, pivots). Write here FIRST; a plan file's trail section is a readable non-authoritative copy. On divergence this field wins — append any unmirrored entries here, never rewrite history.
 ---
 ```
 
