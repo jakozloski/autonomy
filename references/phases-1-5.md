@@ -112,6 +112,17 @@ The first real review invocation is the authoritative entitlement/quota test. Mi
 
 Execute the plan.
 
+**Red/green regression evidence (mandatory when `defect_evidence_mode != "none"`):**
+
+- Record the root cause the fix addresses in `regression_evidence.root_cause` — the Phase 1 hypothesis when the investigation adapter ran, otherwise a one-line falsifiable claim. No bug fix proceeds without a recorded root-cause claim.
+- Before implementing the fix item, write the smallest test that reproduces that root cause (for `skill_helper_defect`, inside the package's own test suite). Run it from a clean worktree (`git status --porcelain=v1 -z` empty immediately before and after the run — evidence captured across a dirty tree is invalid; commit first, then rerun) and confirm it fails **for the expected reason** — the assertion demonstrating the bug, not an import/fixture/setup error. A wrong-reason failure re-enters investigation. Persist the structured `red_evidence` record (argv, exit code, timestamp, `tested_head_sha`, output digest); set `status: "red_verified"`.
+- Implement the fix, then run the focused test (green) plus the correctness subset of `QUALITY_CHECK_STEPS`, again across a clean tree. Persist `green_evidence`, set `status: "complete"` and `evaluated_head_sha` = the green `tested_head_sha`. Any later file-changing commit invalidates `green_evidence`/`evaluated_head_sha` until the focused test is re-run.
+- Evidence comes from actually executed commands only; fabricated or paraphrased output is a workflow violation (the runtime-verification standard). Persisted argv is AUDIT-ONLY: reruns reconstruct the command from current repository configuration plus validated `test_paths`; if the runner cannot be re-derived, BLOCK.
+- Takeover (Entry B) where the fix already exists: a regression test covering the fixed path is still required and must run green. If demonstrating red would require reverting the fix, set `red_exemption_reason: "takeover: red requires revert"` — the status still ends `"complete"`, never `"exempt"`.
+- Genuinely untestable fixes (config-only, generated files, environment-specific, deterministically unreproducible): set `status: "exempt"` with an explicit `exemption_reason` plus `root_cause`, and set `evaluated_head_sha` to the HEAD where the exemption was re-evaluated; Phase 5's `## Evidence` must then name the exact manual scenario a human must verify.
+- On resume with `status: "red_verified"`: re-run the focused test first. If it now passes unexpectedly, or fails for a different reason, re-enter root-cause investigation — never assume the fix landed.
+- `defect_evidence_mode == "none"`: set `status: "not_applicable"` (no execution evidence) — zero ceremony for features and refactors.
+
 1. Work through each item in the plan systematically
 2. After each completed plan item that changed files, before starting the next plan item:
    - Run the test/typecheck steps from `QUALITY_CHECK_STEPS` (the subset that validates correctness, not formatting)
@@ -340,7 +351,7 @@ After any monitor-loop code/conflict/review fix, reclassify touched files. Befor
 
 ## Phase 5: Create / Update PR
 
-**Precondition:** `phases.runtime_verification.status` must be `"complete"` or `"waived"`. If it is `blocked`, stop. Never convert `in_progress` or `blocked` to `waived` automatically when repository policy is mandatory.
+**Precondition:** `phases.runtime_verification.status` must be `"complete"` or `"waived"`. If it is `blocked`, stop. Never convert `in_progress` or `blocked` to `waived` automatically when repository policy is mandatory. Additionally, per `defect_evidence_mode`: when it is `"runtime_bug_fix"` or `"skill_helper_defect"`, `regression_evidence.status` must be `"complete"` or `"exempt"` AND `variant_analysis.status` must be `"complete"`, with `regression_evidence.evaluated_head_sha` and `variant_analysis.analyzed_head_sha` both equal to the HEAD being pushed; when it is `"none"`, they must be `"not_applicable"`/`"skipped"`. A failed evidence precondition stops before push.
 
 ### PR Body Template (MANDATORY)
 
@@ -357,7 +368,7 @@ Every PR body produced by this workflow MUST include these five sections in orde
    - `🧪 Needs human QA` — `phases.runtime_verification.status` was `"waived"` (the default case)
    - `✅ Runtime-verified by agent` — `phases.runtime_verification.status` was `"complete"` (user opted in AND the adapter succeeded)
 4. **`## Test plan`** — checkbox list of manual verification steps for the human QA reviewer. One checkbox per distinct flow or edge case.
-5. **`## Evidence`** — actual command output, rendered artifact, screenshot/video, endpoint result, benchmark, or a direct CI/comment link proving the changed path works. A test plan alone is not evidence. If end-to-end verification was unavailable, name the exact blocked scenario and the downstream check required.
+5. **`## Evidence`** — actual command output, rendered artifact, screenshot/video, endpoint result, benchmark, or a direct CI/comment link proving the changed path works. A test plan alone is not evidence. If end-to-end verification was unavailable, name the exact blocked scenario and the downstream check required. For bug fixes (`defect_evidence_mode != "none"`), this section must include the red/green regression status with bounded, redacted output excerpts (or the persisted exemption reason and its manual scenario), the variant-analysis patterns and inspected counts, fixed sites, and reported out-of-boundary sites or an explicit "none found".
 
 The Prompt Trail lets engineers do a "prompt review" alongside the code review — checking whether the original request was well-scoped, whether scope crept, and whether the agent interpreted the prompt correctly. Bad prompts produce plausible-looking but wrong code; without this trail there's no way to audit intent.
 
