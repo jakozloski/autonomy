@@ -86,7 +86,7 @@ The first real review invocation is the authoritative entitlement/quota test. Mi
      1. Premise confirmation (CEO phase) — auto-confirmed in autonomous mode with logged rationale
      2. User challenges (final gate) — when BOTH models disagree with stated direction. In autonomous mode: if security/feasibility blocker → BLOCK and notify user. Otherwise → accept models' recommendation with logged rationale.
    - **Taste decisions:** Close approaches, borderline scope, and Codex disagreements are logged in the Decision Audit Trail and auto-decided using the 6 principles above.
-   - All decisions logged to Decision Audit Trail in the plan file
+   - All decisions logged to Decision Audit Trail in the plan file and mirrored to the durable `decision_audit_trail` state field (the state field is authoritative when no plan file exists)
    - Set `gstack_integration.autoplan.status: "complete"` in state
    - On success: set `phases.plan_review: "complete"` in state
    - A failed Claude voice may use the explicit Fable CLI path. A failed Codex voice follows the core blocking matrix; it may not degrade to a different model or Claude-only approval.
@@ -128,7 +128,7 @@ Execute the plan.
 
 - Build an exact search matching only the known defective pattern (start literal: `rg -F`), then generalize ONE element at a time — identifier → any identifier, literal → its class — inspecting every newly introduced match at each step. Search the whole repository, not just the fixed module (for `skill_helper_defect`, the whole package).
 - Stop generalizing when new matches are mostly false positives (roughly half or more) or a step adds more than ~200 matches — tighten the pattern instead of skimming.
-- Variants **inside the user-requested boundary** are the same defect: fix them in this PR with test coverage where practical (record a reason where not). After variant fixes, re-run the focused regression test and the correctness subset across a clean tree — a file-changing variant fix invalidates prior green evidence — then REFRESH the search at the new HEAD (the patterns are already derived; the re-run is cheap) and set `variant_analysis.status: "complete"` with `analyzed_head_sha` = that final searched HEAD, so it can equal the push HEAD.
+- Variants **inside the user-requested boundary** are the same defect: fix them in this PR with test coverage where practical (record a reason where not). After variant fixes, re-run the focused regression test (when one exists — `exempt` fixes have none) and the correctness subset across a clean tree — a file-changing variant fix invalidates prior green evidence and requires re-evaluating an `exempt` `evaluated_head_sha` alike — then REFRESH the search at the new HEAD (the patterns are already derived; the re-run is cheap) and set `variant_analysis.status: "complete"` with `analyzed_head_sha` = that final searched HEAD, so it can equal the push HEAD.
 - Variants **outside the boundary** are always REPORTED in the PR body (exact `file:line` sites, or an explicit "none found"). Write to a tracker only when the resolved `issue_tracker.write_path` and repository policy authorize that specific operation; never mutate a tracker as a side effect of variant reporting.
 - Persist `variant_analysis` (patterns tried, matches inspected, fixed sites, reported sites).
 
