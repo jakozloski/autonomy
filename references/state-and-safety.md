@@ -198,7 +198,7 @@ gstack_integration:
   review:
     status: "complete|skipped"
     tier: "small|medium|large|null"
-    notes: [] # append-only records: { session_id, pass_number, fallback, focus_triggers: [] } — fired focus triggers per pass + degraded-path audit; a legacy scalar note reads as one { fallback } record
+    notes: [] # append-only records: { session_id, pass_number, fallback, focus_triggers: [] } — fired focus triggers per pass + degraded-path audit; never a bare string (legacy scalar notes predate v1 and surface through the versionless-suspect path)
   qa:
     status: "complete|skipped" # optional adapter status; cannot waive a mandatory repository check
   design_review:
@@ -266,6 +266,7 @@ phases:
   # "paused" = PR is clean (checks passing, no feedback, branch up to date) but not yet approved.
   # "blocked" = condition (c) fired (3-strike CI/conflict, exhausted/unknown feedback, or CHANGES_REQUESTED) OR prompt-trail sync failure at an otherwise-eligible flip/clean-exit pass (attempt_log: prompt-trail:stale).
   # The agent exited the monitor loop. Re-invoke to resume monitoring (paused) or after human fixes (blocked).
+decision_audit_trail: [] # optional append-only strings: model selections, gate decisions, pivots (the Decision Audit Trail)
 ---
 ```
 
@@ -363,7 +364,7 @@ The agent may be interrupted by user redirect, Ctrl-C, harness shutdown, or sess
 **Phase-transition state (on graceful abort only):** When the agent CAN detect the abort (e.g., explicit user `stop` or a clearly-bounded interruption), write:
 
 - `current_phase: "aborted_at_<phase>"`
-- `phases.<current>: "blocked"`
+- `phases.<current>: "blocked"` (for `runtime_verification`, write `phases.runtime_verification.status: "blocked"` — that phase entry is a mapping, never overwrite it with a scalar)
 
 Then output:
 
