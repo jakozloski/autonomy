@@ -12,6 +12,7 @@ from validate_package import (
     BUILTIN_EXPECTED_HEADINGS,
     CODEX_FLOOR_MODEL,
     EXEC_MODEL_FLAGS,
+    REQUIRED_GATE_MARKERS,
     REQUIRED_REDACTION_PATTERNS,
     REQUIRED_SCRIPT_FILES,
     RENAMED_FORMER_HEADINGS,
@@ -35,6 +36,10 @@ def _valid_skill_text() -> str:
             f"Use `codex review {REVIEW_MODEL_FLAGS}` for Codex review.",
             f"The codex floor model is {CODEX_FLOOR_MODEL}; newer eligible models auto-forward.",
             "This skill owns orchestration; do not substitute the separate ultracode mode.",
+            *(
+                f"Gate marker: {marker}"
+                for marker in REQUIRED_GATE_MARKERS.get("SKILL.md", ())
+            ),
             "",
         )
     )
@@ -93,6 +98,13 @@ class PackageFixture:
             for pattern, _samples in REQUIRED_REDACTION_PATTERNS.values():
                 state_file.write(f"Required pattern: `{pattern}`\n")
 
+        for relative_path, markers in REQUIRED_GATE_MARKERS.items():
+            if relative_path == "SKILL.md":
+                continue  # markers are embedded by _valid_skill_text()
+            with (self.root / relative_path).open("a", encoding="utf-8") as handle:
+                for marker in markers:
+                    handle.write(f"Gate marker: {marker}\n")
+
         (self.root / "references" / "heading-manifest.md").write_text(
             _heading_inventory(), encoding="utf-8"
         )
@@ -133,6 +145,41 @@ class ValidatePackageTests(unittest.TestCase):
         errors = validate_package(self.package.root)
 
         self.assertIn("missing required script file: scripts/model_policy.py", errors)
+
+    def test_missing_state_schema_helper_and_tests_fail(self) -> None:
+        for relative_path in ("scripts/state_schema.py", "scripts/test_state_schema.py"):
+            with self.subTest(script=relative_path):
+                target = self.package.root / relative_path
+                target.unlink()
+                try:
+                    errors = validate_package(self.package.root)
+                    self.assertIn(
+                        f"missing required script file: {relative_path}", errors
+                    )
+                finally:
+                    target.write_text("# package fixture\n", encoding="utf-8")
+
+    def test_missing_gate_marker_is_rejected_per_file_and_marker(self) -> None:
+        for relative_path, markers in REQUIRED_GATE_MARKERS.items():
+            for marker in markers:
+                with self.subTest(file=relative_path, marker=marker):
+                    target = self.package.root / relative_path
+                    original = target.read_text(encoding="utf-8")
+                    stripped = "\n".join(
+                        line
+                        for line in original.splitlines()
+                        if marker not in line
+                    ) + "\n"
+                    assert marker not in stripped
+                    target.write_text(stripped, encoding="utf-8")
+                    try:
+                        errors = validate_package(self.package.root)
+                        self.assertIn(
+                            f"{relative_path}: missing required gate marker {marker!r}",
+                            errors,
+                        )
+                    finally:
+                        target.write_text(original, encoding="utf-8")
 
     def test_frontmatter_rejects_non_portable_keys(self) -> None:
         skill_path = self.package.root / "SKILL.md"
