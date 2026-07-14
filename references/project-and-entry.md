@@ -163,7 +163,7 @@ The user provides an issue, bug report, feature request, or context to work from
 1. Read and understand the full context provided
 2. **Initialize state file** — create `.claude/workflow-state.local.md` with `state_schema_version: 1`, `workflow_id`, `description`, `current_phase: "entry"` so state exists for resume if the session is interrupted
 3. **Resolve `base_branch`** — resolve per the `BASE_BRANCH` section in Resolved Project Profile above and persist to state immediately, before any command that references `origin/<base_branch>`.
-4. **Resolve Project Profile** — execute the remaining discovery steps above to populate `resolved_conventions` in the state file before continuing. This MUST complete before any phase begins. After profile resolution and before Phase 1, initialize the remaining schema blocks (`phases`, `regression_evidence`, `variant_analysis`, ledgers) so the full-tier schema requirement is satisfiable from Phase 1 onward.
+4. **Resolve Project Profile** — execute the remaining discovery steps above to populate `resolved_conventions` in the state file before continuing. This MUST complete before any phase begins. After profile resolution and before Phase 1, initialize EVERY remaining top-level block from the documented state template — `phases`, `regression_evidence`, `variant_analysis`, ledgers, tracking/acknowledgment maps, monitor counters, and handoffs — the full v1 mapping, so the full-tier schema requirement is satisfiable from Phase 1 onward.
 5. Explore the codebase to understand the affected areas
 6. **Run Scope Analysis & Skill Selection** from the issue/context (see below) so `change_type` is known before branch/ticket classification.
 7. **Choose the repository-compliant branch name and finalize ticket policy.** If the current branch is protected, create the branch using the prefix required for the classified change (for example `chore/` for exempt maintenance or `feature/` for ticketed product work), then recompute `ticket_required` from the final branch + `change_type` and persist the exact rule:
@@ -213,7 +213,7 @@ The user provides a PR number or URL from another agent or person.
        # No stash entry was created (working tree was effectively clean after
        # ignoring untracked-but-tracked-as-ignored files). Persist the shell
        # empty string here; serialize it to state as YAML `null` so the
-       # field stays consistent with `stash_ref: { string|null }` in the
+       # field stays consistent with `stash_ref: null # string|null` in the
        # schema. The restore guard checks `-n "${STASH_REF:-}"` which treats
        # both empty string and unset as falsy.
        STASH_REF=""
@@ -255,7 +255,7 @@ The user provides a PR number or URL from another agent or person.
 
    **Note:** `STASH_REF` is captured by exact-message match using a unique nonce; this is race-free regardless of concurrent stash-push activity from other processes.
 
-4. **Resolve Project Profile** — execute the discovery steps above to populate `resolved_conventions` in the state file before continuing. `base_branch` was already persisted in step 2. This MUST complete before any phase begins. After profile resolution, initialize the remaining schema blocks (`phases`, `regression_evidence`, `variant_analysis`, ledgers) so the full-tier schema requirement is satisfiable from Phase 1 onward.
+4. **Resolve Project Profile** — execute the discovery steps above to populate `resolved_conventions` in the state file before continuing. `base_branch` was already persisted in step 2. This MUST complete before any phase begins. After profile resolution, initialize EVERY remaining top-level block from the documented state template — `phases`, `regression_evidence`, `variant_analysis`, ledgers, tracking/acknowledgment maps, monitor counters, and handoffs — the full v1 mapping, so the full-tier schema requirement is satisfiable from Phase 1 onward.
 5. Read the PR description and all feedback from the paginated issue-comment, review, and inline-comment REST endpoints; use GraphQL only to supplement thread resolution state
 6. Understand what's been done and what's pending
 7. Assess current state:
@@ -265,7 +265,7 @@ The user provides a PR number or URL from another agent or person.
    - Are there merge conflicts? → Note them
 8. **Run Scope Analysis & Skill Selection** (see section below) — uses `git diff` against `base_branch` (now persisted in state) to classify scope and select applicable gstack skills. Recompute `ticket_required` from the checked-out branch + classified `change_type`, persisting the exact exemption rule.
 9. If there's implementation work remaining → proceed to **Phase 1: Plan** for the remaining work
-10. If implementation is done → set `phases.plan`, `phases.plan_review`, and `phases.implementation` to `"complete"` in state (structurally not applicable for a completed PR takeover). **When the taken-over change is a bug fix (`defect_evidence_mode != "none"`), complete the red/green + variant evidence gate first (the Phase 3 blocks; the takeover red-exemption path applies) — it is a precondition of Phase 4 entry on this path, not something the completed-implementation shortcut may skip.** Set `current_phase: "self_review"` and `phases.self_review: "in_progress"`. Proceed to **Phase 4: Self-Review**.
+10. If implementation is done → set `phases.plan`, `phases.plan_review`, and `phases.implementation` to `"complete"` in state (structurally not applicable for a completed PR takeover). **When the taken-over change is a bug fix (`defect_evidence_mode != "none"`), complete the red/green + variant evidence gate first (the Phase 3 blocks; the takeover red-exemption path applies) — it is a precondition of Phase 4 entry on this path, not something the completed-implementation shortcut may skip. When the mode is `"none"`, apply the unconditional evidence status assignment instead (`not_applicable`/`skipped` with a reason).** Set `current_phase: "self_review"` and `phases.self_review: "in_progress"`. Proceed to **Phase 4: Self-Review**.
 
     **Takeover phase-transition bookkeeping:** Update both `current_phase` AND the corresponding `phases.*` status at every transition on the takeover path:
     - `current_phase: "self_review"`, `phases.self_review: "in_progress"` → Phase 4

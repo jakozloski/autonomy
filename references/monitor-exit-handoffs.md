@@ -51,7 +51,7 @@ Evaluate the fresh `CHECKS` snapshot (not stale Step 1 results):
 
 #### MANDATORY VERIFICATION GATE
 
-Before evaluating any exit condition that ends the loop (conditions a, c, d), you MUST execute and print a sanity-check verification block. This is a hard precondition: declaring exit without printing this block is a workflow violation.
+Before evaluating any exit condition that ends the loop (conditions a, c, d), you MUST execute and print a sanity-check verification block. This is a hard precondition: declaring exit without printing this block is a workflow violation. (Reminder: when `defect_evidence_mode != "none"`, the core Validation-Before-Push evidence re-bind — `evaluated_head_sha`/`analyzed_head_sha` equal to the push HEAD — applies to every monitor-loop push too; a monitor fix commit invalidates both until re-run.)
 
 **This block is a SANITY CHECK.** The canonical unreplied detection above (compute `unreplied_all` / `unreplied_actionable` from REST `in_reply_to_id` + `authenticated_actor` + edit-timestamp comparison + `thread_reply_timestamps` grace) is authoritative. This block must not diverge from it — if the simplified count here disagrees with the canonical values, trust the canonical values for gating decisions and log the discrepancy for investigation.
 

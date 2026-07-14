@@ -451,13 +451,10 @@ def parse_state_text(text: str) -> tuple[dict, list[str]]:
     if close_index is None:
         raise StructuralError("state file frontmatter fence is never closed")
     # close_index is the 1-based line number of the closing fence, which is
-    # lines[close_index - 1] zero-based; the body starts right after it.
+    # lines[close_index - 1] zero-based; the body starts right after it.  The
+    # body is OPAQUE: it is never parsed as data (so later "---" lines are
+    # plain text, e.g. markdown horizontal rules) — it is only taint-scanned.
     body_lines = lines[close_index:]
-    for body_offset, raw in enumerate(body_lines, start=close_index + 1):
-        if raw.strip() == "---":
-            raise StructuralError(
-                f"line {body_offset}: extra document separators are rejected"
-            )
     parsed_lines = _collect_lines(fence_lines)
     if not parsed_lines:
         raise StructuralError("state frontmatter is empty")
@@ -731,6 +728,8 @@ class _Validator:
                     self.error(
                         "invariant(vi): variant_analysis.complete requires a full-hex analyzed_head_sha"
                     )
+                if variant_status == "skipped" and not variants.get("skipped_reason"):
+                    self.error("invariant(v): skipped requires skipped_reason")
                 for list_key in ("search_patterns", "variants_fixed", "variants_reported"):
                     value = variants.get(list_key)
                     if value is not None and not isinstance(value, list):
@@ -831,6 +830,10 @@ class _Validator:
                         self.error(f"regression_evidence.test_paths[{position}]: {problem}")
 
         evaluated = regression.get("evaluated_head_sha")
+        if status in ("red_verified", "complete", "exempt") and not regression.get(
+            "root_cause"
+        ):
+            self.error(f"invariant(v): {status} requires root_cause")
         if status == "red_verified":
             if red is None or not red_ok:
                 self.error("invariant(v): red_verified requires a complete red_evidence record")
@@ -848,8 +851,6 @@ class _Validator:
                     "invariant(v): evaluated_head_sha must equal green_evidence.tested_head_sha"
                 )
         elif status == "exempt":
-            if not regression.get("root_cause"):
-                self.error("invariant(v): exempt requires root_cause")
             if not regression.get("exemption_reason"):
                 self.error("invariant(v): exempt requires exemption_reason")
             if not _is_full_hex(evaluated):
