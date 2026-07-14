@@ -35,11 +35,47 @@ REQUIRED_REFERENCE_FILES = (
 REQUIRED_SCRIPT_FILES = (
     "scripts/handoff_decision.py",
     "scripts/model_policy.py",
+    "scripts/state_schema.py",
     "scripts/validate_package.py",
     "scripts/test_handoff_decision.py",
     "scripts/test_model_policy.py",
+    "scripts/test_state_schema.py",
     "scripts/test_validate_package.py",
 )
+
+# Evidence-gate and state-hardening content contracts.  Each marker is an
+# exact substring the named file must contain; renaming the prose label in a
+# reference must update this inventory in the same commit (same contract as
+# the heading manifest).
+REQUIRED_GATE_MARKERS = {
+    "SKILL.md": (
+        "state_schema.py",
+        "red/green regression evidence",
+        "evaluated_head_sha",
+    ),
+    "references/phases-1-5.md": (
+        "Red/green regression evidence (mandatory when",
+        "Variant analysis (mandatory when",
+        "Diff-triggered review focus lines",
+        "regression_evidence.status",
+    ),
+    "references/state-and-safety.md": (
+        "Resume trust model",
+        "regression_evidence:",
+        "variant_analysis:",
+        "state_schema_version",
+        "analyzed_head_sha",
+        "audit-only",
+        "defect_evidence_mode",
+    ),
+    "references/monitor-exit-handoffs.md": (
+        "diff-triggered review focus lines",
+    ),
+    "references/project-and-entry.md": (
+        "red/green + variant evidence gate",
+        "defect_evidence_mode",
+    ),
+}
 
 REQUIRED_REDACTION_PATTERNS = {
     "aws_access_or_session_key": (
@@ -533,6 +569,24 @@ def _validate_references(
     return errors
 
 
+def _validate_gate_markers(package_dir: Path) -> list[str]:
+    """Require every evidence-gate/state-hardening marker in its named file."""
+    errors: list[str] = []
+    for relative_path, markers in sorted(REQUIRED_GATE_MARKERS.items()):
+        candidate = package_dir / relative_path
+        if not candidate.is_file():
+            # Missing reference/skill files are reported by their own checks;
+            # do not duplicate that error here.
+            continue
+        text = candidate.read_text(encoding="utf-8")
+        for marker in markers:
+            if marker not in text:
+                errors.append(
+                    f"{relative_path}: missing required gate marker {marker!r}"
+                )
+    return errors
+
+
 def _validate_policy_text(package_dir: Path) -> list[str]:
     errors: list[str] = []
     combined_parts: list[str] = []
@@ -664,6 +718,7 @@ def validate_package(
         if not (package_dir / required_file).is_file():
             errors.append(f"missing required script file: {required_file}")
     errors.extend(_validate_policy_text(package_dir))
+    errors.extend(_validate_gate_markers(package_dir))
     errors.extend(_validate_openai_yaml(package_dir))
     return errors
 
