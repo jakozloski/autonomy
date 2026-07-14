@@ -265,7 +265,7 @@ The user provides a PR number or URL from another agent or person.
    - Are there merge conflicts? → Note them
 8. **Run Scope Analysis & Skill Selection** (see section below) — uses `git diff` against `base_branch` (now persisted in state) to classify scope and select applicable gstack skills. Recompute `ticket_required` from the checked-out branch + classified `change_type`, persisting the exact exemption rule.
 9. If there's implementation work remaining → proceed to **Phase 1: Plan** for the remaining work
-10. If implementation is done → set `phases.plan`, `phases.plan_review`, and `phases.implementation` to `"complete"` in state (structurally not applicable for a completed PR takeover). Set `current_phase: "self_review"` and `phases.self_review: "in_progress"`. Proceed to **Phase 4: Self-Review**.
+10. If implementation is done → set `phases.plan`, `phases.plan_review`, and `phases.implementation` to `"complete"` in state (structurally not applicable for a completed PR takeover). **When the taken-over change is a bug fix (`defect_evidence_mode != "none"`), complete the red/green + variant evidence gate first (the Phase 3 blocks; the takeover red-exemption path applies) — it is a precondition of Phase 4 entry on this path, not something the completed-implementation shortcut may skip.** Set `current_phase: "self_review"` and `phases.self_review: "in_progress"`. Proceed to **Phase 4: Self-Review**.
 
     **Takeover phase-transition bookkeeping:** Update both `current_phase` AND the corresponding `phases.*` status at every transition on the takeover path:
     - `current_phase: "self_review"`, `phases.self_review: "in_progress"` → Phase 4

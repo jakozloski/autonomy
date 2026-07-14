@@ -123,6 +123,14 @@ Execute the plan.
 - On resume with `status: "red_verified"`: re-run the focused test first. If it now passes unexpectedly, or fails for a different reason, re-enter root-cause investigation — never assume the fix landed.
 - `defect_evidence_mode == "none"`: set `status: "not_applicable"` (no execution evidence) — zero ceremony for features and refactors.
 
+**Variant analysis (mandatory when `defect_evidence_mode != "none"`, after the fix is verified green):**
+
+- Build an exact search matching only the known defective pattern (start literal: `rg -F`), then generalize ONE element at a time — identifier → any identifier, literal → its class — inspecting every newly introduced match at each step. Search the whole repository, not just the fixed module (for `skill_helper_defect`, the whole package).
+- Stop generalizing when new matches are mostly false positives (roughly half or more) or a step adds more than ~200 matches — tighten the pattern instead of skimming.
+- Variants **inside the user-requested boundary** are the same defect: fix them in this PR with test coverage where practical (record a reason where not). After variant fixes, re-run the focused regression test and the correctness subset across a clean tree — a file-changing variant fix invalidates prior green evidence — then set `variant_analysis.status: "complete"` with `analyzed_head_sha` = the HEAD searched.
+- Variants **outside the boundary** are always REPORTED in the PR body (exact `file:line` sites, or an explicit "none found"). Write to a tracker only when the resolved `issue_tracker.write_path` and repository policy authorize that specific operation; never mutate a tracker as a side effect of variant reporting.
+- Persist `variant_analysis` (patterns tried, matches inspected, fixed sites, reported sites). `defect_evidence_mode == "none"`: `status: "skipped"` with a reason.
+
 1. Work through each item in the plan systematically
 2. After each completed plan item that changed files, before starting the next plan item:
    - Run the test/typecheck steps from `QUALITY_CHECK_STEPS` (the subset that validates correctness, not formatting)
@@ -130,7 +138,7 @@ Execute the plan.
 3. When all plan items are complete, run ALL steps in `QUALITY_CHECK_STEPS` sequentially
 4. Fix any issues that arise from quality checks
 5. Commit all changes
-6. **Recompute Scope Analysis** — re-run Scope Analysis steps 2-4 from the actual `git diff` (implementation may have changed which files are affected). Update scope/change type/selected skills, then recompute branch/type-dependent `ticket_required` and applicable mandatory runtime-verification kinds. Recomputing does not re-run Phase 2.
+6. **Recompute Scope Analysis** — re-run Scope Analysis steps 2-4 from the actual `git diff` (implementation may have changed which files are affected). Update scope/change type/selected skills — including `defect_evidence_mode`, recomputed together with `change_type` — then recompute branch/type-dependent `ticket_required` and applicable mandatory runtime-verification kinds. Recomputing does not re-run Phase 2.
 
 ---
 
