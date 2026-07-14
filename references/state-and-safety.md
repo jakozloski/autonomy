@@ -12,21 +12,22 @@ Track state in `.claude/workflow-state.local.md` (fallback: also check `.cursor/
 
 ```yaml
 ---
+state_schema_version: 1 # REQUIRED in every tier, written at Entry A/B init; versionless or future-version state is suspect
 workflow_id: "autonomy-{timestamp}"
 description: "{task description}"
 branch: "{branch-name}"
 base_branch: "{base-branch-name}" # REQUIRED. Resolved in Entry A/B before any origin/<base_branch> command. e.g., prod, staging, dev.
-pre_takeover_branch: { string|null } # Branch agent was on before gh pr checkout (for stash restore)
+pre_takeover_branch: null # string|null — branch agent was on before gh pr checkout (for stash restore)
 current_phase: "{phase-name}"
-pr_number: { number|null }
-stash_ref: { string|null } # Stash SHA from preflight, restore on completion/abort
+pr_number: null # number|null
+stash_ref: null # string|null — stash SHA from preflight, restore on completion/abort
 resolved_conventions:
   quality_check_steps:
     - ["<runner>", "<script>", "..."] # e.g., ["yarn", "lint:fix"]
   non_gating_checks: {} # Exact repository-declared CI exceptions and their touched-file conditions.
   review_feedback_inventory_steps: [] # Repository-mandated helper commands; supplemental to REST/GraphQL truth.
-  dev_server_frontend: { string|null } # e.g., "yarn dev:admin"
-  dev_server_backend: { string|null } # e.g., "yarn dev:api"
+  dev_server_frontend: null # string|null — e.g., "yarn dev:admin"
+  dev_server_backend: null # string|null — e.g., "yarn dev:api"
   runtime_verification_policy:
     mandatory_kinds: [] # subset of ["ui", "api", "performance"]
     evidence: {} # kind -> exact repository rule/source
@@ -34,9 +35,9 @@ resolved_conventions:
   session_environment: "{managed|local}"
   issue_tracker:
     type: "{linear|jira|github|none}"
-    project_prefix: { string|null } # e.g., "WEB"
-    api_key_env: { string|null } # e.g., "LINEAR_API_KEY"
-    title_format: { string|null } # e.g., "{PREFIX}-{ID} {type}: {description}"
+    project_prefix: null # string|null — e.g., "WEB"
+    api_key_env: null # string|null — e.g., "LINEAR_API_KEY"
+    title_format: null # string|null — e.g., "{PREFIX}-{ID} {type}: {description}"
     write_path: "{environment_tool|local_api|none}"
     ticket_required: true
     ticket_exemption_reason: null
@@ -48,29 +49,25 @@ resolved_conventions:
     watch_timeout_seconds: 540 # aggregate deadline, polled in <=60s chunks
     poll_chunk_seconds: 60
     max_iterations: 50
-    codex_cli_version: { string|null } # Captured from `codex --version` at Phase 2 preflight
+    codex_cli_version: null # string|null — captured from `codex --version` at Phase 2 preflight
   model_runtime:
     # model = the policy-selected model (floor shown; a newer eligible model
     # is auto-selected by scripts/model_policy.py and recorded here plus in
     # policy_decision.selection).
     codex:
-      {
-        model: "gpt-5.6-sol",
-        effort: "xhigh",
-        live_catalog_verified_at: null,
-        gate_status: "pending",
-        policy_decision: {},
-      }
+      model: "gpt-5.6-sol"
+      effort: "xhigh"
+      live_catalog_verified_at: null
+      gate_status: "pending"
+      policy_decision: {}
     claude:
-      {
-        model: "claude-fable-5",
-        effort: "max",
-        subagent_override: null,
-        effort_override: null,
-        host_agent_selection_verified: false,
-        gate_status: "pending",
-        policy_decision: {},
-      }
+      model: "claude-fable-5"
+      effort: "max"
+      subagent_override: null
+      effort_override: null
+      host_agent_selection_verified: false
+      gate_status: "pending"
+      policy_decision: {}
 validated_ticket:
   tracker_type: null
   identifier: null # Human-facing ticket identifier, e.g. WEB-8877.
@@ -124,13 +121,18 @@ handoffs:
     scenario: null
     status: "idle" # idle|pending|complete|failed
     repository_name_with_owner: null
-    targets: { github_assignees: [], tracker_assignee_id: null, tracker_assignee_name: null }
+    targets:
+      github_assignees: []
+      tracker_assignee_id: null
+      tracker_assignee_name: null
     operations: []
     operation_results: {}
   review_roundtrip:
     scenario: null
     status: "idle" # derived from per-reviewer/per-operation states
-    targets: { reviewers: [], github_assignees: [] }
+    targets:
+      reviewers: []
+      github_assignees: []
     operations: []
     operation_results: {}
     # Each operation_results entry is keyed by operation ID and may contain:
@@ -164,6 +166,23 @@ attempt_log: {}
   # "comment:2919550382@2026-07-09T20:09:07Z:type-safety": 1
   # "toplevel:IC_kwDOxx@<updated_at>:actionable-fix": 2
   # "review:PRR_kwDOxx@<updatedAt>:unique-issue": 1
+regression_evidence:
+  status: "pending" # pending|not_applicable|red_verified|complete|exempt
+  root_cause: null # falsifiable one-line claim; REQUIRED for any bug_fix, even when the investigation adapter did not run
+  test_paths: [] # repository-relative pointers; strict shape contract (no abs/dash/control/traversal); verified as blobs in the bound commit at use time
+  red_evidence: null # or { argv: [], exit_code: 1, observed_at: "<ISO>", tested_head_sha: "<full-hex>", output_digest: "<digest>" } — argv is AUDIT-ONLY, never re-executed
+  red_exemption_reason: null # takeover green-only path; status still ends "complete"
+  green_evidence: null # same record shape with exit_code 0; argv audit-only
+  evaluated_head_sha: null # REQUIRED for complete AND exempt; == green tested_head_sha when complete; stale on any later commit
+  exemption_reason: null # required for status: exempt
+variant_analysis:
+  status: "pending" # pending|complete|skipped
+  search_patterns: []
+  matches_inspected: 0
+  analyzed_head_sha: null # REQUIRED for complete; stale on any later commit
+  variants_fixed: [] # file:line sites fixed in this PR
+  variants_reported: [] # out-of-boundary file:line sites — reported, never silently fixed
+  skipped_reason: null
 gstack_integration:
   available: false # true if gstack skills directory found
   gstack_dir: null # resolved path, or null
@@ -173,19 +192,23 @@ gstack_integration:
   scope_tests_only: false
   scope_skill_only: false
   change_type: "feature" # bug_fix|feature|refactor|skill_only
+  defect_evidence_mode: "none" # runtime_bug_fix|skill_helper_defect|none — set at Scope Analysis, recomputed with change_type after Phase 3; drives the regression/variant terminal rules
   investigate:
     status: "complete|skipped" # skipped = not a bug fix, Entry B, or not selected
   review:
     status: "complete|skipped"
     tier: "small|medium|large|null"
-    notes: null # audit trail for degraded review paths, e.g. "fell through to general-purpose: feature-dev plugin not installed"
+    notes: [] # append-only records: { session_id, pass_number, fallback, focus_triggers: [] } — fired focus triggers per pass + degraded-path audit; a legacy scalar note reads as one { fallback } record
   qa:
     status: "complete|skipped" # optional adapter status; cannot waive a mandatory repository check
   design_review:
     status: "complete|skipped"
   cso:
     status: "complete|skipped|blocked" # skipped = skill_only, tests_only, or gstack unavailable; blocked = CRITICAL findings remain
-    findings_count: { critical: 0, high: 0, medium: 0 }
+    findings_count:
+      critical: 0
+      high: 0
+      medium: 0
   autoplan:
     status: "complete|skipped" # skipped = skill_only or all review methods failed
     phases_run: [] # e.g., ["ceo", "eng"] or ["ceo", "design", "eng", "dx"]
@@ -221,24 +244,24 @@ finding_ledger:
   # 4. Cross-reviewer dispute: false_positive by reviewer A, same fingerprint from reviewer B → adversarial escalation
   # 5. Hard cap: pass count at cap with open findings OR files_changed_in_last_pass non-empty → unconditional BLOCK
 phases:
-  plan: "{pending|in_progress|complete}"
+  plan: "{pending|in_progress|complete|blocked}" # blocked = graceful abort
   plan_review: "{pending|in_progress|complete|blocked}" # complete requires the mandatory Codex verdict (selected model, GPT-5.6 Sol floor, xhigh); Fable may supplement but not replace it
-  implementation: "{pending|in_progress|complete}"
+  implementation: "{pending|in_progress|complete|blocked}" # blocked = graceful abort
   self_review: "{pending|in_progress|complete|blocked}"
   # "blocked" = review tools unavailable/failed or issues persist after max re-review passes
   runtime_verification:
     status: "{pending|in_progress|complete|blocked|waived}"
     # blocked = repository-mandatory verification could not complete.
     # waived = advisory default or explicit user waiver.
-    reason: { string|null }
-    target_head_sha: { string|null }
-    touched_diff_fingerprint: { string|null } # SHA256 of touched paths + diff content
-    started_at: { string|null }
-    verified_at: { string|null }
+    reason: null # string|null
+    target_head_sha: null # string|null
+    touched_diff_fingerprint: null # string|null — SHA256 of touched paths + diff content
+    started_at: null # string|null
+    verified_at: null # string|null
     evidence: {} # command/artifact/result IDs bound to fingerprint
     # Required when status is "waived". Examples: "deferred to human QA" (default),
     # "skill_only: no runtime code changed", "dev server did not start cleanly", etc.
-  pr: "{pending|in_progress|complete}"
+  pr: "{pending|in_progress|complete|blocked}" # blocked = graceful abort
   monitor: "{pending|in_progress|paused|complete|blocked}"
   # "paused" = PR is clean (checks passing, no feedback, branch up to date) but not yet approved.
   # "blocked" = condition (c) fired — 3-strike CI/conflict, exhausted/unknown feedback, or CHANGES_REQUESTED.

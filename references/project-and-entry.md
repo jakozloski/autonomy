@@ -161,9 +161,9 @@ Resolution is deterministic:
 The user provides an issue, bug report, feature request, or context to work from.
 
 1. Read and understand the full context provided
-2. **Initialize state file** — create `.claude/workflow-state.local.md` with `workflow_id`, `description`, `current_phase: "entry"` so state exists for resume if the session is interrupted
+2. **Initialize state file** — create `.claude/workflow-state.local.md` with `state_schema_version: 1`, `workflow_id`, `description`, `current_phase: "entry"` so state exists for resume if the session is interrupted
 3. **Resolve `base_branch`** — resolve per the `BASE_BRANCH` section in Resolved Project Profile above and persist to state immediately, before any command that references `origin/<base_branch>`.
-4. **Resolve Project Profile** — execute the remaining discovery steps above to populate `resolved_conventions` in the state file before continuing. This MUST complete before any phase begins.
+4. **Resolve Project Profile** — execute the remaining discovery steps above to populate `resolved_conventions` in the state file before continuing. This MUST complete before any phase begins. After profile resolution and before Phase 1, initialize the remaining schema blocks (`phases`, `regression_evidence`, `variant_analysis`, ledgers) so the full-tier schema requirement is satisfiable from Phase 1 onward.
 5. Explore the codebase to understand the affected areas
 6. **Run Scope Analysis & Skill Selection** from the issue/context (see below) so `change_type` is known before branch/ticket classification.
 7. **Choose the repository-compliant branch name and finalize ticket policy.** If the current branch is protected, create the branch using the prefix required for the classified change (for example `chore/` for exempt maintenance or `feature/` for ticketed product work), then recompute `ticket_required` from the final branch + `change_type` and persist the exact rule:
@@ -181,7 +181,7 @@ The user provides a PR number or URL from another agent or person.
 
 1. Fetch the PR: `gh pr view <number> --json title,body,headRefName,baseRefName,files,reviewDecision`. **Capture** `baseRefName` from the response into a local variable (to be persisted as `base_branch` in step 2's state file init). Fetch feedback separately through the REST endpoints defined in Phase 6 so account type and edit timestamps remain authoritative.
 2. **Initialize state file** (before any git operations):
-   - Create `.claude/workflow-state.local.md` with `workflow_id`, `description`, `current_phase: "takeover"`, `pr_number`, and `base_branch` = the `baseRefName` captured in step 1. **Persist this before any command that references `origin/<base_branch>` runs** — it is the first value written to state for this workflow.
+   - Create `.claude/workflow-state.local.md` with `state_schema_version: 1`, `workflow_id`, `description`, `current_phase: "takeover"`, `pr_number`, and `base_branch` = the `baseRefName` captured in step 1. **Persist this before any command that references `origin/<base_branch>` runs** — it is the first value written to state for this workflow.
    - This ensures state exists even if subsequent steps fail
 3. Check out the branch safely:
 
@@ -255,7 +255,7 @@ The user provides a PR number or URL from another agent or person.
 
    **Note:** `STASH_REF` is captured by exact-message match using a unique nonce; this is race-free regardless of concurrent stash-push activity from other processes.
 
-4. **Resolve Project Profile** — execute the discovery steps above to populate `resolved_conventions` in the state file before continuing. `base_branch` was already persisted in step 2. This MUST complete before any phase begins.
+4. **Resolve Project Profile** — execute the discovery steps above to populate `resolved_conventions` in the state file before continuing. `base_branch` was already persisted in step 2. This MUST complete before any phase begins. After profile resolution, initialize the remaining schema blocks (`phases`, `regression_evidence`, `variant_analysis`, ledgers) so the full-tier schema requirement is satisfiable from Phase 1 onward.
 5. Read the PR description and all feedback from the paginated issue-comment, review, and inline-comment REST endpoints; use GraphQL only to supplement thread resolution state
 6. Understand what's been done and what's pending
 7. Assess current state:
@@ -328,6 +328,8 @@ From entry context:
 2. **`bug_fix`** — if entry context mentions bug/error/regression/"fix" AND `scope_skill_only == false`.
 3. **`refactor`** — if entry context explicitly describes restructuring without behavior change.
 4. **`feature`** — default.
+
+In the same step, set the orthogonal `defect_evidence_mode` classifier (persisted next to `change_type`, recomputed with it after Phase 3): `bug_fix` → `"runtime_bug_fix"`; `skill_only` that fixes a testable helper-script defect → `"skill_helper_defect"`; everything else → `"none"`. It drives the red/green + variant evidence gate; the state validator cross-checks it against `change_type` and never infers it from evidence statuses.
 
 ### Step 4: Select Skills via Capability-Gated Matrix
 
