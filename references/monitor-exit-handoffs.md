@@ -299,7 +299,11 @@ PHASE_6_SELF_REVIEW(phase_context, REVIEW_BASE):
 
   1. REVIEW_FILES = git diff --name-only $REVIEW_BASE..HEAD
      If empty → return (no code changes to review)
-  2. Run the review tool (same fallback chain as Phase 4), scoped to REVIEW_FILES
+  2. Run the review tool (same fallback chain as Phase 4), scoped to REVIEW_FILES.
+     Before this and before every later pass in this procedure, recompute the
+     diff-triggered review focus lines from THIS session's
+     git diff $REVIEW_BASE..HEAD and append them to every review prompt
+     (definition in Phase 4); sessions never reuse another session's triggers.
   3. Log all findings to finding_ledger: session_id, phase=phase_context, pass_number=1
      Initialize convergence[session_id] = {
        pass_actionable_counts: [open_count],
