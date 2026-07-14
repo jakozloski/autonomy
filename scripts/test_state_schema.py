@@ -236,7 +236,7 @@ class StructureTests(unittest.TestCase):
         self.assertEqual(result["state"], SUSPECT)
         self.assertTrue(any("duplicate key" in error for error in result["errors"]))
 
-    def test_anchor_alias_tag_merge_and_extra_document_are_rejected(self) -> None:
+    def test_anchor_alias_tag_and_merge_are_rejected_but_body_is_opaque(self) -> None:
         for payload in (
             "extra: &anchor 1",
             "extra: *anchor",
@@ -507,6 +507,8 @@ class EvidenceTests(unittest.TestCase):
             text, '  defect_evidence_mode: "none"', '  defect_evidence_mode: "runtime_bug_fix"'
         )
         text = _mutate(text, '  status: "pending"\n  root_cause: null', f'  status: "{status}"\n  root_cause: "off-by-one in pager"')
+        if status in ("red_verified", "complete"):
+            text = _mutate(text, "  test_paths: []", '  test_paths: ["tests/test_bug.py"]')
         if red:
             text = _mutate(text, "  red_evidence: null", self.RED)
         if green:
@@ -572,14 +574,27 @@ class EvidenceTests(unittest.TestCase):
         )
         self.assertEqual(evaluate_state_text(text)["state"], SUSPECT)
 
-    def test_red_verified_and_complete_require_root_cause(self) -> None:
-        for status, red, green in (("red_verified", True, False), ("complete", True, True)):
+    def test_red_verified_complete_and_exempt_require_root_cause(self) -> None:
+        for status, red, green in (
+            ("red_verified", True, False),
+            ("complete", True, True),
+            ("exempt", False, False),
+        ):
             with self.subTest(status=status):
-                text = self._bug_fix_state(status, red=red, green=green)
-                if status == "complete":
-                    text = _mutate(
-                        text, "  evaluated_head_sha: null", f'  evaluated_head_sha: "{SHA_B}"'
+                if status == "exempt":
+                    text = self._bug_fix_state(
+                        status, red=red, green=green,
+                        extra='  exemption_reason: "config-only change"',
                     )
+                    text = _mutate(
+                        text, "  evaluated_head_sha: null", f'  evaluated_head_sha: "{SHA_A}"'
+                    )
+                else:
+                    text = self._bug_fix_state(status, red=red, green=green)
+                    if status == "complete":
+                        text = _mutate(
+                            text, "  evaluated_head_sha: null", f'  evaluated_head_sha: "{SHA_B}"'
+                        )
                 text = _mutate(
                     text,
                     '  root_cause: "off-by-one in pager"',
@@ -588,6 +603,23 @@ class EvidenceTests(unittest.TestCase):
                 result = evaluate_state_text(text)
                 self.assertEqual(result["state"], SUSPECT)
                 self.assertTrue(any("requires root_cause" in error for error in result["errors"]))
+
+    def test_red_verified_and_complete_require_nonempty_test_paths(self) -> None:
+        for status, red, green in (("red_verified", True, False), ("complete", True, True)):
+            with self.subTest(status=status):
+                text = self._bug_fix_state(status, red=red, green=green)
+                if status == "complete":
+                    text = _mutate(
+                        text, "  evaluated_head_sha: null", f'  evaluated_head_sha: "{SHA_B}"'
+                    )
+                text = _mutate(
+                    text, '  test_paths: ["tests/test_bug.py"]', "  test_paths: []"
+                )
+                result = evaluate_state_text(text)
+                self.assertEqual(result["state"], SUSPECT)
+                self.assertTrue(
+                    any("requires non-empty test_paths" in error for error in result["errors"])
+                )
 
     def test_variant_skipped_requires_reason(self) -> None:
         text = _mutate(
@@ -648,7 +680,9 @@ class EvidenceTests(unittest.TestCase):
         ):
             with self.subTest(reason=reason):
                 text = self._bug_fix_state("red_verified", red=True, green=False)
-                text = _mutate(text, "  test_paths: []", f"  test_paths: [{bad_path}]")
+                text = _mutate(
+                    text, '  test_paths: ["tests/test_bug.py"]', f"  test_paths: [{bad_path}]"
+                )
                 self.assertEqual(evaluate_state_text(text)["state"], SUSPECT)
 
 
