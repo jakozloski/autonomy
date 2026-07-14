@@ -138,6 +138,7 @@ FULL_STATE = "\n".join(
         "  next_seq_id: 1",
         "  entries: []",
         "  convergence: {}",
+        "decision_audit_trail: []",
         "phases:",
         '  plan: "in_progress"',
         '  plan_review: "pending"',
@@ -243,6 +244,7 @@ class StructureTests(unittest.TestCase):
             "extra: !!python/object 1",
             '"<<": 1',
             "extra: |\n  block",
+            "...",
         ):
             with self.subTest(payload=payload):
                 text = _mutate(_entry_state(), 'current_phase: "entry"', f'current_phase: "entry"\n{payload}')
@@ -687,6 +689,13 @@ class EvidenceTests(unittest.TestCase):
 
 
 class ValueContractTests(unittest.TestCase):
+    def test_decision_audit_trail_must_be_string_list(self) -> None:
+        text = _mutate(FULL_STATE, "decision_audit_trail: []", 'decision_audit_trail: "not a list"')
+        self.assertEqual(evaluate_state_text(text)["state"], SUSPECT)
+        missing = _mutate(FULL_STATE, "decision_audit_trail: []\n", "")
+        result = evaluate_state_text(missing)
+        self.assertEqual(result["state"], SUSPECT)  # required at full tier
+
     def test_attempt_log_values_must_be_non_negative_integers(self) -> None:
         text = _mutate(FULL_STATE, "attempt_log: {}", 'attempt_log:\n  "ci:lint": -1')
         self.assertEqual(evaluate_state_text(text)["state"], SUSPECT)
