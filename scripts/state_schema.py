@@ -27,12 +27,14 @@ JSON-quoted strings; scalar values are ``null``, booleans, integers, or
 strings (plain or JSON-quoted); inline collections are restricted to the
 empty ``{}``/``[]`` and single-line lists of JSON-compatible scalars; block
 lists use ``- `` items (scalars or records). Everything the schema never
-emits is REJECTED as structural error: tabs in indentation, tags (``!``),
-anchors/aliases (``&``/``*``), merge keys (``<<``), duplicate keys, extra
-documents, non-string (unquoted numeric) keys, multiline flow collections,
-and block scalars (``|``/``>``). The optional markdown body after the
-closing fence carries no machine-read values; it is taint-scanned only and
-findings are reported as ``body:<line>``.
+emits is REJECTED as structural error inside the frontmatter fence: tabs in
+indentation, tags (``!``), anchors/aliases (``&``/``*``), merge keys
+(``<<``), duplicate keys, ``...`` document-end markers, non-string
+(unquoted numeric) keys, multiline flow collections, and block scalars
+(``|``/``>``). The optional markdown body after the closing fence is
+OPAQUE: it is never parsed as data (later ``---`` lines are plain text such
+as markdown horizontal rules), carries no machine-read values, and is
+taint-scanned only, with findings reported as ``body:<line>``.
 
 Cross-field invariants (source of truth for the reference text)
 ----------------------------------------------------------------
@@ -60,12 +62,15 @@ Cross-field invariants (source of truth for the reference text)
       ``phases.pr`` is non-pending: mode != none requires regression
       ``complete|exempt`` AND variants ``complete``; mode none requires
       regression ``not_applicable`` AND variants ``skipped``.
-(v)   Status-dependent evidence completeness: ``red_verified`` requires a
-      complete red record; ``complete`` requires a complete green record,
-      red record or ``red_exemption_reason``, and ``evaluated_head_sha`` ==
-      green ``tested_head_sha``; ``exempt`` requires ``root_cause``,
-      ``exemption_reason``, and ``evaluated_head_sha``; ``not_applicable``
-      rejects execution evidence.
+(v)   Status-dependent evidence completeness: ``root_cause`` is required
+      for ``red_verified``, ``complete``, AND ``exempt``; ``red_verified``
+      requires a complete red record and non-empty ``test_paths``;
+      ``complete`` requires a complete green record, non-empty
+      ``test_paths``, red record or ``red_exemption_reason``, and
+      ``evaluated_head_sha`` == green ``tested_head_sha``; ``exempt``
+      requires ``exemption_reason`` and ``evaluated_head_sha``;
+      ``not_applicable`` rejects execution evidence; variant ``skipped``
+      requires ``skipped_reason``.
 (vi)  Freshness fields when evidence is terminal: ``evaluated_head_sha``
       (regression complete|exempt) and ``analyzed_head_sha`` (variants
       complete) are full-length hex object IDs.
@@ -834,6 +839,8 @@ class _Validator:
             "root_cause"
         ):
             self.error(f"invariant(v): {status} requires root_cause")
+        if status in ("red_verified", "complete") and not test_paths:
+            self.error(f"invariant(v): {status} requires non-empty test_paths")
         if status == "red_verified":
             if red is None or not red_ok:
                 self.error("invariant(v): red_verified requires a complete red_evidence record")
