@@ -695,6 +695,14 @@ class ValueContractTests(unittest.TestCase):
         missing = _mutate(FULL_STATE, "decision_audit_trail: []\n", "")
         result = evaluate_state_text(missing)
         self.assertEqual(result["state"], SUSPECT)  # required at full tier
+        empty_item = _mutate(FULL_STATE, "decision_audit_trail: []", 'decision_audit_trail: [""]')
+        self.assertEqual(evaluate_state_text(empty_item)["state"], SUSPECT)
+        record_item = _mutate(
+            FULL_STATE,
+            "decision_audit_trail: []",
+            'decision_audit_trail:\n  - selected: "gpt-5.6-sol"',
+        )
+        self.assertEqual(evaluate_state_text(record_item)["state"], SUSPECT)
 
     def test_attempt_log_values_must_be_non_negative_integers(self) -> None:
         text = _mutate(FULL_STATE, "attempt_log: {}", 'attempt_log:\n  "ci:lint": -1')
