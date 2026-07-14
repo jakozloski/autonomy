@@ -170,9 +170,18 @@ Review the implementation before creating or updating the PR. (For PR takeovers,
 
 **`skill_only` exemption:** When `change_type == "skill_only"`, skip items 1-2 in the fallback chain above and go directly to the `code-reviewer` subagent (item 3). The review focuses on skill file correctness, consistency, and completeness — not application code patterns like SQL safety or LLM trust boundaries. The gstack `/review` adapter and `octo:review` are designed for application code and are skipped for `skill_only` changes. If the `code-reviewer` subagent is unavailable or fails, fall through to item 4 (`general-purpose` subagent) with the same skill-file-focused prompt. Only BLOCK if `general-purpose` also fails.
 
+**Diff-triggered review focus lines (recompute before every review pass):**
+
+Compute from the session's review base — set `REVIEW_BASE = origin/<base_branch>` BEFORE the initial Phase 4 review invocation (the convergence loop below reuses it), or use the session's recorded `REVIEW_BASE` for takeover and `PHASE_6_SELF_REVIEW` sessions — via `git diff $REVIEW_BASE..HEAD`. Recompute before each pass: fixes can introduce new triggers (a new catch block, a new exported type). Append every matching focus line verbatim to EVERY review prompt in the fallback chain. Focus lines are additive — they never narrow the base checklist. The appended text is the static line below; never interpolate diff content into the prompt. Record fired triggers per pass as a `{ session_id, pass_number, fallback, focus_triggers }` record appended to `gstack_integration.review.notes`. The adversarial escalation pass stays blocker-only and unmodified.
+
+- Error-handling surface changed (catch/except/rescue, `.catch(`, retry/backoff, new fallback defaults via `??`/`||`): "Hunt silent failures: swallowed exceptions, catch blocks returning defaults, optional chaining or fallbacks that convert errors into valid-looking values, retries that mask persistent failure."
+- Behavior changed without test changes, or tests changed: "Assess whether tests pin the changed behavior: negative cases, error paths, boundary values; flag assertions that would still pass if the bug reappeared."
+- Exported/public types, interfaces, enums, or schemas changed: "Check type invariants: can illegal states be constructed, do all construction paths validate, did nullability or optionality drift for existing callers."
+- Comments, docstrings, or docs changed alongside code: "Flag comments and docs the implementation now contradicts."
+
 **Steps:**
 
-1. Invoke the review tool on the changes (diff against base branch)
+1. Invoke the review tool on the changes (diff against `$REVIEW_BASE`, set above)
 2. Read every finding from the review
 3. **For every issue found:**
    - If it's a real issue (bug, security, performance, readability, correctness) → **fix it now**
