@@ -17,7 +17,7 @@ def _entry_state() -> str:
         (
             "---",
             "state_schema_version: 1",
-            'workflow_id: "autonomy-123"',
+            'workflow_id: "wf-entry-123"',
             'description: "Fix the thing"',
             'current_phase: "entry"',
             "---",
@@ -31,7 +31,7 @@ def _takeover_state() -> str:
         (
             "---",
             "state_schema_version: 1",
-            'workflow_id: "autonomy-124"',
+            'workflow_id: "wf-takeover-124"',
             'description: "Take over PR"',
             'current_phase: "takeover"',
             "pr_number: 42",
@@ -46,7 +46,7 @@ FULL_STATE = "\n".join(
     (
         "---",
         "state_schema_version: 1",
-        'workflow_id: "autonomy-125"',
+        'workflow_id: "wf-full-125"',
         'description: "Full workflow"',
         'branch: "feat/thing"',
         'base_branch: "main"',
@@ -82,7 +82,7 @@ FULL_STATE = "\n".join(
         "last_processed_comments: {}",
         "last_processed_reviews: {}",
         "last_processed_threads: {}",
-        'authenticated_actor: "jakozloski"',
+        'authenticated_actor: "octocat"',
         "thread_reply_timestamps: {}",
         "acknowledged_top_level_comments: {}",
         "acknowledged_top_level_reviews: {}",
@@ -248,11 +248,15 @@ class StructureTests(unittest.TestCase):
                 text = _mutate(_entry_state(), 'current_phase: "entry"', f'current_phase: "entry"\n{payload}')
                 result = evaluate_state_text(text)
                 self.assertEqual(result["state"], SUSPECT)
-        extra_doc = _entry_state() + "---\nsecond: 1\n"
-        self.assertEqual(evaluate_state_text(extra_doc)["state"], SUSPECT)
+        # The body after the closing fence is OPAQUE: a later "---" is plain
+        # text (markdown horizontal rule), never a second parsed document.
+        body_hr = _entry_state() + "notes\n\n---\n\nkey: value here is prose, not data\n"
+        result = evaluate_state_text(body_hr)
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["state"], VALID)
 
     def test_tabs_and_nonempty_inline_maps_are_rejected(self) -> None:
-        tabbed = _mutate(_entry_state(), 'workflow_id: "autonomy-123"', '\tworkflow_id: "autonomy-123"')
+        tabbed = _mutate(_entry_state(), 'workflow_id: "wf-entry-123"', '\tworkflow_id: "wf-entry-123"')
         self.assertEqual(evaluate_state_text(tabbed)["state"], SUSPECT)
         inline = _mutate(_entry_state(), 'current_phase: "entry"', 'current_phase: "entry"\nextra: { a: 1 }')
         self.assertEqual(evaluate_state_text(inline)["state"], SUSPECT)
@@ -567,6 +571,31 @@ class EvidenceTests(unittest.TestCase):
             '    argv: ["python3", 5]\n    exit_code: 1',
         )
         self.assertEqual(evaluate_state_text(text)["state"], SUSPECT)
+
+    def test_red_verified_and_complete_require_root_cause(self) -> None:
+        for status, red, green in (("red_verified", True, False), ("complete", True, True)):
+            with self.subTest(status=status):
+                text = self._bug_fix_state(status, red=red, green=green)
+                if status == "complete":
+                    text = _mutate(
+                        text, "  evaluated_head_sha: null", f'  evaluated_head_sha: "{SHA_B}"'
+                    )
+                text = _mutate(
+                    text,
+                    '  root_cause: "off-by-one in pager"',
+                    "  root_cause: null",
+                )
+                result = evaluate_state_text(text)
+                self.assertEqual(result["state"], SUSPECT)
+                self.assertTrue(any("requires root_cause" in error for error in result["errors"]))
+
+    def test_variant_skipped_requires_reason(self) -> None:
+        text = _mutate(
+            FULL_STATE, '  status: "pending"\n  search_patterns: []', '  status: "skipped"\n  search_patterns: []'
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(any("skipped requires skipped_reason" in error for error in result["errors"]))
 
     def test_mode_change_type_mismatch_is_suspect(self) -> None:
         text = _mutate(

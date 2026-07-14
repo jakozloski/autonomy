@@ -115,21 +115,22 @@ Execute the plan.
 **Red/green regression evidence (mandatory when `defect_evidence_mode != "none"`):**
 
 - Record the root cause the fix addresses in `regression_evidence.root_cause` — the Phase 1 hypothesis when the investigation adapter ran, otherwise a one-line falsifiable claim. No bug fix proceeds without a recorded root-cause claim.
-- Before implementing the fix item, write the smallest test that reproduces that root cause (for `skill_helper_defect`, inside the package's own test suite). Run it from a clean worktree (`git status --porcelain=v1 -z` empty immediately before and after the run — evidence captured across a dirty tree is invalid; commit first, then rerun) and confirm it fails **for the expected reason** — the assertion demonstrating the bug, not an import/fixture/setup error. A wrong-reason failure re-enters investigation. Persist the structured `red_evidence` record (argv, exit code, timestamp, `tested_head_sha`, output digest); set `status: "red_verified"`.
+- Before implementing the fix item, write the smallest test that reproduces that root cause (for `skill_helper_defect`, inside the package's own test suite). Run it from a clean worktree (`git status --porcelain=v1 -z` empty immediately before and after the run — evidence captured across a dirty tree is invalid; commit first, then rerun) and confirm it fails **for the expected reason** — the assertion demonstrating the bug, not an import/fixture/setup error. A wrong-reason failure re-enters investigation. Persist the structured `red_evidence` record (argv, exit code, timestamp, `tested_head_sha`, output digest) AND the regression test file path(s) in `test_paths` (reruns re-derive the command from them; without them every re-evaluation BLOCKs); set `status: "red_verified"`.
 - Implement the fix, then run the focused test (green) plus the correctness subset of `QUALITY_CHECK_STEPS`, again across a clean tree. Persist `green_evidence`, set `status: "complete"` and `evaluated_head_sha` = the green `tested_head_sha`. Any later file-changing commit invalidates `green_evidence`/`evaluated_head_sha` until the focused test is re-run.
 - Evidence comes from actually executed commands only; fabricated or paraphrased output is a workflow violation (the runtime-verification standard). Persisted argv is AUDIT-ONLY: reruns reconstruct the command from current repository configuration plus validated `test_paths`; if the runner cannot be re-derived, BLOCK.
 - Takeover (Entry B) where the fix already exists: a regression test covering the fixed path is still required and must run green. If demonstrating red would require reverting the fix, set `red_exemption_reason: "takeover: red requires revert"` — the status still ends `"complete"`, never `"exempt"`.
 - Genuinely untestable fixes (config-only, generated files, environment-specific, deterministically unreproducible): set `status: "exempt"` with an explicit `exemption_reason` plus `root_cause`, and set `evaluated_head_sha` to the HEAD where the exemption was re-evaluated; Phase 5's `## Evidence` must then name the exact manual scenario a human must verify.
 - On resume with `status: "red_verified"`: re-run the focused test first. If it now passes unexpectedly, or fails for a different reason, re-enter root-cause investigation — never assume the fix landed.
-- `defect_evidence_mode == "none"`: set `status: "not_applicable"` (no execution evidence) — zero ceremony for features and refactors.
 
-**Variant analysis (mandatory when `defect_evidence_mode != "none"`, after the fix is verified green):**
+**Evidence status assignment (all modes, unconditional):** at Phase 3 start — and on the Entry B completed-implementation path before Phase 4 — set the evidence statuses from `defect_evidence_mode`: `"none"` → `regression_evidence.status: "not_applicable"` (no execution evidence) and `variant_analysis.status: "skipped"` with a `skipped_reason`, zero further ceremony; otherwise leave both `"pending"` for the gates above and below to complete.
+
+**Variant analysis (mandatory when `defect_evidence_mode != "none"`, after the fix lands — after the green run, or once the exemption is recorded for `exempt` fixes):**
 
 - Build an exact search matching only the known defective pattern (start literal: `rg -F`), then generalize ONE element at a time — identifier → any identifier, literal → its class — inspecting every newly introduced match at each step. Search the whole repository, not just the fixed module (for `skill_helper_defect`, the whole package).
 - Stop generalizing when new matches are mostly false positives (roughly half or more) or a step adds more than ~200 matches — tighten the pattern instead of skimming.
-- Variants **inside the user-requested boundary** are the same defect: fix them in this PR with test coverage where practical (record a reason where not). After variant fixes, re-run the focused regression test and the correctness subset across a clean tree — a file-changing variant fix invalidates prior green evidence — then set `variant_analysis.status: "complete"` with `analyzed_head_sha` = the HEAD searched.
+- Variants **inside the user-requested boundary** are the same defect: fix them in this PR with test coverage where practical (record a reason where not). After variant fixes, re-run the focused regression test and the correctness subset across a clean tree — a file-changing variant fix invalidates prior green evidence — then REFRESH the search at the new HEAD (the patterns are already derived; the re-run is cheap) and set `variant_analysis.status: "complete"` with `analyzed_head_sha` = that final searched HEAD, so it can equal the push HEAD.
 - Variants **outside the boundary** are always REPORTED in the PR body (exact `file:line` sites, or an explicit "none found"). Write to a tracker only when the resolved `issue_tracker.write_path` and repository policy authorize that specific operation; never mutate a tracker as a side effect of variant reporting.
-- Persist `variant_analysis` (patterns tried, matches inspected, fixed sites, reported sites). `defect_evidence_mode == "none"`: `status: "skipped"` with a reason.
+- Persist `variant_analysis` (patterns tried, matches inspected, fixed sites, reported sites).
 
 1. Work through each item in the plan systematically
 2. After each completed plan item that changed files, before starting the next plan item:
@@ -138,7 +139,7 @@ Execute the plan.
 3. When all plan items are complete, run ALL steps in `QUALITY_CHECK_STEPS` sequentially
 4. Fix any issues that arise from quality checks
 5. Commit all changes
-6. **Recompute Scope Analysis** — re-run Scope Analysis steps 2-4 from the actual `git diff` (implementation may have changed which files are affected). Update scope/change type/selected skills — including `defect_evidence_mode`, recomputed together with `change_type` — then recompute branch/type-dependent `ticket_required` and applicable mandatory runtime-verification kinds. Recomputing does not re-run Phase 2.
+6. **Recompute Scope Analysis** — re-run Scope Analysis steps 2-4 from the actual `git diff` (implementation may have changed which files are affected). Update scope/change type/selected skills — including `defect_evidence_mode`, recomputed together with `change_type` — then recompute branch/type-dependent `ticket_required` and applicable mandatory runtime-verification kinds. Recomputing does not re-run Phase 2. If the recomputation flips the mode: a flip TO a defect mode runs the evidence gates now (demonstrate red by locally reverting the fix commit where practical; otherwise record `red_exemption_reason: "post-implementation reclassification: red requires revert"` with the green run); a flip to `"none"` clears recorded execution evidence and sets `not_applicable`/`skipped` with a reason.
 
 ---
 
@@ -164,7 +165,7 @@ Review the implementation before creating or updating the PR. (For PR takeovers,
 
    > You are conducting a code review on the diff against `$REVIEW_BASE`. Focus on: correctness bugs, security issues, missing edge cases, unsafe assumptions, contradiction with the project's `CLAUDE.md` (read it first). Report findings as a numbered list with file:line citations. Do NOT propose stylistic changes. Cap output at 50 findings — prioritize the highest-confidence/highest-severity items.
 
-   Log fallback path in `gstack_integration.review.notes` (e.g., `"fellthrough to general-purpose: feature-dev plugin not installed"`).
+   Log the fallback path as this pass's `gstack_integration.review.notes` record — e.g., `fallback: "fell through to general-purpose: feature-dev plugin not installed"` inside the appended `{ session_id, pass_number, fallback, focus_triggers }` record (notes is a list of records, never a bare string).
 
 5. **BLOCK** — only if `general-purpose` also fails (very unlikely — it is always available). Set `phases.self_review: "blocked"` in state. You may NOT skip self-review. Self-review may NOT be waived.
 
@@ -368,7 +369,7 @@ After any monitor-loop code/conflict/review fix, reclassify touched files. Befor
 
 ## Phase 5: Create / Update PR
 
-**Precondition:** `phases.runtime_verification.status` must be `"complete"` or `"waived"`. If it is `blocked`, stop. Never convert `in_progress` or `blocked` to `waived` automatically when repository policy is mandatory. Additionally, per `defect_evidence_mode`: when it is `"runtime_bug_fix"` or `"skill_helper_defect"`, `regression_evidence.status` must be `"complete"` or `"exempt"` AND `variant_analysis.status` must be `"complete"`, with `regression_evidence.evaluated_head_sha` and `variant_analysis.analyzed_head_sha` both equal to the HEAD being pushed; when it is `"none"`, they must be `"not_applicable"`/`"skipped"`. A failed evidence precondition stops before push.
+**Precondition:** `phases.runtime_verification.status` must be `"complete"` or `"waived"`. If it is `blocked`, stop. Never convert `in_progress` or `blocked` to `waived` automatically when repository policy is mandatory. Additionally, per `defect_evidence_mode`: when it is `"runtime_bug_fix"` or `"skill_helper_defect"`, `regression_evidence.status` must be `"complete"` or `"exempt"` AND `variant_analysis.status` must be `"complete"`, with `regression_evidence.evaluated_head_sha` and `variant_analysis.analyzed_head_sha` both equal to the HEAD being pushed; when it is `"none"`, they must be `"not_applicable"`/`"skipped"`. Evaluate this whole precondition BEFORE writing the Phase 5 transition (`current_phase: "pr"`, `phases.pr: "in_progress"`): a failure keeps the workflow in its prior phase and stops before push — never persist a non-pending `pr` alongside non-terminal evidence.
 
 ### PR Body Template (MANDATORY)
 
