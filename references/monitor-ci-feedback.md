@@ -121,9 +121,9 @@ Classify this snapshot through `resolved_conventions.non_gating_checks` before a
 Every failing `GATING_CHECK` must be investigated and either fixed or BLOCKed via the 3-strike rule. Do not invent a failure category to bypass it. A repository-declared non-gating result is not renamed “pre-existing” or “flaky”: record the exact policy, prove its touched-file condition is satisfied, and continue without changing unrelated files.
 
 - If gating checks are **pending**: fetch `headRefOid`, sort the pending gating-check names, and hash `headRefOid + pending-name-set` into `PENDING_SIGNATURE`. Start the watch asynchronously and poll its session in chunks of at most `POLL_CHUNK`, emitting progress at least once per minute. `WATCH_TIMEOUT` is the aggregate 540s deadline, never one blocking wait. On aggregate timeout increment only `ci:watch_timeout:<PENDING_SIGNATURE>`; three consecutive deadlines for that exact head/check set BLOCK. A settled snapshot deletes the key; a changed head/set clears stale keys.
-- If checks have `bucket == "skipping"`: treat as passing. The `skipping` bucket indicates a check that chose not to run (e.g., bot review checks that skip certain file types). This is a terminal state — it means the check decided it has nothing to do, not that it's still running.
+- If checks have `bucket == "skipping"`: treat as passing. The `skipping` bucket indicates a check that chose not to run (e.g., bot review checks that skip certain file types). This is a terminal state — it means the check decided it has nothing to do, not that it's still running. Exception: for a workflow modified by this PR's own diff, `skipping` is never terminal-pass — Step 4's CI-config self-verification (monitor-exit-handoffs.md) requires an actual run at the current head.
 - If a gating check has `bucket == "cancel"`: log as `ci:<check_name>:cancelled` in `attempt_log`, apply 3-strike rule.
-- If gating checks are **passing** (all `GATING_CHECKS` have `bucket` in `{"pass", "skipping"}`): proceed to Step 2
+- If gating checks are **passing** (all `GATING_CHECKS` have `bucket` in `{"pass", "skipping"}`): proceed to Step 2 — subject, for workflows modified by this PR's diff, to Step 4's CI-config self-verification before any flip or exit
 
 ### Step 2: Check Review Feedback
 
