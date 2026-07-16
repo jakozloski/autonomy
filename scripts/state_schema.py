@@ -14,7 +14,8 @@ RESTRICTED parser, applies phase-aware schema requirements, and prints one
 JSON object::
 
     {"version": 1, "state": "valid" | "suspect",
-     "errors": [...], "tainted": [{"path": ..., "digest": ...}, ...],
+     "errors": [...],
+     "tainted": [{"path": ..., "digest": ..., "kind": "key"|"value"|"body"}, ...],
      "phase_requirements": "<tier>"}
 
 Exit codes: 0 = valid, 1 = suspect, 2 = usage/internal error (callers treat
@@ -214,11 +215,21 @@ def _digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:24]
 
 
+def _is_tainted(text: str) -> bool:
+    return any(pattern.search(text) for pattern in TAINT_PATTERNS)
+
+
 def _safe_key(key: str) -> str:
-    """Render a dynamic map key for diagnostics without reproducing it."""
-    if _SAFE_PATH_KEY.match(key):
-        return key
-    return f"key<{_digest(key)}>"
+    """Render a dynamic map key for diagnostics without reproducing it.
+
+    Masks BOTH charset-unsafe keys and instruction-like (tainted) keys — a
+    tainted key can be plain letters and spaces, so the charset check alone
+    is not sufficient. Every diagnostic surface (validator errors and taint
+    paths) routes through this function.
+    """
+    if _is_tainted(key) or not _SAFE_PATH_KEY.match(key):
+        return f"key<{_digest(key)}>"
+    return key
 
 
 # ---------------------------------------------------------------------------
@@ -1131,13 +1142,21 @@ class _Validator:
 
 def _scan_value(value: Any, path: str, findings: list[dict[str, str]]) -> None:
     if isinstance(value, str):
-        for pattern in TAINT_PATTERNS:
-            if pattern.search(value):
-                findings.append({"path": path, "digest": _digest(value)})
-                return
+        if _is_tainted(value):
+            findings.append({"path": path, "digest": _digest(value), "kind": "value"})
     elif isinstance(value, dict):
         for key, child in value.items():
-            _scan_value(child, f"{path}.{_safe_key(str(key))}", findings)
+            key_text = str(key)
+            # Open-keyed maps make KEYS an injection surface too. _safe_key
+            # digest-masks tainted keys (in every path they appear in), and a
+            # tainted key is its own finding, distinguished from value
+            # findings by kind so identical paths cannot collapse together.
+            child_path = f"{path}.{_safe_key(key_text)}"
+            if _is_tainted(key_text):
+                findings.append(
+                    {"path": child_path, "digest": _digest(key_text), "kind": "key"}
+                )
+            _scan_value(child, child_path, findings)
     elif isinstance(value, list):
         for position, child in enumerate(value):
             _scan_value(child, f"{path}[{position}]", findings)
@@ -1146,12 +1165,19 @@ def _scan_value(value: Any, path: str, findings: list[dict[str, str]]) -> None:
 def taint_scan(state: dict, body_lines: list[str]) -> list[dict[str, str]]:
     findings: list[dict[str, str]] = []
     for key, value in state.items():
-        _scan_value(value, _safe_key(str(key)), findings)
+        key_text = str(key)
+        root_path = _safe_key(key_text)
+        # Depth-0 keys are the same injection surface as nested map keys.
+        if _is_tainted(key_text):
+            findings.append(
+                {"path": root_path, "digest": _digest(key_text), "kind": "key"}
+            )
+        _scan_value(value, root_path, findings)
     for offset, line in enumerate(body_lines, start=1):
-        for pattern in TAINT_PATTERNS:
-            if pattern.search(line):
-                findings.append({"path": f"body:{offset}", "digest": _digest(line)})
-                break
+        if _is_tainted(line):
+            findings.append(
+                {"path": f"body:{offset}", "digest": _digest(line), "kind": "body"}
+            )
     return findings
 
 
