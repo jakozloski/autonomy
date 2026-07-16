@@ -173,7 +173,7 @@ def _terminal_monitor_state() -> str:
     text = _mutate(text, '  plan_review: "pending"', '  plan_review: "complete"')
     text = _mutate(text, '  implementation: "pending"', '  implementation: "complete"')
     text = _mutate(text, '  self_review: "pending"', '  self_review: "complete"')
-    text = _mutate(text, '    status: "pending"\n    reason: null', '    status: "waived"\n    reason: null')
+    text = _mutate(text, '    status: "pending"\n    reason: null', '    status: "waived"\n    reason: "skill_only: no runtime code changed"')
     text = _mutate(text, '  pr: "pending"', '  pr: "complete"')
     text = _mutate(text, '  monitor: "pending"', '  monitor: "paused"')
     # Invariant (iv): once pr is non-pending, mode none requires terminal
@@ -394,9 +394,11 @@ class HandoffInvariantTests(unittest.TestCase):
             '      "github_assignees":',
             '        status: "complete"',
             '        verified_at: "2026-07-14T17:00:00Z"',
+            '        evidence: "assignee array verified"',
             '      "tracker_assign":',
             '        status: "complete"',
             '        verified_at: "2026-07-14T17:01:00Z"',
+            '        evidence: "ticket owner verified"',
         )
     )
 
@@ -449,7 +451,7 @@ class HandoffInvariantTests(unittest.TestCase):
 
     def test_complete_with_failed_result_is_suspect(self) -> None:
         results = self.RESULTS_BOTH_COMPLETE.replace(
-            '        status: "complete"\n        verified_at: "2026-07-14T17:01:00Z"',
+            '        status: "complete"\n        verified_at: "2026-07-14T17:01:00Z"\n        evidence: "ticket owner verified"',
             '        status: "failed"\n        verified_at: "2026-07-14T17:01:00Z"\n        error: "boom"',
         )
         text = _qa_handoff(self.OPS_TWO, results, "complete")
@@ -646,7 +648,7 @@ class EvidenceTests(unittest.TestCase):
         text = _mutate(text, '  plan_review: "pending"', '  plan_review: "complete"')
         text = _mutate(text, '  implementation: "pending"', '  implementation: "complete"')
         text = _mutate(text, '  self_review: "pending"', '  self_review: "complete"')
-        text = _mutate(text, '    status: "pending"\n    reason: null', '    status: "waived"\n    reason: null')
+        text = _mutate(text, '    status: "pending"\n    reason: null', '    status: "waived"\n    reason: "skill_only: no runtime code changed"')
         text = _mutate(text, '  pr: "pending"', '  pr: "in_progress"')
         result = evaluate_state_text(text)
         self.assertEqual(result["state"], SUSPECT)
@@ -658,7 +660,7 @@ class EvidenceTests(unittest.TestCase):
         text = _mutate(text, '  plan_review: "pending"', '  plan_review: "complete"')
         text = _mutate(text, '  implementation: "pending"', '  implementation: "complete"')
         text = _mutate(text, '  self_review: "pending"', '  self_review: "complete"')
-        text = _mutate(text, '    status: "pending"\n    reason: null', '    status: "waived"\n    reason: null')
+        text = _mutate(text, '    status: "pending"\n    reason: null', '    status: "waived"\n    reason: "skill_only: no runtime code changed"')
         text = _mutate(text, '  pr: "pending"', '  pr: "in_progress"')
         text = _mutate(text, '  status: "pending"\n  root_cause: null', '  status: "red_verified"\n  root_cause: "claim"')
         text = _mutate(text, "  red_evidence: null", EvidenceTests.RED)
@@ -703,6 +705,210 @@ class ValueContractTests(unittest.TestCase):
             'decision_audit_trail:\n  - selected: "gpt-5.6-sol"',
         )
         self.assertEqual(evaluate_state_text(record_item)["state"], SUSPECT)
+
+    def test_timestamps_must_be_calendar_valid(self) -> None:
+        text = _mutate(FULL_STATE, "post_push_until: null", 'post_push_until: "2026-99-99T25:61:61Z"')
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+
+    def test_waived_runtime_verification_requires_reason(self) -> None:
+        text = _mutate(FULL_STATE, '    status: "pending"\n    reason: null', '    status: "waived"\n    reason: null')
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(any("waived requires a non-empty reason" in error for error in result["errors"]))
+
+    COMPLETE_NO_EVIDENCE = "\n".join(
+        (
+            "    operation_results:",
+            '      "github_assignees":',
+            '        status: "complete"',
+            '        verified_at: "2026-07-16T11:00:00Z"',
+            '      "tracker_assign":',
+            '        status: "complete"',
+            '        verified_at: "2026-07-16T11:01:00Z"',
+            '        evidence: "assignee list verified"',
+        )
+    )
+
+    def test_complete_operation_requires_evidence(self) -> None:
+        text = _qa_handoff(HandoffInvariantTests.OPS_TWO, self.COMPLETE_NO_EVIDENCE, "complete")
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(any("requires non-empty evidence" in error for error in result["errors"]))
+
+    def test_failed_and_retryable_operations_require_error(self) -> None:
+        # Aggregate derivations are kept consistent so ONLY the error-contract
+        # check can produce the failure.
+        for status, aggregate, monitor_fix in (
+            ("failed", "failed", None),
+            ("retryable", "pending", '  monitor: "in_progress"'),
+        ):
+            with self.subTest(status=status):
+                results = "\n".join(
+                    (
+                        "    operation_results:",
+                        '      "github_assignees":',
+                        f'        status: "{status}"',
+                        '        verified_at: "2026-07-16T11:00:00Z"',
+                        '      "tracker_assign":',
+                        '        status: "failed"',
+                        '        verified_at: "2026-07-16T11:01:00Z"',
+                        '        error: "postcondition absent"',
+                    )
+                )
+                text = _qa_handoff(HandoffInvariantTests.OPS_TWO, results, aggregate)
+                if monitor_fix:
+                    text = _mutate(text, '  monitor: "paused"', monitor_fix)
+                result = evaluate_state_text(text)
+                self.assertTrue(
+                    any(f"{status} requires a non-empty error" in e for e in result["errors"]),
+                    result["errors"],
+                )
+
+    def test_operation_timestamps_must_be_iso(self) -> None:
+        for field, payload in (
+            ("verified_at", self.COMPLETE_NO_EVIDENCE.replace(
+                '        verified_at: "2026-07-16T11:01:00Z"\n        evidence: "assignee list verified"',
+                '        verified_at: "yesterday"\n        evidence: "assignee list verified"',
+            ).replace(
+                '      "github_assignees":\n        status: "complete"\n        verified_at: "2026-07-16T11:00:00Z"',
+                '      "github_assignees":\n        status: "complete"\n        verified_at: "2026-07-16T11:00:00Z"\n        evidence: "ok"',
+            )),
+            ("started_at", "\n".join(
+                (
+                    "    operation_results:",
+                    '      "github_assignees":',
+                    '        status: "pending"',
+                    '        started_at: "not-a-time"',
+                )
+            )),
+        ):
+            with self.subTest(field=field):
+                aggregate = "complete" if field == "verified_at" else "pending"
+                text = _qa_handoff(HandoffInvariantTests.OPS_TWO, payload, aggregate)
+                if field == "started_at":
+                    text = _mutate(text, '  monitor: "paused"', '  monitor: "in_progress"')
+                    text = _mutate(
+                        text,
+                        '    operations: ["github_assignees", "tracker_assign"]',
+                        '    operations: ["github_assignees"]',
+                    )
+                result = evaluate_state_text(text)
+                self.assertTrue(
+                    any(f"{field}: must be an ISO 8601 timestamp" in e for e in result["errors"]),
+                    result["errors"],
+                )
+
+    def test_fractional_second_timestamps_are_interpreter_uniform(self) -> None:
+        text = _mutate(FULL_STATE, "post_push_until: null", 'post_push_until: "2026-07-14T16:00:00.5Z"')
+        self.assertEqual(evaluate_state_text(text)["errors"], [])
+        nanos = _mutate(FULL_STATE, "post_push_until: null", 'post_push_until: "2026-07-14T16:00:00.123456789Z"')
+        self.assertEqual(evaluate_state_text(nanos)["errors"], [])
+
+    def test_fractional_normalization_mechanism_survives_strict_parsers(self) -> None:
+        # On 3.11+ fromisoformat natively accepts any fraction length and "Z",
+        # so end-to-end acceptance alone cannot pin the normalization. Emulate
+        # a pre-3.11 strict parser: the helper's normalized output (6-digit
+        # fraction, +00:00 offset) must still parse, proving normalization ran.
+        import state_schema as module
+
+        real_datetime = module.datetime
+
+        class _Strict310Datetime:
+            @staticmethod
+            def fromisoformat(value: str):
+                if value.endswith("Z"):
+                    raise ValueError("pre-3.11 rejects Z")
+                if "." in value:
+                    fraction = value.split(".", 1)[1]
+                    for sep in ("+", "-"):
+                        fraction = fraction.split(sep, 1)[0]
+                    if len(fraction) not in (3, 6):
+                        raise ValueError("pre-3.11 accepts only 3/6 fraction digits")
+                return real_datetime.fromisoformat(value)
+
+        module.datetime = _Strict310Datetime
+        try:
+            self.assertTrue(module._is_iso_timestamp("2026-07-14T16:00:00.5Z"))
+            self.assertTrue(module._is_iso_timestamp("2026-07-14T16:00:00.123456789Z"))
+        finally:
+            module.datetime = real_datetime
+
+    def test_ledger_seq_ids_unique_and_next_seq_consistent(self) -> None:
+        entries = "\n".join(
+            (
+                "  entries:",
+                "    - seq_id: 1",
+                '      fingerprint: "a:b:c:d"',
+                '      session_id: "phase_4"',
+                '      status: "open"',
+                "    - seq_id: 1",
+                '      fingerprint: "a:b:c:e"',
+                '      session_id: "phase_4"',
+                '      status: "open"',
+            )
+        )
+        dup = _mutate(FULL_STATE, "  entries: []", entries)
+        result = evaluate_state_text(dup)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(any("must be unique" in error for error in result["errors"]))
+        stale = _mutate(FULL_STATE, "  entries: []", entries.replace("    - seq_id: 1\n      fingerprint: \"a:b:c:e\"", "    - seq_id: 2\n      fingerprint: \"a:b:c:e\""))
+        # next_seq_id stays 1 while max seq is 2 → stale
+        result2 = evaluate_state_text(stale)
+        self.assertEqual(result2["state"], SUSPECT)
+        self.assertTrue(any("highest seq_id + 1" in error for error in result2["errors"]))
+        # Positive boundary: populated consistent ledger validates clean.
+        consistent = _mutate(FULL_STATE, "  next_seq_id: 1", "  next_seq_id: 3")
+        consistent = _mutate(
+            consistent,
+            "  entries: []",
+            entries.replace(
+                '    - seq_id: 1\n      fingerprint: "a:b:c:e"',
+                '    - seq_id: 2\n      fingerprint: "a:b:c:e"',
+            ),
+        )
+        self.assertEqual(evaluate_state_text(consistent)["errors"], [])
+        # Absent allocator with populated entries is stale drift too.
+        missing_next = _mutate(consistent, "  next_seq_id: 3\n", "")
+        result3 = evaluate_state_text(missing_next)
+        self.assertEqual(result3["state"], SUSPECT)
+        self.assertTrue(any("required when entries exist" in error for error in result3["errors"]))
+
+    def test_resolved_conventions_contracts(self) -> None:
+        null_conv = _mutate(FULL_STATE, "resolved_conventions:\n  quality_check_steps: []", "resolved_conventions: null")
+        self.assertEqual(evaluate_state_text(null_conv)["state"], SUSPECT)
+        bad_step = _mutate(
+            FULL_STATE,
+            "  quality_check_steps: []",
+            '  quality_check_steps:\n    - ["yarn", ""]',
+        )
+        result = evaluate_state_text(bad_step)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(any("argv list of strings" in error for error in result["errors"]))
+        good_step = _mutate(
+            FULL_STATE,
+            "  quality_check_steps: []",
+            '  quality_check_steps:\n    - ["yarn", "lint:fix"]',
+        )
+        self.assertEqual(evaluate_state_text(good_step)["errors"], [])
+
+    def test_conventions_enum_and_list_contracts(self) -> None:
+        cases = (
+            ('  quality_check_steps: []', '  quality_check_steps: []\n  protected_branches: ["main", 3]', "protected_branches"),
+            ('  quality_check_steps: []', '  quality_check_steps: []\n  session_environment: "cloud"', "session_environment"),
+            ('  quality_check_steps: []', '  quality_check_steps: []\n  issue_tracker: "linear"', "issue_tracker: must be a mapping"),
+            ('  quality_check_steps: []', '  quality_check_steps: []\n  issue_tracker:\n    write_path: "direct"', "write_path"),
+        )
+        for old, new, marker in cases:
+            with self.subTest(marker=marker):
+                text = _mutate(FULL_STATE, old, new)
+                result = evaluate_state_text(text)
+                self.assertEqual(result["state"], SUSPECT)
+                self.assertTrue(any(marker in error for error in result["errors"]), result["errors"])
+        non_map_ticket = _mutate(FULL_STATE, "validated_ticket:\n  tracker_type: null", "validated_ticket: []\nunused_placeholder:\n  tracker_type: null")
+        result = evaluate_state_text(non_map_ticket)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(any("validated_ticket: must be a mapping" in error for error in result["errors"]))
 
     def test_attempt_log_values_must_be_non_negative_integers(self) -> None:
         text = _mutate(FULL_STATE, "attempt_log: {}", 'attempt_log:\n  "ci:lint": -1')

@@ -86,6 +86,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime
 import re
 import sys
 from typing import Any
@@ -496,7 +497,21 @@ def _type_name(value: Any) -> str:
 
 
 def _is_iso_timestamp(value: Any) -> bool:
-    return isinstance(value, str) and bool(_ISO_TS.match(value))
+    """Shape AND calendar validity, timezone required (not just regex shape)."""
+    if not isinstance(value, str) or not _ISO_TS.match(value):
+        return False
+    normalized = value.replace("Z", "+00:00")
+    # Normalize fractional seconds to exactly 6 digits so the verdict is
+    # identical on every interpreter (pre-3.11 fromisoformat only accepts
+    # 3- or 6-digit fractions; 3.11+ accepts any length).
+    normalized = re.sub(
+        r"\.(\d+)", lambda m: "." + m.group(1)[:6].ljust(6, "0"), normalized, count=1
+    )
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
 
 
 def _is_full_hex(value: Any) -> bool:
@@ -640,6 +655,17 @@ class _Validator:
             self.validate_gstack(state.get("gstack_integration"), tier_name)
         if "clean_poll_timestamps" in state:
             self.validate_clean_polls(state.get("clean_poll_timestamps"))
+        # human_roundtrip's mapping check lives in validate_human_roundtrip;
+        # listing it here would duplicate the diagnostic.
+        for structured_key in (
+            "resolved_conventions",
+            "validated_ticket",
+        ):
+            if structured_key in state and not isinstance(state.get(structured_key), dict):
+                self.error(f"{structured_key}: must be a mapping")
+        conventions = state.get("resolved_conventions")
+        if isinstance(conventions, dict):
+            self.validate_conventions(conventions)
         if "decision_audit_trail" in state:
             trail = state.get("decision_audit_trail")
             if not isinstance(trail, list) or any(
@@ -672,6 +698,10 @@ class _Validator:
                 status = value.get("status")
                 if not self.check_enum(status, RUNTIME_VERIFICATION_ENUM, "phases.runtime_verification.status"):
                     return None
+                if status == "waived" and not value.get("reason"):
+                    self.error(
+                        "phases.runtime_verification: waived requires a non-empty reason"
+                    )
                 return status
             enum = MONITOR_ENUM if name == "monitor" else SIMPLE_PHASE_ENUM
             if not self.check_enum(value, enum, f"phases.{name}"):
@@ -973,18 +1003,23 @@ class _Validator:
                 ):
                     continue
                 result_statuses[op_id] = op_status
+                op_path = f"handoffs.{safe_kind}.operation_results.{safe_op}"
+                for ts_field in ("started_at", "verified_at"):
+                    ts_value = record.get(ts_field)
+                    if ts_value is not None and not _is_iso_timestamp(ts_value):
+                        self.error(f"{op_path}.{ts_field}: must be an ISO 8601 timestamp")
                 if op_status == "pending" and not record.get("started_at"):
-                    self.error(
-                        f"handoffs.{safe_kind}.operation_results.{safe_op}: pending requires started_at"
-                    )
-                if op_status == "complete" and not record.get("verified_at"):
-                    self.error(
-                        f"handoffs.{safe_kind}.operation_results.{safe_op}: complete requires verified_at"
-                    )
-                if op_status in ("failed", "retryable") and not record.get("verified_at"):
-                    self.error(
-                        f"handoffs.{safe_kind}.operation_results.{safe_op}: {op_status} requires verified_at"
-                    )
+                    self.error(f"{op_path}: pending requires started_at")
+                if op_status == "complete":
+                    if not record.get("verified_at"):
+                        self.error(f"{op_path}: complete requires verified_at")
+                    if not record.get("evidence"):
+                        self.error(f"{op_path}: complete requires non-empty evidence")
+                if op_status in ("failed", "retryable"):
+                    if not record.get("verified_at"):
+                        self.error(f"{op_path}: {op_status} requires verified_at")
+                    if not record.get("error"):
+                        self.error(f"{op_path}: {op_status} requires a non-empty error")
 
             missing = [op for op in operations if op not in result_statuses]
             nonterminal = [
@@ -1075,6 +1110,24 @@ class _Validator:
                 self.error(
                     f"finding_ledger.entries[{position}].pass_number: must be an integer >= 1"
                 )
+        seq_ids = [
+            entry.get("seq_id")
+            for entry in entries
+            if isinstance(entry, dict)
+            and isinstance(entry.get("seq_id"), int)
+            and not isinstance(entry.get("seq_id"), bool)
+        ]
+        if len(set(seq_ids)) != len(seq_ids):
+            self.error("finding_ledger.entries: seq_id values must be unique")
+        if seq_ids:
+            if not isinstance(next_seq, int) or isinstance(next_seq, bool):
+                self.error(
+                    "finding_ledger.next_seq_id: required when entries exist"
+                )
+            elif next_seq != max(seq_ids) + 1:
+                self.error(
+                    "finding_ledger.next_seq_id: must equal the highest seq_id + 1"
+                )
         convergence = ledger.get("convergence")
         if convergence is not None and not isinstance(convergence, dict):
             self.error("finding_ledger.convergence: must be a mapping")
@@ -1118,6 +1171,50 @@ class _Validator:
                         self.error(
                             f"gstack_integration.review.notes[{position}].focus_triggers: must be a list of strings"
                         )
+
+    def validate_conventions(self, conventions: dict) -> None:
+        steps = conventions.get("quality_check_steps")
+        if steps is not None:
+            if not isinstance(steps, list):
+                self.error("resolved_conventions.quality_check_steps: must be a list")
+            else:
+                for position, step in enumerate(steps):
+                    # Executable cache — argv arrays of non-empty strings only.
+                    if (
+                        not isinstance(step, list)
+                        or not step
+                        or any(not isinstance(part, str) or not part for part in step)
+                    ):
+                        self.error(
+                            f"resolved_conventions.quality_check_steps[{position}]: "
+                            "must be a non-empty argv list of strings"
+                        )
+        branches = conventions.get("protected_branches")
+        if branches is not None and (
+            not isinstance(branches, list)
+            or any(not isinstance(item, str) or not item for item in branches)
+        ):
+            self.error(
+                "resolved_conventions.protected_branches: must be a list of non-empty strings"
+            )
+        environment = conventions.get("session_environment")
+        if environment is not None:
+            self.check_enum(
+                environment,
+                frozenset(("managed", "local")),
+                "resolved_conventions.session_environment",
+            )
+        tracker = conventions.get("issue_tracker")
+        if tracker is not None and not isinstance(tracker, dict):
+            self.error("resolved_conventions.issue_tracker: must be a mapping")
+        elif isinstance(tracker, dict):
+            write_path = tracker.get("write_path")
+            if write_path is not None:
+                self.check_enum(
+                    write_path,
+                    frozenset(("environment_tool", "local_api", "none")),
+                    "resolved_conventions.issue_tracker.write_path",
+                )
 
     def validate_clean_polls(self, polls: Any) -> None:
         if not isinstance(polls, list):
