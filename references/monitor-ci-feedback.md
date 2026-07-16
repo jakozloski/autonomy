@@ -54,7 +54,7 @@ while True:
      # unresolved human threads can't be bypassed by an APPROVED match in (a)/(b).
      c. If stuck (CI, conflict, branch-state, or ready-flip with 3+ attempts) OR exhausted_feedback/manual_unknown_feedback/manual_branch_protection_blockers non-empty OR CHANGES_REQUESTED OR unresolved_human_threads > 0 → run only eligible human-feedback roundtrip work, then persist blocked. If draft, leave it draft.
      ▸ Draft-PR gate (not an exit; see Step 4): if isDraft AND post_push_until is not null AND the clean-pass
-        preconditions hold (gating checks passing + all_feedback_addressed + branch_pause_ready + grace_elapsed)
+        preconditions hold (gating checks passing + all_feedback_addressed + branch_pause_ready + grace_elapsed + CI-config self-verification when applicable)
         # NOTE: no stable_poll_confirmed here — the flip is not an exit, so it fires on the
         #       first grace-elapsed clean pass instead of waiting for the two-poll convergence.
         #       post_push_until is armed for every monitored draft (Phase 5 create / takeover),
@@ -62,10 +62,10 @@ while True:
         #       null-trivial. Do NOT flip on a null post_push_until.
         → persist post_push_until = now + BOT_GRACE_WINDOW, clear clean_poll_timestamps,
           then gh pr ready <PR_NUMBER>, go to 1   # flip triggers Bugbot's single per-PR review
-     a. If approved AND gating checks passing AND grace_elapsed(post_push_until) AND all_feedback_addressed AND stable_poll_confirmed AND NOT isDraft AND branch_completion_ready → persist QA handoff operations (verify, don't re-execute, if a prior paused exit recorded them complete); only then complete
+     a. If approved AND gating checks passing AND grace_elapsed(post_push_until) AND all_feedback_addressed AND stable_poll_confirmed AND NOT isDraft AND branch_completion_ready AND CI-config self-verification satisfied (when applicable) → persist QA handoff operations (verify, don't re-execute, if a prior paused exit recorded them complete); only then complete
      b. If approved AND gating checks passing BUT (NOT grace_elapsed(post_push_until) OR NOT stable_poll_confirmed)
         → set loop_reason = "wait_repoll"; wait ≤60s per stable-poll schedule, go to 1
-     d. If everything is clean AND all_feedback_addressed AND stable_poll_confirmed AND NOT isDraft AND branch_pause_ready (see Step 4)
+     d. If everything is clean AND all_feedback_addressed AND stable_poll_confirmed AND NOT isDraft AND branch_pause_ready AND CI-config self-verification satisfied (when applicable) (see Step 4)
         → run the QA handoff (same operations/ledger as (a), scenario clean_unapproved;
           skip execution if already recorded complete), then set phases.monitor = "paused",
           output WORKFLOW PAUSED, end loop
