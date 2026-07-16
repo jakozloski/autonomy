@@ -54,7 +54,7 @@ while True:
      # unresolved human threads can't be bypassed by an APPROVED match in (a)/(b).
      c. If stuck (CI, conflict, branch-state, or ready-flip with 3+ attempts) OR exhausted_feedback/manual_unknown_feedback/manual_branch_protection_blockers non-empty OR CHANGES_REQUESTED OR unresolved_human_threads > 0 → run only eligible human-feedback roundtrip work, then persist blocked. If draft, leave it draft.
      ▸ Draft-PR gate (not an exit; see Step 4): if isDraft AND post_push_until is not null AND the clean-pass
-        preconditions hold (gating checks passing + all_feedback_addressed + branch_pause_ready + grace_elapsed + CI-config self-verification when applicable)
+        preconditions hold (gating checks passing + all_feedback_addressed + branch_pause_ready + grace_elapsed + CI-config self-verification when applicable, draft-unrunnable ready-only workflows excluded at flip)
         # NOTE: no stable_poll_confirmed here — the flip is not an exit, so it fires on the
         #       first grace-elapsed clean pass instead of waiting for the two-poll convergence.
         #       post_push_until is armed for every monitored draft (Phase 5 create / takeover),
