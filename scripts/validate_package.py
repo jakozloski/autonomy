@@ -58,6 +58,10 @@ REQUIRED_GATE_MARKERS = {
         "Variant analysis (mandatory when",
         "Diff-triggered review focus lines",
         "regression_evidence.status",
+        "Repository reviewer rubric",
+        "Root cause & scope decision",
+        "one sanitized checkbox per AC",
+        "CI evidence: pending for head",
     ),
     "references/state-and-safety.md": (
         "Resume trust model",
@@ -67,9 +71,12 @@ REQUIRED_GATE_MARKERS = {
         "analyzed_head_sha",
         "audit-only",
         "defect_evidence_mode",
+        "pr_artifacts",
     ),
     "references/monitor-exit-handoffs.md": (
         "diff-triggered review focus lines",
+        "CI-config self-verification",
+        "QA rehearsal (advisory, non-blocking",
     ),
     "references/project-and-entry.md": (
         "red/green + variant evidence gate",
