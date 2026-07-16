@@ -141,6 +141,11 @@ handoffs:
     # non-empty error; complete requires verified_at and non-empty verification
     # evidence; failed requires verified_at and non-empty error. A persisted
     # pending result resumes with verify_before_retry, never a blind mutation.
+  pr_artifacts:
+    scenario: null
+    status: "idle" # anchored PR-artifact mutations; generic lifecycle, never planned by handoff_decision.py
+    operations: [] # head-bound IDs, e.g. "ci-evidence:<head_sha>", "qa-rehearsal:<head_sha>"
+    operation_results: {}
 last_check_status: "{passing|failing|pending}"
 monitor_iterations: 0
 monitor_poll_ticks: 0 # passive grace/stability waits; does not consume work cap
@@ -293,6 +298,7 @@ decision_audit_trail: [] # append-only strings: THE authoritative Decision Audit
 - For helper input, copy `validated_ticket.identifier` to `issue_tracker.ticket_identifier` and `validated_ticket.provider_id` to `issue_tracker.ticket_provider_id`. The human-readable identifier and opaque provider ID are distinct required fields for a validated Linear ticket.
 - Before an external call, write its `operation_results[id]` with `status: pending`, incremented attempts, and `started_at`. After the call, re-fetch the postcondition and write `complete` or `failed` with `verified_at` plus evidence/error. On resume, feed the pending record to `scripts/handoff_decision.py`; execute its `verify_before_retry` control item first. If the postcondition is absent and attempts remain, persist `retryable` with `verified_at`/error, re-plan, then persist the next pending attempt before calling. Three attempts become failed/BLOCKED, never a blind fourth mutation.
 - `handoffs.<kind>.status` is derived: `idle` before planning; `pending` while any operation is pending/waiting; `complete` when all planned operations verify; `failed` when every operation is terminal and at least one failed. Terminal `phases.monitor` state is written only after the applicable aggregate handoff status is `complete|failed`.
+- `handoffs.pr_artifacts` records anchored PR-artifact mutations — the `<!-- autonomy:ci-evidence -->` body record and the `<!-- autonomy:qa-rehearsal -->` comment — as head-bound operations (`ci-evidence:<head_sha>`, `qa-rehearsal:<head_sha>`) with the same write-ahead/verify-before-retry lifecycle. It is never passed to `scripts/handoff_decision.py`: the planner rejects operation IDs it did not plan. A head change supersedes the prior record with a fresh operation under the new head's ID; each artifact keeps zero-or-one matching anchor — duplicate anchors fail closed.
 - A failed QA handoff is non-blocking only after it is recorded and included in the completion warning. A failed review-roundtrip operation does not change the already-blocked result, but the output must name the manual action.
 
 **On workflow completion or abort:** If `STASH_REF` is set and conditions are safe, switch back to the original branch and restore stashed work. Variables (`PRE_TAKEOVER_BRANCH`, `STASH_REF`) are read from `.claude/workflow-state.local.md` before this block runs.
