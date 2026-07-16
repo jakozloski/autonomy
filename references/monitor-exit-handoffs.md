@@ -15,11 +15,13 @@ gh pr view <PR_NUMBER> --json reviewDecision,isDraft,mergeStateStatus,mergeable,
 # the branch is NOT up to date — return to Step 3 instead of flipping/exiting, so a base
 # push that landed after Step 3 cannot let the gate mark a stale PR ready or clean.
 
-# 3. Fresh feedback — re-run all three REST queries (issue comments, reviews,
-#    inline comments), the GraphQL reviewThreads query, and the top-level
-#    comment/review checks from Step 2. Re-compute unreplied_all,
+# 3. Fresh feedback — re-run all three Phase A REST metadata queries (issue
+#    comments, reviews, inline comments), the GraphQL reviewThreads query, and
+#    the top-level comment/review checks from Step 2. Re-compute unreplied_all,
 #    unreplied_actionable, and all_feedback_addressed using the canonical rules in
-#    "Compute unreplied inline comment sets".
+#    "Compute unreplied inline comment sets". Exit evaluation needs completeness,
+#    identity, and timestamps — never bodies. Any record that needs evaluation
+#    sends the loop back to Step 2, which performs its Phase B body fetch there.
 ```
 
 Before any other Step 4 decision, compare fresh `headRefOid` with `last_observed_head_sha`. If state is null (first Step 4 pass of this workflow), just persist the observed SHA and continue — Phase 5 already armed `post_push_until` for the agent's own push, and re-arming here would silently add a full extra grace window before any exit. If the SHA CHANGED from the persisted value, persist the new SHA, set `post_push_until = now + BOT_GRACE_WINDOW`, clear `clean_poll_timestamps`, clear transient `ci:watch_timeout:*` and `branch:status_unknown:*` counters, and return to Step 1. The changed-SHA branch covers collaborator pushes that the local push path never observed. Every clean-poll record must carry this same head SHA.
@@ -253,7 +255,7 @@ Track `clean_poll_timestamps: []` as `{head_sha, observed_at}` records. This gat
 
 **Polling schedule:**
 
-A single long sleep would violate the host contract. Enforce the stable-poll gate by elapsed-time comparison across async/≤60s wait chunks and iteration re-entries, with a brief progress update at least once per minute.
+A single long sleep would violate the host contract. Enforce the stable-poll gate by elapsed-time comparison across async/≤60s wait chunks and iteration re-entries, with a brief progress update at least once per minute. Keep every wait INSIDE the turn (an async wait polled in ≤60s chunks); never implement a wait by ending the turn or scheduling a wake-up longer than the provider's prompt-cache TTL (~5 minutes) — a turn-ending wait past the TTL forces the next pass to re-read the entire accumulated context at full input price, which costs far more than the poll it defers. The ≤60s chunk bound is therefore a cost invariant as well as a host-contract one: waiting changes when the next check runs, never what it evaluates.
 
 > **This schedule is reached only via conditions (b)/(e).** Every clean pre-grace or pre-stability wait sets `loop_reason = "wait_repoll"` before its ≤60s chunk. When grace matures, the passive read-only pass promotes back to `work` before draft flip, handoff, pause, or completion. Thus required waiting never consumes the logical-work cap.
 
