@@ -179,9 +179,8 @@ The user provides an issue, bug report, feature request, or context to work from
 
 The user provides a PR number or URL from another agent or person.
 
-1. Fetch the PR: `gh pr view <number> --json title,body,headRefName,baseRefName,files,reviewDecision`. **Capture** `baseRefName` from the response into a local variable (to be persisted as `base_branch` in step 2's state file init). Fetch feedback separately through the REST endpoints defined in Phase 6 so account type and edit timestamps remain authoritative.
-2. **Initialize state file** (before any git operations):
-   - Create `.claude/workflow-state.local.md` with `workflow_id`, `description`, `current_phase: "takeover"`, `pr_number`, `base_branch` = the `baseRefName` captured in step 1, and the `## Prompt Ledger` body section seeded with the takeover instruction as sequence 1 (core invariant; the PR's inherited trail is imported into its own block when the body is read in step 5). **Persist this before any command that references `origin/<base_branch>` runs** — it is the first value written to state for this workflow.
+1. **Initialize minimal state first** — create `.claude/workflow-state.local.md` at `current_phase: "entry"` with `workflow_id`, `description`, and the `## Prompt Ledger` body section seeded with the takeover instruction as sequence 1 (core invariant): the prompt is durably captured before any external call can fail or interrupt the session, and the entry tier requires no PR fields, so this pre-fetch write validates cleanly.
+2. **Fetch the PR and complete takeover state**: `gh pr view <number> --json title,body,headRefName,baseRefName,files,reviewDecision`; then update the state file to `current_phase: "takeover"`, persisting `pr_number` and `base_branch` = the fetched `baseRefName`. **Persist these before any command that references `origin/<base_branch>` runs.** Fetch feedback separately through the REST endpoints defined in Phase 6 so account type and edit timestamps remain authoritative. (The PR's inherited trail is imported into its own ledger block when the body is read in step 5.)
    - This ensures state exists even if subsequent steps fail
 3. Check out the branch safely:
 

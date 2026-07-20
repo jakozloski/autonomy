@@ -367,7 +367,7 @@ When an aggregate deadline fires, log `<adapter>:timeout` in `attempt_log`. The 
 
 ## Secret/Token Redaction
 
-Before posting ANY content to PRs, comments, or logs (including the Prompt Trail), and before appending any entry to the state-file Prompt Ledger, scan output bodies with the format-anchored patterns below. Replace matches with `[REDACTED: <kind>]`. Use **only format-anchored patterns** to avoid false positives on ordinary base64-looking data:
+Before posting ANY content to PRs, comments, or logs (including the Prompt Trail), and before appending any entry to the state-file Prompt Ledger, scan output bodies with the format-anchored patterns below. These patterns cover credentials and tokens only; customer-PII redaction is a judgment obligation the agent applies at write time, not an automated detection this list provides. Replace matches with `[REDACTED: <kind>]`. Use **only format-anchored patterns** to avoid false positives on ordinary base64-looking data:
 
 - AWS access/session key: `(AKIA|ASIA)[0-9A-Z]{16}`
 - AWS secret value (label-anchored): `(?i)AWS_SECRET_ACCESS_KEY["']?\s*[:=]\s*["']?[A-Za-z0-9/+=]{40}["']?`
