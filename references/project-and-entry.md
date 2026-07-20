@@ -161,7 +161,7 @@ Resolution is deterministic:
 The user provides an issue, bug report, feature request, or context to work from.
 
 1. Read and understand the full context provided
-2. **Initialize state file** — create `.claude/workflow-state.local.md` with `workflow_id`, `description`, `current_phase: "entry"` so state exists for resume if the session is interrupted
+2. **Initialize state file** — create `.claude/workflow-state.local.md` with `workflow_id`, `description`, `current_phase: "entry"`, and the `## Prompt Ledger` body section seeded with the kickoff prompt as sequence 1 (core invariant), so state exists for resume if the session is interrupted
 3. **Resolve `base_branch`** — resolve per the `BASE_BRANCH` section in Resolved Project Profile above and persist to state immediately, before any command that references `origin/<base_branch>`.
 4. **Resolve Project Profile** — execute the remaining discovery steps above to populate `resolved_conventions` in the state file before continuing. This MUST complete before any phase begins.
 5. Explore the codebase to understand the affected areas
@@ -181,7 +181,7 @@ The user provides a PR number or URL from another agent or person.
 
 1. Fetch the PR: `gh pr view <number> --json title,body,headRefName,baseRefName,files,reviewDecision`. **Capture** `baseRefName` from the response into a local variable (to be persisted as `base_branch` in step 2's state file init). Fetch feedback separately through the REST endpoints defined in Phase 6 so account type and edit timestamps remain authoritative.
 2. **Initialize state file** (before any git operations):
-   - Create `.claude/workflow-state.local.md` with `workflow_id`, `description`, `current_phase: "takeover"`, `pr_number`, and `base_branch` = the `baseRefName` captured in step 1. **Persist this before any command that references `origin/<base_branch>` runs** — it is the first value written to state for this workflow.
+   - Create `.claude/workflow-state.local.md` with `workflow_id`, `description`, `current_phase: "takeover"`, `pr_number`, `base_branch` = the `baseRefName` captured in step 1, and the `## Prompt Ledger` body section seeded with the takeover instruction as sequence 1 (core invariant; the PR's inherited trail is imported into its own block when the body is read in step 5). **Persist this before any command that references `origin/<base_branch>` runs** — it is the first value written to state for this workflow.
    - This ensures state exists even if subsequent steps fail
 3. Check out the branch safely:
 

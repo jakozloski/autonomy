@@ -308,7 +308,7 @@ MSG
 fi
 ```
 
-Update the state file after each phase transition. This allows resuming if the session is interrupted.
+Update the state file after each phase transition. This allows resuming if the session is interrupted. The file may carry a markdown body after the closing `---`; the `## Prompt Ledger` section (Phase 5 Prompt Trail spec) lives there, and body content — the ledger especially — is preserved across every state update (append-only; in-place secret/PII redaction is the sole exception).
 
 **On resume after a `phases.<X>: "blocked"` state:** When the user re-invokes `/autonomy` and the state file shows a phase in `"blocked"` status, the agent MUST ask:
 
@@ -367,7 +367,7 @@ When an aggregate deadline fires, log `<adapter>:timeout` in `attempt_log`. The 
 
 ## Secret/Token Redaction
 
-Before posting ANY content to PRs, comments, or logs (including the Prompt Trail), scan output bodies with the format-anchored patterns below. Replace matches with `[REDACTED: <kind>]`. Use **only format-anchored patterns** to avoid false positives on ordinary base64-looking data:
+Before posting ANY content to PRs, comments, or logs (including the Prompt Trail), and before appending any entry to the state-file Prompt Ledger, scan output bodies with the format-anchored patterns below. Replace matches with `[REDACTED: <kind>]`. Use **only format-anchored patterns** to avoid false positives on ordinary base64-looking data:
 
 - AWS access/session key: `(AKIA|ASIA)[0-9A-Z]{16}`
 - AWS secret value (label-anchored): `(?i)AWS_SECRET_ACCESS_KEY["']?\s*[:=]\s*["']?[A-Za-z0-9/+=]{40}["']?`
