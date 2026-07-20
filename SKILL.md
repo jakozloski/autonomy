@@ -40,6 +40,7 @@ The [heading manifest](references/heading-manifest.md) maps every heading from t
 - Run every resolved quality step before each push. Unexpected auto-fixed files outside the touched-file boundary STOP the workflow.
 - Persist state before externally visible mutations, verify their postconditions, then persist terminal state.
 - Three failed attempts with the same signature BLOCK. Do not loop forever.
+- At the start of every user turn during an active workflow, append that turn's user prompt — redacted, sequence-numbered — to the state-body Prompt Ledger before any other work; the kickoff prompt becomes sequence 1, written as part of state initialization. If the Phase 5 Prompt Trail subsection's format is not active in context, re-read it before appending.
 
 ## Mandatory Model Policy
 
@@ -103,7 +104,7 @@ State lives at `.claude/workflow-state.local.md`, with `.cursor/workflow-state.l
 4. **Self-review:** use the skill-only/application fallback chain, ledger every finding, fix every real issue, justify false positives, and re-review file-changing fixes until convergence or the documented cap.
    4a. **Security gate:** run only for applicable scopes; critical unresolved findings BLOCK.
 5. **Update PR:** require ticket policy, evidence, runtime-verification disposition, clean checks, and a non-protected branch; push/update the existing PR when taking over.
-6. **Monitor:** iterate fresh CI, feedback, and branch checks; never evaluate exit on stale post-push data.
+6. **Monitor:** iterate fresh CI, feedback, and branch checks; never evaluate exit on stale post-push data. The draft→ready flip and the clean exits additionally require the PR body's Prompt Trail to be current with the state-file Prompt Ledger (Phase 5 template): a stale trail hard-blocks ready, paused, and complete, while a blocked exit still persists `blocked`, recording `prompt-trail-stale` as an additional reason — and no later resume may leave blocked while the trail is stale. Before any Phase 6 trail synchronization, re-read the Prompt Trail subsection of [phases-1-5.md](references/phases-1-5.md); the sync procedure lives there and is not otherwise loaded during monitoring.
 
 Phase transition writes must update both `current_phase` and the phase status. Terminal status is written only after required handoff operations have reached verified `complete` or recorded `failed` with the mandated warning.
 
@@ -141,9 +142,9 @@ For a skill-only change, runtime verification is waived with reason `skill_only:
 
 ## Completion Semantics
 
-- **Complete:** approved, required checks passing, the PR is known mergeable/current, every bot thread resolved, grace/stable-poll gates satisfied, no exhausted feedback, all human and bot feedback addressed, and QA handoff attempted and recorded (fired at the first clean exit; verified, not re-executed, if a prior paused exit already recorded it).
-- **Paused:** required checks passing, the PR is known mergeable/current, every bot thread resolved, grace/stable-poll gates satisfied, no exhausted feedback, and all human and bot feedback addressed, but human approval is still pending. QA handoff attempted and recorded (mapped repos), same as the approved exit — preview QA proceeds while code review is pending; still never merge and never write `complete`.
-- **Blocked:** a documented gate or three-strike condition requires human action. Run a review-roundtrip handoff only when human feedback is the sole blocker and every eligibility condition is durably satisfied.
+- **Complete:** approved, required checks passing, the PR is known mergeable/current, every bot thread resolved, grace/stable-poll gates satisfied, the Prompt Trail current, no exhausted feedback, all human and bot feedback addressed, and QA handoff attempted and recorded (fired at the first clean exit; verified, not re-executed, if a prior paused exit already recorded it).
+- **Paused:** required checks passing, the PR is known mergeable/current, every bot thread resolved, grace/stable-poll gates satisfied, the Prompt Trail current, no exhausted feedback, and all human and bot feedback addressed, but human approval is still pending. QA handoff attempted and recorded (mapped repos), same as the approved exit — preview QA proceeds while code review is pending; still never merge and never write `complete`.
+- **Blocked:** a documented gate or three-strike condition requires human action. Run a review-roundtrip handoff only when human feedback is the sole blocker and every eligibility condition is durably satisfied. A stale Prompt Trail adds `prompt-trail-stale` to the blockers and must be synchronized before any later resume exits blocked.
 
 Do not merge the PR. A clean unapproved PR pauses for its requested human reviewer.
 
