@@ -277,7 +277,7 @@ The user provides a PR number or URL from another agent or person.
     - `phases.self_review` → `"complete"` or `"blocked"`
     - `phases.runtime_verification.status` → `"complete"`, `"blocked"`, or `"waived"`
     - `phases.pr` → `"complete"`
-    - `phases.monitor` → `"paused"`, `"complete"`, or `"blocked"` (see Phase 6 condition (c) for when `blocked` applies)
+    - `phases.monitor` → `"paused"`, `"complete"`, or `"blocked"` (see Phase 6 condition (c) and the core's Prompt Trail transition gate for when `blocked` applies)
 
     This ensures resume behavior is unambiguous if the session is interrupted.
 

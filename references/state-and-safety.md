@@ -241,7 +241,7 @@ phases:
   pr: "{pending|in_progress|complete}"
   monitor: "{pending|in_progress|paused|complete|blocked}"
   # "paused" = PR is clean (checks passing, no feedback, branch up to date) but not yet approved.
-  # "blocked" = condition (c) fired — 3-strike CI/conflict, exhausted/unknown feedback, or CHANGES_REQUESTED.
+  # "blocked" = condition (c) fired (3-strike CI/conflict, exhausted/unknown feedback, or CHANGES_REQUESTED) OR prompt-trail sync failure at an otherwise-eligible flip/clean-exit pass (attempt_log: prompt-trail:stale).
   # The agent exited the monitor loop. Re-invoke to resume monitoring (paused) or after human fixes (blocked).
 ---
 ```
