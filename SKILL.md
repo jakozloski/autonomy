@@ -40,7 +40,7 @@ The [heading manifest](references/heading-manifest.md) maps every heading from t
 - Run every resolved quality step before each push. Unexpected auto-fixed files outside the touched-file boundary STOP the workflow.
 - Persist state before externally visible mutations, verify their postconditions, then persist terminal state.
 - Three failed attempts with the same signature BLOCK. Do not loop forever.
-- At the start of every user turn during an active workflow, append that turn's user prompt — redacted, sequence-numbered — to the state-file Prompt Ledger before any other work; the kickoff prompt becomes sequence 1, written as part of state initialization (a takeover's inherited trail lives in its own separately-numbered block per the Phase 5 spec). If the Phase 5 PR Body Template's Prompt Trail bullets are not in context, re-read them before appending.
+- At the start of every user turn during an active workflow, append that turn's user prompt — redacted, sequence-numbered — to the state-file Prompt Ledger before any other work; the kickoff prompt becomes sequence 1, written as part of state initialization (a takeover's inherited trail lives in its own separately-numbered block per the Phase 5 spec). If the Phase 5 PR Body Template's Prompt Trail bullets are not in context, re-read them before appending. When the workflow's PR already exists, synchronize the PR-body trail immediately after the append — before any further implementation, delegation, commit, or push — so reviewers always see the complete instruction record mid-review; a failed sync blocks further work under the monitor gate's semantics.
 
 ## Mandatory Model Policy
 
