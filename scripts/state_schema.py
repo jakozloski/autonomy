@@ -49,6 +49,8 @@ Cross-field invariants (source of truth for the reference text)
       requires ``runtime_verification: complete|waived``; ``monitor``
       requires ``pr: complete``. A blocked predecessor never authorizes a
       successor (Entry B bootstrap marks skipped phases complete first).
+      ``pr: complete`` additionally requires a non-null top-level
+      ``pr_number``.
 (iii) Per-handoff derived status, every tier: result keys are a SUBSET of
       planned operation IDs (never orphans); ``idle`` iff operations and
       results are both empty; ``pending`` iff operations exist and any
@@ -600,6 +602,11 @@ class _Validator:
             tier_name != "minimal_entry" or state.get("base_branch") is not None
         ):
             self.require_string(state, "base_branch", "top-level", nullable=(tier_name == "minimal_entry"))
+        if tier_name == "takeover" and "pr_number" in state and state.get("pr_number") is None:
+            # Presence alone is not enough: a takeover without a PR number is
+            # meaningless, so the takeover tier requires a non-null value.
+            # (Absence is reported once by the required-key loop above.)
+            self.error("pr_number: takeover requires a non-null PR number")
         if "pr_number" in state and state.get("pr_number") is not None:
             pr_number = state.get("pr_number")
             if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0:
@@ -742,6 +749,13 @@ class _Validator:
                         f"invariant(ii): phases.{successor} is non-pending but "
                         f"phases.{predecessor} is not in {'|'.join(allowed)}"
                     )
+        # A complete pr phase (and via the chain, every monitor state) proves a
+        # PR exists — pr_number may no longer be null. in_progress/blocked stay
+        # exempt: they legitimately precede `gh pr create`.
+        if statuses.get("pr") == "complete" and self.state.get("pr_number") is None:
+            self.error(
+                "invariant(ii): phases.pr complete requires a non-null pr_number"
+            )
 
     def validate_evidence(self, tier_name: str) -> None:
         state = self.state
