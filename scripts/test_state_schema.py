@@ -177,6 +177,7 @@ def _terminal_monitor_state() -> str:
     text = _mutate(text, '    status: "pending"\n    reason: null', '    status: "waived"\n    reason: "skill_only: no runtime code changed"')
     text = _mutate(text, '  pr: "pending"', '  pr: "complete"')
     text = _mutate(text, '  monitor: "pending"', '  monitor: "paused"')
+    text = _mutate(text, "pr_number: null", "pr_number: 7")
     # Invariant (iv): once pr is non-pending, mode none requires terminal
     # not_applicable / skipped evidence statuses.
     text = _mutate(text, '  status: "pending"\n  root_cause: null', '  status: "not_applicable"\n  root_cause: null')
@@ -296,6 +297,31 @@ class TierAndVersionTests(unittest.TestCase):
         text = _mutate(_takeover_state(), "pr_number: 42\n", "")
         result = evaluate_state_text(text)
         self.assertEqual(result["state"], SUSPECT)
+
+    def test_pr_complete_requires_non_null_pr_number(self) -> None:
+        text = _terminal_monitor_state()
+        text = _mutate(text, "pr_number: 7", "pr_number: null")
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("phases.pr complete requires a non-null pr_number" in e for e in result["errors"]),
+            result["errors"],
+        )
+
+    def test_absent_takeover_pr_number_reports_one_error(self) -> None:
+        text = _mutate(_takeover_state(), "pr_number: 42\n", "")
+        result = evaluate_state_text(text)
+        pr_errors = [e for e in result["errors"] if "pr_number" in e]
+        self.assertEqual(len(pr_errors), 1, result["errors"])
+
+    def test_takeover_null_pr_number_is_suspect(self) -> None:
+        text = _mutate(_takeover_state(), "pr_number: 42", "pr_number: null")
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("takeover requires a non-null PR number" in e for e in result["errors"]),
+            result["errors"],
+        )
 
     def test_full_tier_missing_phases_is_suspect(self) -> None:
         text = _mutate(_entry_state(), 'current_phase: "entry"', 'current_phase: "plan"')
