@@ -99,7 +99,7 @@ State lives at `.claude/workflow-state.local.md`, with `.cursor/workflow-state.l
 ## Phase State Machine
 
 1. **Plan:** investigate as required, explore with exact-model read-only agents, reuse existing patterns, write success criteria, and challenge all six edge-case dimensions.
-2. **Review plan:** the selected Codex model (floor GPT-5.6 Sol) at xhigh must approve within eight rounds. Runtime failure follows the mandatory model policy above.
+2. **Review plan:** the selected Codex model (floor GPT-5.6 Sol) at xhigh must approve. Rounds are unbounded while converging: BLOCK for human adjudication only on a stall (two consecutive rounds resolving zero previously-open findings) or at the 20-round runaway backstop. Runtime failure follows the mandatory model policy above.
 3. **Implement:** complete one logical plan item at a time; for bug fixes, capture red/green regression evidence and run variant analysis; run correctness checks and commit after each file-changing item; finish with all quality checks.
 4. **Self-review:** use the skill-only/application fallback chain, ledger every finding, fix every real issue, justify false positives, and re-review file-changing fixes until convergence or the documented cap.
    4a. **Security gate:** run only for applicable scopes; critical unresolved findings BLOCK.

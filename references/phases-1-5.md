@@ -94,15 +94,16 @@ The first real review invocation is the authoritative entitlement/quota test. Mi
 2. **Direct Codex review** (when `/autoplan` is not selected):
    - Read the `codex-review` skill file from the discovered path above and follow its steps directly (do NOT invoke it as a slash command from inside this skill)
    - Invoke Codex with `-m <selected-codex-model> -c 'model_reasoning_effort="xhigh"'` using the policy-selected model from state (floor `gpt-5.6-sol`; the codex-review skill uses `codex exec`, which accepts `-m`) — if its defaults ever differ, Model Configuration wins
-   - Codex and Claude iterate (up to 8 rounds) until Codex approves
+   - Codex and Claude iterate until Codex approves — no fixed working budget; this round policy overrides any round cap in the delegated codex-review skill. Log each round's open findings in the Decision Audit Trail
    - If Codex raises valid concerns, revise the plan
    - If Codex suggests something contradicting explicit user requirements or repo rules, skip with logged note
-   - If NOT approved after 8 rounds: BLOCK and ask user
+   - A round makes progress when at least one previously-open finding is resolved (revision accepted or pushback accepted — it no longer appears in the next REVISE output). Two consecutive no-progress rounds = a stall: the reviewer has now held the same position three times (the core three-strike invariant) — BLOCK and ask the user, listing each disputed finding with both positions
+   - Runaway backstop: 20 rounds. Not a working budget — reaching it without approval or a detected stall is anomalous; BLOCK and ask the user
    - On approval: set `phases.plan_review: "complete"` in state
 
 3. **Fable adversarial supplement:** when the selected plan-review flow calls for a Claude voice, run Fable 5 at max via the verified Agent-tool or explicit CLI path. It may strengthen or challenge the plan, but it does not replace the mandatory Codex verdict.
 
-4. **BLOCK** — if the required Codex process fails, reaches eight rounds without approval, or a required Fable voice cannot run under the core policy. Set `phases.plan_review: "blocked"` in state.
+4. **BLOCK** — if the required Codex process fails, review stalls (two consecutive no-progress rounds), the 20-round runaway backstop is reached without approval, or a required Fable voice cannot run under the core policy. Set `phases.plan_review: "blocked"` in state.
 
 **Runtime failure handling:** Apply the core model failure matrix. Never silently proceed without the selected Codex model's approval (floor GPT-5.6 Sol).
 
