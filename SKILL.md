@@ -145,7 +145,7 @@ For a skill-only change, runtime verification is waived with reason `skill_only:
 
 - **Complete:** approved, required checks passing, the PR is known mergeable/current, every bot thread resolved, grace/stable-poll gates satisfied, the Prompt Trail current, no exhausted feedback, all human and bot feedback addressed, and QA handoff attempted and recorded (fired at the first clean exit; verified, not re-executed, if a prior paused exit already recorded it).
 - **Paused:** required checks passing, the PR is known mergeable/current, every bot thread resolved, grace/stable-poll gates satisfied, the Prompt Trail current, no exhausted feedback, and all human and bot feedback addressed, but human approval is still pending. QA handoff attempted and recorded (mapped repos), same as the approved exit — preview QA proceeds while code review is pending; still never merge and never write `complete`.
-- **Blocked:** a documented gate or three-strike condition requires human action. Run a review-roundtrip handoff only when human feedback is the sole blocker and every eligibility condition is durably satisfied. A stale Prompt Trail adds `prompt-trail-stale` to the blockers and must be synchronized before any later resume exits blocked.
+- **Blocked:** a documented gate or three-strike condition requires human action. Run a review-roundtrip handoff only when human feedback is the sole blocker and every eligibility condition is durably satisfied. A stale Prompt Trail adds `prompt-trail:stale` to the blockers and must be synchronized before any later resume exits blocked.
 
 Do not merge the PR. A clean unapproved PR pauses for its requested human reviewer.
 

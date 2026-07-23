@@ -1337,13 +1337,13 @@ def main(argv: list[str]) -> int:
     try:
         with open(argv[1], encoding="utf-8") as handle:
             text = handle.read()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         print(
             json.dumps(
                 {
                     "version": SCHEMA_VERSION,
                     "state": SUSPECT,
-                    "errors": ["state file could not be read"],
+                    "errors": ["state file could not be read or decoded"],
                     "tainted": [],
                     "phase_requirements": "unparsed",
                 }

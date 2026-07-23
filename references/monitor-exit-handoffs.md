@@ -47,7 +47,7 @@ Note: `all_feedback_addressed` uses `unreplied_all`, not `unreplied_actionable`,
 
 Evaluate the fresh `CHECKS` snapshot (not stale Step 1 results):
 
-- If ANY gating check has `bucket == "pending"`: do NOT evaluate exit conditions. Sleep 60 seconds, go back to Step 1.
+- If ANY gating check has `bucket == "pending"`: do NOT evaluate exit conditions. Set `loop_reason = "wait_repoll"` (a pending-check wait is passive and never consumes the work-iteration cap), sleep ≤60 seconds, go back to Step 1.
 - If ANY gating check has `bucket == "fail"` or `bucket == "cancel"`: do NOT evaluate exit conditions. Go back to Step 1 immediately.
 - Only proceed if every gating check has `bucket` in `{"pass", "skipping"}` and every excluded check has persisted repository-policy evidence.
 

@@ -308,7 +308,7 @@ CHANGED_FILES=$(git diff --name-only origin/<base_branch>...HEAD 2>/dev/null || 
 
 - `scope_frontend`: any file matching `*.tsx`, `*.jsx`, `*.css`, `*.scss`, `*.html`, or paths containing `components/`, `pages/`, `views/`, `app/`
 - `scope_backend`: any file matching paths containing `api/`, `server/`, `services/`, `routes/`
-- `scope_tests_only`: `CHANGED_FILES` is non-empty AND ALL changed files are in `__tests__/`, `*.test.*`, `*.spec.*`
+- `scope_tests_only`: `CHANGED_FILES` is non-empty AND ALL changed files are in `__tests__/`, `tests/`, `test/`, or match `*.test.*`, `*.spec.*`, `test_*.py`, `*_test.*`
 - `scope_skill_only`: `CHANGED_FILES` is non-empty AND ALL changed files are in `.claude/skills/` OR `.agents/skills/` (some repos symlink `.claude/skills/` to `.agents/skills/` — both paths count as skill-only)
 - **Empty diff guard:** If `CHANGED_FILES` is empty, set both `scope_tests_only` and `scope_skill_only` to `false`. An empty diff means no commits yet — use the issue/context fallback from above, not vacuous truth.
 

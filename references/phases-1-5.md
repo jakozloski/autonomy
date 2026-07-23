@@ -339,7 +339,7 @@ Compute from the session's review base — set `REVIEW_BASE = origin/<base_branc
 
 - User explicitly asks for it in this session
 - Change is large AND clearly in `scope_frontend` AND the `/qa` adapter capability gate is clean (browse binary present, `DEV_SERVER_FRONTEND` resolves, dev server starts cleanly within ~60s)
-- Even then: if any step fails, set `phases.runtime_verification.status: "waived"` with `phases.runtime_verification.reason` describing the failure — always produce a terminal state of `complete` or `waived`
+- Even then: if any step fails, set `phases.runtime_verification.status: "waived"` with `phases.runtime_verification.reason` describing the failure — always produce a terminal state of `complete` or `waived` — UNLESS a repository-mandatory kind matches the diff: the mandatory override below then governs and the failure is `blocked`, never auto-waived
 
 **Mandatory override:** If `resolved_conventions.runtime_verification_policy` marks an affected kind mandatory, run its verification even when the user did not opt in. UI changes require the resolved frontend server and an actual browser check; API changes require the relevant test or endpoint request; performance changes require before/after metric evidence. A missing server/tool, failed verification, or absent evidence sets status `blocked` and stops before Phase 5. Only an explicit user waiver may change that status to `waived`, with the waiver reason persisted.
 

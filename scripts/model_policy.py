@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate the mandatory model policy without making remote calls.
+"""Evaluate the mandatory Conductor model policy without making remote calls.
 
 The command reads one JSON object from stdin and writes one JSON object to
 stdout.  Every field in the input is observed by the caller; this module never
@@ -456,6 +456,27 @@ def evaluate_codex(raw: Any) -> dict[str, Any]:
     )
 
 
+def _explicit_cli_arguments(model: str) -> list[str]:
+    """Read-only explicit-CLI invocation tail, defined once so the two
+    emission sites cannot drift apart."""
+    return [
+        "-p",
+        "--model",
+        model,
+        "--effort",
+        CLAUDE_EFFORT,
+        "--permission-mode",
+        "plan",
+        "--allowedTools",
+        ",".join(CLAUDE_READ_ONLY_ALLOWED_TOOLS),
+        "--disallowedTools",
+        ",".join(CLAUDE_READ_ONLY_DENIED_TOOLS),
+        "--disable-slash-commands",
+        "--no-session-persistence",
+        "--no-chrome",
+    ]
+
+
 def _claude_base(version: Any) -> dict[str, Any]:
     return {
         "state": "blocked",
@@ -570,22 +591,7 @@ def _waive_or_block_claude(
                     "reason": "explicit_waiver_fallback",
                 },
                 "execution_path": "explicit_cli",
-                "arguments": [
-                    "-p",
-                    "--model",
-                    fallback_model,
-                    "--effort",
-                    CLAUDE_EFFORT,
-                    "--permission-mode",
-                    "plan",
-                    "--allowedTools",
-                    ",".join(CLAUDE_READ_ONLY_ALLOWED_TOOLS),
-                    "--disallowedTools",
-                    ",".join(CLAUDE_READ_ONLY_DENIED_TOOLS),
-                    "--disable-slash-commands",
-                    "--no-session-persistence",
-                    "--no-chrome",
-                ],
+                "arguments": _explicit_cli_arguments(fallback_model),
                 "environment_unset": list(CLAUDE_READ_ONLY_ENV_UNSET),
                 "next_action": "invoke_explicit_named_fallback",
                 "waiver_granted": True,
@@ -757,22 +763,7 @@ def evaluate_claude(raw: Any) -> dict[str, Any]:
 
     if conflict:
         execution_path = "explicit_cli"
-        arguments = [
-            "-p",
-            "--model",
-            model_flag,
-            "--effort",
-            CLAUDE_EFFORT,
-            "--permission-mode",
-            "plan",
-            "--allowedTools",
-            ",".join(CLAUDE_READ_ONLY_ALLOWED_TOOLS),
-            "--disallowedTools",
-            ",".join(CLAUDE_READ_ONLY_DENIED_TOOLS),
-            "--disable-slash-commands",
-            "--no-session-persistence",
-            "--no-chrome",
-        ]
+        arguments = _explicit_cli_arguments(model_flag)
         next_action = "invoke_explicit_claude_cli"
         environment_unset = list(CLAUDE_READ_ONLY_ENV_UNSET)
     else:

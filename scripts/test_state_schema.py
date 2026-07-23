@@ -1100,5 +1100,25 @@ class TaintTests(unittest.TestCase):
         self.assertIn(f"key<{expected_digest}>", serialized)
 
 
+class MainEntryTests(unittest.TestCase):
+    def test_undecodable_state_file_fails_closed(self) -> None:
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+
+        import state_schema as module
+
+        with tempfile.NamedTemporaryFile(suffix=".md", delete=False) as handle:
+            handle.write(b"---\nstate_schema_version: 1\n\xff\xfe garbage")
+            path = handle.name
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            exit_code = module.main(["state_schema.py", path])
+        self.assertEqual(exit_code, 2)
+        payload = json.loads(buffer.getvalue())
+        self.assertEqual(payload["state"], SUSPECT)
+        self.assertTrue(any("read or decoded" in e for e in payload["errors"]))
+
+
 if __name__ == "__main__":
     unittest.main()
