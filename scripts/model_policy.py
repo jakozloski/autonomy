@@ -751,9 +751,9 @@ def apply_auth_recovery(
         "next_action": "clear_human_codex_login_block",
         "credential_source": observed_category,
     }
+
+
 def _access_failures(prefix: str, label: str) -> dict[Any, tuple[str, str]]:
-
-
     """Access-failure table for one leg, so the two legs cannot drift apart."""
 
     unavailable = (f"{prefix}_unavailable", f"{label} is unavailable")
