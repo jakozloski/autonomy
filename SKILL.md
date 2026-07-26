@@ -44,17 +44,35 @@ The [heading manifest](references/heading-manifest.md) maps every heading from t
 
 ## Mandatory Model Policy
 
-These values override defaults in delegated skills and adapters. Match compute shape to task shape: `ultra` reasoning (GPT) and the `ultracode` workflow mode (Fable) are breadth modes, justified only when a task genuinely decomposes into independent parts; `xhigh` (GPT) and `max` effort (Fable) are depth modes for one hard problem. Every mandatory voice in this workflow is one hard problem — review one plan, review one diff — so the floors below are depth floors.
+These values override defaults in delegated skills and adapters. Match compute shape to task shape: `ultra` reasoning (GPT) and the `ultracode` workflow mode (Fable) are breadth modes, justified only when a task genuinely decomposes into independent parts; `xhigh` (GPT) and `max` effort (Claude) are depth modes for one hard problem. Every mandatory voice in this workflow is one hard problem — review one plan, review one diff — so the floors below are depth floors.
 
-**Floors, not pins — auto-forward selection.** The models below are floors. At the model gate, `scripts/model_policy.py` selects the newest eligible model at or above each floor from the observed facts: for Codex, live-catalog models supporting `xhigh` (down-tier variants like `-mini` excluded); for Claude, observed `fable`/`mythos`-family models. When a newer model ships, it is adopted automatically — persist the helper's `selection` result in state, log it in the Decision Audit Trail, and use the selected model for every invocation in the run. Anything below a floor still BLOCKs: upgrades are automatic, downgrades never are.
+Three legs, three distinct jobs:
 
-### Claude voices: Fable 5 at max
+| Leg            | Floor                  | Role                                                                | On failure         |
+| -------------- | ---------------------- | ------------------------------------------------------------------- | ------------------ |
+| Claude primary | Opus 5 at `max`        | Explorers, the always-runs structured review, every Claude fallback | BLOCK              |
+| Codex          | GPT-5.6 Sol at `xhigh` | The mandatory plan verdict and diff review                          | BLOCK              |
+| Third voice    | Fable 5 at `max`       | The escalation opinion on hard problems                             | Degrade and record |
 
-- Use Claude Fable 5 (`claude-fable-5`, CLI alias `fable`) at `max` effort. Fable 5 supplies the native long-context model; `max` is its deepest model-reasoning setting — the right shape for a voice's single hard problem. Do not substitute the separate `ultracode` workflow mode: it is a breadth mode for work that genuinely decomposes into independent parts, and this skill already owns that decomposition by dispatching its own voices.
-- Require Claude Code `>= 2.1.170`. Explicit CLI voices clear model/effort/permission overrides and add `--permission-mode plan --allowedTools Read,Glob,Grep --disallowedTools Edit,Write,NotebookEdit,Bash,WebFetch,WebSearch,Agent,Task --disable-slash-commands --no-session-persistence --no-chrome` after the Fable/max flags. Reviewer/explorer voices are read-only even when repository settings pre-authorize mutations.
-- Agent-tool voices may use `model: "fable"` only after confirming the host enforces per-agent model, max effort, and a read-only tool boundary; environment model/effort overrides must also be compatible. Otherwise use the clean-environment, read-only explicit CLI voice.
-- Built-in Explore agents are fixed to a smaller model. Use a read-only general-purpose/custom explorer pinned to Fable, or the explicit Fable CLI path.
-- If Fable is unavailable because of version, entitlement, provider policy, or zero-data-retention policy, BLOCK with the exact reason. An explicit user waiver must also name an observed, available, versioned Opus model and authorize it at max effort; never continue by dropping the Claude voice or by claiming the provider-dependent `opus` alias is a particular version.
+The cross-vendor gate is the point: the model that writes the code is not the model that approves it. The third voice extends that — when the primary and Codex cannot converge, the tiebreaker is a third model rather than a rerun of one that already spoke.
+
+**Floors, not pins — auto-forward selection.** The models below are floors. At the model gate, `scripts/model_policy.py` selects the newest eligible model at or above each floor from the observed facts: for Codex, live-catalog models supporting `xhigh` (down-tier variants like `-mini` excluded); for the Claude primary, observed `opus`-family models; for the third voice, observed `fable`/`mythos`-family models. The two Claude legs forward along their own lineages — a newer Fable never advances the primary, and a newer Opus never advances the third voice. When a newer model ships, it is adopted automatically — persist the helper's `selection` result in state, log it in the Decision Audit Trail, and use the selected model for every invocation in the run. Anything below a floor still BLOCKs: upgrades are automatic, downgrades never are.
+
+### Claude voices: Opus 5 at max
+
+- Use Claude Opus 5 (`claude-opus-5`, CLI alias `opus`) at `max` effort — its deepest model-reasoning setting, the right shape for a voice's single hard problem. Do not substitute the separate `ultracode` workflow mode: it is a breadth mode for work that genuinely decomposes into independent parts, and this skill already owns that decomposition by dispatching its own voices.
+- A context-window variant suffix (`claude-opus-5[1m]`) names the same model version with a larger window. It is accepted wherever the bare slug is, and is never treated as a downgrade or an upgrade. Prefer it only when a single review genuinely will not fit the standard window — it carries a long-context premium on every call.
+- Require Claude Code `>= 2.1.170`. Explicit CLI voices clear model/effort/permission overrides and add `--permission-mode plan --allowedTools Read,Glob,Grep --disallowedTools Edit,Write,NotebookEdit,Bash,WebFetch,WebSearch,Agent,Task --disable-slash-commands --no-session-persistence --no-chrome` after the model/effort flags. Reviewer/explorer voices are read-only even when repository settings pre-authorize mutations.
+- Agent-tool voices may use `model: "opus"` only after confirming the host enforces per-agent model, max effort, and a read-only tool boundary; environment model/effort overrides must also be compatible. Otherwise use the clean-environment, read-only explicit CLI voice.
+- Built-in Explore agents are fixed to a smaller model. Use a read-only general-purpose/custom explorer pinned to Opus, or the explicit Opus CLI path.
+- If Opus is unavailable because of version, entitlement, provider policy, or zero-data-retention policy, BLOCK with the exact reason. An explicit user waiver must also name an observed, available, versioned Fable or Mythos model and authorize it at max effort; never continue by dropping the Claude voice or by claiming a provider-dependent bare alias is a particular version.
+
+### Third voice: Fable 5 at max
+
+- Use Claude Fable 5 (`claude-fable-5`, CLI alias `fable`) at `max` effort as a third opinion **in addition to** the Codex verdict, never in place of it. It is read-only on both execution paths, under exactly the same tool boundary as the primary.
+- It runs at four deterministic points, each specified in [phases-1-5.md](references/phases-1-5.md): the first no-progress plan-review round, a large diff, an adversarial escalation, and a primary-vs-Codex dispute. These are not optional — they are where "this problem is hard" is already established by the workflow's own signals.
+- It may also be invoked by judgment at any review point when a problem looks likely to benefit from another perspective. Every judgment invocation records its trigger reason in state; an unlogged invocation is not permitted, because an unrecorded trigger cannot be audited or tuned.
+- This leg is a supplement, not a gate. If Fable is unavailable for any reason — including an organization data-retention policy it cannot satisfy — record the degradation in state and continue. Do NOT BLOCK on it: blocking would misreport a supplement as a mandatory gate, and the Codex verdict is what actually gates the plan.
 
 ### Codex voices: GPT-5.6 Sol at xhigh
 
@@ -76,9 +94,9 @@ Mandatory Phase 2 failure policy:
 | Usage quota exhausted                                 | BLOCK until the reported reset or the user changes access |
 | Timeout or transient transport error                  | Log one retry; a second failure BLOCKs                    |
 
-Never retry on a lower Codex model or effort. Optional Codex voices in later review tiers may use their documented Fable fallback only after the mandatory Phase 2 Codex gate has succeeded.
+Never retry on a lower Codex model or effort. Optional Codex voices in later review tiers may use their documented Claude fallback only after the mandatory Phase 2 Codex gate has succeeded.
 
-Feed observed CLI versions, live-catalog facts, invocation outcomes, Fable access, ZDR compatibility, and subagent overrides to `scripts/model_policy.py` at the model gate. Persist its JSON decision in state. The helper is side-effect-free: the agent still performs every probe and invocation, then records the observed result; a helper result of `blocked` is a workflow block, not a fallback signal.
+Feed observed CLI versions, live-catalog facts, invocation outcomes, Opus access, Fable access, ZDR compatibility, and subagent overrides to `scripts/model_policy.py` at the model gate. Persist all three of its JSON decisions in state. The helper is side-effect-free: the agent still performs every probe and invocation, then records the observed result; a helper result of `blocked` is a workflow block, not a fallback signal, while a third-voice result of `unavailable` is a recorded degradation and not a block.
 
 ## Authorization and Entry Routing
 
@@ -99,9 +117,9 @@ State lives at `.claude/workflow-state.local.md`, with `.cursor/workflow-state.l
 ## Phase State Machine
 
 1. **Plan:** investigate as required, explore with exact-model read-only agents, reuse existing patterns, write success criteria, and challenge all six edge-case dimensions.
-2. **Review plan:** the selected Codex model (floor GPT-5.6 Sol) at xhigh must approve. Rounds are unbounded while converging: BLOCK for human adjudication only on a stall (two consecutive rounds resolving zero previously-open findings) or at the 20-round runaway backstop. Runtime failure follows the mandatory model policy above.
+2. **Review plan:** the selected Codex model (floor GPT-5.6 Sol) at xhigh must approve. Rounds are unbounded while converging: BLOCK for human adjudication only on a stall (two consecutive rounds resolving zero previously-open findings) or at the 20-round runaway backstop. On the FIRST no-progress round, run the third voice before continuing — a fresh perspective is cheaper than a human interrupt, and a stall is the workflow's own signal that this problem is hard. Runtime failure follows the mandatory model policy above.
 3. **Implement:** complete one logical plan item at a time; for bug fixes, capture red/green regression evidence and run variant analysis; run correctness checks and commit after each file-changing item; finish with all quality checks.
-4. **Self-review:** use the skill-only/application fallback chain, ledger every finding, fix every real issue, justify false positives, and re-review file-changing fixes until convergence or the documented cap.
+4. **Self-review:** use the skill-only/application fallback chain, ledger every finding, fix every real issue, justify false positives, and re-review file-changing fixes until convergence or the documented cap. Large diffs, adversarial escalation, and primary-vs-Codex disputes each pull in the third voice.
    4a. **Security gate:** run only for applicable scopes; critical unresolved findings BLOCK.
 5. **Update PR:** require ticket policy, evidence, runtime-verification disposition, clean checks, and a non-protected branch; push/update the existing PR when taking over.
 6. **Monitor:** iterate fresh CI, feedback, and branch checks; never evaluate exit on stale post-push data. Before the draft→ready flip and before every terminal exit, verify the PR body's Prompt Trail is current with the state-file Prompt Ledger and synchronize it if stale (append missing entries, replace mismatched ones from the ledger, and repair archives — repost any missing or edited archive comment from the ledger via `--body-file`, then relink its range — before the body edit; a body-only sync neither changes the PR head nor resets grace/stable-poll state); first re-read the Prompt Trail bullets in [phases-1-5.md](references/phases-1-5.md)'s PR Body Template — they are not otherwise loaded during monitoring. Only if synchronization fails does the stale trail block: on sync failure at an otherwise-eligible flip or clean-exit pass, exit BLOCKED immediately — persist `phases.monitor: "blocked"` and record `prompt-trail:stale` in `attempt_log`, exactly as a condition-(c) exit would — never falling through to the remaining exit conditions or spinning on the iteration cap. A blocked exit reached for any other cause records `prompt-trail:stale` alongside that cause only when its own trail sync also failed — a blocked exit with a current trail records no trail marker; no later resume may exit the blocked state while the trail is stale (resume re-attempts the sync first). This gate is an additional conjunct of the draft-PR gate and exit conditions wherever the monitor references enumerate them.
@@ -153,7 +171,7 @@ Do not merge the PR. A clean unapproved PR pauses for its requested human review
 
 1. Never skip a mandatory phase or quality command.
 2. Never leave a review comment without a verified reply or written justification.
-3. Never silently downgrade below the GPT-5.6 Sol/xhigh or Fable 5/max floors. Newer-model auto-selection is upward only and always recorded in state and the audit trail; `ultra` and `ultracode` are breadth modes for genuinely decomposable tasks, never an upgrade for one hard problem.
+3. Never silently downgrade below the GPT-5.6 Sol/xhigh, Opus 5/max, or Fable 5/max floors. Newer-model auto-selection is upward only, stays within each leg's own lineage, and is always recorded in state and the audit trail; `ultra` and `ultracode` are breadth modes for genuinely decomposable tasks, never an upgrade for one hard problem.
 4. Never assign mapped QA owners in a fork or same-name unrelated repository.
 5. Never persist terminal monitor status before required handoff operations finish or fail durably.
 6. Never treat a bot as a human reviewer or assignment target.

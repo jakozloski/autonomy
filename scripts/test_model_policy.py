@@ -9,8 +9,12 @@ from unittest import mock
 from model_policy import (
     CLAUDE_EFFORT,
     CLAUDE_MODEL,
+    CLAUDE_MODEL_ALIAS,
     CODEX_EFFORT,
     CODEX_MODEL,
+    THIRD_VOICE_EFFORT,
+    THIRD_VOICE_MODEL,
+    THIRD_VOICE_MODEL_ALIAS,
     evaluate_model_policy,
     main,
 )
@@ -56,6 +60,28 @@ def valid_claude(**overrides: object) -> dict:
     config = {
         "installed": True,
         "version": "2.1.170 (Claude Code)",
+        "opus_access": "available",
+        "zero_data_retention": "compatible",
+        "environment": {
+            "CLAUDE_CODE_SUBAGENT_MODEL": None,
+            "CLAUDE_CODE_EFFORT_LEVEL": None,
+        },
+        "host_capabilities": {
+            "agent_model_selection": True,
+            "agent_effort_selection": True,
+            "agent_read_only_enforced": True,
+        },
+        "observed_models": ["claude-opus-5", "claude-fable-5"],
+        "explicit_waiver": False,
+    }
+    config.update(overrides)
+    return config
+
+
+def valid_third_voice(**overrides: object) -> dict:
+    config = {
+        "installed": True,
+        "version": "2.1.170 (Claude Code)",
         "fable_access": "available",
         "zero_data_retention": "compatible",
         "environment": {
@@ -67,22 +93,29 @@ def valid_claude(**overrides: object) -> dict:
             "agent_effort_selection": True,
             "agent_read_only_enforced": True,
         },
-        "observed_models": ["claude-fable-5", "claude-opus-4-8"],
-        "explicit_waiver": False,
+        "observed_models": ["claude-fable-5"],
     }
     config.update(overrides)
     return config
 
 
-def request(*, codex: dict | None = None, claude: dict | None = None) -> dict:
+def request(
+    *,
+    codex: dict | None = None,
+    claude: dict | None = None,
+    third_voice: dict | None = None,
+) -> dict:
     return {
         "codex": codex if codex is not None else valid_codex(),
         "claude": claude if claude is not None else valid_claude(),
+        "claude_third_voice": (
+            third_voice if third_voice is not None else valid_third_voice()
+        ),
     }
 
 
 class ModelPolicyTest(unittest.TestCase):
-    def test_ready_policy_pins_sol_xhigh_and_fable_max(self) -> None:
+    def test_ready_policy_pins_sol_xhigh_opus_max_and_fable_third_voice(self) -> None:
         result = evaluate_model_policy(request())
 
         self.assertEqual(result["state"], "ready")
@@ -97,6 +130,26 @@ class ModelPolicyTest(unittest.TestCase):
         self.assertEqual(result["claude"]["execution_path"], "agent_tool")
         self.assertFalse(result["codex"]["downgrade_allowed"])
         self.assertIsNone(result["codex"]["fallback_model"])
+
+        third = result["claude_third_voice"]
+        self.assertEqual(
+            (third["model"], third["effort"]),
+            (THIRD_VOICE_MODEL, THIRD_VOICE_EFFORT),
+        )
+        self.assertEqual(third["state"], "ready")
+        self.assertEqual(third["role"], "supplementary")
+        self.assertFalse(third["blocking"])
+
+    def test_primary_and_third_voice_are_different_models(self) -> None:
+        """The escalation opinion must not be the model it is escalating from."""
+
+        result = evaluate_model_policy(request())
+
+        self.assertNotEqual(
+            result["claude"]["model"], result["claude_third_voice"]["model"]
+        )
+        self.assertEqual(CLAUDE_MODEL_ALIAS, "opus")
+        self.assertEqual(THIRD_VOICE_MODEL_ALIAS, "fable")
 
     def test_codex_missing_cli_blocks_with_install_action(self) -> None:
         result = evaluate_model_policy(request(codex={"installed": False}))["codex"]
@@ -261,7 +314,7 @@ class ModelPolicyTest(unittest.TestCase):
                 self.assertEqual(result["reason_code"], reason_code)
                 self.assertFalse(result["waiver_granted"])
 
-    def test_claude_fable_access_failures_block_pending_waiver(self) -> None:
+    def test_claude_opus_access_failures_block_pending_waiver(self) -> None:
         for access in (
             "unavailable",
             "entitlement_denied",
@@ -270,7 +323,7 @@ class ModelPolicyTest(unittest.TestCase):
         ):
             with self.subTest(access=access):
                 result = evaluate_model_policy(
-                    request(claude=valid_claude(fable_access=access))
+                    request(claude=valid_claude(opus_access=access))
                 )["claude"]
                 self.assertEqual(result["state"], "blocked")
                 self.assertTrue(result["waiver_required"])
@@ -289,7 +342,7 @@ class ModelPolicyTest(unittest.TestCase):
 
     def test_malformed_claude_gate_observations_block_without_waiver(self) -> None:
         cases = (
-            {"fable_access": []},
+            {"opus_access": []},
             {"zero_data_retention": []},
             {"environment": []},
             {"environment": {"CLAUDE_CODE_SUBAGENT_MODEL": 123}},
@@ -305,12 +358,12 @@ class ModelPolicyTest(unittest.TestCase):
     def test_claude_unavailability_can_only_continue_after_explicit_waiver(
         self,
     ) -> None:
-        unavailable = valid_claude(fable_access="unavailable")
+        unavailable = valid_claude(opus_access="unavailable")
         blocked = evaluate_model_policy(request(claude=unavailable))["claude"]
 
         unavailable["explicit_waiver"] = True
         unavailable["waiver_fallback"] = {
-            "model": "claude-opus-4-8",
+            "model": "claude-fable-5",
             "effort": "max",
             "available": True,
             "explicitly_authorized": True,
@@ -321,14 +374,27 @@ class ModelPolicyTest(unittest.TestCase):
         self.assertEqual(blocked["state"], "blocked")
         self.assertEqual(waived["state"], "waived")
         self.assertTrue(waived["waiver_granted"])
-        self.assertEqual(waived["model"], "claude-opus-4-8")
+        self.assertEqual(waived["model"], "claude-fable-5")
         self.assertEqual(waived["execution_path"], "explicit_cli")
 
-    def test_waiver_rejects_unobserved_or_malformed_opus_fallback(self) -> None:
-        for model in ("claude-opus-", "claude-opus-malicious", "claude-opus-foo/bar"):
+    def test_waiver_rejects_unobserved_or_malformed_fallback(self) -> None:
+        for model in (
+            "claude-fable-",
+            "claude-fable-malicious",
+            "claude-fable-foo/bar",
+            # Opus is the primary now; naming it as its own fallback is not a
+            # substitute for restoring access to it.
+            "claude-opus-4-8",
+            "claude-opus-5",
+            # A waiver may authorize a different lineage; it may not authorize a
+            # version below a floor. No path in this module proposes a downgrade.
+            "claude-fable-1",
+            "claude-fable-4-5",
+            "claude-mythos-4",
+        ):
             with self.subTest(model=model):
                 claude = valid_claude(
-                    fable_access="unavailable",
+                    opus_access="unavailable",
                     explicit_waiver=True,
                     waiver_fallback={
                         "model": model,
@@ -345,10 +411,10 @@ class ModelPolicyTest(unittest.TestCase):
     def test_missing_claude_cli_cannot_select_explicit_fallback(self) -> None:
         claude = valid_claude(
             installed=False,
-            fable_access="unavailable",
+            opus_access="unavailable",
             explicit_waiver=True,
             waiver_fallback={
-                "model": "claude-opus-4-8",
+                "model": "claude-fable-5",
                 "effort": "max",
                 "available": True,
                 "explicitly_authorized": True,
@@ -376,7 +442,7 @@ class ModelPolicyTest(unittest.TestCase):
             [
                 "-p",
                 "--model",
-                "fable",
+                "opus",
                 "--effort",
                 "max",
                 "--permission-mode",
@@ -393,8 +459,10 @@ class ModelPolicyTest(unittest.TestCase):
         self.assertTrue(result["read_only"]["required"])
         self.assertEqual(result["read_only"]["permission_mode"], "plan")
 
-    def test_matching_fable_override_keeps_agent_tool_path(self) -> None:
-        for override in (None, "", "fable", "claude-fable-5"):
+    def test_matching_opus_override_keeps_agent_tool_path(self) -> None:
+        # The bare floor, its alias, and its context-window variant all name the
+        # same model version, so none of them is a conflicting override.
+        for override in (None, "", "opus", "claude-opus-5", "claude-opus-5[1m]"):
             with self.subTest(override=override):
                 result = evaluate_model_policy(
                     request(
@@ -564,16 +632,16 @@ class AutoForwardSelectionTest(unittest.TestCase):
         self.assertEqual(result["state"], "blocked")
         self.assertEqual(result["reason_code"], "live_catalog_missing_capability")
 
-    def test_newer_fable_is_auto_selected_for_agent_and_cli_paths(self) -> None:
+    def test_newer_opus_is_auto_selected_for_agent_and_cli_paths(self) -> None:
         claude = valid_claude(
-            observed_models=["claude-fable-5", "claude-fable-6", "claude-opus-4-8"]
+            observed_models=["claude-opus-5", "claude-opus-6", "claude-fable-5"]
         )
         result = evaluate_model_policy(request(claude=claude))["claude"]
 
         self.assertEqual(result["state"], "ready")
-        self.assertEqual(result["model"], "claude-fable-6")
+        self.assertEqual(result["model"], "claude-opus-6")
         self.assertEqual(result["execution_path"], "agent_tool")
-        self.assertIn("model=claude-fable-6", result["arguments"])
+        self.assertIn("model=claude-opus-6", result["arguments"])
         self.assertEqual(result["selection"]["reason"], "newer_model_auto_selected")
 
         claude["host_capabilities"] = {}
@@ -581,19 +649,59 @@ class AutoForwardSelectionTest(unittest.TestCase):
 
         self.assertEqual(result["execution_path"], "explicit_cli")
         model_flag = result["arguments"][result["arguments"].index("--model") + 1]
-        self.assertEqual(model_flag, "claude-fable-6")
+        self.assertEqual(model_flag, "claude-opus-6")
+
+    def test_newer_fable_forwards_the_third_voice_not_the_primary(self) -> None:
+        """The two legs auto-forward independently along their own lineages."""
+
+        result = evaluate_model_policy(
+            request(
+                claude=valid_claude(observed_models=["claude-opus-5", "claude-fable-6"]),
+                third_voice=valid_third_voice(observed_models=["claude-fable-6"]),
+            )
+        )
+
+        self.assertEqual(result["claude"]["model"], CLAUDE_MODEL)
+        self.assertEqual(result["claude"]["selection"]["reason"], "floor_model")
+        self.assertEqual(result["claude_third_voice"]["model"], "claude-fable-6")
+        self.assertEqual(
+            result["claude_third_voice"]["selection"]["reason"],
+            "newer_model_auto_selected",
+        )
 
     def test_fable_family_preferred_over_mythos_on_version_tie(self) -> None:
-        claude = valid_claude(observed_models=["claude-mythos-6", "claude-fable-6"])
+        third = valid_third_voice(
+            observed_models=["claude-mythos-6", "claude-fable-6"]
+        )
 
-        result = evaluate_model_policy(request(claude=claude))["claude"]
+        result = evaluate_model_policy(request(third_voice=third))
 
-        self.assertEqual(result["model"], "claude-fable-6")
+        self.assertEqual(result["claude_third_voice"]["model"], "claude-fable-6")
+
+    def test_context_window_variant_is_the_same_version_not_an_upgrade(self) -> None:
+        only_variant = evaluate_model_policy(
+            request(claude=valid_claude(observed_models=["claude-opus-5[1m]"]))
+        )["claude"]
+
+        self.assertEqual(only_variant["model"], "claude-opus-5[1m]")
+        self.assertEqual(only_variant["selection"]["reason"], "floor_model_variant")
+
+        # With both present the bare slug wins — the standard-cost default.
+        both = evaluate_model_policy(
+            request(
+                claude=valid_claude(
+                    observed_models=["claude-opus-5[1m]", "claude-opus-5"]
+                )
+            )
+        )["claude"]
+
+        self.assertEqual(both["model"], CLAUDE_MODEL)
+        self.assertEqual(both["selection"]["reason"], "floor_model")
 
     def test_floor_override_conflicts_when_newer_model_selected(self) -> None:
         claude = valid_claude(
-            observed_models=["claude-fable-6"],
-            environment={"CLAUDE_CODE_SUBAGENT_MODEL": "fable"},
+            observed_models=["claude-opus-6"],
+            environment={"CLAUDE_CODE_SUBAGENT_MODEL": "opus"},
         )
 
         result = evaluate_model_policy(request(claude=claude))["claude"]
@@ -602,12 +710,110 @@ class AutoForwardSelectionTest(unittest.TestCase):
         self.assertEqual(result["execution_path"], "explicit_cli")
 
     def test_malformed_observed_models_fall_back_to_the_floor(self) -> None:
-        for observed in (None, "claude-fable-6", [123, {}, "claude-haiku-4-5"]):
+        for observed in (None, "claude-opus-6", [123, {}, "claude-haiku-4-5"]):
             with self.subTest(observed=observed):
                 claude = valid_claude(observed_models=observed)
                 result = evaluate_model_policy(request(claude=claude))["claude"]
                 self.assertEqual(result["model"], CLAUDE_MODEL)
                 self.assertEqual(result["selection"]["reason"], "floor_model")
+
+    def test_down_tier_claude_models_are_never_selected(self) -> None:
+        for observed in (["claude-opus-4-8"], ["claude-sonnet-5"], ["claude-haiku-4-5"]):
+            with self.subTest(observed=observed):
+                result = evaluate_model_policy(
+                    request(claude=valid_claude(observed_models=observed))
+                )["claude"]
+                self.assertEqual(result["model"], CLAUDE_MODEL)
+                self.assertEqual(result["selection"]["reason"], "floor_model")
+
+
+class ThirdVoiceTest(unittest.TestCase):
+    """The escalation voice is a supplement: it degrades, it never blocks."""
+
+    def test_unavailable_third_voice_does_not_block_the_workflow(self) -> None:
+        for field, value, reason_code in (
+            ("fable_access", "unavailable", "fable_unavailable"),
+            ("fable_access", "entitlement_denied", "fable_entitlement_denied"),
+            ("zero_data_retention", "incompatible", "zdr_incompatible"),
+            ("installed", False, "cli_missing"),
+        ):
+            with self.subTest(field=field, value=value):
+                result = evaluate_model_policy(
+                    request(third_voice=valid_third_voice(**{field: value}))
+                )
+
+                self.assertEqual(result["state"], "ready")
+                third = result["claude_third_voice"]
+                self.assertEqual(third["state"], "unavailable")
+                self.assertEqual(third["reason_code"], reason_code)
+                self.assertFalse(third["blocking"])
+                self.assertEqual(third["next_action"], "continue_without_third_voice")
+
+    def test_absent_third_voice_observation_is_reported_not_guessed(self) -> None:
+        result = evaluate_model_policy(
+            {"codex": valid_codex(), "claude": valid_claude()}
+        )
+
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(result["claude_third_voice"]["state"], "unavailable")
+        self.assertEqual(result["claude_third_voice"]["reason_code"], "not_observed")
+
+    def test_third_voice_is_read_only_on_both_execution_paths(self) -> None:
+        agent = evaluate_model_policy(request())["claude_third_voice"]
+        self.assertEqual(agent["execution_path"], "agent_tool")
+        self.assertTrue(agent["read_only"]["required"])
+
+        cli = evaluate_model_policy(
+            request(third_voice=valid_third_voice(host_capabilities={}))
+        )["claude_third_voice"]
+        self.assertEqual(cli["execution_path"], "explicit_cli")
+        self.assertIn("--permission-mode", cli["arguments"])
+        self.assertIn("plan", cli["arguments"])
+        for denied in ("Edit", "Write", "Bash"):
+            self.assertIn(denied, cli["arguments"][cli["arguments"].index("--disallowedTools") + 1])
+
+    def test_opus_does_not_forward_the_third_voice(self) -> None:
+        """The third voice stays on its own lineage even when Opus is newer."""
+
+        for observed in (
+            ["claude-opus-6"],
+            ["claude-opus-5", "claude-opus-6"],
+            ["claude-sonnet-5"],
+            ["claude-fable-4-5"],
+            ["claude-haiku-4-5"],
+        ):
+            with self.subTest(observed=observed):
+                result = evaluate_model_policy(
+                    request(third_voice=valid_third_voice(observed_models=observed))
+                )["claude_third_voice"]
+                self.assertEqual(result["model"], THIRD_VOICE_MODEL)
+                self.assertEqual(result["selection"]["reason"], "floor_model")
+
+    def test_third_voice_never_reports_a_blocked_state(self) -> None:
+        for third in (
+            valid_third_voice(installed=False),
+            valid_third_voice(version="0.0.1"),
+            valid_third_voice(fable_access=[]),
+            valid_third_voice(zero_data_retention=[]),
+            # Unhashable env overrides must not raise out of the whole gate: a
+            # traceback is strictly worse than a decision, for every leg.
+            valid_third_voice(environment={"CLAUDE_CODE_EFFORT_LEVEL": []}),
+            valid_third_voice(environment={"CLAUDE_CODE_SUBAGENT_MODEL": []}),
+            valid_third_voice(environment={"CLAUDE_CODE_EFFORT_LEVEL": {}}),
+            None,
+        ):
+            with self.subTest(third=third):
+                result = evaluate_model_policy(
+                    {
+                        "codex": valid_codex(),
+                        "claude": valid_claude(),
+                        "claude_third_voice": third,
+                    }
+                )
+                self.assertIn(
+                    result["claude_third_voice"]["state"], {"ready", "unavailable"}
+                )
+                self.assertEqual(result["state"], "ready")
 
 
 if __name__ == "__main__":

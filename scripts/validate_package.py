@@ -165,7 +165,8 @@ BUILTIN_EXPECTED_HEADINGS: Mapping[str, tuple[str, ...]] = {
         "## Loading Contract",
         "## Non-Negotiable Invariants",
         "## Mandatory Model Policy",
-        "### Claude voices: Fable 5 at max",
+        "### Claude voices: Opus 5 at max",
+        "### Third voice: Fable 5 at max",
         "### Codex voices: GPT-5.6 Sol at xhigh",
         "## Authorization and Entry Routing",
         "## Project Profile and State",
@@ -199,6 +200,7 @@ BUILTIN_EXPECTED_HEADINGS: Mapping[str, tuple[str, ...]] = {
     "references/phases-1-5.md": (
         "## Phase 1: Plan",
         "## Phase 2: Review the Plan",
+        "## Third-Voice Triggers",
         "## Phase 3: Implement",
         "## Phase 4: Self-Review",
         "## Phase 4a: Security Gate",

@@ -22,7 +22,7 @@ Expected input shape::
       "claude": {
         "installed": true,
         "version": "2.1.170 (Claude Code)",
-        "fable_access": "available",
+        "opus_access": "available",
         "zero_data_retention": "compatible",
         "environment": {
           "CLAUDE_CODE_SUBAGENT_MODEL": null,
@@ -34,6 +34,12 @@ Expected input shape::
           "agent_read_only_enforced": false
         },
         "explicit_waiver": false
+      },
+      "claude_third_voice": {
+        "installed": true,
+        "version": "2.1.170 (Claude Code)",
+        "fable_access": "available",
+        "zero_data_retention": "compatible"
       }
     }
 
@@ -42,14 +48,25 @@ the authoritative entitlement/quota signal.  A timeout or transport failure
 may retry once with the exact same model and effort; every other Codex failure
 blocks, and no path proposes a downgrade.
 
+Three legs are evaluated.  ``codex`` and ``claude`` are gating: a failure on
+either blocks the workflow.  ``claude_third_voice`` is a supplement — the
+escalation opinion called in on hard problems — so its failures report
+``unavailable`` and the run continues with the degradation recorded.  Making
+it blocking would misrepresent a supplement as a mandatory gate.
+
 Model selection is floor-based, not pinned.  From the observed facts the
 helper selects the newest eligible model at or above each floor: for Codex,
 live-catalog models named ``gpt-<version>[-variant]`` that support the
-required effort, excluding down-tier variants such as ``-mini``; for Claude,
-entries in the optional ``claude.observed_models`` list from the ``fable`` or
-``mythos`` families.  Upgrades are automatic and reported under each
-decision's ``selection`` key; anything below a floor still blocks, and no
-path proposes a downgrade.
+required effort, excluding down-tier variants such as ``-mini``; for the
+primary Claude leg, ``opus``-family entries in the optional
+``claude.observed_models`` list; for the third voice, ``fable``/``mythos``
+entries in ``claude_third_voice.observed_models``.  Upgrades are automatic and
+reported under each decision's ``selection`` key; anything below a floor still
+blocks, and no path proposes a downgrade.
+
+A context-window variant suffix (``claude-opus-5[1m]``) denotes the same model
+version as its bare slug.  It is accepted wherever the bare slug is, and is
+never treated as either a downgrade or an upgrade.
 
 ``xhigh`` is the depth setting for this workflow's single-problem voices;
 ``ultra`` is the breadth mode, reserved for tasks that genuinely decompose
@@ -64,7 +81,7 @@ import sys
 from typing import Any
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 CODEX_MODEL = "gpt-5.6-sol"  # floor: newest eligible catalog model >= this wins
 CODEX_FLOOR_VERSION = (5, 6)
@@ -74,10 +91,20 @@ CODEX_MAX_ATTEMPTS = 2
 # Variant tokens that mark down-tier siblings, never auto-forward targets.
 CODEX_EXCLUDED_VARIANT_TOKENS = ("mini", "nano", "lite", "chat")
 
-CLAUDE_MODEL = "claude-fable-5"  # floor: newest observed fable/mythos >= this wins
+# Primary Claude leg: explorers, the always-runs structured review, and every
+# Claude fallback.  Gating — a failure here blocks.
+CLAUDE_MODEL = "claude-opus-5"  # floor: newest observed opus >= this wins
 CLAUDE_FLOOR_VERSION = (5,)
-CLAUDE_MODEL_ALIAS = "fable"
+CLAUDE_MODEL_ALIAS = "opus"
 CLAUDE_EFFORT = "max"
+
+# Third voice: the escalation opinion, called in on hard problems alongside the
+# Codex verdict.  Supplementary — a failure here degrades, it does not block.
+THIRD_VOICE_MODEL = "claude-fable-5"  # floor: newest observed fable/mythos wins
+THIRD_VOICE_FLOOR_VERSION = (5,)
+THIRD_VOICE_MODEL_ALIAS = "fable"
+THIRD_VOICE_EFFORT = "max"
+
 MIN_CLAUDE_VERSION = (2, 1, 170)
 CLAUDE_READ_ONLY_ALLOWED_TOOLS = ("Read", "Glob", "Grep")
 CLAUDE_READ_ONLY_DENIED_TOOLS = (
@@ -105,7 +132,14 @@ _GPT_SLUG = re.compile(
     r"gpt-(?P<major>\d+)(?:\.(?P<minor>\d+))?(?:-(?P<variant>[a-z0-9-]+))?"
 )
 
+# A trailing ``[1m]``-style suffix selects a context-window variant of the same
+# model version.  It is captured so the variant can be recognised as equal, not
+# ranked above or below the bare slug.
 _CLAUDE_UPGRADE_SLUG = re.compile(
+    r"claude-opus-(?P<version>\d+(?:-\d+)*)(?P<variant>\[[0-9a-z]+\])?"
+)
+
+_THIRD_VOICE_UPGRADE_SLUG = re.compile(
     r"claude-(?P<family>fable|mythos)-(?P<version>\d+(?:-\d+)*)"
 )
 
@@ -139,47 +173,56 @@ _CODEX_BLOCKING_FAILURES = {
 
 _CODEX_RETRYABLE_FAILURES = {"timeout", "transport_error"}
 
-_CLAUDE_ACCESS_FAILURES = {
-    False: (
-        "fable_unavailable",
-        "Claude Fable 5 is unavailable",
-    ),
-    "unavailable": (
-        "fable_unavailable",
-        "Claude Fable 5 is unavailable",
-    ),
-    "entitlement_denied": (
-        "fable_entitlement_denied",
-        "Claude Fable 5 entitlement was denied",
-    ),
-    "provider_policy_denied": (
-        "fable_provider_policy_denied",
-        "Provider policy does not permit Claude Fable 5",
-    ),
-    "unknown": (
-        "fable_access_unverified",
-        "Claude Fable 5 access has not been verified",
-    ),
-}
+def _access_failures(prefix: str, label: str) -> dict[Any, tuple[str, str]]:
+    """Access-failure table for one leg, so the two legs cannot drift apart."""
 
-_CLAUDE_ZDR_FAILURES = {
-    False: (
+    unavailable = (f"{prefix}_unavailable", f"{label} is unavailable")
+    return {
+        False: unavailable,
+        "unavailable": unavailable,
+        "entitlement_denied": (
+            f"{prefix}_entitlement_denied",
+            f"{label} entitlement was denied",
+        ),
+        "provider_policy_denied": (
+            f"{prefix}_provider_policy_denied",
+            f"Provider policy does not permit {label}",
+        ),
+        "unknown": (
+            f"{prefix}_access_unverified",
+            f"{label} access has not been verified",
+        ),
+    }
+
+
+def _zdr_failures(label: str) -> dict[Any, tuple[str, str]]:
+    """Zero-data-retention failure table for one leg."""
+
+    incompatible = (
         "zdr_incompatible",
-        "Claude Fable 5 does not satisfy the required zero-data-retention policy",
-    ),
-    "incompatible": (
-        "zdr_incompatible",
-        "Claude Fable 5 does not satisfy the required zero-data-retention policy",
-    ),
-    "denied": (
-        "zdr_incompatible",
-        "Claude Fable 5 does not satisfy the required zero-data-retention policy",
-    ),
-    "unknown": (
-        "zdr_unverified",
-        "Claude Fable 5 zero-data-retention compatibility is unverified",
-    ),
-}
+        f"{label} does not satisfy the required zero-data-retention policy",
+    )
+    return {
+        False: incompatible,
+        "incompatible": incompatible,
+        "denied": incompatible,
+        "unknown": (
+            "zdr_unverified",
+            f"{label} zero-data-retention compatibility is unverified",
+        ),
+    }
+
+
+_CLAUDE_ACCESS_FAILURES = _access_failures("opus", "Claude Opus 5")
+_CLAUDE_ZDR_FAILURES = _zdr_failures("Claude Opus 5")
+
+_THIRD_VOICE_ACCESS_FAILURES = _access_failures("fable", "Claude Fable 5")
+_THIRD_VOICE_ZDR_FAILURES = _zdr_failures("Claude Fable 5")
+
+_ACCESS_STATUS_VALUES = (
+    "available, unavailable, entitlement_denied, provider_policy_denied, or unknown"
+)
+_ZDR_STATUS_VALUES = "compatible, incompatible, denied, or unknown"
 
 
 def _semver(value: Any) -> tuple[tuple[int, int, int], bool] | None:
@@ -456,15 +499,15 @@ def evaluate_codex(raw: Any) -> dict[str, Any]:
     )
 
 
-def _explicit_cli_arguments(model: str) -> list[str]:
-    """Read-only explicit-CLI invocation tail, defined once so the two
-    emission sites cannot drift apart."""
+def _explicit_cli_arguments(model: str, effort: str = CLAUDE_EFFORT) -> list[str]:
+    """Read-only explicit-CLI invocation tail, defined once so every emission
+    site — both Claude legs — cannot drift apart."""
     return [
         "-p",
         "--model",
         model,
         "--effort",
-        CLAUDE_EFFORT,
+        effort,
         "--permission-mode",
         "plan",
         "--allowedTools",
@@ -504,12 +547,29 @@ def _claude_base(version: Any) -> dict[str, Any]:
     }
 
 
-def _select_claude_model(observed_models: Any) -> tuple[str, str]:
-    """Return the newest observed fable/mythos model at or above the floor.
+def _claude_floor_variant(slug: Any) -> bool:
+    """True when ``slug`` is the floor model, or a context-window variant of it.
 
-    Falls back to the floor when nothing newer is observed.  Ties on version
-    prefer the ``fable`` family (generally available), then lexicographic
-    order — deterministic by construction.
+    ``claude-opus-5[1m]`` is the same model version as ``claude-opus-5`` with a
+    larger context window, so it is accepted anywhere the bare slug is.
+    """
+
+    if not isinstance(slug, str):
+        return False
+    match = _CLAUDE_UPGRADE_SLUG.fullmatch(slug)
+    if match is None:
+        return False
+    version = tuple(int(part) for part in match.group("version").split("-"))
+    return version == CLAUDE_FLOOR_VERSION
+
+
+def _select_claude_model(observed_models: Any) -> tuple[str, str]:
+    """Return the newest observed opus model at or above the primary floor.
+
+    Falls back to the floor when nothing newer is observed.  A ``[1m]``-style
+    context-window suffix marks the same version, so it never outranks the bare
+    slug; ties prefer the bare slug (the standard-cost default), then
+    lexicographic order — deterministic by construction.
     """
 
     if not isinstance(observed_models, list):
@@ -525,14 +585,65 @@ def _select_claude_model(observed_models: Any) -> tuple[str, str]:
         version = tuple(int(part) for part in match.group("version").split("-"))
         if version < CLAUDE_FLOOR_VERSION:
             continue
-        family_rank = 1 if match.group("family") == "fable" else 0
-        key = (version, family_rank, item)
+        variant_rank = 0 if match.group("variant") else 1
+        key = (version, variant_rank, item)
         if best is None or key > best[0]:
             best = (key, item)
 
     if best is None or best[1] == CLAUDE_MODEL:
         return CLAUDE_MODEL, "floor_model"
+    if _claude_floor_variant(best[1]):
+        # Same version as the floor, larger context window — not an upgrade.
+        return best[1], "floor_model_variant"
     return best[1], "newer_model_auto_selected"
+
+
+def _select_third_voice_model(observed_models: Any) -> tuple[str, str]:
+    """Return the newest observed fable/mythos model at or above the floor.
+
+    Falls back to the floor when nothing newer is observed.  Ties on version
+    prefer the ``fable`` family (generally available), then lexicographic
+    order — deterministic by construction.
+    """
+
+    if not isinstance(observed_models, list):
+        return THIRD_VOICE_MODEL, "floor_model"
+
+    best: tuple[tuple[Any, ...], str] | None = None
+    for item in observed_models:
+        if not isinstance(item, str):
+            continue
+        match = _THIRD_VOICE_UPGRADE_SLUG.fullmatch(item)
+        if match is None:
+            continue
+        version = tuple(int(part) for part in match.group("version").split("-"))
+        if version < THIRD_VOICE_FLOOR_VERSION:
+            continue
+        family_rank = 1 if match.group("family") == "fable" else 0
+        key = (version, family_rank, item)
+        if best is None or key > best[0]:
+            best = (key, item)
+
+    if best is None or best[1] == THIRD_VOICE_MODEL:
+        return THIRD_VOICE_MODEL, "floor_model"
+    return best[1], "newer_model_auto_selected"
+
+
+def _at_or_above_third_voice_floor(slug: Any) -> bool:
+    """True when ``slug`` is a fable/mythos model at or above the third-voice floor.
+
+    A waiver may authorize a different lineage; it may not authorize a version
+    below a floor.  Nothing in this module proposes a downgrade, and an explicit
+    human waiver is not an exception to that.
+    """
+
+    if not isinstance(slug, str):
+        return False
+    match = _THIRD_VOICE_UPGRADE_SLUG.fullmatch(slug)
+    if match is None:
+        return False
+    version = tuple(int(part) for part in match.group("version").split("-"))
+    return version >= THIRD_VOICE_FLOOR_VERSION
 
 
 def _waive_or_block_claude(
@@ -565,7 +676,7 @@ def _waive_or_block_claude(
             fallback.get("available") is not True
             or fallback.get("explicitly_authorized") is not True
             or not isinstance(fallback_model, str)
-            or re.fullmatch(r"claude-opus-[0-9]+(?:-[0-9]+)+", fallback_model) is None
+            or not _at_or_above_third_voice_floor(fallback_model)
             or not isinstance(observed_models, list)
             or not all(isinstance(model, str) for model in observed_models)
             or fallback_model not in observed_models
@@ -576,7 +687,7 @@ def _waive_or_block_claude(
             return _block_claude_input(
                 decision,
                 "invalid_named_fallback",
-                "The waived fallback must be an available, explicitly authorized, versioned Claude Opus model at max effort",
+                "The waived fallback must be an available, explicitly authorized Claude Fable or Mythos model at or above the Fable 5 floor, at max effort",
             )
         decision.update(
             {
@@ -605,7 +716,7 @@ def _waive_or_block_claude(
             "state": "blocked",
             "reason_code": reason_code,
             "reason": reason,
-            "next_action": "request_explicit_waiver_or_restore_fable_access",
+            "next_action": "request_explicit_waiver_or_restore_opus_access",
             "waiver_required": True,
         }
     )
@@ -629,7 +740,11 @@ def _block_claude_input(
 
 
 def evaluate_claude(raw: Any) -> dict[str, Any]:
-    """Evaluate the Fable/max gate and choose Agent or explicit CLI execution."""
+    """Evaluate the primary Opus/max gate and choose Agent or explicit CLI.
+
+    This leg is gating: any failure blocks unless an explicit waiver names an
+    observed Fable/Mythos-family model at max effort.
+    """
 
     config = raw if isinstance(raw, dict) else {}
     version = config.get("version")
@@ -670,7 +785,7 @@ def evaluate_claude(raw: Any) -> dict[str, Any]:
             "Claude Code must be at least 2.1.170",
         )
 
-    access = config.get("fable_access", "unknown")
+    access = config.get("opus_access", "unknown")
     if access is not True and access != "available":
         if access is False:
             code, reason = _CLAUDE_ACCESS_FAILURES[False]
@@ -679,9 +794,8 @@ def evaluate_claude(raw: Any) -> dict[str, Any]:
         else:
             return _block_claude_input(
                 decision,
-                "invalid_fable_access",
-                "fable_access must be available, unavailable, entitlement_denied, "
-                "provider_policy_denied, or unknown",
+                "invalid_opus_access",
+                f"opus_access must be {_ACCESS_STATUS_VALUES}",
             )
         return _waive_or_block_claude(decision, config, code, reason)
 
@@ -695,7 +809,7 @@ def evaluate_claude(raw: Any) -> dict[str, Any]:
             return _block_claude_input(
                 decision,
                 "invalid_zdr_status",
-                "zero_data_retention must be compatible, incompatible, denied, or unknown",
+                f"zero_data_retention must be {_ZDR_STATUS_VALUES}",
             )
         return _waive_or_block_claude(decision, config, code, reason)
 
@@ -740,6 +854,7 @@ def evaluate_claude(raw: Any) -> dict[str, Any]:
         config.get("observed_models")
     )
     at_floor = selected_model == CLAUDE_MODEL
+    at_floor_version = _claude_floor_variant(selected_model)
     model_flag = CLAUDE_MODEL_ALIAS if at_floor else selected_model
     decision["model"] = selected_model
     decision["selection"] = {
@@ -750,9 +865,13 @@ def evaluate_claude(raw: Any) -> dict[str, Any]:
 
     exact_override = override if isinstance(override, str) else ""
     compatible_overrides = {"", selected_model}
-    if at_floor:
+    if at_floor_version:
         compatible_overrides |= {CLAUDE_MODEL_ALIAS, CLAUDE_MODEL}
-    model_conflict = exact_override not in compatible_overrides
+    # A context-window variant of the floor names the same model version, so it
+    # is not a conflicting override.
+    model_conflict = exact_override not in compatible_overrides and not (
+        at_floor_version and _claude_floor_variant(exact_override)
+    )
     effort_conflict = effort_override not in {None, CLAUDE_EFFORT}
     agent_selection_verified = (
         host_capabilities.get("agent_model_selection") is True
@@ -768,16 +887,220 @@ def evaluate_claude(raw: Any) -> dict[str, Any]:
         environment_unset = list(CLAUDE_READ_ONLY_ENV_UNSET)
     else:
         execution_path = "agent_tool"
-        arguments = [f"model={model_flag}", "effort=max"]
-        next_action = "invoke_fable_agent"
+        arguments = [f"model={model_flag}", f"effort={CLAUDE_EFFORT}"]
+        next_action = "invoke_opus_agent"
+        environment_unset = []
+
+    if at_floor:
+        selection_note = ""
+    elif at_floor_version:
+        selection_note = " (context-window variant of the Opus 5 floor)"
+    else:
+        selection_note = " (auto-selected above the Opus 5 floor)"
+
+    decision.update(
+        {
+            "state": "ready",
+            "reason_code": ("explicit_cli_required" if conflict else "opus_ready"),
+            "reason": (
+                "Unverified model/effort/read-only agent selection or a conflicting override requires the explicit read-only Claude CLI path"
+                if conflict
+                else f"{selected_model} at max effort is available{selection_note}"
+            ),
+            "execution_path": execution_path,
+            "arguments": arguments,
+            "environment_unset": environment_unset,
+            "subagent_model_override": override,
+            "next_action": next_action,
+        }
+    )
+    return decision
+
+
+def _third_voice_base(version: Any) -> dict[str, Any]:
+    return {
+        "state": "unavailable",
+        "reason_code": None,
+        "reason": None,
+        "role": "supplementary",
+        "blocking": False,
+        "model": THIRD_VOICE_MODEL,
+        "effort": THIRD_VOICE_EFFORT,
+        "observed_version": version if isinstance(version, str) else None,
+        "execution_path": None,
+        "arguments": [],
+        "environment_unset": [],
+        "read_only": {
+            "required": True,
+            "permission_mode": "plan",
+            "allowed_tools": list(CLAUDE_READ_ONLY_ALLOWED_TOOLS),
+            "denied_tools": list(CLAUDE_READ_ONLY_DENIED_TOOLS),
+        },
+        "subagent_model_override": None,
+        "downgrade_allowed": False,
+        "next_action": None,
+        "selection": None,
+    }
+
+
+def _degrade_third_voice(
+    decision: dict[str, Any],
+    reason_code: str,
+    reason: str,
+    next_action: str = "continue_without_third_voice",
+) -> dict[str, Any]:
+    """Record the third voice as unavailable without blocking the workflow."""
+
+    decision.update(
+        {
+            "state": "unavailable",
+            "reason_code": reason_code,
+            "reason": reason,
+            "next_action": next_action,
+        }
+    )
+    return decision
+
+
+def evaluate_third_voice(raw: Any) -> dict[str, Any]:
+    """Evaluate the supplementary Fable/max escalation voice.
+
+    This leg never blocks.  It is the extra opinion called in on hard problems
+    — a stalled plan review, a large diff, an adversarial escalation, or a
+    primary-vs-Codex dispute — so when it cannot run, the caller records the
+    degradation and continues.  Treating a supplement as a mandatory gate would
+    misreport what the workflow actually enforces.
+    """
+
+    config = raw if isinstance(raw, dict) else {}
+    version = config.get("version")
+    decision = _third_voice_base(version)
+
+    if not config:
+        return _degrade_third_voice(
+            decision,
+            "not_observed",
+            "No third-voice observation was supplied",
+            "observe_third_voice_or_continue_without_it",
+        )
+    if config.get("installed") is not True:
+        return _degrade_third_voice(
+            decision, "cli_missing", "Claude Code is not installed"
+        )
+    if not isinstance(version, str) or _semver(version) is None:
+        return _degrade_third_voice(
+            decision,
+            "version_unparseable",
+            "Claude Code version could not be parsed as semantic versioning",
+            "correct_observation_input",
+        )
+    if not _version_at_least(version, MIN_CLAUDE_VERSION):
+        return _degrade_third_voice(
+            decision, "cli_too_old", "Claude Code must be at least 2.1.170"
+        )
+
+    access = config.get("fable_access", "unknown")
+    if access is not True and access != "available":
+        if access is False:
+            code, reason = _THIRD_VOICE_ACCESS_FAILURES[False]
+        elif isinstance(access, str) and access in _THIRD_VOICE_ACCESS_FAILURES:
+            code, reason = _THIRD_VOICE_ACCESS_FAILURES[access]
+        else:
+            return _degrade_third_voice(
+                decision,
+                "invalid_fable_access",
+                f"fable_access must be {_ACCESS_STATUS_VALUES}",
+                "correct_observation_input",
+            )
+        return _degrade_third_voice(decision, code, reason)
+
+    zdr = config.get("zero_data_retention", "unknown")
+    if zdr is not True and zdr != "compatible":
+        if zdr is False:
+            code, reason = _THIRD_VOICE_ZDR_FAILURES[False]
+        elif isinstance(zdr, str) and zdr in _THIRD_VOICE_ZDR_FAILURES:
+            code, reason = _THIRD_VOICE_ZDR_FAILURES[zdr]
+        else:
+            return _degrade_third_voice(
+                decision,
+                "invalid_zdr_status",
+                f"zero_data_retention must be {_ZDR_STATUS_VALUES}",
+                "correct_observation_input",
+            )
+        return _degrade_third_voice(decision, code, reason)
+
+    environment = config.get("environment")
+    if not isinstance(environment, dict):
+        environment = {}
+    override = environment.get("CLAUDE_CODE_SUBAGENT_MODEL")
+    effort_override = environment.get("CLAUDE_CODE_EFFORT_LEVEL")
+    # Validate before comparing: an unhashable value here would raise out of the
+    # whole gate, which is strictly worse than blocking — the caller would get a
+    # traceback instead of a decision for any leg.
+    if override is not None and not isinstance(override, str):
+        return _degrade_third_voice(
+            decision,
+            "invalid_subagent_override",
+            "CLAUDE_CODE_SUBAGENT_MODEL must be a string or null",
+            "correct_observation_input",
+        )
+    if effort_override is not None and not isinstance(effort_override, str):
+        return _degrade_third_voice(
+            decision,
+            "invalid_effort_override",
+            "CLAUDE_CODE_EFFORT_LEVEL must be a string or null",
+            "correct_observation_input",
+        )
+    host_capabilities = config.get("host_capabilities")
+    if not isinstance(host_capabilities, dict):
+        host_capabilities = {}
+
+    selected_model, selection_reason = _select_third_voice_model(
+        config.get("observed_models")
+    )
+    at_floor = selected_model == THIRD_VOICE_MODEL
+    model_flag = THIRD_VOICE_MODEL_ALIAS if at_floor else selected_model
+    decision["model"] = selected_model
+    decision["selection"] = {
+        "floor_model": THIRD_VOICE_MODEL,
+        "selected_model": selected_model,
+        "reason": selection_reason,
+    }
+
+    exact_override = override if isinstance(override, str) else ""
+    compatible_overrides = {"", selected_model}
+    if at_floor:
+        compatible_overrides |= {THIRD_VOICE_MODEL_ALIAS, THIRD_VOICE_MODEL}
+    agent_selection_verified = (
+        host_capabilities.get("agent_model_selection") is True
+        and host_capabilities.get("agent_effort_selection") is True
+        and host_capabilities.get("agent_read_only_enforced") is True
+    )
+    conflict = (
+        exact_override not in compatible_overrides
+        or effort_override not in {None, THIRD_VOICE_EFFORT}
+        or not agent_selection_verified
+    )
+
+    if conflict:
+        execution_path = "explicit_cli"
+        arguments = _explicit_cli_arguments(model_flag, THIRD_VOICE_EFFORT)
+        next_action = "invoke_explicit_third_voice_cli"
+        environment_unset = list(CLAUDE_READ_ONLY_ENV_UNSET)
+    else:
+        execution_path = "agent_tool"
+        arguments = [f"model={model_flag}", f"effort={THIRD_VOICE_EFFORT}"]
+        next_action = "invoke_third_voice_agent"
         environment_unset = []
 
     decision.update(
         {
             "state": "ready",
-            "reason_code": ("explicit_cli_required" if conflict else "fable_ready"),
+            "reason_code": (
+                "explicit_cli_required" if conflict else "third_voice_ready"
+            ),
             "reason": (
-                "Unverified model/effort/read-only agent selection or a conflicting override requires the explicit read-only Fable CLI path"
+                "Unverified model/effort/read-only agent selection or a conflicting override requires the explicit read-only third-voice CLI path"
                 if conflict
                 else (
                     f"{selected_model} at max effort is available"
@@ -795,7 +1118,7 @@ def evaluate_claude(raw: Any) -> dict[str, Any]:
 
 
 def evaluate_model_policy(request: Any) -> dict[str, Any]:
-    """Return deterministic Codex and Claude decisions for observed facts."""
+    """Return deterministic Codex, Claude, and third-voice decisions."""
 
     if not isinstance(request, dict):
         return {
@@ -803,11 +1126,15 @@ def evaluate_model_policy(request: Any) -> dict[str, Any]:
             "state": "blocked",
             "codex": None,
             "claude": None,
+            "claude_third_voice": None,
             "errors": ["input must be a JSON object"],
         }
 
     codex = evaluate_codex(request.get("codex"))
     claude = evaluate_claude(request.get("claude"))
+    third_voice = evaluate_third_voice(request.get("claude_third_voice"))
+    # Only the gating legs decide the aggregate: the third voice is a
+    # supplement, so an unavailable third voice never blocks the workflow.
     states = {codex["state"], claude["state"]}
     if "blocked" in states:
         state = "blocked"
@@ -825,6 +1152,7 @@ def evaluate_model_policy(request: Any) -> dict[str, Any]:
         "state": state,
         "codex": codex,
         "claude": claude,
+        "claude_third_voice": third_voice,
         "errors": [],
     }
 
@@ -838,6 +1166,7 @@ def main() -> int:
             "state": "blocked",
             "codex": None,
             "claude": None,
+            "claude_third_voice": None,
             "errors": [f"input must be valid JSON: {error}"],
         }
     else:
