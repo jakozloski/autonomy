@@ -338,6 +338,11 @@ def bounded_excerpt(existing: str, addition: str) -> str:
     Only recognised transport/error events and diagnostic stderr are ever
     passed here; assistant/tool/unknown payloads (which can embed repository
     source) never reach persisted evidence.
+
+    This strips URL-embedded credentials ONLY.  A bare ``Authorization:
+    Bearer ...`` or ``OPENAI_API_KEY=...`` in stderr survives, so the caller
+    must still apply the package's format-anchored Secret/Token Redaction
+    before persisting the excerpt anywhere.
     """
 
     combined = f"{existing}\n{strip_url_secrets(addition)}" if existing else strip_url_secrets(addition)
@@ -746,31 +751,9 @@ def apply_auth_recovery(
         "next_action": "clear_human_codex_login_block",
         "credential_source": observed_category,
     }
-
-_CLAUDE_ACCESS_FAILURES = {
-    False: (
-        "fable_unavailable",
-        "Claude Fable 5 is unavailable",
-    ),
-    "unavailable": (
-        "fable_unavailable",
-        "Claude Fable 5 is unavailable",
-    ),
-    "entitlement_denied": (
-        "fable_entitlement_denied",
-        "Claude Fable 5 entitlement was denied",
-    ),
-    "provider_policy_denied": (
-        "fable_provider_policy_denied",
-        "Provider policy does not permit Claude Fable 5",
-    ),
-    "unknown": (
-        "fable_access_unverified",
-        "Claude Fable 5 access has not been verified",
-    ),
-}
-
 def _access_failures(prefix: str, label: str) -> dict[Any, tuple[str, str]]:
+
+
     """Access-failure table for one leg, so the two legs cannot drift apart."""
 
     unavailable = (f"{prefix}_unavailable", f"{label} is unavailable")

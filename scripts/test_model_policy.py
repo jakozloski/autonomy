@@ -11,6 +11,7 @@ import signal
 import subprocess
 import textwrap
 import time
+from typing import Any
 
 from model_policy import (
     CLASSIFY_EXIT_AUTH_ERROR,
@@ -349,6 +350,12 @@ class ModelPolicyTest(unittest.TestCase):
                 )["claude"]
                 self.assertEqual(result["state"], "blocked")
                 self.assertTrue(result["waiver_required"])
+                # Pin the leg's own code family: a stale Fable-valued table
+                # shadowing the Opus one would otherwise pass unnoticed.
+                self.assertTrue(
+                    result["reason_code"].startswith("opus_"),
+                    f"primary leg must report opus_* codes, got {result['reason_code']}",
+                )
 
     def test_claude_zdr_failures_block_pending_waiver(self) -> None:
         for status in ("incompatible", "denied", "unknown"):
