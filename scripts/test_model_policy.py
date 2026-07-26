@@ -1120,6 +1120,51 @@ class SuperviseStreamLiveProcessTests(unittest.TestCase):
 class SuperviseStreamDeadlineTests(unittest.TestCase):
     """A silent child must not park the supervisor forever."""
 
+    def test_slow_but_alive_stream_is_not_killed(self) -> None:
+        """The bound is on SILENCE, not runtime.
+
+        An xhigh review legitimately streams for many minutes; a total-runtime
+        cap would SIGKILL healthy reviews, which is worse than the hang it
+        replaced. This child outruns the idle window in total while never
+        pausing longer than it.
+        """
+
+        script = textwrap.dedent(
+            """
+            import json, sys, time
+            for _ in range(8):
+                sys.stdout.write(json.dumps({"type": "token_count"}) + "\\n")
+                sys.stdout.flush()
+                time.sleep(0.25)
+            """
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        killed = []
+
+        try:
+            # Total runtime ~2s exceeds the 1s bound; no single gap does.
+            result = supervise_stream(
+                process.stdout,
+                process.stderr,
+                lambda: killed.append(True),
+                idle_timeout_seconds=1.0,
+            )
+
+            self.assertEqual(result["outcome"], "clean")
+            self.assertEqual(killed, [])
+        finally:
+            if process.poll() is None:  # pragma: no cover - cleanup safety
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            process.wait(timeout=10)
+            for pipe in (process.stdout, process.stderr):
+                if pipe is not None:
+                    pipe.close()
+
     def test_silent_child_hits_the_deadline_and_is_killed(self) -> None:
         script = "import time; time.sleep(120)"  # never writes, never exits
         process = subprocess.Popen(
@@ -1135,7 +1180,10 @@ class SuperviseStreamDeadlineTests(unittest.TestCase):
         started = time.monotonic()
         try:
             result = supervise_stream(
-                process.stdout, process.stderr, kill_group, timeout_seconds=1.0
+                process.stdout,
+                process.stderr,
+                kill_group,
+                idle_timeout_seconds=1.0,
             )
             elapsed = time.monotonic() - started
 

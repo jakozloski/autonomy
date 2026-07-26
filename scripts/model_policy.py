@@ -239,11 +239,6 @@ CLASSIFY_EXIT_AUTH_ERROR = 3
 CLASSIFY_EXIT_INTERNAL_FAILURE = 4
 CLASSIFY_EXIT_TIMEOUT = 5
 
-# Default supervision deadline.  A child that neither writes nor exits (hung
-# TLS connect, stalled provider) must not park the supervisor forever: the
-# fail-fast guarantee belongs in this module, not in caller prose.
-DEFAULT_SUPERVISE_TIMEOUT_SECONDS = 60.0
-
 _URL_TAIL = re.compile(r"(?P<url>[a-zA-Z][a-zA-Z0-9+.-]*://[^\s'\"]*)")
 _URL_USERINFO = re.compile(r"(?P<scheme>[a-zA-Z][a-zA-Z0-9+.-]*://)[^/@\s]*@")
 
@@ -415,7 +410,7 @@ def supervise_stream(
     kill_callback: Callable[[], None],
     *,
     read_size: int = 65536,
-    timeout_seconds: float | None = DEFAULT_SUPERVISE_TIMEOUT_SECONDS,
+    idle_timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     """Supervise a running Codex process's real pipes; kill it on auth failure.
 
@@ -428,8 +423,13 @@ def supervise_stream(
     Returns ``{"outcome", "exit_code", "excerpts", "auth_line_source"}`` where
     outcome is ``clean``/``auth_error``/``internal_failure``/``timeout``.
     Every failure outcome kills the process group; the caller then BLOCKs.
-    ``timeout_seconds`` bounds a silent child (pass ``None`` to wait forever,
-    which only a caller with its own deadline should do).  This function
+    ``idle_timeout_seconds`` bounds SILENCE, not total runtime: the clock
+    resets on every byte received, so a slow-but-alive stream is never killed.
+    That distinction is the whole point — an xhigh review legitimately runs for
+    many minutes, and a total-runtime cap would SIGKILL healthy reviews.  It
+    defaults to ``None`` (no internal bound) because the caller owns the
+    aggregate deadline; pass a value only to detect a child that has gone
+    completely silent.  This function
     never spawns a process and never inspects credentials.
     """
 
@@ -448,9 +448,12 @@ def supervise_stream(
             selector.register(pipe, selectors.EVENT_READ, source)
             registered += 1
 
-    deadline = (
-        None if timeout_seconds is None else time.monotonic() + timeout_seconds
-    )
+    def _next_deadline() -> float | None:
+        if idle_timeout_seconds is None:
+            return None
+        return time.monotonic() + idle_timeout_seconds
+
+    deadline = _next_deadline()
     try:
         while registered and outcome == "clean":
             remaining = None if deadline is None else deadline - time.monotonic()
@@ -459,9 +462,12 @@ def supervise_stream(
                 break
             ready = selector.select(remaining)
             if not ready:
-                # No fd readable before the deadline: the child is silent.
+                # Nothing readable for a whole idle window: the child is silent.
                 outcome = "timeout"
                 break
+            # Activity: restart the idle clock, so a long-but-alive stream
+            # (an xhigh review emitting over several minutes) is never killed.
+            deadline = _next_deadline()
             for key, _ in ready:
                 source = key.data
                 pipe = key.fileobj
