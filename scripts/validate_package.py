@@ -54,6 +54,13 @@ REQUIRED_GATE_MARKERS = {
         "evaluated_head_sha",
         "Prompt Ledger",
         "prompt-trail:stale",
+        # Follow-through contracts: fail-fast gate, terminal turn, salvage.
+        "Model-Gate Entry Preflight",
+        "Deterministic authentication failure",
+        "Terminal-exit turn contract",
+        "branch-established:",
+        "validation-before-push:",
+        "Stranded work",
     ),
     "references/phases-1-5.md": (
         "Red/green regression evidence (mandatory when",
@@ -65,6 +72,11 @@ REQUIRED_GATE_MARKERS = {
         "Root cause & scope decision",
         "one sanitized checkbox per AC",
         "CI evidence: pending for head",
+        # Authentication detection must stay structured-channel only.
+        "Authentication detection (every real Codex invocation",
+        "supervise_stream(stdout_pipe, stderr_pipe, kill_callback)",
+        "verify_frozen_selection()",
+        "attempts are per-invocation and reset each round",
     ),
     "references/state-and-safety.md": (
         "Resume trust model",
@@ -75,15 +87,27 @@ REQUIRED_GATE_MARKERS = {
         "audit-only",
         "defect_evidence_mode",
         "pr_artifacts",
+        "Stranded work",
+        "postcondition-bound",
     ),
     "references/monitor-exit-handoffs.md": (
         "diff-triggered review focus lines",
         "CI-config self-verification",
         "QA rehearsal (advisory, non-blocking",
+        # Human-only dependency grammar: forms select fixed verifiers.
+        "closed, package-authored grammar",
+        "human:codex-login",
+        "human:user-confirm",
+        "fires on PRESENCE",
+        "Degraded terminal path",
     ),
     "references/project-and-entry.md": (
         "red/green + variant evidence gate",
         "defect_evidence_mode",
+        "Real access smoke test (authoritative)",
+        "Path-inheritance invariant",
+        "routing_fingerprint",
+        "Package-root identity (evaluated BEFORE the empty-diff guard)",
     ),
 }
 

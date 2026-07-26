@@ -6,7 +6,7 @@
 
 - Set to `"in_progress"` when entering/re-entering the monitor loop (including resume after pause)
 - Set to `"paused"` when condition (d) fires (clean, ready-for-review PR awaiting human approval)
-- Set to `"complete"` when condition (a) fires (approved + checks passing + grace elapsed)
+- Set to `"complete"` when condition (a) fires (approved + checks passing + grace elapsed). The loop may end the agent's turn ONLY at `paused`, `complete`, or `blocked` — leaving `"in_progress"` with no terminal signal strands the PR silently; a human-only dependency exits via condition (c)'s `human:` keys.
 
 ```text
 # Pseudocode — not directly executable. Constants are read from
@@ -52,7 +52,7 @@ while True:
      # Evaluation order: c → draft-PR gate → a → b → d → e (first match wins).
      # Condition (c) MUST be checked first so terminal-exhaustion / CHANGES_REQUESTED /
      # unresolved human threads can't be bypassed by an APPROVED match in (a)/(b).
-     c. If stuck (CI, conflict, branch-state, or ready-flip with 3+ attempts) OR exhausted_feedback/manual_unknown_feedback/manual_branch_protection_blockers non-empty OR CHANGES_REQUESTED OR unresolved_human_threads > 0 → run only eligible human-feedback roundtrip work, then persist blocked. If draft, leave it draft.
+     c. If stuck (CI, conflict, branch-state, ready-flip 3+ attempts) OR exhausted_feedback/manual_unknown_feedback/manual_branch_protection_blockers non-empty OR CHANGES_REQUESTED OR unresolved_human_threads > 0 OR any `human:` key present (fires on presence) → run only eligible roundtrip work, then persist blocked + stranded-work report. If draft, leave it draft.
      ▸ Draft-PR gate (not an exit; see Step 4): if isDraft AND post_push_until is not null AND the clean-pass
         preconditions hold (gating checks passing + all_feedback_addressed + branch_pause_ready + grace_elapsed + CI-config self-verification when applicable, draft-unrunnable ready-only workflows excluded at flip)
         # NOTE: no stable_poll_confirmed here — the flip is not an exit, so it fires on the

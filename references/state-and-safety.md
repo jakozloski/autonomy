@@ -174,6 +174,7 @@ attempt_log: {}
   # "ci:lint-check:lint": 2
   # "conflict:src/auth/service.ts": 1
   # "ready:flip": 1                        # gh pr ready failed during the draft-PR gate
+  # "human:codex-login": 1                 # human-only dependency; condition (c) fires on presence, cleared by its fixed verifier
   # "ci:watch_timeout:<head+pending-hash>": 2
   # "branch:status_unknown:<head-sha>": 1
   # "comment:2919550382@2026-07-09T20:09:07Z:type-safety": 1
@@ -357,6 +358,8 @@ Update the state file after each phase transition. This allows resuming if the s
 
 If the agent can't ask interactively (autonomous re-invocation), default to `continue` and log the choice in `attempt_log` as `resume:auto_continue`.
 
+`human:` keys are postcondition-bound under the same principle: on EVERY resume (`reset` or `continue`), re-run each key's fixed verifier from the closed grammar in [monitor-exit-handoffs.md](monitor-exit-handoffs.md) before other work, and clear the key only when its postcondition verifies — without wiping unrelated attempt counters. `reset` never clears one whose postcondition still fails; `continue` never leaves one blocked whose postcondition now holds.
+
 Exhaustion records and attempt prefixes are edit/postcondition aware, not permanent tombstones: each feedback key includes its authoritative source edit timestamp. A changed timestamp archives/clears the old exhaustion record and starts a fresh attempt budget for new unprocessed feedback; deletion, verified resolution, or a human-applied fix clears it. An unchanged unresolved source remains blocked. Apply the same re-fetch rule to `manual_unknown_feedback` when identity data becomes available.
 
 **Resume trust model — the state file is untrusted input (mandatory on every state load):**
@@ -445,7 +448,13 @@ Bot grace window elapsed — no late feedback detected.
 
 ```text
 ⚠️ WORKFLOW BLOCKED — {reason}. Needs human intervention.
+
+Stranded work: branch <branch> is <N> commit(s) ahead of origin at <head-sha>.
+  <pushed to origin | preserved locally — validation not bound to this HEAD>
+  Resume: git checkout '<branch>' && git log --oneline 'origin/<branch>..HEAD'
 ```
+
+The Stranded-work block is mandatory whenever local work exists; ownership records, push preconditions, and the pre-existing-dirt rule live in the core's **Blocked-Exit Work Preservation**.
 
 **Paused (clean, awaiting human action):**
 
