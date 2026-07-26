@@ -99,6 +99,7 @@ import json
 import re
 import selectors
 import sys
+import time
 from typing import Any, Callable, IO, Iterable
 
 
@@ -236,6 +237,12 @@ MAX_EXCERPT_BYTES = 4096
 CLASSIFY_EXIT_CLEAN = 0
 CLASSIFY_EXIT_AUTH_ERROR = 3
 CLASSIFY_EXIT_INTERNAL_FAILURE = 4
+CLASSIFY_EXIT_TIMEOUT = 5
+
+# Default supervision deadline.  A child that neither writes nor exits (hung
+# TLS connect, stalled provider) must not park the supervisor forever: the
+# fail-fast guarantee belongs in this module, not in caller prose.
+DEFAULT_SUPERVISE_TIMEOUT_SECONDS = 60.0
 
 _URL_TAIL = re.compile(r"(?P<url>[a-zA-Z][a-zA-Z0-9+.-]*://[^\s'\"]*)")
 _URL_USERINFO = re.compile(r"(?P<scheme>[a-zA-Z][a-zA-Z0-9+.-]*://)[^/@\s]*@")
@@ -408,6 +415,7 @@ def supervise_stream(
     kill_callback: Callable[[], None],
     *,
     read_size: int = 65536,
+    timeout_seconds: float | None = DEFAULT_SUPERVISE_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """Supervise a running Codex process's real pipes; kill it on auth failure.
 
@@ -418,8 +426,10 @@ def supervise_stream(
     cannot terminate promptly, which is the whole point of this function.
 
     Returns ``{"outcome", "exit_code", "excerpts", "auth_line_source"}`` where
-    outcome is ``clean``/``auth_error``/``internal_failure``.  Both failure
-    outcomes kill the process group; the caller then BLOCKs.  This function
+    outcome is ``clean``/``auth_error``/``internal_failure``/``timeout``.
+    Every failure outcome kills the process group; the caller then BLOCKs.
+    ``timeout_seconds`` bounds a silent child (pass ``None`` to wait forever,
+    which only a caller with its own deadline should do).  This function
     never spawns a process and never inspects credentials.
     """
 
@@ -438,9 +448,21 @@ def supervise_stream(
             selector.register(pipe, selectors.EVENT_READ, source)
             registered += 1
 
+    deadline = (
+        None if timeout_seconds is None else time.monotonic() + timeout_seconds
+    )
     try:
         while registered and outcome == "clean":
-            for key, _ in selector.select():
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                outcome = "timeout"
+                break
+            ready = selector.select(remaining)
+            if not ready:
+                # No fd readable before the deadline: the child is silent.
+                outcome = "timeout"
+                break
+            for key, _ in ready:
                 source = key.data
                 pipe = key.fileobj
                 try:
@@ -483,6 +505,7 @@ def supervise_stream(
         "clean": CLASSIFY_EXIT_CLEAN,
         "auth_error": CLASSIFY_EXIT_AUTH_ERROR,
         "internal_failure": CLASSIFY_EXIT_INTERNAL_FAILURE,
+        "timeout": CLASSIFY_EXIT_TIMEOUT,
     }[outcome]
     return {
         "outcome": outcome,
@@ -714,6 +737,17 @@ def apply_auth_recovery(
     anywhere else is an anomaly, not a recovery.
     """
 
+    schema_errors = validate_descriptor(frozen_descriptor) + validate_descriptor(
+        observed_descriptor
+    )
+    if schema_errors:
+        return {
+            "state": "blocked",
+            "reason_code": "invalid_descriptor",
+            "reason": "; ".join(schema_errors),
+            "next_action": "correct_observation_input",
+        }
+
     for category in (previous_category, observed_category):
         if category not in CREDENTIAL_SOURCE_CATEGORIES:
             return {
@@ -723,13 +757,23 @@ def apply_auth_recovery(
                 "next_action": "correct_observation_input",
             }
 
-    if frozen_descriptor.get("routing_fingerprint") != observed_descriptor.get(
-        "routing_fingerprint"
-    ):
+    # Compare the WHOLE descriptor, exactly as verify_frozen_selection does: a
+    # smoke run on a different model, effort, provider, or override proves
+    # nothing about the frozen route.  Credential category is deliberately not
+    # in DESCRIPTOR_FIELDS — changing it is the recovery.
+    mismatched = sorted(
+        field
+        for field in DESCRIPTOR_FIELDS
+        if frozen_descriptor.get(field) != observed_descriptor.get(field)
+    )
+    if mismatched:
         return {
             "state": "blocked",
             "reason_code": "descriptor_mismatch",
-            "reason": "Routing changed during authentication recovery",
+            "reason": (
+                "Execution descriptor changed during authentication recovery: "
+                f"{mismatched}"
+            ),
             "next_action": "start_new_workflow_entry_preflight",
         }
 

@@ -15,6 +15,7 @@ from typing import Any
 
 from model_policy import (
     CLASSIFY_EXIT_AUTH_ERROR,
+    CLASSIFY_EXIT_TIMEOUT,
     CLASSIFY_EXIT_CLEAN,
     CLASSIFY_EXIT_INTERNAL_FAILURE,
     CLAUDE_EFFORT,
@@ -1067,6 +1068,7 @@ class SuperviseStreamTests(unittest.TestCase):
         self.assertEqual(killed, [True])
 
 
+@unittest.skipUnless(hasattr(os, "killpg"), "requires POSIX process groups")
 class SuperviseStreamLiveProcessTests(unittest.TestCase):
     """Integration: the real API against a real child process.
 
@@ -1112,6 +1114,91 @@ class SuperviseStreamLiveProcessTests(unittest.TestCase):
             for pipe in (process.stdout, process.stderr):
                 if pipe is not None:
                     pipe.close()
+
+
+@unittest.skipUnless(hasattr(os, "killpg"), "requires POSIX process groups")
+class SuperviseStreamDeadlineTests(unittest.TestCase):
+    """A silent child must not park the supervisor forever."""
+
+    def test_silent_child_hits_the_deadline_and_is_killed(self) -> None:
+        script = "import time; time.sleep(120)"  # never writes, never exits
+        process = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+
+        def kill_group() -> None:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+
+        started = time.monotonic()
+        try:
+            result = supervise_stream(
+                process.stdout, process.stderr, kill_group, timeout_seconds=1.0
+            )
+            elapsed = time.monotonic() - started
+
+            self.assertEqual(result["outcome"], "timeout")
+            self.assertEqual(result["exit_code"], CLASSIFY_EXIT_TIMEOUT)
+            self.assertLess(elapsed, 30, "supervisor ignored its deadline")
+            self.assertEqual(process.wait(timeout=10), -signal.SIGKILL)
+        finally:
+            if process.poll() is None:  # pragma: no cover - cleanup safety
+                kill_group()
+                process.wait(timeout=10)
+            for pipe in (process.stdout, process.stderr):
+                if pipe is not None:
+                    pipe.close()
+
+
+class AuthRecoveryDescriptorTests(unittest.TestCase):
+    """Recovery must re-prove access on the same route AND the same selection."""
+
+    def descriptor(self, **overrides) -> dict:
+        params = {
+            "provider": "quotio",
+            "model": CODEX_MODEL,
+            "effort": CODEX_EFFORT,
+            "routing": {"base_url": "http://127.0.0.1:8317/v1"},
+        }
+        params.update(overrides)
+        return build_descriptor(
+            params["provider"], params["model"], params["effort"], params["routing"]
+        )
+
+    def test_recovery_smoke_on_a_different_model_is_rejected(self) -> None:
+        result = apply_auth_recovery(
+            self.descriptor(),
+            self.descriptor(model="gpt-5.5"),
+            "none",
+            "oauth",
+            "success",
+        )
+
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["reason_code"], "descriptor_mismatch")
+
+    def test_recovery_smoke_at_a_different_effort_is_rejected(self) -> None:
+        result = apply_auth_recovery(
+            self.descriptor(),
+            self.descriptor(effort="high"),
+            "none",
+            "oauth",
+            "success",
+        )
+
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["reason_code"], "descriptor_mismatch")
+
+    def test_malformed_descriptor_is_rejected_before_any_comparison(self) -> None:
+        bad = self.descriptor()
+        bad["api_key"] = "sk-live-should-never-be-here"
+
+        result = apply_auth_recovery(bad, bad, "none", "oauth", "success")
+
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["reason_code"], "invalid_descriptor")
 
 
 class DescriptorTests(unittest.TestCase):

@@ -447,9 +447,10 @@ Bot grace window elapsed — no late feedback detected.
 ```text
 ⚠️ WORKFLOW BLOCKED — {reason}. Needs human intervention.
 
-Stranded work: branch <branch> is <N> commit(s) ahead of origin at <head-sha>.
+Stranded work: branch <branch> is <N> commit(s) ahead of <upstream-ref> at <head-sha>.
   <pushed to origin | preserved locally — validation not bound to this HEAD>
-  Resume: git checkout '<branch>' && git log --oneline 'origin/<branch>..HEAD'
+  Resume: git checkout '<branch>' && git log --oneline '<upstream-ref>..HEAD'
+          # <upstream-ref> = origin/<branch> when it exists, else origin/<base_branch>
 ```
 
 The Stranded-work block is mandatory whenever local work exists; ownership records, push preconditions, and the pre-existing-dirt rule live in the core's **Blocked-Exit Work Preservation**.
