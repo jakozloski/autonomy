@@ -6,17 +6,39 @@ import sys
 import unittest
 from unittest import mock
 
+import os
+import signal
+import subprocess
+import textwrap
+import time
+
 from model_policy import (
+    CLASSIFY_EXIT_AUTH_ERROR,
+    CLASSIFY_EXIT_CLEAN,
+    CLASSIFY_EXIT_INTERNAL_FAILURE,
     CLAUDE_EFFORT,
     CLAUDE_MODEL,
     CLAUDE_MODEL_ALIAS,
     CODEX_EFFORT,
     CODEX_MODEL,
+    apply_auth_recovery,
+    bounded_excerpt,
+    build_descriptor,
+    classify_stream_event,
+    MAX_EXCERPT_BYTES,
+    MAX_RAW_RECORD_BYTES,
+    SOURCE_STDERR,
+    SOURCE_STDOUT_JSON,
     THIRD_VOICE_EFFORT,
     THIRD_VOICE_MODEL,
     THIRD_VOICE_MODEL_ALIAS,
     evaluate_model_policy,
     main,
+    routing_fingerprint,
+    strip_url_secrets,
+    supervise_stream,
+    validate_descriptor,
+    verify_frozen_selection,
 )
 
 
@@ -814,6 +836,405 @@ class ThirdVoiceTest(unittest.TestCase):
                     result["claude_third_voice"]["state"], {"ready", "unavailable"}
                 )
                 self.assertEqual(result["state"], "ready")
+
+
+class AuthenticationPolicyTests(unittest.TestCase):
+    """A dead credential must block immediately, never burn the retry budget."""
+
+    def test_authentication_error_blocks_without_retry(self) -> None:
+        codex = valid_codex()
+        codex["first_real_invocation"] = {
+            "status": "authentication_error",
+            "attempts": 1,
+        }
+
+        result = evaluate_model_policy(request(codex=codex))["codex"]
+
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["reason_code"], "authentication_error")
+        self.assertEqual(result["next_action"], "repair_authentication")
+        self.assertFalse(result.get("downgrade_allowed", False))
+
+    def test_attempts_are_scoped_to_one_invocation_not_cumulative(self) -> None:
+        # A later review round reports attempts=1 for its own sequence; the
+        # helper must accept it rather than treating it as a third try.
+        codex = valid_codex()
+        codex["first_real_invocation"] = {"status": "success", "attempts": 1}
+        self.assertEqual(
+            evaluate_model_policy(request(codex=codex))["codex"]["state"], "ready"
+        )
+
+        codex["first_real_invocation"] = {"status": "timeout", "attempts": 1}
+        retry = evaluate_model_policy(request(codex=codex))["codex"]
+        self.assertEqual(retry["state"], "retry")
+        self.assertEqual(retry["retry"]["remaining"], 1)
+
+
+class StreamClassifierTests(unittest.TestCase):
+    """The auth boundary: only structured errors/stderr may kill an invocation."""
+
+    def test_assistant_text_mentioning_401_is_benign(self) -> None:
+        event = json.dumps(
+            {
+                "type": "assistant_message",
+                "message": "The plan adds a row for HTTP 401 invalid_refresh_token.",
+            }
+        )
+        self.assertEqual(
+            classify_stream_event(SOURCE_STDOUT_JSON, event), "benign"
+        )
+
+    def test_transport_error_with_401_is_auth_error(self) -> None:
+        event = json.dumps({"type": "error", "status": 401, "message": "Unauthorized"})
+        self.assertEqual(
+            classify_stream_event(SOURCE_STDOUT_JSON, event), "auth_error"
+        )
+
+    def test_invalid_refresh_token_error_event_is_auth_error(self) -> None:
+        event = json.dumps(
+            {"type": "stream_error", "error": {"code": "invalid_refresh_token"}}
+        )
+        self.assertEqual(
+            classify_stream_event(SOURCE_STDOUT_JSON, event), "auth_error"
+        )
+
+    def test_unknown_well_formed_event_is_benign(self) -> None:
+        event = json.dumps({"type": "token_count", "tokens": 401})
+        self.assertEqual(classify_stream_event(SOURCE_STDOUT_JSON, event), "benign")
+
+    def test_invalid_json_on_json_channel_is_internal_failure(self) -> None:
+        self.assertEqual(
+            classify_stream_event(SOURCE_STDOUT_JSON, '{"type": "error"'),
+            "internal_failure",
+        )
+
+    def test_diagnostic_stderr_auth_signature_is_auth_error(self) -> None:
+        self.assertEqual(
+            classify_stream_event(SOURCE_STDERR, "ERROR: 401 invalid_refresh_token"),
+            "auth_error",
+        )
+
+    def test_embedded_source_field_cannot_forge_provenance(self) -> None:
+        # An assistant event claiming to be stderr must still be benign: the
+        # tag comes from the file descriptor, never from event content.
+        event = json.dumps(
+            {
+                "type": "assistant_message",
+                "source": SOURCE_STDERR,
+                "message": "401 invalid_refresh_token",
+            }
+        )
+        self.assertEqual(classify_stream_event(SOURCE_STDOUT_JSON, event), "benign")
+
+    def test_oversized_record_is_internal_failure(self) -> None:
+        oversized = "x" * (MAX_RAW_RECORD_BYTES + 1)
+        self.assertEqual(
+            classify_stream_event(SOURCE_STDOUT_JSON, oversized), "internal_failure"
+        )
+
+    def test_unknown_source_tag_is_internal_failure(self) -> None:
+        self.assertEqual(classify_stream_event("smuggled", "{}"), "internal_failure")
+
+
+class ExcerptRedactionTests(unittest.TestCase):
+    def test_url_userinfo_query_and_fragment_are_stripped(self) -> None:
+        cleaned = strip_url_secrets("https://user:token@host/path?key=SECRET#frag")
+        self.assertNotIn("token", cleaned)
+        self.assertNotIn("SECRET", cleaned)
+        self.assertIn("https://host/path", cleaned)
+
+    def test_excerpt_is_byte_capped(self) -> None:
+        excerpt = bounded_excerpt("", "y" * (MAX_EXCERPT_BYTES * 2))
+        self.assertLessEqual(len(excerpt.encode("utf-8")), MAX_EXCERPT_BYTES)
+
+
+class _FakePipe:
+    """Byte pipe stub that yields chunks then EOF, mimicking a real read()."""
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = list(chunks)
+
+    def fileno(self) -> int:  # pragma: no cover - selector stub only
+        return -1
+
+    def read(self, _size: int) -> bytes:
+        return self._chunks.pop(0) if self._chunks else b""
+
+
+class _ImmediateSelector:
+    """Selector stub: reports every registered pipe readable each pass."""
+
+    def __init__(self) -> None:
+        self._registry: list[tuple[Any, str]] = []
+
+    def register(self, fileobj, _events, data):  # noqa: ANN001
+        self._registry.append((fileobj, data))
+
+    def unregister(self, fileobj):  # noqa: ANN001
+        self._registry = [(f, d) for f, d in self._registry if f is not fileobj]
+
+    def select(self, timeout=None):  # noqa: ANN001, ARG002
+        return [(mock.Mock(fileobj=f, data=d), 1) for f, d in self._registry]
+
+    def close(self) -> None:
+        self._registry = []
+
+
+class SuperviseStreamTests(unittest.TestCase):
+    """supervise_stream owns the kill decision; all three exits are pinned."""
+
+    def setUp(self) -> None:
+        patcher = mock.patch("model_policy.selectors.DefaultSelector", _ImmediateSelector)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_clean_stream_does_not_kill(self) -> None:
+        stdout = _FakePipe([json.dumps({"type": "assistant_message", "message": "ok"}).encode() + b"\n"])
+        killed = []
+
+        result = supervise_stream(stdout, None, lambda: killed.append(True))
+
+        self.assertEqual(result["outcome"], "clean")
+        self.assertEqual(result["exit_code"], CLASSIFY_EXIT_CLEAN)
+        self.assertEqual(killed, [])
+
+    def test_auth_error_kills_and_reports(self) -> None:
+        stdout = _FakePipe(
+            [json.dumps({"type": "error", "status": 401}).encode() + b"\n"]
+        )
+        killed = []
+
+        result = supervise_stream(stdout, None, lambda: killed.append(True))
+
+        self.assertEqual(result["outcome"], "auth_error")
+        self.assertEqual(result["exit_code"], CLASSIFY_EXIT_AUTH_ERROR)
+        self.assertEqual(killed, [True])
+
+    def test_internal_failure_kills_and_blocks(self) -> None:
+        stdout = _FakePipe([b'{"type": "error"\n'])
+        killed = []
+
+        result = supervise_stream(stdout, None, lambda: killed.append(True))
+
+        self.assertEqual(result["outcome"], "internal_failure")
+        self.assertEqual(result["exit_code"], CLASSIFY_EXIT_INTERNAL_FAILURE)
+        self.assertEqual(killed, [True])
+
+    def test_final_record_without_trailing_newline_is_processed(self) -> None:
+        stdout = _FakePipe([json.dumps({"type": "error", "status": 401}).encode()])
+        killed = []
+
+        result = supervise_stream(stdout, None, lambda: killed.append(True))
+
+        self.assertEqual(result["outcome"], "auth_error")
+        self.assertEqual(killed, [True])
+
+    def test_utf8_split_across_reads_is_decoded(self) -> None:
+        payload = json.dumps(
+            {"type": "assistant_message", "message": "né"}, ensure_ascii=False
+        ).encode("utf-8")
+        split = payload.index(b"\xc3") + 1
+        stdout = _FakePipe([payload[:split], payload[split:] + b"\n"])
+
+        result = supervise_stream(stdout, None, lambda: None)
+
+        self.assertEqual(result["outcome"], "clean")
+
+    def test_benign_json_payloads_never_enter_persisted_evidence(self) -> None:
+        secret_text = "PROPRIETARY_REPOSITORY_SOURCE"
+        stdout = _FakePipe(
+            [json.dumps({"type": "assistant_message", "message": secret_text}).encode() + b"\n"]
+        )
+
+        result = supervise_stream(stdout, None, lambda: None)
+
+        self.assertNotIn(secret_text, json.dumps(result["excerpts"]))
+
+    def test_oversized_unterminated_record_is_internal_failure(self) -> None:
+        stdout = _FakePipe([b"x" * (MAX_RAW_RECORD_BYTES + 10)])
+        killed = []
+
+        result = supervise_stream(stdout, None, lambda: killed.append(True))
+
+        self.assertEqual(result["outcome"], "internal_failure")
+        self.assertEqual(killed, [True])
+
+
+class SuperviseStreamLiveProcessTests(unittest.TestCase):
+    """Integration: the real API against a real child process.
+
+    Covers the deadlock case the reviewer flagged — one channel flooded past
+    kernel pipe capacity while the auth event arrives on the other.
+    """
+
+    def test_flooding_one_channel_does_not_prevent_prompt_termination(self) -> None:
+        script = textwrap.dedent(
+            """
+            import json, sys, time
+            # Flood stderr well past a pipe buffer, then emit the auth event on
+            # stdout. A sequential reader would deadlock here.
+            sys.stderr.write("flood line\\n" * 40000)
+            sys.stderr.flush()
+            sys.stdout.write(json.dumps({"type": "error", "status": 401}) + "\\n")
+            sys.stdout.flush()
+            time.sleep(120)
+            """
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+
+        def kill_group() -> None:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+
+        started = time.monotonic()
+        try:
+            result = supervise_stream(process.stdout, process.stderr, kill_group)
+            elapsed = time.monotonic() - started
+
+            self.assertEqual(result["outcome"], "auth_error")
+            self.assertLess(elapsed, 30, "supervisor deadlocked instead of terminating")
+            self.assertEqual(process.wait(timeout=10), -signal.SIGKILL)
+        finally:
+            if process.poll() is None:  # pragma: no cover - cleanup safety
+                kill_group()
+                process.wait(timeout=10)
+            for pipe in (process.stdout, process.stderr):
+                if pipe is not None:
+                    pipe.close()
+
+
+class DescriptorTests(unittest.TestCase):
+    """The descriptor is persisted to state: it must never carry credentials."""
+
+    def routing(self, **overrides) -> dict:
+        base = {
+            "base_url": "http://127.0.0.1:8317/v1",
+            "wire_api": "responses",
+            "profile": "default",
+            "codex_home": "/home/user/.codex",
+            "routing_env": {"CODEX_PROFILE": "default"},
+        }
+        base.update(overrides)
+        return base
+
+    def test_descriptor_has_closed_schema(self) -> None:
+        descriptor = build_descriptor("quotio", CODEX_MODEL, CODEX_EFFORT, self.routing())
+        self.assertEqual(validate_descriptor(descriptor), [])
+        self.assertNotIn("credential_source", descriptor)
+
+    def test_unknown_policy_override_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            build_descriptor(
+                "quotio",
+                CODEX_MODEL,
+                CODEX_EFFORT,
+                self.routing(),
+                policy_overrides={"api_key": "sk-live"},
+            )
+
+    def test_fingerprint_excludes_credential_bearing_url_material(self) -> None:
+        hostile = self.routing(base_url="https://user:token@host/v1?key=SECRET")
+        fingerprint = routing_fingerprint(hostile)
+        sanitized = routing_fingerprint(self.routing(base_url="https://host/v1?[STRIPPED]"))
+        self.assertEqual(fingerprint, sanitized)
+
+    def test_fingerprint_drops_secret_shaped_routing_env(self) -> None:
+        with_secret = self.routing(
+            routing_env={"CODEX_PROFILE": "default", "OPENAI_API_KEY": "sk-live"}
+        )
+        self.assertEqual(routing_fingerprint(with_secret), routing_fingerprint(self.routing()))
+
+    def test_same_provider_name_with_changed_endpoint_mismatches(self) -> None:
+        frozen = build_descriptor("quotio", CODEX_MODEL, CODEX_EFFORT, self.routing())
+        moved = build_descriptor(
+            "quotio",
+            CODEX_MODEL,
+            CODEX_EFFORT,
+            self.routing(base_url="http://127.0.0.1:9999/v1"),
+        )
+
+        result = verify_frozen_selection(CODEX_MODEL, frozen, live_catalog(), moved)
+
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["reason_code"], "descriptor_mismatch")
+
+
+class FrozenSelectionTests(unittest.TestCase):
+    def descriptor(self) -> dict:
+        return build_descriptor(
+            "quotio",
+            CODEX_MODEL,
+            CODEX_EFFORT,
+            {"base_url": "http://127.0.0.1:8317/v1", "wire_api": "responses"},
+        )
+
+    def test_newer_catalog_model_is_not_adopted_mid_run(self) -> None:
+        catalog = live_catalog()
+        catalog["models"].append(
+            {"slug": "gpt-5.7-sol", "supported_reasoning_levels": [{"effort": CODEX_EFFORT}]}
+        )
+        descriptor = self.descriptor()
+
+        result = verify_frozen_selection(CODEX_MODEL, descriptor, catalog, descriptor)
+
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(result["selection"]["selected_model"], CODEX_MODEL)
+        self.assertEqual(result["selection"]["reason"], "frozen_selection")
+
+    def test_frozen_model_removed_from_catalog_blocks(self) -> None:
+        descriptor = self.descriptor()
+
+        result = verify_frozen_selection(
+            CODEX_MODEL, descriptor, live_catalog(include_sol=False), descriptor
+        )
+
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["reason_code"], "frozen_model_ineligible")
+        self.assertEqual(result["next_action"], "start_new_workflow_entry_preflight")
+
+
+class AuthRecoveryTests(unittest.TestCase):
+    """`none -> oauth` must be able to clear a human:codex-login block."""
+
+    def descriptor(self, base_url: str = "http://127.0.0.1:8317/v1") -> dict:
+        return build_descriptor(
+            "quotio", CODEX_MODEL, CODEX_EFFORT, {"base_url": base_url}
+        )
+
+    def test_login_recovery_on_unchanged_route_clears_the_block(self) -> None:
+        descriptor = self.descriptor()
+
+        result = apply_auth_recovery(descriptor, descriptor, "none", "oauth", "success")
+
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(result["next_action"], "clear_human_codex_login_block")
+        self.assertEqual(result["credential_source"], "oauth")
+
+    def test_recovery_requires_a_successful_smoke(self) -> None:
+        descriptor = self.descriptor()
+
+        result = apply_auth_recovery(
+            descriptor, descriptor, "none", "oauth", "authentication_error"
+        )
+
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["reason_code"], "authentication_error")
+
+    def test_category_change_with_changed_routing_is_an_anomaly(self) -> None:
+        result = apply_auth_recovery(
+            self.descriptor(),
+            self.descriptor("https://elsewhere.example/v1"),
+            "none",
+            "oauth",
+            "success",
+        )
+
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["reason_code"], "descriptor_mismatch")
 
 
 if __name__ == "__main__":
