@@ -328,6 +328,12 @@ def _auth_scope_text(event: dict[str, Any]) -> str:
 
 
 def _has_auth_signature(text: str) -> bool:
+    """True when *text* carries a deterministic authentication failure marker.
+
+    Callers must pass only auth-bearing structured-event fields or diagnostic
+    stderr — never assistant/tool content, which may discuss "401" innocently.
+    """
+
     lowered = text.lower()
     if any(signature in lowered for signature in _AUTH_SIGNATURES):
         return True
@@ -529,6 +535,12 @@ def _apply_verdict(
     auth_line_source: str | None,
     excerpts: dict[str, str],
 ) -> tuple[str, str | None, dict[str, str]]:
+    """Fold one line's verdict into the running supervision outcome.
+
+    Retains diagnostic stderr as evidence but never JSON-channel benign
+    payloads, which can embed repository source.
+    """
+
     if verdict == "auth_error":
         excerpts[source] = bounded_excerpt(excerpts[source], line)
         return "auth_error", source, excerpts
