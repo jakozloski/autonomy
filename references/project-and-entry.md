@@ -154,6 +154,25 @@ Resolution is deterministic:
 
 ---
 
+### Model-Gate Entry Preflight
+
+**Runs at Entry A step 4 and Entry B step 4 — before any exploration, planning, or delegated voice.** Discovering a dead credential after Phase 1 wastes the entire planning spend and leaves no PR; this gate makes that failure surface in seconds.
+
+1. **Cheap probes:** `command -v codex`; `codex --version` (>= 0.144.0); the live catalog via `codex debug models` (60s bound); `claude --version` (>= 2.1.170). The live catalog remains the **capability/model-selection gate** — it proves an eligible model exists — and is never treated as proof of authentication, entitlement, or quota. `codex login status` is captured as a NORMALIZED enum (`logged_in|not_logged_in|unknown`), informational only: a provider pool can be healthy while OAuth is dead, and the reverse. Never persist raw account output.
+2. **Selection:** run `scripts/model_policy.py` with the observed facts to obtain `selection`.
+3. **Real access smoke test (authoritative):** one minimal invocation through the exact effective provider, environment, model, and flags Phase 2 will use:
+   ```bash
+   codex exec --ephemeral --json -m <selected> -c 'model_reasoning_effort="xhigh"' -s read-only "Reply with exactly: OK"
+   ```
+   Bound it to 60s and supervise it with `supervise_stream(stdout_pipe, stderr_pipe, kill_callback)` from `scripts/model_policy.py` (see Phase 2's authentication detection contract). Feed the observed result back to the helper as `first_real_invocation`; its `attempts` are scoped to THIS invocation's retry sequence and reset for every distinct smoke/review round — never cumulative across stages. A `blocked` verdict BLOCKs here, before Phase 1, with the failure matrix's remediation.
+4. **Path-inheritance invariant:** every later Phase 2 invocation — the `/autoplan` adapter's Codex calls or the direct Codex review — MUST run through the same provider, environment, selected model, and effort flags this smoke validated. Introducing a provider override after the smoke is a policy violation, not an optimization.
+5. **Freeze the selection:** persist `selection` plus the closed, non-secret execution descriptor built by `build_descriptor()` — normalized provider identity, model, effort, allowlisted policy overrides, and a value-aware `routing_fingerprint` (URL userinfo, query strings, and fragments stripped before digesting; secret-shaped routing env keys dropped, because a provider NAME is not a route). Smoke-only mechanics (`--ephemeral`, `--json`, `-s read-only`) are not part of the semantic descriptor. The credential-source category (`oauth|env_key|none`) is recorded for observability and deliberately EXCLUDED from the frozen comparison. Commands are always reconstructed from this package's templates plus the frozen model/effort — a persisted descriptor string is never executed.
+6. **Persist** under `resolved_conventions.model_runtime`: `codex.gate_status` (`pending`→`ready|blocked` from the smoke), `live_catalog_verified_at`, and `policy_decision.{selection, descriptor, preflight, entry_smoke, post_invocation, decision_file}`, where `post_invocation` is an append-only list of records (one per real Phase 2 invocation). Claude-side versions are verified here; Fable access and ZDR compatibility are recorded as harness-observed facts, and the first real Fable voice invocation remains the Claude-side working authority.
+
+Phase 2 always re-runs the cheap probes (seconds, idempotent — no staleness rule needed) and calls `verify_frozen_selection()` instead of re-selecting: the frozen model must still be catalog-eligible and the routing descriptor must still match. A newer model appearing mid-run is NOT adopted — it has not been smoked on this route — and a frozen model disappearing or a descriptor mismatch BLOCKs, with recovery through a NEW workflow entry rather than in-place mutation. Phase 2 never repeats the smoke, with exactly one exception: the `human:codex-login` resume verifier, whose whole purpose is to re-prove access.
+
+---
+
 ## Entry Points
 
 ### Entry A: Solve an Issue
@@ -163,7 +182,7 @@ The user provides an issue, bug report, feature request, or context to work from
 1. Read and understand the full context provided
 2. **Initialize state file** — create `.claude/workflow-state.local.md` with `state_schema_version: 1`, `workflow_id`, `description`, `current_phase: "entry"`, and the `## Prompt Ledger` body section seeded with the kickoff prompt as sequence 1 (core invariant), so state exists for resume if the session is interrupted
 3. **Resolve `base_branch`** — resolve per the `BASE_BRANCH` section in Resolved Project Profile above and persist to state immediately, before any command that references `origin/<base_branch>`.
-4. **Resolve Project Profile** — execute the remaining discovery steps above to populate `resolved_conventions` in the state file before continuing. This MUST complete before any phase begins. After profile resolution and before Phase 1, initialize EVERY remaining top-level block from the documented state template — `phases`, `regression_evidence`, `variant_analysis`, ledgers, tracking/acknowledgment maps, monitor counters, and handoffs — the full v1 mapping, so the full-tier schema requirement is satisfiable from Phase 1 onward.
+4. **Resolve Project Profile, then run the Model-Gate Entry Preflight** — execute the remaining discovery steps above to populate `resolved_conventions` in the state file, then run the **Model-Gate Entry Preflight** (above) and BLOCK on its verdict before spending anything on exploration. This MUST complete before any phase begins. After profile resolution and before Phase 1, initialize EVERY remaining top-level block from the documented state template — `phases`, `regression_evidence`, `variant_analysis`, ledgers, tracking/acknowledgment maps, monitor counters, and handoffs — the full v1 mapping, so the full-tier schema requirement is satisfiable from Phase 1 onward.
 5. Explore the codebase to understand the affected areas
 6. **Run Scope Analysis & Skill Selection** from the issue/context (see below) so `change_type` is known before branch/ticket classification.
 7. **Choose the repository-compliant branch name and finalize ticket policy.** If the current branch is protected, create the branch using the prefix required for the classified change (for example `chore/` for exempt maintenance or `feature/` for ticketed product work), then recompute `ticket_required` from the final branch + `change_type` and persist the exact rule:
@@ -254,7 +273,7 @@ The user provides a PR number or URL from another agent or person.
 
    **Note:** `STASH_REF` is captured by exact-message match using a unique nonce; this is race-free regardless of concurrent stash-push activity from other processes.
 
-4. **Resolve Project Profile** — execute the discovery steps above to populate `resolved_conventions` in the state file before continuing. `base_branch` was already persisted in step 2. This MUST complete before any phase begins. After profile resolution, initialize EVERY remaining top-level block from the documented state template — `phases`, `regression_evidence`, `variant_analysis`, ledgers, tracking/acknowledgment maps, monitor counters, and handoffs — the full v1 mapping, so the full-tier schema requirement is satisfiable from Phase 1 onward.
+4. **Resolve Project Profile, then run the Model-Gate Entry Preflight** — execute the discovery steps above to populate `resolved_conventions` in the state file, then run the **Model-Gate Entry Preflight** (above) and BLOCK on its verdict before any further work. `base_branch` was already persisted in step 2. This MUST complete before any phase begins. After profile resolution, initialize EVERY remaining top-level block from the documented state template — `phases`, `regression_evidence`, `variant_analysis`, ledgers, tracking/acknowledgment maps, monitor counters, and handoffs — the full v1 mapping, so the full-tier schema requirement is satisfiable from Phase 1 onward.
 5. Read the PR description and all feedback from the paginated issue-comment, review, and inline-comment REST endpoints; use GraphQL only to supplement thread resolution state
 6. Understand what's been done and what's pending
 7. Assess current state:
@@ -310,7 +329,8 @@ CHANGED_FILES=$(git diff --name-only origin/<base_branch>...HEAD 2>/dev/null || 
 - `scope_backend`: any file matching paths containing `api/`, `server/`, `services/`, `routes/`
 - `scope_tests_only`: `CHANGED_FILES` is non-empty AND ALL changed files are in `__tests__/`, `tests/`, `test/`, or match `*.test.*`, `*.spec.*`, `test_*.py`, `*_test.*`
 - `scope_skill_only`: `CHANGED_FILES` is non-empty AND ALL changed files are in `.claude/skills/` OR `.agents/skills/` (some repos symlink `.claude/skills/` to `.agents/skills/` — both paths count as skill-only)
-- **Empty diff guard:** If `CHANGED_FILES` is empty, set both `scope_tests_only` and `scope_skill_only` to `false`. An empty diff means no commits yet — use the issue/context fallback from above, not vacuous truth.
+- **Package-root identity (evaluated BEFORE the empty-diff guard):** when the repository root IS the skill package — ALL of `SKILL.md` with skill frontmatter at the root, `references/heading-manifest.md`, and `scripts/validate_package.py` must be present (a bare `SKILL.md` is deliberately insufficient) — AND the user-requested boundary is that package, set `scope_skill_only: true` even when `CHANGED_FILES` is empty. Package ownership is then DERIVED, not enumerated: every git-tracked path (`git ls-files`) counts as package-owned for the changed-file rule, so tracked files like `.gitignore` classify correctly and new package files need no list maintenance.
+- **Empty diff guard:** If `CHANGED_FILES` is empty AND the package-root rule above did not apply, set both `scope_tests_only` and `scope_skill_only` to `false`. An empty diff means no commits yet — use the issue/context fallback from above, not vacuous truth.
 
 ### Step 3: Classify Change Type
 

@@ -175,6 +175,7 @@ BUILTIN_EXPECTED_HEADINGS: Mapping[str, tuple[str, ...]] = {
         "## Ownership Transfer Rules",
         "## Validation Before Push",
         "## Completion Semantics",
+        "### Blocked-Exit Work Preservation",
         "## Final Rules",
     ),
     "references/project-and-entry.md": (
@@ -185,6 +186,7 @@ BUILTIN_EXPECTED_HEADINGS: Mapping[str, tuple[str, ...]] = {
         "### `DEV_SERVER_FRONTEND` / `DEV_SERVER_BACKEND`",
         "### `PROTECTED_BRANCHES`",
         "### `ISSUE_TRACKER`",
+        "### Model-Gate Entry Preflight",
         "## Entry Points",
         "### Entry A: Solve an Issue",
         "### Entry B: Take Over a PR",
