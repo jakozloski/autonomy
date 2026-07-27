@@ -51,16 +51,16 @@ CODEX_VERSION=$(codex --version 2>/dev/null | awk '{print $2}')
 # delivered by the live catalog and may not exist in the binary's bundled
 # snapshot. Capture the full catalog JSON — scripts/model_policy.py performs
 # the eligibility check and auto-forward selection (newest eligible model at
-# or above the gpt-5.6-sol floor with xhigh support; -mini/-nano style
+# or above the gpt-5.6-sol floor with max support; -mini/-nano style
 # variants excluded). A helper result without an eligible model BLOCKs:
 codex debug models > /tmp/codex-live-catalog.json || BLOCK "Could not read the live Codex catalog"
 ```
 
-These probes are cheap RE-VERIFICATION: access was already proven by the **Model-Gate Entry Preflight**'s smoke invocation before Phase 1 spend. Build the observed-facts JSON documented by `scripts/model_policy.py` and call `verify_frozen_selection()` with the frozen model, the frozen descriptor, this fresh catalog, and the currently observed descriptor. It VERIFIES and never re-selects: `blocked: frozen_model_ineligible` or `blocked: descriptor_mismatch` stops here, and recovery is a NEW workflow entry with a fresh preflight — never an in-place mutation of the frozen selection. A newer eligible model in the fresh catalog is deliberately NOT adopted mid-run; it has not been smoked on this route, and auto-forward happens at the next workflow's entry. Do not repeat the smoke here (the `human:codex-login` resume verifier is the sole exception). After the real review invocation, run the helper again with the exact observed status and that invocation's own attempt count — attempts are per-invocation and reset each round, never cumulative — appending the result to `policy_decision.post_invocation`. Continue only on `ready`; honor `retry` exactly once with the same frozen-model/xhigh flags. The helper makes no vendor calls and does not replace the real invocation.
+These probes are cheap RE-VERIFICATION: access was already proven by the **Model-Gate Entry Preflight**'s smoke invocation before Phase 1 spend. Build the observed-facts JSON documented by `scripts/model_policy.py` and call `verify_frozen_selection()` with the frozen model, the frozen descriptor, this fresh catalog, and the currently observed descriptor. It VERIFIES and never re-selects: `blocked: frozen_model_ineligible` or `blocked: descriptor_mismatch` stops here, and recovery is a NEW workflow entry with a fresh preflight — never an in-place mutation of the frozen selection. A newer eligible model in the fresh catalog is deliberately NOT adopted mid-run; it has not been smoked on this route, and auto-forward happens at the next workflow's entry. Do not repeat the smoke here (the `human:codex-login` resume verifier is the sole exception). After the real review invocation, run the helper again with the exact observed status and that invocation's own attempt count — attempts are per-invocation and reset each round, never cumulative — appending the result to `policy_decision.post_invocation`. Continue only on `ready`; honor `retry` exactly once with the same frozen-model/max flags. The helper makes no vendor calls and does not replace the real invocation.
 
 Entitlement denial, quota exhaustion, authentication failure, missing CLI, old CLI, or missing live capability follows the blocking failure matrix in the core skill. A transient transport failure gets one logged retry; a second failure BLOCKs. Never substitute a lower model or a Claude-only approval.
 
-**Authentication detection (every real Codex invocation, including the entry smoke):** run Codex with `--json` and supervise its stdout/stderr through `supervise_stream(stdout_pipe, stderr_pipe, kill_callback)` from `scripts/model_policy.py`, which takes the real pipe handles so each line's provenance is fixed by construction. Only auth-bearing structured events and CLI diagnostic stderr can produce `auth_error` — a plan or review that merely *discusses* HTTP 401 must never kill a healthy invocation, and an embedded `source` field in event content is never trusted. Pass `idle_timeout_seconds` only to catch a child that has gone completely SILENT — it bounds silence, never total runtime, because an xhigh review legitimately streams for many minutes and a runtime cap would kill healthy reviews; the entry smoke is the natural place for a tight bound (its prompt is trivial), while review invocations rely on the caller's own aggregate deadline (Timeout Heuristics). On `auth_error`, kill the process group immediately (never wait out the CLI's internal retry loop — an observed failure retried ~194 times before being killed) and BLOCK with `authentication_error`; on `internal_failure` (classifier crash, unreadable pipe, invalid or truncated stdout-json) or `timeout` (no output for a whole idle window) also kill and BLOCK — an unmonitored invocation is exactly what this boundary prevents. A 401 on a provider-OVERRIDE invocation is not proof the default provider is dead: the default-path smoke decides. Persist only a normalized error code plus the bounded, URL-stripped excerpt the supervisor returns — and run that excerpt through Secret/Token Redaction (state-and-safety.md) before persisting it. The supervisor removes URL-embedded credentials (userinfo, query, fragment) and nothing else; a bare `Authorization: Bearer ...` or `OPENAI_API_KEY=...` printed to stderr is caught only by those format-anchored patterns.
+**Authentication detection (every real Codex invocation, including the entry smoke):** run Codex with `--json` and supervise its stdout/stderr through `supervise_stream(stdout_pipe, stderr_pipe, kill_callback)` from `scripts/model_policy.py`, which takes the real pipe handles so each line's provenance is fixed by construction. Only auth-bearing structured events and CLI diagnostic stderr can produce `auth_error` — a plan or review that merely *discusses* HTTP 401 must never kill a healthy invocation, and an embedded `source` field in event content is never trusted. Pass `idle_timeout_seconds` only to catch a child that has gone completely SILENT — it bounds silence, never total runtime, because a max-effort review legitimately streams for many minutes and a runtime cap would kill healthy reviews; the entry smoke is the natural place for a tight bound (its prompt is trivial), while review invocations rely on the caller's own aggregate deadline (Timeout Heuristics). On `auth_error`, kill the process group immediately (never wait out the CLI's internal retry loop — an observed failure retried ~194 times before being killed) and BLOCK with `authentication_error`; on `internal_failure` (classifier crash, unreadable pipe, invalid or truncated stdout-json) or `timeout` (no output for a whole idle window) also kill and BLOCK — an unmonitored invocation is exactly what this boundary prevents. A 401 on a provider-OVERRIDE invocation is not proof the default provider is dead: the default-path smoke decides. Persist only a normalized error code plus the bounded, URL-stripped excerpt the supervisor returns — and run that excerpt through Secret/Token Redaction (state-and-safety.md) before persisting it. The supervisor removes URL-embedded credentials (userinfo, query, fragment) and nothing else; a bare `Authorization: Bearer ...` or `OPENAI_API_KEY=...` printed to stderr is caught only by those format-anchored patterns.
 
 **codex-review skill discovery:** The Codex-only review path (option 2 below) executes the `codex-review` skill's instructions directly. Resolve its SKILL.md path in this order (first match wins):
 
@@ -71,7 +71,7 @@ Entitlement denial, quota exhaustion, authentication failure, missing CLI, old C
 **Tool selection (capability-gated):**
 
 1. **gstack `/autoplan` adapter** (primary, when gstack available, `change_type != skill_only`, and the mandatory Codex preflight succeeds):
-   - All Codex calls run the policy-selected model (floor GPT-5.6 Sol) at `xhigh` reasoning (flag form per subcommand — see Model Configuration); Claude review voices run on the selected reviewer model (floor Opus 5)
+   - All Codex calls run the policy-selected model (floor GPT-5.6 Sol) at `max` reasoning (flag form per subcommand — see Model Configuration); Claude review voices run on the selected reviewer model (floor Opus 5)
    - Runs the full 4-phase review pipeline with dual voices (Claude subagent + Codex) and auto-decisions:
      - **CEO Review** (Phase 1): Strategy, scope, premises, 6-month regret test, competitive risk. Override mode: COMPLETE WITHIN AUTHORIZED BOUNDARY.
      - **Design Review** (Phase 2, conditional on `scope_frontend`): UX dimensions, design system compliance, 7-dimension rating. Skipped if no frontend scope.
@@ -95,18 +95,17 @@ Entitlement denial, quota exhaustion, authentication failure, missing CLI, old C
 
 2. **Direct Codex review** (when `/autoplan` is not selected):
    - Read the `codex-review` skill file from the discovered path above and follow its steps directly (do NOT invoke it as a slash command from inside this skill)
-   - Invoke Codex with `-m <selected-codex-model> -c 'model_reasoning_effort="xhigh"'` using the policy-selected model from state (floor `gpt-5.6-sol`; the codex-review skill uses `codex exec`, which accepts `-m`) — if its defaults ever differ, Model Configuration wins
+   - Invoke Codex with `-m <selected-codex-model> -c 'model_reasoning_effort="max"'` using the policy-selected model from state (floor `gpt-5.6-sol`; the codex-review skill uses `codex exec`, which accepts `-m`) — if its defaults ever differ, Model Configuration wins
    - Codex and Claude iterate until Codex approves — no fixed working budget; this round policy overrides any round cap in the delegated codex-review skill. Log each round's open findings in the Decision Audit Trail
    - If Codex raises valid concerns, revise the plan
    - If Codex suggests something contradicting explicit user requirements or repo rules, skip with logged note
    - A round makes progress when at least one previously-open finding is resolved (revision accepted or pushback accepted — it no longer appears in the next REVISE output). Two consecutive no-progress rounds = a stall: the reviewer has now held the same position three times (the core three-strike invariant) — BLOCK and ask the user, listing each disputed finding with both positions
    - **On the FIRST no-progress round, bring in the Claude reviewer before continuing** (trigger `plan_review_no_progress`; the selected reviewer model, floor Opus 5, at max). Give it the plan, the disputed findings, and both positions, and ask it to break the deadlock — not to re-review from scratch. Record its verdict in the Decision Audit Trail. Its round does not count toward the stall counter: it is a new voice in the discussion, not the disputants repeating themselves. If the next round still resolves nothing, that is the second no-progress round and the stall BLOCK fires as specified above
-   - Runaway backstop: 20 rounds. Not a working budget — reaching it without approval or a detected stall is anomalous; BLOCK and ask the user
    - On approval: set `phases.plan_review: "complete"` in state
 
 3. **Claude-reviewer supplement:** when the selected plan-review flow calls for an extra Claude perspective, run the selected reviewer model (floor Opus 5) at max via the verified Agent-tool or explicit CLI path. It may strengthen or challenge the plan, but it does not replace the mandatory Codex verdict — the plan discussion's two reviewers are different models, and the verdict stays with Codex.
 
-4. **BLOCK** — if the required Codex process fails, review stalls (two consecutive no-progress rounds), the 20-round runaway backstop is reached without approval, or a required Claude voice (base or reviewer) cannot run under the core policy. Set `phases.plan_review: "blocked"` in state.
+4. **BLOCK** — if the required Codex process fails, review stalls (two consecutive no-progress rounds), or a required Claude voice (base or reviewer) cannot run under the core policy. Set `phases.plan_review: "blocked"` in state. There is no round cap: rounds that keep resolving findings keep running until Codex approves.
 
 **Runtime failure handling:** Apply the core model failure matrix. Never silently proceed without the selected Codex model's approval (floor GPT-5.6 Sol).
 
@@ -176,7 +175,7 @@ Review the implementation before creating or updating the PR. (For PR takeovers,
      - **Small (<50 lines):** Claude structured review only. No multi-model for small diffs.
      - **Medium (50-199 lines):** + Codex adversarial challenge (if `command -v codex` succeeds) OR a reviewer-model adversarial subagent (fallback)
      - **Large (200+ lines):** + Codex structured review (if available) + **fresh-base adversarial pass** (trigger `large_diff`) + Codex adversarial challenge (if available). If Codex is unavailable, run the reviewer structured review + the fresh-base adversarial pass + one more reviewer adversarial subagent pass instead. If the fresh-base escalation cannot run, substitute a reviewer adversarial subagent pass and record the degradation in this pass's `notes`.
-   - Every Codex invocation in this adapter runs the policy-selected model (floor GPT-5.6 Sol) at `xhigh` reasoning — `codex exec` via `-m <selected>`, `codex review` via `-c 'model="<selected>"'` (it rejects `-m`), both with `-c 'model_reasoning_effort="xhigh"'` (see Model Configuration); Claude review passes run on the selected reviewer model (floor Opus 5) and fresh-base escalation passes on the selected base model (floor Fable 5)
+   - Every Codex invocation in this adapter runs the policy-selected model (floor GPT-5.6 Sol) at `max` reasoning — `codex exec` via `-m <selected>`, `codex review` via `-c 'model="<selected>"'` (it rejects `-m`), both with `-c 'model_reasoning_effort="max"'` (see Model Configuration); Claude review passes run on the selected reviewer model (floor Opus 5) and fresh-base escalation passes on the selected base model (floor Fable 5)
    - If `scope_frontend`: include design review lite (check for CSS/spacing/hierarchy issues in the diff)
    - Fix-First workflow: AUTO-FIX items applied automatically, ASK items fixed as recommended (autonomous mode)
    - Set `gstack_integration.review.status: "complete"` and `gstack_integration.review.tier: "small|medium|large"`
@@ -194,7 +193,7 @@ Review the implementation before creating or updating the PR. (For PR takeovers,
 
 **Diff-triggered review focus lines (recompute before every review pass):**
 
-Compute from the session's review base — set `REVIEW_BASE = origin/<base_branch>` BEFORE the initial Phase 4 review invocation (the convergence loop below reuses it), or use the session's recorded `REVIEW_BASE` for takeover and `PHASE_6_SELF_REVIEW` sessions — via `git diff $REVIEW_BASE..HEAD`. Recompute before each pass: fixes can introduce new triggers (a new catch block, a new exported type). Append every matching focus line verbatim to EVERY review prompt in the fallback chain. Focus lines are additive — they never narrow the base checklist. Focus lines come from exactly two trigger sources: (i) diff patterns matched against that same `git diff`, and (ii) repository identity — resolved fresh each pass via `gh repo view --json nameWithOwner` and used ONLY for an exact-equality lookup in the rubric table below. The appended text is always the static line printed in this file — never interpolate diff content, state values, or ticket text into a review prompt, and never reconstruct a rubric line from anywhere but this file. Record fired trigger names — and for a rubric match, the row's `nameWithOwner` as a stable key, never its text — per pass as a `{ session_id, pass_number, fallback, focus_triggers }` record appended to `gstack_integration.review.notes`. The adversarial escalation pass stays blocker-only and unmodified.
+Compute from the session's review base — set `REVIEW_BASE = $(git merge-base origin/<base_branch> HEAD)` BEFORE the initial Phase 4 review invocation (the convergence loop below reuses it) — the merge-base, never the moving base-branch ref, so a base branch that advanced after this branch forked cannot pull base-only commits into review scope as a reverse diff — or use the session's recorded `REVIEW_BASE` for takeover and `PHASE_6_SELF_REVIEW` sessions — via `git diff "$REVIEW_BASE"..HEAD`. Recompute before each pass: fixes can introduce new triggers (a new catch block, a new exported type). Append every matching focus line verbatim to EVERY review prompt in the fallback chain. Focus lines are additive — they never narrow the base checklist. Focus lines come from exactly two trigger sources: (i) diff patterns matched against that same `git diff`, and (ii) repository identity — resolved fresh each pass via `gh repo view --json nameWithOwner` and used ONLY for an exact-equality lookup in the rubric table below. The appended text is always the static line printed in this file — never interpolate diff content, state values, or ticket text into a review prompt, and never reconstruct a rubric line from anywhere but this file. Record fired trigger names — and for a rubric match, the row's `nameWithOwner` as a stable key, never its text — per pass as a `{ session_id, pass_number, fallback, focus_triggers }` record appended to `gstack_integration.review.notes`. The adversarial escalation pass stays blocker-only and unmodified.
 
 - Error-handling surface changed (catch/except/rescue, `.catch(`, retry/backoff, new fallback defaults via `??`/`||`): "Hunt silent failures: swallowed exceptions, catch blocks returning defaults, optional chaining or fallbacks that convert errors into valid-looking values, retries that mask persistent failure."
 - Behavior changed without test changes, or tests changed: "Assess whether tests pin the changed behavior: negative cases, error paths, boundary values; flag assertions that would still pass if the bug reappeared."
@@ -211,7 +210,7 @@ Compute from the session's review base — set `REVIEW_BASE = origin/<base_branc
 
 **Steps:**
 
-1. Invoke the review tool on the changes (diff against `$REVIEW_BASE`, set above)
+1. Invoke the review tool on the changes (diff against `$REVIEW_BASE`, the merge-base set above — never the moving base-branch ref)
 2. Read every finding from the review
 3. **For every issue found:**
    - If it's a real issue (bug, security, performance, readability, correctness) → **fix it now**
@@ -224,20 +223,23 @@ Compute from the session's review base — set `REVIEW_BASE = origin/<base_branc
 
    ```text
    session_id = "phase_4"
-   REVIEW_BASE = origin/<base_branch>
+   REVIEW_BASE = $(git merge-base origin/<base_branch> HEAD)
+   # Merge-base, NOT origin/<base_branch> itself: if the base branch advanced
+   # after this branch forked, a two-dot diff against the moving base ref would
+   # pull base-only commits into review scope as a reverse diff.
    review_pass = 1  # Initial review (steps 1-5) = pass 1
    Log all findings from initial review to finding_ledger:
      session_id, pass_number=1, phase="phase_4"
    Append resolution entries for any findings fixed/false_positive'd during initial review
    Initialize convergence[session_id] = {
      pass_actionable_counts: [open_count],
-     last_diff_content_hash: SHA256(git diff $REVIEW_BASE..HEAD),
+     last_diff_content_hash: SHA256(git diff "$REVIEW_BASE"..HEAD),
      prev_diff_content_hash: null,
      adversarial_triggered: false
    }
    files_changed_in_last_pass = files changed by initial review fixes (may be empty)
 
-   while review_pass < 8:  # Hard cap: 8 total passes (initial + 7 re-reviews)
+   while true:  # No pass cap — reviewing continues until a pass leaves nothing to review
      a. Mandatory re-review gate: If files_changed_in_last_pass is non-empty,
         a re-review pass MUST run regardless of current open set.
         If files_changed_in_last_pass is empty AND current open set is empty
@@ -265,9 +267,11 @@ Compute from the session's review base — set `REVIEW_BASE = origin/<base_branc
      k. Update convergence[session_id]: append open_count to
         pass_actionable_counts, rotate diff hashes
 
-   Rule 5 (hard cap): If review_pass == 8 with open findings
-   OR files_changed_in_last_pass is non-empty → BLOCK unconditionally, notify user.
-   Final-pass fixes that changed files cannot be left unreviewed.
+   Rule 5 (clean-pass exit, no cap): The loop ends only at step (a)'s
+   convergence check — a pass leaving no open findings and no files changed
+   by fixes — or through a Rule 1-4 BLOCK when passes stop resolving anything.
+   A high pass count alone never stops the loop, and exiting with open
+   findings or unreviewed fix commits is never allowed.
    ```
 
    See **Finding Ledger** in State Tracking for schema, entry ordering (`seq_id`), current open set definition, and convergence rule definitions.
@@ -291,16 +295,16 @@ Compute from the session's review base — set `REVIEW_BASE = origin/<base_branc
        the escalation still runs, it is just no longer a third model.
     2. Only blocker-severity findings are actionable
     3. Triage each finding: `fixed` (commit+SHA + resolution entry), `false_positive` (justification + entry), `escalated` (→ BLOCK)
-    4. Does NOT count against the review pass cap
+    4. Does NOT advance `review_pass` — it is an escalation, not an ordinary pass
     5. Does NOT recurse (fixes from adversarial pass do not trigger another adversarial pass)
     6. Log all findings to `finding_ledger` with `reviewer="escalation_voice"` (or `"adversarial"` when the reviewer-model fallback ran), current `session_id`
     7. If an adversarial fix changes files, union those files into
-       `files_changed_in_last_pass`; never replace the prior set. In the Phase 4
-       loop, return to an ordinary review pass over that union. If no ordinary
-       pass remains under Rule 5, BLOCK. In `PHASE_6_SELF_REVIEW`, the two-pass
-       budget is already exhausted, so any adversarial file change BLOCKs before
-       push. An adversarial pass may close findings, but it may never certify its
-       own code changes.
+       `files_changed_in_last_pass`; never replace the prior set. Return to an
+       ordinary review pass over that union — in the Phase 4 loop and in
+       `PHASE_6_SELF_REVIEW` alike, the loop is uncapped, so a next ordinary
+       pass always exists. An adversarial pass may close findings, but it may
+       never certify its own code changes: its file changes always receive one
+       more ordinary pass.
 
 7. **[Takeover only] Address pre-existing review feedback:** If Entry B step 7 found unaddressed feedback, execute the same REST-first fetch/evaluate/fix/reply/state procedure as Phase 6 Step 2 for every external human and bot surface present at takeover time. Human `CHANGES_REQUESTED` or unresolved inline feedback is a work list, not an immediate skip: fix every in-boundary issue, acknowledge top-level/review bodies, and reply to every inline root. Never auto-resolve a human thread. After the Phase 5 push, unresolved human threads or `CHANGES_REQUESTED` terminate through condition (c), with review-roundtrip handoff only when its durable eligibility proof succeeds. Specifically:
    - **Prerequisite:** Resolve `authenticated_actor` before computing thread ownership — always run `gh api user --jq .login` at the start of this step and persist to state immediately, even if already populated, to cover resumed sessions and token rotation

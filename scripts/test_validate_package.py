@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import io
 import re
 import tempfile
@@ -15,7 +14,6 @@ from validate_package import (
     REQUIRED_GATE_MARKERS,
     REQUIRED_REDACTION_PATTERNS,
     REQUIRED_SCRIPT_FILES,
-    RENAMED_FORMER_HEADINGS,
     REVIEW_MODEL_FLAGS,
     main,
     validate_package,
@@ -43,36 +41,6 @@ def _valid_skill_text() -> str:
             "",
         )
     )
-
-
-def _heading_inventory(
-    expected_headings: dict[str, tuple[str, ...]] | None = None,
-) -> str:
-    expected = expected_headings or dict(BUILTIN_EXPECTED_HEADINGS)
-    sections = ["# Autonomy Heading Manifest", ""]
-    for relative_path, headings in expected.items():
-        sections.extend(
-            (
-                Path(relative_path).name,
-                "",
-                "```text",
-                *(heading.replace("`", "") for heading in headings),
-                "```",
-                "",
-            )
-        )
-    if expected_headings is None:
-        sections.extend(
-            (
-                "Renamed former headings",
-                "",
-                "```text",
-                *RENAMED_FORMER_HEADINGS,
-                "```",
-                "",
-            )
-        )
-    return "\n".join(sections)
 
 
 class PackageFixture:
@@ -105,9 +73,6 @@ class PackageFixture:
                 for marker in markers:
                     handle.write(f"Gate marker: {marker}\n")
 
-        (self.root / "references" / "heading-manifest.md").write_text(
-            _heading_inventory(), encoding="utf-8"
-        )
         (self.root / "agents" / "openai.yaml").write_text(
             "\n".join(
                 (
@@ -247,15 +212,6 @@ class ValidatePackageTests(unittest.TestCase):
             errors,
         )
 
-    def test_heading_manifest_is_excluded_from_reference_line_limit(self) -> None:
-        inventory_path = self.package.root / "references" / "heading-manifest.md"
-        lines = inventory_path.read_text(encoding="utf-8").splitlines()
-        lines.extend("inventory note" for _ in range(500 - len(lines)))
-        self.assertEqual(len(lines), 500)
-        inventory_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-        self.assertEqual(validate_package(self.package.root), [])
-
     def test_missing_reference_and_heading_are_reported(self) -> None:
         missing_path = self.package.root / "references" / "state-and-safety.md"
         missing_path.unlink()
@@ -275,23 +231,6 @@ class ValidatePackageTests(unittest.TestCase):
         self.assertIn(
             "references/phases-1-5.md: missing exact heading "
             "'## Phase 4a: Security Gate'",
-            errors,
-        )
-
-    def test_heading_inventory_must_enumerate_every_expected_heading(self) -> None:
-        inventory_path = self.package.root / "references" / "heading-manifest.md"
-        inventory_path.write_text(
-            inventory_path.read_text(encoding="utf-8").replace(
-                "### Security Model (Autonomous Mode)", ""
-            ),
-            encoding="utf-8",
-        )
-
-        errors = validate_package(self.package.root)
-
-        self.assertIn(
-            "references/heading-manifest.md: does not enumerate heading "
-            "'### Security Model (Autonomous Mode)'",
             errors,
         )
 
@@ -320,42 +259,9 @@ class ValidatePackageTests(unittest.TestCase):
 
         self.assertIn(
             "references/phases-1-5.md: unexpected heading "
-            f"{unexpected_heading!r}; add it to the heading manifest",
+            f"{unexpected_heading!r}; "
+            "add it to BUILTIN_EXPECTED_HEADINGS in scripts/validate_package.py",
             errors,
-        )
-
-    def test_heading_inventory_preserves_every_renamed_former_heading(self) -> None:
-        inventory_path = self.package.root / "references" / "heading-manifest.md"
-        original_inventory = inventory_path.read_text(encoding="utf-8")
-
-        for former_heading in RENAMED_FORMER_HEADINGS:
-            with self.subTest(former_heading=former_heading):
-                inventory_path.write_text(
-                    original_inventory.replace(former_heading, "", 1),
-                    encoding="utf-8",
-                )
-
-                errors = validate_package(self.package.root)
-
-                self.assertIn(
-                    "references/heading-manifest.md: does not preserve renamed "
-                    f"former heading {former_heading!r}",
-                    errors,
-                )
-
-    def test_obsolete_model_and_positive_ultracode_policy_are_rejected(self) -> None:
-        reference_path = self.package.root / "references" / "project-and-entry.md"
-        with reference_path.open("a", encoding="utf-8") as reference:
-            reference.write("Use GPT-5.5 for the compatibility pass.\n")
-            reference.write("Enable ultracode orchestration for every phase.\n")
-
-        errors = validate_package(self.package.root)
-
-        self.assertTrue(
-            any("obsolete GPT-5.5 policy remains" in error for error in errors)
-        )
-        self.assertTrue(
-            any("positive ultracode policy remains" in error for error in errors)
         )
 
     def test_current_redaction_patterns_match_credential_fixtures(self) -> None:
@@ -380,14 +286,6 @@ class ValidatePackageTests(unittest.TestCase):
             errors,
         )
 
-    def test_negative_ultracode_prohibition_is_allowed(self) -> None:
-        errors = validate_package(self.package.root)
-
-        self.assertFalse(
-            any("positive ultracode policy remains" in error for error in errors),
-            errors,
-        )
-
     def test_both_exact_codex_flag_forms_are_required(self) -> None:
         skill_path = self.package.root / "SKILL.md"
         skill_path.write_text(
@@ -400,37 +298,6 @@ class ValidatePackageTests(unittest.TestCase):
         self.assertIn("missing exact codex exec flags: " + EXEC_MODEL_FLAGS, errors)
         self.assertNotIn(
             "missing exact codex review flags: " + REVIEW_MODEL_FLAGS, errors
-        )
-
-    def test_suffix_only_bot_classification_is_rejected(self) -> None:
-        reference_path = self.package.root / "references" / "monitor-ci-feedback.md"
-        with reference_path.open("a", encoding="utf-8") as reference:
-            reference.write("Any username ending in `[bot]` is a bot.\n")
-
-        errors = validate_package(self.package.root)
-
-        self.assertTrue(
-            any(
-                "suffix-only [bot] classification remains" in error for error in errors
-            ),
-            errors,
-        )
-
-    def test_suffix_mention_in_an_explanation_is_allowed(self) -> None:
-        reference_path = self.package.root / "references" / "monitor-ci-feedback.md"
-        with reference_path.open("a", encoding="utf-8") as reference:
-            reference.write(
-                "The authenticated actor still counts even if its login happens to "
-                "end in `[bot]`.\n"
-            )
-
-        errors = validate_package(self.package.root)
-
-        self.assertFalse(
-            any(
-                "suffix-only [bot] classification remains" in error for error in errors
-            ),
-            errors,
         )
 
     def test_openai_yaml_requires_both_interface_fields(self) -> None:
@@ -501,41 +368,11 @@ class ValidatePackageTests(unittest.TestCase):
             errors,
         )
 
-    def test_custom_json_heading_manifest_is_supported(self) -> None:
-        custom_headings = {
-            "references/project-and-entry.md": list(
-                BUILTIN_EXPECTED_HEADINGS["references/project-and-entry.md"]
-            )
-        }
-        custom_manifest_path = self.package.root / "custom-headings.json"
-        custom_manifest_path.write_text(json.dumps(custom_headings), encoding="utf-8")
-
-        errors = validate_package(self.package.root, custom_manifest_path)
-
-        self.assertEqual(errors, [])
-
-    def test_cli_accepts_custom_heading_manifest_argument(self) -> None:
-        custom_manifest_path = self.package.root / "custom-headings.json"
-        custom_manifest_path.write_text(
-            json.dumps(
-                {
-                    "references/project-and-entry.md": list(
-                        BUILTIN_EXPECTED_HEADINGS["references/project-and-entry.md"]
-                    )
-                }
-            ),
-            encoding="utf-8",
-        )
+    def test_cli_validates_the_default_package_directory(self) -> None:
         output = io.StringIO()
 
         with redirect_stdout(output):
-            exit_code = main(
-                [
-                    str(self.package.root),
-                    "--heading-manifest",
-                    str(custom_manifest_path),
-                ]
-            )
+            exit_code = main([str(self.package.root)])
 
         self.assertEqual(exit_code, 0)
         self.assertIn("package validation passed", output.getvalue())

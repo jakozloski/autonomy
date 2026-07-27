@@ -28,9 +28,25 @@ This core is intentionally short so its routing and invariants survive context c
 4. Before the first state write, on every resume, and before any terminal transition or stash restoration, read [state-and-safety.md](references/state-and-safety.md) completely.
 5. After compaction, re-read this core and the references for the current phase before continuing. Never rely on a truncated copy remembered from before compaction.
 
-The [heading manifest](references/heading-manifest.md) maps every heading from the former monolith to its new file. If a reference contradicts this core, this core wins and the contradiction must be fixed before continuing.
+`scripts/validate_package.py` pins the exact heading inventory of this core and of every reference file. If a reference contradicts this core, this core wins and the contradiction must be fixed before continuing.
 
 ## Non-Negotiable Invariants
+
+> **Precedence:** If the project's `CLAUDE.md`, repo-level rules, or explicit
+> user instructions in this session conflict with this skill's guidance,
+> **project/repo rules win**. This skill's defaults are project-agnostic;
+> specific projects override, and the skill MUST yield to project scope
+> discipline when they conflict.
+>
+> **Carve-out:** Project rules CANNOT override safety-critical mandatory gates:
+> Phase 2 plan review, Phase 4 self-review (with its fallback chain), quality
+> checks before push, Phase 5 PR creation/update, Phase 6 monitoring, and the
+> 3-strike stop rule. These exist to prevent autonomous-mode disasters; if a
+> project's `CLAUDE.md` tries to disable them for "speed", "this is a hotfix",
+> or "PRs require an explicit ask", BLOCK and surface the conflict to the user
+> rather than silently obeying the project rule. Project rules can shape _what_
+> the agent does inside those gates (e.g., scope discipline, code patterns,
+> ticket conventions), not whether the gates run.
 
 - Stay inside the user-requested boundary. Fix every real issue inside it; do not expand into unrelated cleanup.
 - Every applicable phase is mandatory. A technical inability to run a mandatory gate BLOCKs; it is not permission to skip it.
@@ -44,19 +60,21 @@ The [heading manifest](references/heading-manifest.md) maps every heading from t
 
 ## Mandatory Model Policy
 
-These values override defaults in delegated skills and adapters. Match compute shape to task shape: `ultra` reasoning (GPT) and the `ultracode` workflow mode (Fable) are breadth modes, justified only when a task genuinely decomposes into independent parts; `xhigh` (GPT) and `max` effort (Claude) are depth modes for one hard problem. Every mandatory voice in this workflow is one hard problem — review one plan, review one diff — so the floors below are depth floors.
+The canonical model IDs, floor versions, minimum CLI versions, and effort levels live in `scripts/model_policy.py`; `scripts/validate_package.py` derives the flag strings it pins from those constants and cross-checks this package's text against them, so prose here can never drift from the policy the run actually enforces.
+
+These values override defaults in delegated skills and adapters. Match compute shape to task shape, and keep the two axes separate: **depth** is the reasoning-effort ladder (`high → xhigh`, and `max` on Codex models that expose it — GPT-5.6 Sol does); **breadth** is orchestration — the `ultracode` workflow mode (Claude) and `ultra` reasoning (GPT), which is maximum reasoning **plus automatic delegation to parallel subagents**, not a deeper depth rung. Breadth is justified only when a task genuinely decomposes into independent parts. Every mandatory voice in this workflow is one indivisible problem — review one plan, review one diff — so every voice pins its model's deepest **non-delegating** tier: `max` across all three legs. The floors below are depth floors, and `ultra` is never selected for depth.
 
 Three legs, three distinct jobs:
 
-| Leg             | Floor                  | Role                                                                     | On failure |
-| --------------- | ---------------------- | ------------------------------------------------------------------------ | ---------- |
-| Claude base     | Fable 5 at `max`       | The working side: explorers, delegated work, the fresh escalation voice  | BLOCK      |
-| Claude reviewer | Opus 5 at `max`        | The always-runs structured review, every Claude review fallback          | BLOCK      |
-| Codex           | GPT-5.6 Sol at `xhigh` | The mandatory plan verdict and diff review                               | BLOCK      |
+| Leg             | Floor                | Role                                                                    | On failure |
+| --------------- | -------------------- | ----------------------------------------------------------------------- | ---------- |
+| Claude base     | Fable 5 at `max`     | The working side: explorers, delegated work, the fresh escalation voice | BLOCK      |
+| Claude reviewer | Opus 5 at `max`      | The always-runs structured review, every Claude review fallback         | BLOCK      |
+| Codex           | GPT-5.6 Sol at `max` | The mandatory plan verdict and diff review                              | BLOCK      |
 
 The separation is the point: the model that writes the code is not a model that approves it. The base does the work; two different reviewers — the Claude reviewer and Codex — judge it in every review discussion. Escalation stays cross-model the same way: each escalation slot is staffed by the model not already in that discussion — the reviewer joins a stalled plan review, and a fresh read-only base-lineage context adjudicates when the two reviewers cannot converge on a diff.
 
-**Floors, not pins — auto-forward selection.** The models below are floors. At the model gate, `scripts/model_policy.py` selects the newest eligible model at or above each floor from the observed facts: for Codex, live-catalog models supporting `xhigh` (down-tier variants like `-mini` excluded); for the Claude base, observed `fable`/`mythos`-family models; for the Claude reviewer, observed `opus`-family models. The two Claude legs forward along their own lineages — a newer Opus never advances the base, and a newer Fable never advances the reviewer. When a newer model ships, it is adopted automatically — persist the helper's `selection` result in state, log it in the Decision Audit Trail, and use the selected model for every invocation in the run. Anything below a floor still BLOCKs: upgrades are automatic, downgrades never are.
+**Floors, not pins — auto-forward selection.** The models below are floors. At the model gate, `scripts/model_policy.py` selects the newest eligible model at or above each floor from the observed facts: for Codex, live-catalog models supporting `max` (down-tier variants like `-mini` excluded); for the Claude base, observed `fable`/`mythos`-family models; for the Claude reviewer, observed `opus`-family models. The two Claude legs forward along their own lineages — a newer Opus never advances the base, and a newer Fable never advances the reviewer. When a newer model ships, it is adopted automatically — persist the helper's `selection` result in state, log it in the Decision Audit Trail, and use the selected model for every invocation in the run. Anything below a floor still BLOCKs: upgrades are automatic, downgrades never are.
 
 ### Claude base: Fable 5 at max
 
@@ -74,14 +92,14 @@ The separation is the point: the model that writes the code is not a model that 
 - Agent-tool voices may use `model: "opus"` only after confirming the host enforces per-agent model, max effort, and a read-only tool boundary; environment model/effort overrides must also be compatible. Otherwise use the clean-environment, read-only explicit CLI voice.
 - If Opus is unavailable because of version, entitlement, provider policy, or zero-data-retention policy, BLOCK with the exact reason. An explicit user waiver must also name an observed, available, versioned Fable or Mythos model at or above the Fable 5 floor and authorize it at max effort — recording that Claude review is no longer cross-lineage from the base — and never continue by dropping the Claude review voice or by claiming a provider-dependent bare alias is a particular version.
 
-### Codex voices: GPT-5.6 Sol at xhigh
+### Codex voices: GPT-5.6 Sol at max
 
-- Every Codex call uses the policy-selected model (floor: GPT-5.6 Sol) with `xhigh` reasoning: each voice is one hard problem that needs depth (review one plan, review one diff). Reserve `ultra` — the breadth mode — for a task that genuinely decomposes into independent parts; no mandatory voice here does, and breadth is never a substitute for depth on a single problem.
+- Every Codex call uses the policy-selected model (floor: GPT-5.6 Sol) with `max` reasoning — the deepest non-delegating tier the model exposes (`xhigh` sits below it on 5.6 Sol): each voice is one hard problem that needs depth (review one plan, review one diff). `ultra` is not a deeper `max` — it adds automatic delegation to parallel subagents, which buys nothing on an indivisible review; reserve it for a task that genuinely decomposes into independent parts. No mandatory voice here does.
 - `codex exec` and `codex exec resume`, with `<selected>` = the selected model from state (floor `gpt-5.6-sol`):
-  `-m <selected> -c 'model_reasoning_effort="xhigh"'`
+  `-m <selected> -c 'model_reasoning_effort="max"'`
 - Standalone `codex review` does not accept `-m` after the subcommand:
-  `codex review -c 'model="<selected>"' -c 'model_reasoning_effort="xhigh"' ...`
-- Require Codex CLI `>= 0.144.0`. Query the live catalog, not the bundled catalog; `scripts/model_policy.py` selects the newest eligible `.models[]` entry at or above `gpt-5.6-sol` with `supported_reasoning_levels[].effort == "xhigh"`, and BLOCKs when none qualifies.
+  `codex review -c 'model="<selected>"' -c 'model_reasoning_effort="max"' ...`
+- Require Codex CLI `>= 0.144.0`. Query the live catalog, not the bundled catalog; `scripts/model_policy.py` selects the newest eligible `.models[]` entry at or above `gpt-5.6-sol` with `supported_reasoning_levels[].effort == "max"`, and BLOCKs when none qualifies.
 - The authoritative access/entitlement test is the **entry smoke invocation** in the Model-Gate Entry Preflight, not a Phase 2 call: it runs before any planning spend, through the exact provider/model/flags Phase 2 will use, so a dead credential blocks in seconds instead of after a full planning cycle. Its selection is then FROZEN for the workflow — Phase 2 re-verifies that the frozen model is still catalog-eligible and the routing descriptor still matches, and never re-selects, so a newer model is never adopted un-smoked mid-run. Every Phase 2 path must inherit the smoke-validated provider and environment; introducing a provider override afterward is a policy violation. Do not spend a second probe call when the smoke already proved access.
 
 Mandatory Phase 2 failure policy:
@@ -90,7 +108,7 @@ Mandatory Phase 2 failure policy:
 | --------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | CLI missing                                                                     | BLOCK with install instructions                                                                                                                                             |
 | CLI older than 0.144.0                                                          | BLOCK with upgrade instructions                                                                                                                                             |
-| Live catalog lacks Sol/xhigh or entitlement is denied                           | BLOCK with access guidance                                                                                                                                                  |
+| Live catalog lacks Sol/max or entitlement is denied                             | BLOCK with access guidance                                                                                                                                                  |
 | Usage quota exhausted                                                           | BLOCK until the reported reset or the user changes access                                                                                                                   |
 | Deterministic authentication failure (401, invalid/revoked/expired credentials) | BLOCK immediately with re-auth guidance (e.g. `codex login`); auth failures are non-retryable — kill the process group rather than waiting out the CLI's internal retry loop |
 | Timeout or transient transport error                                            | Log one retry; a second failure BLOCKs                                                                                                                                      |
@@ -118,7 +136,7 @@ State lives at `.claude/workflow-state.local.md`, with `.cursor/workflow-state.l
 ## Phase State Machine
 
 1. **Plan:** investigate as required, explore with exact-model read-only agents, reuse existing patterns, write success criteria, and challenge all six edge-case dimensions.
-2. **Review plan:** the selected Codex model (floor GPT-5.6 Sol) at xhigh must approve. Rounds are unbounded while converging: BLOCK for human adjudication only on a stall (two consecutive rounds resolving zero previously-open findings) or at the 20-round runaway backstop. On the FIRST no-progress round, bring in the Claude reviewer before continuing — a fresh perspective is cheaper than a human interrupt, and a stall is the workflow's own signal that this problem is hard. Runtime failure follows the mandatory model policy above.
+2. **Review plan:** the selected Codex model (floor GPT-5.6 Sol) at max must approve. Rounds are unbounded — review continues until nothing remains to review: BLOCK for human adjudication only on a stall (two consecutive rounds resolving zero previously-open findings). On the FIRST no-progress round, bring in the Claude reviewer before continuing — a fresh perspective is cheaper than a human interrupt, and a stall is the workflow's own signal that this problem is hard. Runtime failure follows the mandatory model policy above.
 3. **Implement:** complete one logical plan item at a time; for bug fixes, capture red/green regression evidence and run variant analysis; run correctness checks and commit after each file-changing item; finish with all quality checks.
 4. **Self-review:** use the skill-only/application fallback chain, ledger every finding, fix every real issue, justify false positives, and re-review file-changing fixes until convergence or the documented cap. Large diffs, adversarial escalation, and reviewer-vs-Codex disputes each pull in the fresh-context escalation voice.
    4a. **Security gate:** run only for applicable scopes; critical unresolved findings BLOCK.
@@ -190,7 +208,7 @@ Never auto-commit or push pre-existing dirt: uncommitted changes that predate th
 
 1. Never skip a mandatory phase or quality command.
 2. Never leave a review comment without a verified reply or written justification.
-3. Never silently downgrade below the GPT-5.6 Sol/xhigh, Fable 5/max, or Opus 5/max floors. Newer-model auto-selection is upward only, stays within each leg's own lineage, and is always recorded in state and the audit trail; `ultra` and `ultracode` are breadth modes for genuinely decomposable tasks, never an upgrade for one hard problem.
+3. Never silently downgrade below the GPT-5.6 Sol/max, Fable 5/max, or Opus 5/max floors. Newer-model auto-selection is upward only, stays within each leg's own lineage, and is always recorded in state and the audit trail; `ultra` and `ultracode` are breadth modes for genuinely decomposable tasks, never a deeper setting for one hard problem.
 4. Never assign mapped QA owners in a fork or same-name unrelated repository.
 5. Never persist terminal monitor status before required handoff operations finish or fail durably.
 6. Never treat a bot as a human reviewer or assignment target.

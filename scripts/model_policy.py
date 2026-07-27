@@ -14,7 +14,7 @@ Expected input shape::
         "live_catalog": {
           "models": [{
             "slug": "gpt-5.6-sol",
-            "supported_reasoning_levels": [{"effort": "xhigh"}]
+            "supported_reasoning_levels": [{"effort": "max"}]
           }]
         },
         "first_real_invocation": {"status": "success", "attempts": 1}
@@ -101,9 +101,12 @@ A context-window variant suffix (``claude-opus-5[1m]``) denotes the same model
 version as its bare slug.  It is accepted wherever the bare slug is, and is
 never treated as either a downgrade or an upgrade.
 
-``xhigh`` is the depth setting for this workflow's single-problem voices;
-``ultra`` is the breadth mode, reserved for tasks that genuinely decompose
-into independent parts, and is deliberately not part of this gate.
+``max`` is the pin for this workflow's single-problem voices: the deepest
+non-delegating reasoning tier the floor model exposes (the depth axis runs
+``high -> xhigh -> max``).  ``ultra`` is not a deeper rung on that axis — it
+combines maximum reasoning with automatic delegation to parallel subagents
+(the breadth axis), buys nothing on an indivisible review, and is
+deliberately not part of this gate.
 """
 
 from __future__ import annotations
@@ -121,7 +124,7 @@ SCHEMA_VERSION = 3
 
 CODEX_MODEL = "gpt-5.6-sol"  # floor: newest eligible catalog model >= this wins
 CODEX_FLOOR_VERSION = (5, 6)
-CODEX_EFFORT = "xhigh"
+CODEX_EFFORT = "max"  # deepest non-delegating tier on the floor model; never ultra
 MIN_CODEX_VERSION = (0, 144, 0)
 CODEX_MAX_ATTEMPTS = 2
 # Variant tokens that mark down-tier siblings, never auto-forward targets.
@@ -447,7 +450,7 @@ def supervise_stream(
     Every failure outcome kills the process group; the caller then BLOCKs.
     ``idle_timeout_seconds`` bounds SILENCE, not total runtime: the clock
     resets on every byte received, so a slow-but-alive stream is never killed.
-    That distinction is the whole point — an xhigh review legitimately runs for
+    That distinction is the whole point — a max-effort review legitimately runs for
     many minutes, and a total-runtime cap would SIGKILL healthy reviews.  It
     defaults to ``None`` (no internal bound) because the caller owns the
     aggregate deadline; pass a value only to detect a child that has gone
@@ -488,7 +491,7 @@ def supervise_stream(
                 outcome = "timeout"
                 break
             # Activity: restart the idle clock, so a long-but-alive stream
-            # (an xhigh review emitting over several minutes) is never killed.
+            # (a max-effort review emitting over several minutes) is never killed.
             deadline = _next_deadline()
             for key, _ in ready:
                 source = key.data
@@ -726,7 +729,7 @@ def verify_frozen_selection(
             "reason_code": "frozen_model_ineligible",
             "reason": (
                 f"The frozen model {frozen_model} is no longer present in the live "
-                "catalog with xhigh reasoning"
+                f"catalog with {CODEX_EFFORT} reasoning"
             ),
             "next_action": "start_new_workflow_entry_preflight",
         }
@@ -905,6 +908,26 @@ def _version_at_least(value: Any, minimum: tuple[int, int, int]) -> bool:
     return not is_prerelease
 
 
+def _too_old_reason(tool: str, minimum: tuple[int, ...]) -> str:
+    """Render a cli_too_old reason from the minimum-version constant itself.
+
+    The version literal lives only in MIN_CODEX_VERSION / MIN_CLAUDE_VERSION, so
+    raising a floor cannot leave a message quoting the superseded version.
+    """
+
+    return f"{tool} must be at least {'.'.join(str(part) for part in minimum)}"
+
+
+def _codex_arguments(model: str) -> list[str]:
+    """codex exec argv for one invocation.
+
+    Defined once so the two emission sites cannot drift apart, and derived
+    from ``CODEX_EFFORT`` so an effort repoint cannot leave a stale literal.
+    """
+
+    return ["-m", model, "-c", f'model_reasoning_effort="{CODEX_EFFORT}"']
+
+
 def _codex_base(version: Any) -> dict[str, Any]:
     return {
         "state": "blocked",
@@ -915,12 +938,7 @@ def _codex_base(version: Any) -> dict[str, Any]:
         "observed_version": version if isinstance(version, str) else None,
         "live_catalog_verified": False,
         "execution_path": "codex_exec",
-        "arguments": [
-            "-m",
-            CODEX_MODEL,
-            "-c",
-            'model_reasoning_effort="xhigh"',
-        ],
+        "arguments": _codex_arguments(CODEX_MODEL),
         "next_action": None,
         "retry": {
             "attempts": 0,
@@ -1051,7 +1069,7 @@ def evaluate_codex(raw: Any) -> dict[str, Any]:
         return _block_codex(
             decision,
             "cli_too_old",
-            "Codex CLI must be at least 0.144.0",
+            _too_old_reason("Codex CLI", MIN_CODEX_VERSION),
             "upgrade_codex_cli",
         )
 
@@ -1061,17 +1079,12 @@ def evaluate_codex(raw: Any) -> dict[str, Any]:
             decision,
             "live_catalog_missing_capability",
             "The live Codex catalog lacks an eligible model at or above "
-            "GPT-5.6 Sol with xhigh reasoning",
+            f"GPT-5.6 Sol with {CODEX_EFFORT} reasoning",
             "request_access_or_refresh_live_catalog",
         )
     decision["live_catalog_verified"] = True
     decision["model"] = selected_model
-    decision["arguments"] = [
-        "-m",
-        selected_model,
-        "-c",
-        'model_reasoning_effort="xhigh"',
-    ]
+    decision["arguments"] = _codex_arguments(selected_model)
     decision["selection"] = {
         "floor_model": CODEX_MODEL,
         "selected_model": selected_model,
@@ -1153,7 +1166,7 @@ def evaluate_codex(raw: Any) -> dict[str, Any]:
                     "reason_code": status,
                     "reason": (
                         "Transient Codex failure; retry once with the exact same "
-                        "GPT-5.6 Sol/xhigh configuration"
+                        f"GPT-5.6 Sol/{CODEX_EFFORT} configuration"
                     ),
                     "next_action": "retry_same_invocation_once",
                 }
@@ -1519,7 +1532,7 @@ def _evaluate_claude_leg(raw: Any, spec: _ClaudeLegSpec) -> dict[str, Any]:
             config,
             spec,
             "cli_too_old",
-            "Claude Code must be at least 2.1.170",
+            _too_old_reason("Claude Code", MIN_CLAUDE_VERSION),
         )
 
     access = config.get(spec.access_key, "unknown")

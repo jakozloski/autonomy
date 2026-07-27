@@ -31,13 +31,13 @@ If `base_branch` cannot be resolved, BLOCK with a clear error — every downstre
 
 ### `QUALITY_CHECK_STEPS`
 
-A structured list of `[runner, script]` pairs to execute sequentially for quality validation. **No raw shell strings** — each step is a runner + script pair.
+A structured list of argv vectors to execute sequentially for quality validation. **No raw shell strings** — each step is a full argv vector (`[runner, arg, ...]`), and every element is passed to the process as a separate argument.
 
 **Resolution:**
 
 1. Search CLAUDE.md for sections like "Before Committing", "Quality", "Common Commands"
-2. Extract each command, split into runner and script (e.g., `yarn lint:fix` → `["yarn", "lint:fix"]`, `cargo test` → `["cargo", "test"]`, `make check` → `["make", "check"]`)
-3. Validate each runner exists: `command -v <runner>` (more portable than `which`). If a discovered runner is missing, set the workflow to BLOCKED and notify the user which quality step cannot be executed. Do NOT silently skip discovered quality checks.
+2. Extract each command into an argv vector, one element per argument (e.g., `yarn lint:fix` → `["yarn", "lint:fix"]`, `cargo fmt --check` → `["cargo", "fmt", "--check"]`, `make check` → `["make", "check"]`)
+3. Validate each runner (the first argv element) exists: `command -v <runner>` (more portable than `which`). If a discovered runner is missing, set the workflow to BLOCKED and notify the user which quality step cannot be executed. Do NOT silently skip discovered quality checks.
 
    Typical quality-check runners (`yarn`, `npm`, `pnpm`, `cargo`, `make`, `python`, `ruff`, `mypy`, `pytest`, etc.) should be on `PATH`. Project-local binaries like `eslint`/`prettier` are invoked through the package manager, so the resolved runner stays `yarn`/`npm`/etc. — no special-casing for `./node_modules/.bin/` or `npx --no-install` is needed.
 
@@ -162,7 +162,7 @@ Resolution is deterministic:
 2. **Selection:** run `scripts/model_policy.py` with the observed facts to obtain `selection`.
 3. **Real access smoke test (authoritative):** one minimal invocation through the exact effective provider, environment, model, and flags Phase 2 will use:
    ```bash
-   codex exec --ephemeral --json -m <selected> -c 'model_reasoning_effort="xhigh"' -s read-only "Reply with exactly: OK"
+   codex exec --ephemeral --json -m <selected> -c 'model_reasoning_effort="max"' -s read-only "Reply with exactly: OK"
    ```
    Bound it to 60s aggregate and supervise it with `supervise_stream(stdout_pipe, stderr_pipe, kill_callback, idle_timeout_seconds=60)` from `scripts/model_policy.py` — the smoke sends a trivial prompt, so a full minute of silence means the route is hung, not thinking (review invocations, which legitimately go quiet for minutes, leave this `None` and rely on their own aggregate deadline) (see Phase 2's authentication detection contract). Feed the observed result back to the helper as `first_real_invocation`; its `attempts` are scoped to THIS invocation's retry sequence and reset for every distinct smoke/review round — never cumulative across stages. A `blocked` verdict BLOCKs here, before Phase 1, with the failure matrix's remediation.
 4. **Path-inheritance invariant:** every later Phase 2 invocation — the `/autoplan` adapter's Codex calls or the direct Codex review — MUST run through the same provider, environment, selected model, and effort flags this smoke validated. Introducing a provider override after the smoke is a policy violation, not an optimization.

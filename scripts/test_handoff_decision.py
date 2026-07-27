@@ -4,6 +4,7 @@ import io
 import json
 import sys
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from handoff_decision import (
@@ -1783,6 +1784,59 @@ class HandoffDecisionTest(unittest.TestCase):
             json.loads(stdout.getvalue()),
             plan_handoff(request),
         )
+
+    def test_cli_invalid_json_blocks_with_nonzero_exit(self) -> None:
+        stdin = io.StringIO("not-json")
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(sys, "stdin", stdin),
+            mock.patch.object(sys, "stdout", stdout),
+        ):
+            exit_code = main()
+
+        self.assertEqual(exit_code, 2)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["state"], "blocked")
+        self.assertTrue(payload["errors"][0].startswith("input must be valid JSON"))
+
+
+class QaOwnerDocumentationSyncTest(unittest.TestCase):
+    """references/monitor-exit-handoffs.md restates the module's QA mappings.
+
+    QA_OWNER_BY_REPOSITORY / QA_STATE_NAME_BY_TEAM are canonical at runtime;
+    these tests fail whenever the human-readable table drifts from them.
+    """
+
+    @property
+    def reference_text(self) -> str:
+        reference_path = (
+            Path(__file__).resolve().parent.parent
+            / "references"
+            / "monitor-exit-handoffs.md"
+        )
+        return reference_path.read_text(encoding="utf-8")
+
+    def test_qa_owner_table_matches_module_mapping(self) -> None:
+        documented: dict[str, dict[str, str]] = {}
+        for line in self.reference_text.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("|"):
+                continue
+            cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+            # Mapping rows carry a backticked `org/repo` slug; the header,
+            # divider, and "anything else" rows do not.
+            if len(cells) != 3 or not cells[0].startswith("`") or "/" not in cells[0]:
+                continue
+            documented[cells[0].strip("`")] = {
+                "github_login": cells[1].strip("`"),
+                "linear_name": cells[2],
+            }
+
+        self.assertEqual(documented, QA_OWNER_BY_REPOSITORY)
+
+    def test_qa_state_names_match_module_mapping(self) -> None:
+        for team_key, state_name in QA_STATE_NAME_BY_TEAM.items():
+            self.assertIn(f'`{team_key}` → **"{state_name}"**', self.reference_text)
 
 
 if __name__ == "__main__":

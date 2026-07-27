@@ -203,6 +203,8 @@ The rows below are placeholder examples — replace them (together with the matc
 | `example-org/admin-portal`   | `bob-qa`           | Bob Example            |
 | anything else                | none — skip        | none — skip            |
 
+This table restates `QA_OWNER_BY_REPOSITORY` in `scripts/handoff_decision.py`, which is canonical at runtime; a sync test in `scripts/test_handoff_decision.py` fails if the two drift.
+
 The handoff transfers ownership AND stage: for a validated Linear ticket, the plan also moves the ticket to its team's QA-ready workflow state — ticket team `WEB` → **"Preview QA"**, `ADM` → **"Ready for QA"**; tickets on any other team get no state operation (move them manually if a QA state exists). Workflow-state IDs are team-scoped: resolve the ID by that exact name within the ticket's own team. The shipped `WEB`/`ADM` values are placeholder examples — keep this paragraph and `QA_STATE_NAME_BY_TEAM` in `scripts/handoff_decision.py` in sync when you replace them.
 
 **QA rehearsal (advisory, non-blocking preflight — mapped repositories only):** before planning the handoff operations, assemble a rehearsal record with evidence appropriate to each Test-plan AC: runtime-observable ACs need evidence from the current preview deployment or runtime, bound to the AC ID and the current `headRefOid` and verified through trusted APIs (checks, deployments) — never a comment's claim or an arbitrary URL; documentation/test/CI/migration ACs use their natural artifacts. For changed UI surfaces, exercise initial-load and refresh transitions, the error paths of changed flows (including a stale-session retry), each sibling surface sharing a changed pattern (an affordance added to one step of a flow raises the same expectation on its neighbors), and any device- or browser-specific claim on the actual device profile — desktop emulation is not evidence for it. The record is ONE anchored PR comment (`<!-- autonomy:qa-rehearsal -->`; zero-or-one matching anchor, duplicates fail closed) so the QA owner actually receives it — terminal output alone is not delivery — ledgered as `handoffs.pr_artifacts` operation `qa-rehearsal:<head_sha>`. This preflight is advisory and never blocks the exit or fabricates evidence: unexercised items are listed in that comment by stable identifier — the mirrored `AC-n` ID for ticket-derived items, the Test-plan item ordinal (`TP-n`) for every other item including all items of a ticketless PR — never verbatim untrusted AC text; a delivery failure persists `failed` while the handoff continues, and the handoff warning then states that the QA owner did not receive the rehearsal artifact.
@@ -302,9 +304,11 @@ Keep **the FIRST entry and the MOST RECENT entry** in `clean_poll_timestamps` (n
 
 ### PHASE_6_SELF_REVIEW (Diff-Scoped Post-Fix Review)
 
-Common procedure referenced by Phase 6 Steps 1 (sub-step 8a), 2 (sub-step 10a), and 3 (sub-steps 3a, 7a) — called within a monitor loop iteration — and by Phase 4 step 7 (takeover fixes, called before the monitor loop begins; `monitor_iterations` will be 0 at that point, producing `session_id` like `"phase_4_takeover_iter0_call1"`).
+Common procedure referenced by Phase 6 Steps 1 (step 9), 2 (sub-step 10a), and 3 (sub-step 3a in the out-of-date flow, step 9 in the conflict flow) — called within a monitor loop iteration — and by Phase 4 step 7 (takeover fixes, called before the monitor loop begins; `monitor_iterations` will be 0 at that point, producing `session_id` like `"phase_4_takeover_iter0_call1"`).
 
-**Fallback chain inside the monitor loop:** uses the same review-tool fallback chain as **Phase 4's "Tool selection is mandatory with fallback chain" section** (items 1–5 of the chain: gstack `/review`, `octo:review`, `feature-dev:code-reviewer`, `general-purpose`, BLOCK). Reference to "Phase 4 step 4" elsewhere refers to running `QUALITY_CHECK_STEPS`, not the review fallback chain. Including the `general-purpose` subagent fallback is especially important when `change_type == "skill_only"` — the loop must NEVER BLOCK on review-tool unavailability mid-iteration, since the monitor loop has no way to escalate to the user without aborting cleanly. Fall through to `general-purpose`, log the degraded review path in `gstack_integration.review.notes`, and continue.
+**Fallback chain inside the monitor loop:** uses the same review-tool fallback chain as **Phase 4's "Tool selection is mandatory with fallback chain" section** (items 1–5 of the chain: gstack `/review`, `octo:review`, `feature-dev:code-reviewer`, `general-purpose`, BLOCK). Reference to "Phase 4 step 4" elsewhere refers to running `QUALITY_CHECK_STEPS`, not the review fallback chain. Including the `general-purpose` subagent fallback is especially important when `change_type == "skill_only"`. The rule is: **never BLOCK before the chain is exhausted** — an unavailable or failing tool at items 1–3 must fall through to the next item, log the degraded review path in `gstack_integration.review.notes`, and continue, rather than aborting the iteration. This matters because the monitor loop cannot escalate to the user without aborting cleanly, and items 1–3 are routinely unavailable (no gstack, no codex, `feature-dev` not installed) for reasons that say nothing about the diff.
+
+That is **not** a licence to skip the review. If `general-purpose` — item 4, which is effectively always available — also fails, the chain is exhausted and item 5 applies: **BLOCK**. Self-review is mandatory and may not be waived, so continuing past an exhausted chain would push unreviewed code. The two cases are distinct: tool unavailable mid-chain → fall through and continue; final fallback failed → BLOCK and surface it.
 
 **`session_id` uniqueness:** The procedure runs at varying points within a monitor-loop iteration. `state.monitor_iterations` is persisted at the **TOP** of each iteration (see Phase 6 pseudocode — increment + state write happen as the first action of each loop pass). So when this procedure reads `state.monitor_iterations`, it gets the current iteration number, NOT the previous one. To ensure session_ids are unique even within a single iteration (multiple sub-steps may invoke this procedure), the procedure also reads-and-increments `state.monitor_self_review_call_count`:
 
@@ -323,48 +327,60 @@ PHASE_6_SELF_REVIEW(phase_context, REVIEW_BASE):
   call_number                          = state.monitor_self_review_call_count
   session_id = "{phase_context}_iter{state.monitor_iterations}_call{call_number}"
 
-  1. REVIEW_FILES = git diff --name-only $REVIEW_BASE..HEAD
-     If empty → return (no code changes to review)
+  1. REVIEW_FILES = git diff --name-only "$REVIEW_BASE"..HEAD
+     If empty:
+       # Do NOT return yet. An empty committed diff says nothing about the
+       # working tree: `git diff` here excludes uncommitted modifications and
+       # untracked files, so returning early would skip step 7 and let local
+       # changes bypass review entirely.
+       Run step 7's clean-tree check now (tracked + untracked, per step 7).
+       If the tree is clean  → return (genuinely no changes to review)
+       If the tree is dirty  → the caller left work uncommitted; commit or
+                               surface it, then re-enter with a REVIEW_BASE
+                               that covers it. Never return on a dirty tree.
   2. Run the review tool (same fallback chain as Phase 4), scoped to REVIEW_FILES.
      Before this and before every later pass in this procedure, recompute the
      diff-triggered review focus lines from THIS session's
-     git diff $REVIEW_BASE..HEAD and append them to every review prompt
+     git diff "$REVIEW_BASE"..HEAD and append them to every review prompt
      (definition in Phase 4); sessions never reuse another session's triggers.
   3. Log all findings to finding_ledger: session_id, phase=phase_context, pass_number=1
      Initialize convergence[session_id] = {
        pass_actionable_counts: [open_count],
-       last_diff_content_hash: SHA256(git diff $REVIEW_BASE..HEAD),
+       last_diff_content_hash: SHA256(git diff "$REVIEW_BASE"..HEAD),
        prev_diff_content_hash: null,
        adversarial_triggered: false
      }
   4. Fix each actionable finding, commit. Append "fixed" resolution entries.
      Mark false positives with justification. Append "false_positive" entries.
+     pass_number = 1
      files_changed_in_last_pass = files changed by pass-one fixes (may be empty)
-  5. If files_changed_in_last_pass is non-empty (mandatory re-review when fixes changed files):
+  5. While files_changed_in_last_pass is non-empty OR open findings remain
+     (no pass cap — reviewing continues until a pass leaves nothing to review):
      a. Re-union TOUCHED_FILES with files_changed_in_last_pass
      b. Re-run QUALITY_CHECK_STEPS, commit auto-fixes (boundary check)
-     c. Pass 2 scope = the set union of files with open findings from pass 1
-        and `files_changed_in_last_pass`
-     d. Run review tool on pass-2 scope, log findings: pass_number=2
+     c. pass_number += 1; next-pass scope = the set union of files with open
+        findings from the previous pass and `files_changed_in_last_pass`
+     d. Run review tool on that scope, log findings: pass_number
      e. Fix actionable, commit. Append "fixed" entries.
         Mark false positives. Append "false_positive" entries.
-     f. files_changed_in_last_pass = files changed by pass-two fixes (may be empty)
-     g. Re-union TOUCHED_FILES with pass-two fix files
-     h. Re-run QUALITY_CHECK_STEPS, commit auto-fixes (boundary check)
-     i. For open findings from pass 1 absent in pass 2: append "auto_closed" entries
-     j. Update convergence[session_id]
-     k. Apply ALL convergence rules (1-5), scoped to session_id:
+     f. files_changed_in_last_pass = files changed by this pass's fixes (may be empty)
+     g. For open findings from the previous pass absent in this pass:
+        append "auto_closed" entries
+     h. Update convergence[session_id]
+     i. Apply ALL convergence rules (1-5), scoped to session_id:
         - Rule 1 (reappearance) → BLOCK
         - Rule 2 (oscillation) → BLOCK
         - Rule 3 (non-decrease) → adversarial escalation (Phase 4 step 6a). If unresolved → BLOCK
         - Rule 4 (cross-reviewer dispute) → adversarial escalation. If unresolved → BLOCK
         - If that escalation changes files, union them into TOUCHED_FILES and
-          files_changed_in_last_pass, then BLOCK: the two ordinary review passes
-          are exhausted and adversarial code cannot approve itself.
-  6. Rule 5: If (any open findings remain after pass 2 in the finding_ledger for this session_id)
-     OR (files_changed_in_last_pass is non-empty after pass 2)
-     → BLOCK unconditionally, notify user. Final-pass fixes cannot be left unreviewed.
-  7. Verify clean working tree (git diff --name-only HEAD should be empty)
+          files_changed_in_last_pass and continue: the loop is uncapped, so the
+          next ordinary pass reviews them — adversarial code never approves
+          itself and never ships unreviewed.
+  6. Rule 5 (clean-pass exit, no cap): the loop exits only when a pass leaves
+     no open findings and no files changed by fixes. Rules 1-4 BLOCK on
+     divergence; a rising pass count alone never does, and exiting with open
+     findings or unreviewed fix commits is never allowed.
+  7. Verify clean working tree (git status --porcelain=v1 should be empty — tracked AND untracked)
 ```
 
 ---
