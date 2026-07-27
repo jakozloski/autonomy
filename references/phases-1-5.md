@@ -14,7 +14,7 @@ Create a clear implementation plan.
      - This hypothesis feeds directly into the implementation plan's "What changes are needed and why" section
      - Set `gstack_integration.investigate.status: "complete"` in state
    - **Otherwise** (not a bug fix, Entry B, or `/investigate` not selected): set `gstack_integration.investigate.status: "skipped"` in state and proceed to step 2
-2. Explore using Glob/Grep/Read and read-only custom subagents pinned to the selected primary model (floor Opus 5). Do not use the fixed-smaller-model Explore agent. If Agent-tool model/effort/read-only enforcement cannot be verified, use the core policy's explicit Opus CLI invocation (plan permission mode; only Read/Glob/Grep allowed; mutation, shell, web, and delegation tools denied). Supply prepared context or let those read-only tools inspect it; never inherit repository-authorized Edit/Write/git/PR permissions.
+2. Explore using Glob/Grep/Read and read-only custom subagents pinned to the selected base model (floor Fable 5). Do not use the fixed-smaller-model Explore agent. If Agent-tool model/effort/read-only enforcement cannot be verified, use the core policy's explicit base-model CLI invocation (plan permission mode; only Read/Glob/Grep allowed; mutation, shell, web, and delegation tools denied). Supply prepared context or let those read-only tools inspect it; never inherit repository-authorized Edit/Write/git/PR permissions.
 3. Identify existing patterns, utilities, and types to reuse
 4. Write a detailed implementation plan covering:
    - What changes are needed and why
@@ -69,7 +69,7 @@ The first real review invocation is the authoritative entitlement/quota test. Mi
 **Tool selection (capability-gated):**
 
 1. **gstack `/autoplan` adapter** (primary, when gstack available, `change_type != skill_only`, and the mandatory Codex preflight succeeds):
-   - All Codex calls run the policy-selected model (floor GPT-5.6 Sol) at `xhigh` reasoning (flag form per subcommand — see Model Configuration); Claude voices run on the selected Fable-lineage model (floor Fable 5)
+   - All Codex calls run the policy-selected model (floor GPT-5.6 Sol) at `xhigh` reasoning (flag form per subcommand — see Model Configuration); Claude review voices run on the selected reviewer model (floor Opus 5)
    - Runs the full 4-phase review pipeline with dual voices (Claude subagent + Codex) and auto-decisions:
      - **CEO Review** (Phase 1): Strategy, scope, premises, 6-month regret test, competitive risk. Override mode: COMPLETE WITHIN AUTHORIZED BOUNDARY.
      - **Design Review** (Phase 2, conditional on `scope_frontend`): UX dimensions, design system compliance, 7-dimension rating. Skipped if no frontend scope.
@@ -89,7 +89,7 @@ The first real review invocation is the authoritative entitlement/quota test. Mi
    - All decisions logged to the `decision_audit_trail` state field FIRST (it is the authoritative trail; on divergence it wins), then copied into the plan file's readable trail section when a plan file exists
    - Set `gstack_integration.autoplan.status: "complete"` in state
    - On success: set `phases.plan_review: "complete"` in state
-   - A failed Claude voice may use the explicit Claude CLI path. A failed Codex voice follows the core blocking matrix; it may not degrade to a different model or Claude-only approval.
+   - A failed Claude voice may use the explicit reviewer CLI path. A failed Codex voice follows the core blocking matrix; it may not degrade to a different model or Claude-only approval.
 
 2. **Direct Codex review** (when `/autoplan` is not selected):
    - Read the `codex-review` skill file from the discovered path above and follow its steps directly (do NOT invoke it as a slash command from inside this skill)
@@ -98,32 +98,32 @@ The first real review invocation is the authoritative entitlement/quota test. Mi
    - If Codex raises valid concerns, revise the plan
    - If Codex suggests something contradicting explicit user requirements or repo rules, skip with logged note
    - A round makes progress when at least one previously-open finding is resolved (revision accepted or pushback accepted — it no longer appears in the next REVISE output). Two consecutive no-progress rounds = a stall: the reviewer has now held the same position three times (the core three-strike invariant) — BLOCK and ask the user, listing each disputed finding with both positions
-   - **On the FIRST no-progress round, run the third voice before continuing** (trigger `plan_review_no_progress`). Give it the plan, the disputed findings, and both positions, and ask it to break the deadlock — not to re-review from scratch. Record its verdict in the Decision Audit Trail. Its round does not count toward the stall counter: it is a new perspective, not the reviewer repeating itself. If the next round still resolves nothing, that is the second no-progress round and the stall BLOCK fires as specified above
+   - **On the FIRST no-progress round, bring in the Claude reviewer before continuing** (trigger `plan_review_no_progress`; the selected reviewer model, floor Opus 5, at max). Give it the plan, the disputed findings, and both positions, and ask it to break the deadlock — not to re-review from scratch. Record its verdict in the Decision Audit Trail. Its round does not count toward the stall counter: it is a new voice in the discussion, not the disputants repeating themselves. If the next round still resolves nothing, that is the second no-progress round and the stall BLOCK fires as specified above
    - Runaway backstop: 20 rounds. Not a working budget — reaching it without approval or a detected stall is anomalous; BLOCK and ask the user
    - On approval: set `phases.plan_review: "complete"` in state
 
-3. **Third-voice supplement:** when the selected plan-review flow calls for an extra Claude perspective, run the selected third-voice model (floor Fable 5) at max via the verified Agent-tool or explicit CLI path. It may strengthen or challenge the plan, but it does not replace the mandatory Codex verdict. If the third voice is `unavailable` per the model gate, record the degradation in the Decision Audit Trail and continue — it is a supplement, so its absence never blocks Phase 2.
+3. **Claude-reviewer supplement:** when the selected plan-review flow calls for an extra Claude perspective, run the selected reviewer model (floor Opus 5) at max via the verified Agent-tool or explicit CLI path. It may strengthen or challenge the plan, but it does not replace the mandatory Codex verdict — the plan discussion's two reviewers are different models, and the verdict stays with Codex.
 
-4. **BLOCK** — if the required Codex process fails, review stalls (two consecutive no-progress rounds), the 20-round runaway backstop is reached without approval, or the required primary Claude voice cannot run under the core policy. An unavailable third voice is NOT a block condition. Set `phases.plan_review: "blocked"` in state.
+4. **BLOCK** — if the required Codex process fails, review stalls (two consecutive no-progress rounds), the 20-round runaway backstop is reached without approval, or a required Claude voice (base or reviewer) cannot run under the core policy. Set `phases.plan_review: "blocked"` in state.
 
 **Runtime failure handling:** Apply the core model failure matrix. Never silently proceed without the selected Codex model's approval (floor GPT-5.6 Sol).
 
 ---
 
-## Third-Voice Triggers
+## Escalation Voice Triggers
 
-The third voice (floor Fable 5 at max) is the extra perspective for hard problems. Four triggers are deterministic — the workflow has already proven the problem is hard, so the voice runs without further judgment:
+An escalation voice is the extra perspective for hard problems, staffed by the model NOT already in that discussion: in Phase 2 the plan dispute is between the implementer (base lineage) and Codex, so the Claude reviewer (floor Opus 5 at max) is the fresh voice; in Phase 4 both standing reviewers have already spoken, so the escalation voice is the base lineage (floor Fable 5 at max) in a fresh read-only context — never the working session judging its own output. Four triggers are deterministic — the workflow has already proven the problem is hard, so the voice runs without further judgment:
 
-| Trigger                   | Fires at                            | Why this is the hard case                                                                     |
-| ------------------------- | ----------------------------------- | --------------------------------------------------------------------------------------------- |
-| `plan_review_no_progress` | Phase 2, first no-progress round    | Two models are talking past each other; a third perspective is cheaper than a human interrupt |
-| `large_diff`              | Phase 4, 200+ line diff             | Enough surface that one reviewer's blind spot is likely to matter                             |
-| `adversarial_escalation`  | Phase 4 step 6a, convergence rule 3 | Findings stopped decreasing; the current reviewers are not converging                         |
-| `reviewer_dispute`        | Phase 4 step 6a, convergence rule 4 | Primary and Codex disagree — neither disputant can settle it                                  |
+| Trigger                   | Fires at                            | Voice              | Why this is the hard case                                                                        |
+| ------------------------- | ----------------------------------- | ------------------ | ------------------------------------------------------------------------------------------------ |
+| `plan_review_no_progress` | Phase 2, first no-progress round    | Claude reviewer    | Implementer and Codex are talking past each other; a second reviewer is cheaper than a human interrupt |
+| `large_diff`              | Phase 4, 200+ line diff             | Fresh base context | Enough surface that the standing reviewers' blind spots are likely to matter                     |
+| `adversarial_escalation`  | Phase 4 step 6a, convergence rule 3 | Fresh base context | Findings stopped decreasing; the standing reviewers are not converging                           |
+| `reviewer_dispute`        | Phase 4 step 6a, convergence rule 4 | Fresh base context | Reviewer and Codex disagree — neither disputant can settle it                                    |
 
-A fifth trigger, `judgment`, is available at any review point when the problem looks likely to benefit from another perspective. It is discretionary, but not silent: record `{ trigger: "judgment", reason: "<why>", phase, session_id }` in the Decision Audit Trail at invocation time. An unrecorded invocation is not permitted — a trigger nobody can see is a trigger nobody can audit or tune.
+A fifth trigger, `judgment`, is available at any review point when the problem looks likely to benefit from another perspective, staffed by the same not-in-this-discussion rule. It is discretionary, but not silent: record `{ trigger: "judgment", voice, reason: "<why>", phase, session_id }` in the Decision Audit Trail at invocation time. An unrecorded invocation is not permitted — a trigger nobody can see is a trigger nobody can audit or tune.
 
-In every case: the third voice supplements, it never replaces the Codex verdict, and it is read-only under the same tool boundary as the primary. When the model gate reports it `unavailable`, record the degradation on the affected pass and continue; no trigger converts an unavailable third voice into a BLOCK.
+In every case: an escalation voice supplements, it never replaces the Codex verdict, and it is read-only under the same tool boundary as every review voice. Both staffing legs are gating and verified at the model gate. If a reviewer-staffed escalation fails at its trigger, the core model failure matrix applies — the reviewer is a mandatory voice. If a fresh-base escalation fails at its trigger, fall back to a reviewer-model adversarial subagent pass (`feature-dev:code-reviewer`) and record the degradation on the affected pass — the escalation still runs, it is just no longer a third model.
 
 ---
 
@@ -172,15 +172,15 @@ Review the implementation before creating or updating the PR. (For PR takeovers,
    - Run structured checklist review (Claude pass — always runs)
    - Auto-scale adversarial review based on diff size:
      - **Small (<50 lines):** Claude structured review only. No multi-model for small diffs.
-     - **Medium (50-199 lines):** + Codex adversarial challenge (if `command -v codex` succeeds) OR primary Claude adversarial subagent (fallback)
-     - **Large (200+ lines):** + Codex structured review (if available) + **third-voice adversarial pass** (trigger `large_diff`) + Codex adversarial challenge (if available). If Codex is unavailable, run the primary structured review + the third-voice adversarial pass + one more primary adversarial subagent pass instead. If the third voice is `unavailable` per the model gate, substitute a primary adversarial subagent pass and record the degradation in this pass's `notes`.
-   - Every Codex invocation in this adapter runs the policy-selected model (floor GPT-5.6 Sol) at `xhigh` reasoning — `codex exec` via `-m <selected>`, `codex review` via `-c 'model="<selected>"'` (it rejects `-m`), both with `-c 'model_reasoning_effort="xhigh"'` (see Model Configuration); primary Claude passes run on the selected opus-lineage model (floor Opus 5) and third-voice passes on the selected fable-lineage model (floor Fable 5)
+     - **Medium (50-199 lines):** + Codex adversarial challenge (if `command -v codex` succeeds) OR a reviewer-model adversarial subagent (fallback)
+     - **Large (200+ lines):** + Codex structured review (if available) + **fresh-base adversarial pass** (trigger `large_diff`) + Codex adversarial challenge (if available). If Codex is unavailable, run the reviewer structured review + the fresh-base adversarial pass + one more reviewer adversarial subagent pass instead. If the fresh-base escalation cannot run, substitute a reviewer adversarial subagent pass and record the degradation in this pass's `notes`.
+   - Every Codex invocation in this adapter runs the policy-selected model (floor GPT-5.6 Sol) at `xhigh` reasoning — `codex exec` via `-m <selected>`, `codex review` via `-c 'model="<selected>"'` (it rejects `-m`), both with `-c 'model_reasoning_effort="xhigh"'` (see Model Configuration); Claude review passes run on the selected reviewer model (floor Opus 5) and fresh-base escalation passes on the selected base model (floor Fable 5)
    - If `scope_frontend`: include design review lite (check for CSS/spacing/hierarchy issues in the diff)
    - Fix-First workflow: AUTO-FIX items applied automatically, ASK items fixed as recommended (autonomous mode)
    - Set `gstack_integration.review.status: "complete"` and `gstack_integration.review.tier: "small|medium|large"`
 2. **`octo:review`** (fallback, execute the `octo:review` skill instructions directly — located in `~/.claude/skills/claude-octopus/`) — if gstack `/review` adapter is not available. If `octo:review` is also not found, fall through to the next fallback.
-3. **`code-reviewer` subagent** (via Agent tool with `subagent_type: "feature-dev:code-reviewer"` and explicit primary-model selection) — if both above are unavailable. Requires the `feature-dev` plugin to be installed.
-4. **`general-purpose` subagent fallback** (explicitly pinned to the selected primary model, floor Opus 5, or run through the clean-environment Claude CLI command from the core) — when the `feature-dev:code-reviewer` invocation returns "unknown subagent" or any other invocation error. Use the prompt:
+3. **`code-reviewer` subagent** (via Agent tool with `subagent_type: "feature-dev:code-reviewer"` and explicit reviewer-model selection) — if both above are unavailable. Requires the `feature-dev` plugin to be installed.
+4. **`general-purpose` subagent fallback** (explicitly pinned to the selected reviewer model, floor Opus 5, or run through the clean-environment Claude CLI command from the core) — when the `feature-dev:code-reviewer` invocation returns "unknown subagent" or any other invocation error. Use the prompt:
 
    > You are conducting a code review on the diff against `$REVIEW_BASE`. Focus on: correctness bugs, security issues, missing edge cases, unsafe assumptions, contradiction with the project's `CLAUDE.md` (read it first). Report findings as a numbered list with file:line citations. Do NOT propose stylistic changes. Cap output at 50 findings — prioritize the highest-confidence/highest-severity items.
 
@@ -276,21 +276,22 @@ Compute from the session's review base — set `REVIEW_BASE = origin/<base_branc
     If `convergence[session_id].adversarial_triggered == true` → skip, proceed to BLOCK.
     Set `adversarial_triggered = true`.
 
-    1. Single blocker-only adversarial pass run on the **third voice** (floor Fable 5),
-       via the verified Agent-tool path or the explicit read-only CLI path — trigger
+    1. Single blocker-only adversarial pass run on the **escalation voice** — the base
+       lineage (floor Fable 5) in a fresh read-only context, via the verified
+       Agent-tool path or the explicit read-only CLI path — trigger
        `adversarial_escalation` for rule 3, `reviewer_dispute` for rule 4.
        Prompt: "Find blockers only — bugs, security, data loss, correctness errors. Ignore style/naming."
        For a rule 4 dispute, also give it both reviewers' positions and ask it to
-       adjudicate; a dispute between the primary and Codex is exactly the case a
+       adjudicate; a dispute between the reviewer and Codex is exactly the case a
        third model exists to settle, and re-running either disputant cannot settle it.
-       If the third voice is `unavailable` per the model gate, fall back to a primary
-       Claude subagent (`subagent_type: "feature-dev:code-reviewer"`) and record the
-       degradation — the escalation still runs, it is just no longer cross-model.
+       If the escalation voice cannot run, fall back to a reviewer-model subagent
+       (`subagent_type: "feature-dev:code-reviewer"`) and record the degradation —
+       the escalation still runs, it is just no longer a third model.
     2. Only blocker-severity findings are actionable
     3. Triage each finding: `fixed` (commit+SHA + resolution entry), `false_positive` (justification + entry), `escalated` (→ BLOCK)
     4. Does NOT count against the review pass cap
     5. Does NOT recurse (fixes from adversarial pass do not trigger another adversarial pass)
-    6. Log all findings to `finding_ledger` with `reviewer="third_voice"` (or `"adversarial"` when the primary-model fallback ran), current `session_id`
+    6. Log all findings to `finding_ledger` with `reviewer="escalation_voice"` (or `"adversarial"` when the reviewer-model fallback ran), current `session_id`
     7. If an adversarial fix changes files, union those files into
        `files_changed_in_last_pass`; never replace the prior set. In the Phase 4
        loop, return to an ordinary review pass over that union. If no ordinary

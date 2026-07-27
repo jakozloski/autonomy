@@ -61,13 +61,13 @@ Invoke with `/autonomy`, or ask for "solve this issue autonomously" / "take over
 
 The skill checks its model gates up front and blocks with a reason when one is unavailable, instead of quietly downgrading:
 
-- Claude Code `>= 2.1.170` with access to Claude Opus 5 (`claude-opus-5`) at `max` effort — the primary leg
+- Claude Code `>= 2.1.170` with access to Claude Fable 5 (`claude-fable-5`) at `max` effort — the base leg that does the work
+- Claude Opus 5 (`claude-opus-5`) at `max` effort — the reviewer leg: the standing Claude review voice
 - Codex CLI `>= 0.144.0` with access to GPT-5.6 Sol at `xhigh` reasoning (plan-review and code-review gates; `ultra` is a breadth mode reserved for tasks that genuinely decompose into independent parts, so the single-problem gates run depth-mode `xhigh`)
-- Optionally, access to Claude Fable 5 (`claude-fable-5`) at `max` effort — the third voice. Without it the workflow still runs; hard-problem escalations just fall back to the primary model and the degradation is recorded
 - `gh` CLI authenticated for the target repository
 - Python 3 (standard library only) for the helper scripts
 
-The models are floors, not pins. When a newer eligible model shows up (in the Codex live catalog, or a newer model observed in Claude Code), the gate selects it automatically and records the swap in state and the run's audit trail. Each leg advances only along its own lineage — a newer Fable does not promote the primary, and a newer Opus does not promote the third voice. Down-tier variants (`-mini`, `-nano`) are never selected, and anything below a floor still blocks.
+The models are floors, not pins. When a newer eligible model shows up (in the Codex live catalog, or a newer model observed in Claude Code), the gate selects it automatically and records the swap in state and the run's audit trail. Each leg advances only along its own lineage — a newer Opus does not advance the base, and a newer Fable does not advance the reviewer. Down-tier variants (`-mini`, `-nano`) are never selected, and anything below a floor still blocks.
 
 ## FAQ
 
@@ -77,8 +77,8 @@ Because a run on a quietly-substituted model looks fine right up until the PR is
 **Can I run it Claude-only, without Codex?**
 Not out of the box. The cross-vendor gate is the point: the model that writes the code is not the model that approves it. If you want a Claude-only variant anyway, the gates live in two places, the "Mandatory Model Policy" section of `SKILL.md` and `scripts/model_policy.py`. `scripts/test_model_policy.py` pins the expected decisions, so change both together and the tests will tell you what you missed.
 
-**What is the third voice for?**
-Escalation. The primary model reviews, Codex approves, and when those two cannot converge — a stalled plan review, a large diff, findings that stop decreasing, or an outright disagreement — a third model is brought in rather than re-running one that already spoke. It supplements the Codex verdict and never replaces it, and because it is a supplement, losing it degrades the run instead of blocking it.
+**Which model does what?**
+Fable 5 is the base: it writes the plan and the code, explores, and carries the delegated work. Two different reviewers judge that work in every review discussion — Claude Opus 5 at `max` (the structured review and every Claude review fallback) and GPT-5.6 Sol at `xhigh` (the plan verdict and diff review). When a discussion stalls or the two reviewers disagree, the escalation voice is the model not already in that discussion — the Opus reviewer for a stalled plan review, a fresh read-only base-lineage context for a code-review dispute — rather than a rerun of one that already spoke.
 
 **What does a run cost?**
 More than you'd guess from a chat session. A full issue-to-clean-PR cycle makes a lot of frontier-model calls: plan-review rounds, multi-pass self-review, the monitor loop. Keep issues small if cost matters.
