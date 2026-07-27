@@ -129,7 +129,7 @@ Every failing `GATING_CHECK` must be investigated and either fixed or BLOCKed vi
 
 **All bot feedback must be addressed** — whether from required CI checks or non-required review bots. Even trivial feedback you agree with should be fixed in this PR, not deferred. The only exception is genuinely false positives.
 
-First run every resolved `review_feedback_inventory_step` (if any) exactly as repository policy requires. Treat its output as supplemental review context and never as a substitute for the paginated REST/GraphQL completeness and identity queries below.
+First run every step in the resolved `review_feedback_inventory_steps` list (if any) exactly as repository policy requires. Treat its output as supplemental review context and never as a substitute for the paginated REST/GraphQL completeness and identity queries below.
 
 **Known bots in this project (non-exhaustive):**
 
@@ -213,7 +213,7 @@ gh api "repos/$OWNER/$REPO/pulls/<PR_NUMBER>/reviews/<review_id>" --jq '{id, bod
 **For replying to inline comments (in order of preference):**
 
 1. `gh api` REST: `POST /repos/$OWNER/$REPO/pulls/<PR_NUMBER>/comments/{comment_id}/replies`
-2. GitHub MCP `mcp__plugin_github_github__add_reply_to_pull_request_comment`
+2. The session's configured GitHub MCP reply tool — resolve it against what the repository documents (CLAUDE.md, contributor docs, or the Project Profile) rather than assuming a name: organizations often configure a dedicated server/tool for review replies; where only the GitHub plugin is present, `mcp__plugin_github_github__add_reply_to_pull_request_comment` is the equivalent
 3. `gh pr comment` for general (non-inline) replies
 
 This loop **auto-resolves bot-authored threads only**. It still evaluates, fixes, and replies to every external human feedback surface; it never marks a human thread resolved on the reviewer's behalf. Human reviewer feedback is gated as follows:
@@ -341,7 +341,7 @@ From the paginated Pull Reviews REST results where `author_type == "Bot"` AND `a
    - Do NOT implement it
    - Reply with a clear explanation of why
 6. **Reply to every comment** — either:
-   - For inline review threads: use `gh api` or GitHub MCP `add_reply_to_pull_request_comment` to reply directly in the thread
+   - For inline review threads: use `gh api` or the session's configured GitHub MCP reply tool (see the reply-preference list above) to reply directly in the thread
    - For general comments: `gh pr comment <PR_NUMBER> --body "..."`
    - Content: `✅ Fixed in commit {sha}` with brief explanation, or `Reviewed — keeping as-is because {reason}. Happy to change if you disagree.`
    - **Verify reply success:** On failure log `comment:<rest_comment_id>@<EDIT_KEY>:reply_failed`; do not update reply/processed maps.

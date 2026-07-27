@@ -31,13 +31,13 @@ If `base_branch` cannot be resolved, BLOCK with a clear error — every downstre
 
 ### `QUALITY_CHECK_STEPS`
 
-A structured list of `[runner, script]` pairs to execute sequentially for quality validation. **No raw shell strings** — each step is a runner + script pair.
+A structured list of argv vectors to execute sequentially for quality validation. **No raw shell strings** — each step is a full argv vector (`[runner, arg, ...]`), and every element is passed to the process as a separate argument.
 
 **Resolution:**
 
 1. Search CLAUDE.md for sections like "Before Committing", "Quality", "Common Commands"
-2. Extract each command, split into runner and script (e.g., `yarn lint:fix` → `["yarn", "lint:fix"]`, `cargo test` → `["cargo", "test"]`, `make check` → `["make", "check"]`)
-3. Validate each runner exists: `command -v <runner>` (more portable than `which`). If a discovered runner is missing, set the workflow to BLOCKED and notify the user which quality step cannot be executed. Do NOT silently skip discovered quality checks.
+2. Extract each command into an argv vector, one element per argument (e.g., `yarn lint:fix` → `["yarn", "lint:fix"]`, `cargo fmt --check` → `["cargo", "fmt", "--check"]`, `make check` → `["make", "check"]`)
+3. Validate each runner (the first argv element) exists: `command -v <runner>` (more portable than `which`). If a discovered runner is missing, set the workflow to BLOCKED and notify the user which quality step cannot be executed. Do NOT silently skip discovered quality checks.
 
    Typical quality-check runners (`yarn`, `npm`, `pnpm`, `cargo`, `make`, `python`, `ruff`, `mypy`, `pytest`, etc.) should be on `PATH`. Project-local binaries like `eslint`/`prettier` are invoked through the package manager, so the resolved runner stays `yarn`/`npm`/etc. — no special-casing for `./node_modules/.bin/` or `npx --no-install` is needed.
 

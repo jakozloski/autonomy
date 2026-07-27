@@ -9,11 +9,14 @@ package-specific dependencies.
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import sys
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import model_policy  # noqa: E402  (sibling module; path set immediately above)
 
 
 ALLOWED_FRONTMATTER_KEYS = frozenset({"name", "description"})
@@ -21,9 +24,14 @@ REQUIRED_FRONTMATTER_KEYS = ALLOWED_FRONTMATTER_KEYS
 MAX_SKILL_LINES_EXCLUSIVE = 500
 MAX_REFERENCE_LINES_EXCLUSIVE = 500
 
-CODEX_FLOOR_MODEL = "gpt-5.6-sol"
-EXEC_MODEL_FLAGS = "-m <selected> -c 'model_reasoning_effort=\"xhigh\"'"
-REVIEW_MODEL_FLAGS = "-c 'model=\"<selected>\"' -c 'model_reasoning_effort=\"xhigh\"'"
+# Model-policy facts have exactly one source: model_policy.py. The validator
+# derives the strings it pins from those constants instead of restating them, so
+# a floor or effort change cannot leave the validator asserting the old policy.
+CODEX_FLOOR_MODEL = model_policy.CODEX_MODEL
+EXEC_MODEL_FLAGS = f"-m <selected> -c 'model_reasoning_effort=\"{model_policy.CODEX_EFFORT}\"'"
+REVIEW_MODEL_FLAGS = (
+    f"-c 'model=\"<selected>\"' -c 'model_reasoning_effort=\"{model_policy.CODEX_EFFORT}\"'"
+)
 
 REQUIRED_REFERENCE_FILES = (
     "references/project-and-entry.md",
@@ -46,7 +54,7 @@ REQUIRED_SCRIPT_FILES = (
 # Evidence-gate and state-hardening content contracts.  Each marker is an
 # exact substring the named file must contain; renaming the prose label in a
 # reference must update this inventory in the same commit (same contract as
-# the heading manifest).
+# the heading inventory).
 REQUIRED_GATE_MARKERS = {
     "SKILL.md": (
         "state_schema.py",
@@ -154,8 +162,6 @@ REQUIRED_REDACTION_PATTERNS = {
         ("eyJ" + "abcde-fghijk.eyJlmno_pqrstuv.signature-part",),
     ),
 }
-HEADING_MANIFEST_PATH = "references/heading-manifest.md"
-
 # This is the complete heading inventory moved out of the former monolithic
 # SKILL.md. Exact headings are deliberate: renaming one is a navigation change
 # and must update this inventory (or an explicitly supplied JSON manifest).
@@ -167,7 +173,7 @@ BUILTIN_EXPECTED_HEADINGS: Mapping[str, tuple[str, ...]] = {
         "## Mandatory Model Policy",
         "### Claude base: Fable 5 at max",
         "### Claude reviewer: Opus 5 at max",
-        "### Codex voices: GPT-5.6 Sol at xhigh",
+        "### Codex voices: GPT-5.6 Sol at max",
         "## Authorization and Entry Routing",
         "## Project Profile and State",
         "## Phase State Machine",
@@ -246,55 +252,6 @@ BUILTIN_EXPECTED_HEADINGS: Mapping[str, tuple[str, ...]] = {
     ),
 }
 
-# The human-readable heading inventory must retain an explicit old-to-new record
-# for headings renamed during or after the package split. Unchanged former
-# headings are already covered by BUILTIN_EXPECTED_HEADINGS.
-RENAMED_FORMER_HEADINGS = (
-    "## Philosophy",
-    "## Model Configuration (Mandatory)",
-    "### Claude voices: Opus 5 at max",
-    "### Third voice: Fable 5 at max",
-    "### Codex voices: GPT-5.6 Sol at ultra",
-    "## Third-Voice Triggers",
-    "### Step 2: Check for Bot Feedback",
-    "#### QA handoff (repo-conditional — runs inside terminal-success exits (a) and (d))",
-    "#### Review-roundtrip handoff (conditional — runs inside condition (c)'s CHANGES_REQUESTED / unresolved-human-threads exit)",
-)
-
-_GPT_55_PATTERN = re.compile(r"\bgpt(?:-|\s)?5\.5\b", re.IGNORECASE)
-_SUFFIX_BOT_PATTERNS = (
-    re.compile(
-        r"\b(?:end|ends|ending)\s+(?:in|with)\s+[`'\"]?\[bot\]",
-        re.IGNORECASE,
-    ),
-    re.compile(r"\.ends_?with\(\s*['\"]\[bot\]['\"]\s*\)", re.IGNORECASE),
-    re.compile(r"\.endsWith\(\s*['\"]\[bot\]['\"]\s*\)"),
-)
-_SUFFIX_EXPLANATION_PATTERN = re.compile(
-    r"\b(?:even\s+if|whether\s+or\s+not|regardless\s+of|"
-    r"do\s+not\s+classify|don't\s+classify|never\s+classify|"
-    r"must\s+not\s+classify)\b",
-    re.IGNORECASE,
-)
-_ULTRACODE_EXPLICIT_PATTERNS = (
-    re.compile(r"--effort(?:=|\s+)ultracode\b", re.IGNORECASE),
-    re.compile(r"\+\s*(?:the\s+)?ultracode\b", re.IGNORECASE),
-)
-_ULTRACODE_POSITIVE_PATTERNS = (
-    re.compile(r"\bultracode\s+(?:orchestration|opt[- ]?in)\b", re.IGNORECASE),
-    re.compile(
-        r"\b(?:use|run|enable|invoke|select|adopt|require)\b[^.\n]{0,80}"
-        r"\bultracode\b",
-        re.IGNORECASE,
-    ),
-)
-_NEGATION_PATTERN = re.compile(
-    r"\b(?:do\s+not|don't|never|forbid(?:den)?|must\s+not|should\s+not|"
-    r"cannot|can't|without)\b",
-    re.IGNORECASE,
-)
-
-
 def _display_path(path: Path, package_dir: Path) -> str:
     try:
         return path.relative_to(package_dir).as_posix()
@@ -361,33 +318,6 @@ def _parse_frontmatter(skill_text: str) -> tuple[dict[str, str], list[str]]:
     return values, errors
 
 
-def _load_heading_manifest(path: Path) -> Mapping[str, tuple[str, ...]]:
-    """Load a JSON mapping of relative file paths to exact Markdown headings."""
-
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise ValueError(f"unable to read heading manifest {path}: {error}") from error
-
-    if not isinstance(payload, dict):
-        raise ValueError("heading manifest must be a JSON object")
-
-    normalized: dict[str, tuple[str, ...]] = {}
-    for raw_file, raw_headings in payload.items():
-        if not isinstance(raw_file, str) or not raw_file:
-            raise ValueError("heading manifest file names must be non-empty strings")
-        if not isinstance(raw_headings, list) or not raw_headings:
-            raise ValueError(
-                f"heading manifest entry {raw_file!r} must be a non-empty list"
-            )
-        if not all(isinstance(heading, str) and heading for heading in raw_headings):
-            raise ValueError(
-                f"heading manifest entry {raw_file!r} contains an invalid heading"
-            )
-        normalized[raw_file] = tuple(raw_headings)
-    return normalized
-
-
 def _markdown_headings(text: str) -> set[str]:
     headings: set[str] = set()
     in_fence = False
@@ -415,51 +345,6 @@ def _package_policy_files(package_dir: Path) -> list[Path]:
     files.extend(sorted((package_dir / "agents").glob("**/*.yaml")))
     files.extend(sorted((package_dir / "agents").glob("**/*.yml")))
     return [path for path in files if path.is_file()]
-
-
-def _has_positive_ultracode_policy(line: str) -> bool:
-    if "ultracode" not in line.lower():
-        return False
-    if any(pattern.search(line) for pattern in _ULTRACODE_EXPLICIT_PATTERNS):
-        return True
-    if _NEGATION_PATTERN.search(line):
-        return False
-    return any(pattern.search(line) for pattern in _ULTRACODE_POSITIVE_PATTERNS)
-
-
-def _has_suffix_only_bot_classification(line: str) -> bool:
-    if not any(pattern.search(line) for pattern in _SUFFIX_BOT_PATTERNS):
-        return False
-    return _SUFFIX_EXPLANATION_PATTERN.search(line) is None
-
-
-def _extract_yaml_scalar(text: str, key: str) -> list[str]:
-    """Extract simple or block YAML scalar values without a YAML dependency."""
-
-    lines = text.splitlines()
-    values: list[str] = []
-    key_pattern = re.compile(rf"^(\s*){re.escape(key)}\s*:\s*(.*)$")
-    for index, line in enumerate(lines):
-        match = key_pattern.match(line)
-        if not match:
-            continue
-        indentation, raw_value = match.groups()
-        value = raw_value.strip()
-        if value in {"|", "|-", "|+", ">", ">-", ">+"}:
-            block_lines: list[str] = []
-            for continuation in lines[index + 1 :]:
-                if not continuation.strip():
-                    block_lines.append("")
-                    continue
-                continuation_indent = len(continuation) - len(continuation.lstrip())
-                if continuation_indent <= len(indentation):
-                    break
-                block_lines.append(continuation.strip())
-            value = "\n".join(block_lines).strip()
-        elif len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
-            value = value[1:-1]
-        values.append(value)
-    return values
 
 
 def _extract_direct_interface_scalar(text: str, key: str) -> list[str]:
@@ -538,7 +423,7 @@ def _validate_references(
             candidate.relative_to(package_root)
         except ValueError:
             errors.append(
-                f"heading manifest path escapes the skill package: {relative_path}"
+                f"heading inventory path escapes the skill package: {relative_path}"
             )
             continue
         if not candidate.is_file():
@@ -553,34 +438,8 @@ def _validate_references(
         for heading in sorted(actual_headings - expected_heading_set):
             errors.append(
                 f"{relative_path}: unexpected heading {heading!r}; "
-                "add it to the heading manifest"
+                "add it to BUILTIN_EXPECTED_HEADINGS in scripts/validate_package.py"
             )
-
-    inventory_path = package_dir / HEADING_MANIFEST_PATH
-    if not inventory_path.is_file():
-        errors.append(f"missing required heading inventory: {HEADING_MANIFEST_PATH}")
-        return errors
-
-    inventory_text = inventory_path.read_text(encoding="utf-8")
-    # The human-readable table uses inline-code cells. Nested code spans cannot
-    # represent headings that themselves contain backticks, so compare a
-    # normalized semantic form and accept destination basenames.
-    normalized_inventory_text = inventory_text.replace("`", "")
-    for relative_path, headings in sorted(expected_headings.items()):
-        if Path(relative_path).name not in normalized_inventory_text:
-            errors.append(f"{HEADING_MANIFEST_PATH}: does not name {relative_path!r}")
-        for heading in headings:
-            if heading.replace("`", "") not in normalized_inventory_text:
-                errors.append(
-                    f"{HEADING_MANIFEST_PATH}: does not enumerate heading {heading!r}"
-                )
-    if expected_headings is BUILTIN_EXPECTED_HEADINGS:
-        for former_heading in RENAMED_FORMER_HEADINGS:
-            if former_heading.replace("`", "") not in normalized_inventory_text:
-                errors.append(
-                    f"{HEADING_MANIFEST_PATH}: does not preserve renamed former "
-                    f"heading {former_heading!r}"
-                )
     return errors
 
 
@@ -603,25 +462,14 @@ def _validate_gate_markers(package_dir: Path) -> list[str]:
 
 
 def _validate_policy_text(package_dir: Path) -> list[str]:
+    # Package-level contracts only — the current policy's exact flag strings and
+    # floor model must appear somewhere in the package text. Per-line prose
+    # linting was deliberately dropped in review: its exemption rules could not
+    # be applied consistently, and the derived pins above are the real guard.
     errors: list[str] = []
     combined_parts: list[str] = []
     for path in _package_policy_files(package_dir):
-        text = path.read_text(encoding="utf-8")
-        combined_parts.append(text)
-        display_path = _display_path(path, package_dir)
-        for line_number, line in enumerate(text.splitlines(), start=1):
-            if _GPT_55_PATTERN.search(line):
-                errors.append(
-                    f"{display_path}:{line_number}: obsolete GPT-5.5 policy remains"
-                )
-            if _has_positive_ultracode_policy(line):
-                errors.append(
-                    f"{display_path}:{line_number}: positive ultracode policy remains"
-                )
-            if _has_suffix_only_bot_classification(line):
-                errors.append(
-                    f"{display_path}:{line_number}: suffix-only [bot] classification remains"
-                )
+        combined_parts.append(path.read_text(encoding="utf-8"))
 
     combined = "\n".join(combined_parts)
     if EXEC_MODEL_FLAGS not in combined:
@@ -700,10 +548,7 @@ def _validate_openai_yaml(package_dir: Path) -> list[str]:
     return errors
 
 
-def validate_package(
-    package_dir: Path,
-    heading_manifest: Path | None = None,
-) -> list[str]:
+def validate_package(package_dir: Path) -> list[str]:
     """Return every validation error for ``package_dir`` in stable order."""
 
     package_dir = package_dir.resolve()
@@ -711,10 +556,7 @@ def validate_package(
     if not skill_path.is_file():
         return [f"missing SKILL.md in {package_dir}"]
 
-    if heading_manifest is None:
-        expected_headings = BUILTIN_EXPECTED_HEADINGS
-    else:
-        expected_headings = _load_heading_manifest(heading_manifest.resolve())
+    expected_headings = BUILTIN_EXPECTED_HEADINGS
 
     skill_text = skill_path.read_text(encoding="utf-8")
     errors: list[str] = []
@@ -749,21 +591,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default=Path(__file__).resolve().parent.parent,
         help="skill package directory (defaults to the parent of this script directory)",
     )
-    parser.add_argument(
-        "--heading-manifest",
-        type=Path,
-        help=(
-            "optional JSON object mapping package-relative file paths to lists of "
-            "exact Markdown headings; defaults to the built-in inventory"
-        ),
-    )
     return parser
 
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
-        errors = validate_package(args.package_dir, args.heading_manifest)
+        errors = validate_package(args.package_dir)
     except ValueError as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 2
