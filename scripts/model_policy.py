@@ -53,10 +53,29 @@ Expected input shape::
       }
     }
 
-The live catalog is a preflight signal.  The first real Codex invocation is
-the authoritative entitlement/quota signal.  A timeout or transport failure
-may retry once with the exact same model and effort; every other Codex failure
-blocks, and no path proposes a downgrade.
+The live catalog is the capability/model-selection gate: it proves an eligible
+model exists, and never proves authentication, entitlement, or quota.  Access
+is proven by a real invocation, and the workflow runs that invocation as an
+entry smoke test BEFORE planning spend, so a dead credential fails fast instead
+of surfacing after Phase 1.  ``first_real_invocation`` therefore carries the
+MOST RECENT real-invocation observation (the entry smoke first, then each
+Phase 2 review round); its ``attempts`` are scoped to that one invocation's
+retry sequence and reset every round, never accumulated across stages.  A
+timeout or transport failure may retry once with the exact same model and
+effort; every other Codex failure blocks, and no path proposes a downgrade.
+
+Once the entry smoke succeeds, its selection is FROZEN for the workflow.
+``verify_frozen_selection`` re-checks a frozen model against a fresh catalog
+and a frozen routing descriptor; it never re-selects, so a newer model that
+appears mid-run is not silently adopted un-smoked.  Auto-forward happens at
+the next workflow's entry.
+
+Stream supervision lives here too, so the authentication boundary is tested
+code rather than prose: ``classify_stream_event`` decides whether one
+source-tagged line is an auth failure, and ``supervise_stream`` reads the real
+stdout/stderr pipe handles concurrently and kills the process group on the
+first ``auth_error``.  This module still makes no vendor calls and never spawns
+Codex; the caller supplies the process handles and the kill callback.
 
 Three legs are evaluated, and all three are gating: a failure on any leg
 blocks the workflow.  ``claude`` is the base leg — the working side: the
@@ -92,10 +111,13 @@ deliberately not part of this gate.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import selectors
 import sys
-from typing import Any, Callable, Mapping, NamedTuple
+import time
+from typing import IO, Any, Callable, Iterable, Mapping, NamedTuple
 
 
 SCHEMA_VERSION = 3
@@ -165,7 +187,7 @@ _FABLE_SLUG = re.compile(
 _CODEX_BLOCKING_FAILURES = {
     "entitlement_denied": (
         "entitlement_denied",
-        "GPT-5.6 Sol entitlement was denied by the first real invocation",
+        "GPT-5.6 Sol entitlement was denied by the real invocation",
         "request_access",
     ),
     "quota_exhausted": (
@@ -175,22 +197,642 @@ _CODEX_BLOCKING_FAILURES = {
     ),
     "model_unavailable": (
         "model_unavailable",
-        "GPT-5.6 Sol was unavailable to the first real invocation",
+        "GPT-5.6 Sol was unavailable to the real invocation",
         "request_access",
     ),
     "authentication_error": (
         "authentication_error",
-        "Codex authentication failed during the first real invocation",
+        "Codex authentication failed during the real invocation; auth failures are non-retryable",
         "repair_authentication",
     ),
     "error": (
         "invocation_error",
-        "The first real GPT-5.6 Sol invocation failed",
+        "The real GPT-5.6 Sol invocation failed",
         "inspect_error_and_block",
     ),
 }
 
 _CODEX_RETRYABLE_FAILURES = {"timeout", "transport_error"}
+
+# ---------------------------------------------------------------------------
+# Stream supervision (authentication boundary)
+# ---------------------------------------------------------------------------
+
+# Source constants are assigned by supervise_stream from the actual pipe handle
+# a line arrived on.  They are never read from event content: an event may
+# contain an attacker- or repository-supplied "source" field, and honouring it
+# would let assistant text masquerade as a transport error (or hide one).
+SOURCE_STDOUT_JSON = "stdout_json"
+SOURCE_STDERR = "stderr"
+
+# Only these event types can carry an authentication verdict.  Assistant
+# messages, tool output, reasoning, and unknown well-formed events are always
+# benign no matter what text they contain -- a plan or review that merely
+# discusses "HTTP 401" must never kill a healthy invocation.
+_AUTH_BEARING_EVENT_TYPES = frozenset(
+    {"error", "transport_error", "stream_error", "response.failed"}
+)
+
+# Deterministic authentication signatures. Matched only inside auth-bearing
+# structured events or CLI diagnostic stderr.
+_AUTH_SIGNATURES = (
+    "invalid_refresh_token",
+    "invalid_api_key",
+    "invalid_grant",
+    "unauthorized",
+    "authentication_error",
+    "token has expired",
+    "token expired",
+    "credentials have been revoked",
+)
+
+# A raw record larger than this means framing is broken (or hostile): bound the
+# parser instead of accumulating an unbounded buffer.
+MAX_RAW_RECORD_BYTES = 1 << 20  # 1 MiB
+
+# Persisted diagnostic evidence is capped per channel.
+MAX_EXCERPT_BYTES = 4096
+
+CLASSIFY_EXIT_CLEAN = 0
+CLASSIFY_EXIT_AUTH_ERROR = 3
+CLASSIFY_EXIT_INTERNAL_FAILURE = 4
+CLASSIFY_EXIT_TIMEOUT = 5
+
+_URL_TAIL = re.compile(r"(?P<url>[a-zA-Z][a-zA-Z0-9+.-]*://[^\s'\"]*)")
+_URL_USERINFO = re.compile(r"(?P<scheme>[a-zA-Z][a-zA-Z0-9+.-]*://)[^/@\s]*@")
+
+
+def strip_url_secrets(text: str) -> str:
+    """Remove userinfo, query strings, and fragments from any URL in *text*.
+
+    Credential-named-field exclusion alone is not enough: a base URL such as
+    ``https://user:token@host/path?key=SECRET#frag`` carries secrets in its
+    value.  This runs BEFORE fingerprinting and before any excerpt is
+    persisted.
+    """
+
+    def _clean(match: re.Match[str]) -> str:
+        url = match.group("url")
+        url = _URL_USERINFO.sub(r"\g<scheme>", url)
+        for separator in ("?", "#"):
+            head, sep, _ = url.partition(separator)
+            if sep:
+                url = head + sep + "[STRIPPED]"
+        return url
+
+    return _URL_TAIL.sub(_clean, text)
+
+
+def classify_stream_event(source: str, line: str) -> str:
+    """Classify one source-tagged line as ``auth_error``/``benign``/``internal_failure``.
+
+    ``source`` must be one of the module's source constants; ``supervise_stream``
+    derives it from the real file descriptor.  Only auth-bearing structured
+    events on the JSON channel and CLI diagnostic stderr can yield
+    ``auth_error``.  Unparseable JSON on the JSON channel means supervision
+    itself failed, which is ``internal_failure`` -- not something to shrug off,
+    because an unmonitored invocation is exactly what this boundary prevents.
+    """
+
+    if len(line.encode("utf-8", "surrogatepass")) > MAX_RAW_RECORD_BYTES:
+        return "internal_failure"
+
+    if source == SOURCE_STDERR:
+        return "auth_error" if _has_auth_signature(line) else "benign"
+
+    if source != SOURCE_STDOUT_JSON:
+        return "internal_failure"
+
+    stripped = line.strip()
+    if not stripped:
+        return "benign"
+
+    try:
+        event = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        return "internal_failure"
+
+    if not isinstance(event, dict):
+        return "benign"
+
+    event_type = event.get("type")
+    if not isinstance(event_type, str) or event_type not in _AUTH_BEARING_EVENT_TYPES:
+        return "benign"
+
+    return "auth_error" if _has_auth_signature(_auth_scope_text(event)) else "benign"
+
+
+def _auth_scope_text(event: dict[str, Any]) -> str:
+    """Collect only the error-bearing fields of an auth-bearing event."""
+
+    parts: list[str] = []
+    status = event.get("status") or event.get("status_code")
+    if isinstance(status, (int, str)) and not isinstance(status, bool):
+        parts.append(f"status={status}")
+    for key in ("code", "error_code", "message", "error", "reason", "detail"):
+        value = event.get(key)
+        if isinstance(value, str):
+            parts.append(value)
+        elif isinstance(value, dict):
+            for nested_key in ("code", "message", "type", "reason"):
+                nested = value.get(nested_key)
+                if isinstance(nested, str):
+                    parts.append(nested)
+                nested_status = value.get("status")
+                if isinstance(nested_status, (int, str)) and not isinstance(
+                    nested_status, bool
+                ):
+                    parts.append(f"status={nested_status}")
+    return " ".join(parts)
+
+
+def _has_auth_signature(text: str) -> bool:
+    """True when *text* carries a deterministic authentication failure marker.
+
+    Callers must pass only auth-bearing structured-event fields or diagnostic
+    stderr — never assistant/tool content, which may discuss "401" innocently.
+    """
+
+    lowered = text.lower()
+    if any(signature in lowered for signature in _AUTH_SIGNATURES):
+        return True
+    return bool(re.search(r"(?<!\d)401(?!\d)", lowered))
+
+
+def bounded_excerpt(existing: str, addition: str) -> str:
+    """Append *addition* to *existing*, URL-stripped and byte-capped.
+
+    Only recognised transport/error events and diagnostic stderr are ever
+    passed here; assistant/tool/unknown payloads (which can embed repository
+    source) never reach persisted evidence.
+
+    This strips URL-embedded credentials ONLY.  A bare ``Authorization:
+    Bearer ...`` or ``OPENAI_API_KEY=...`` in stderr survives, so the caller
+    must still apply the package's format-anchored Secret/Token Redaction
+    before persisting the excerpt anywhere.
+    """
+
+    combined = f"{existing}\n{strip_url_secrets(addition)}" if existing else strip_url_secrets(addition)
+    encoded = combined.encode("utf-8", "surrogatepass")
+    if len(encoded) <= MAX_EXCERPT_BYTES:
+        return combined
+    return encoded[:MAX_EXCERPT_BYTES].decode("utf-8", "ignore")
+
+
+class _IncrementalLineReader:
+    """UTF-8-safe, size-bounded line splitter for one pipe.
+
+    Decoding happens incrementally so a multi-byte character split across two
+    reads is not corrupted, and a record that grows past
+    ``MAX_RAW_RECORD_BYTES`` without a newline is reported as overflow rather
+    than buffered without bound.
+    """
+
+    def __init__(self) -> None:
+        self._buffer = b""
+        self.overflowed = False
+
+    def feed(self, chunk: bytes) -> list[str]:
+        self._buffer += chunk
+        lines: list[str] = []
+        while True:
+            newline = self._buffer.find(b"\n")
+            if newline == -1:
+                break
+            raw, self._buffer = self._buffer[:newline], self._buffer[newline + 1 :]
+            lines.append(raw.decode("utf-8", "replace").rstrip("\r"))
+        if len(self._buffer) > MAX_RAW_RECORD_BYTES:
+            self.overflowed = True
+            self._buffer = b""
+        return lines
+
+    def flush(self) -> list[str]:
+        """Return a final record that arrived without a trailing newline."""
+
+        if not self._buffer:
+            return []
+        raw, self._buffer = self._buffer, b""
+        return [raw.decode("utf-8", "replace").rstrip("\r")]
+
+
+def _read_available(pipe: Any, size: int) -> bytes:
+    """Read whatever is currently buffered, without waiting for a full *size*.
+
+    ``BufferedReader.read(n)`` blocks until it has n bytes or hits EOF, so a
+    40-byte auth event would sit unread until the child exited -- defeating
+    prompt termination entirely.  ``read1`` returns after one underlying read.
+    """
+
+    reader = getattr(pipe, "read1", None)
+    if callable(reader):
+        return reader(size)
+    return pipe.read(size)
+
+
+def supervise_stream(
+    stdout_pipe: IO[bytes] | None,
+    stderr_pipe: IO[bytes] | None,
+    kill_callback: Callable[[], None],
+    *,
+    read_size: int = 65536,
+    idle_timeout_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Supervise a running Codex process's real pipes; kill it on auth failure.
+
+    Takes the ACTUAL pipe handles so each line's provenance is established by
+    construction -- there is no caller-supplied tag to forge.  Both pipes are
+    drained concurrently through a selector: reading one to exhaustion while the
+    other fills its kernel buffer would deadlock, and a deadlocked supervisor
+    cannot terminate promptly, which is the whole point of this function.
+
+    Returns ``{"outcome", "exit_code", "excerpts", "auth_line_source"}`` where
+    outcome is ``clean``/``auth_error``/``internal_failure``/``timeout``.
+    Every failure outcome kills the process group; the caller then BLOCKs.
+    ``idle_timeout_seconds`` bounds SILENCE, not total runtime: the clock
+    resets on every byte received, so a slow-but-alive stream is never killed.
+    That distinction is the whole point — a max-effort review legitimately runs for
+    many minutes, and a total-runtime cap would SIGKILL healthy reviews.  It
+    defaults to ``None`` (no internal bound) because the caller owns the
+    aggregate deadline; pass a value only to detect a child that has gone
+    completely silent.  This function
+    never spawns a process and never inspects credentials.
+    """
+
+    excerpts: dict[str, str] = {SOURCE_STDOUT_JSON: "", SOURCE_STDERR: ""}
+    readers = {
+        SOURCE_STDOUT_JSON: _IncrementalLineReader(),
+        SOURCE_STDERR: _IncrementalLineReader(),
+    }
+    outcome = "clean"
+    auth_line_source: str | None = None
+
+    selector = selectors.DefaultSelector()
+    registered = 0
+    for source, pipe in ((SOURCE_STDOUT_JSON, stdout_pipe), (SOURCE_STDERR, stderr_pipe)):
+        if pipe is not None:
+            selector.register(pipe, selectors.EVENT_READ, source)
+            registered += 1
+
+    def _next_deadline() -> float | None:
+        if idle_timeout_seconds is None:
+            return None
+        return time.monotonic() + idle_timeout_seconds
+
+    deadline = _next_deadline()
+    try:
+        while registered and outcome == "clean":
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                outcome = "timeout"
+                break
+            ready = selector.select(remaining)
+            if not ready:
+                # Nothing readable for a whole idle window: the child is silent.
+                outcome = "timeout"
+                break
+            # Activity: restart the idle clock, so a long-but-alive stream
+            # (a max-effort review emitting over several minutes) is never killed.
+            deadline = _next_deadline()
+            for key, _ in ready:
+                source = key.data
+                pipe = key.fileobj
+                try:
+                    chunk = _read_available(pipe, read_size)
+                except OSError:
+                    outcome = "internal_failure"
+                    break
+                if not chunk:
+                    selector.unregister(pipe)
+                    registered -= 1
+                    for line in readers[source].flush():
+                        verdict = classify_stream_event(source, line)
+                        outcome, auth_line_source, excerpts = _apply_verdict(
+                            verdict, source, line, outcome, auth_line_source, excerpts
+                        )
+                        if outcome != "clean":
+                            break
+                    continue
+
+                for line in readers[source].feed(chunk):
+                    verdict = classify_stream_event(source, line)
+                    outcome, auth_line_source, excerpts = _apply_verdict(
+                        verdict, source, line, outcome, auth_line_source, excerpts
+                    )
+                    if outcome != "clean":
+                        break
+                if outcome == "clean" and readers[source].overflowed:
+                    outcome = "internal_failure"
+                if outcome != "clean":
+                    break
+    except Exception:  # pragma: no cover - defensive: supervision must fail closed
+        outcome = "internal_failure"
+    finally:
+        selector.close()
+
+    if outcome != "clean":
+        kill_callback()
+
+    exit_code = {
+        "clean": CLASSIFY_EXIT_CLEAN,
+        "auth_error": CLASSIFY_EXIT_AUTH_ERROR,
+        "internal_failure": CLASSIFY_EXIT_INTERNAL_FAILURE,
+        "timeout": CLASSIFY_EXIT_TIMEOUT,
+    }[outcome]
+    return {
+        "outcome": outcome,
+        "exit_code": exit_code,
+        "excerpts": excerpts,
+        "auth_line_source": auth_line_source,
+    }
+
+
+def _apply_verdict(
+    verdict: str,
+    source: str,
+    line: str,
+    outcome: str,
+    auth_line_source: str | None,
+    excerpts: dict[str, str],
+) -> tuple[str, str | None, dict[str, str]]:
+    """Fold one line's verdict into the running supervision outcome.
+
+    Retains diagnostic stderr as evidence but never JSON-channel benign
+    payloads, which can embed repository source.
+    """
+
+    if verdict == "auth_error":
+        excerpts[source] = bounded_excerpt(excerpts[source], line)
+        return "auth_error", source, excerpts
+    if verdict == "internal_failure":
+        return "internal_failure", auth_line_source, excerpts
+    if source == SOURCE_STDERR:
+        # Diagnostic stderr is retainable evidence; JSON-channel benign events
+        # are assistant/tool/unknown payloads and never persisted.
+        excerpts[source] = bounded_excerpt(excerpts[source], line)
+    return outcome, auth_line_source, excerpts
+
+
+def classify_tagged_lines(lines: Iterable[tuple[str, str]]) -> dict[str, Any]:
+    """Diagnostic/test-only helper behind ``--classify-stream``.
+
+    The live path is :func:`supervise_stream`, which derives provenance from
+    real file descriptors.  This helper accepts caller-supplied tags and exists
+    for offline inspection and tests only.
+    """
+
+    verdicts: list[dict[str, str]] = []
+    outcome = "clean"
+    for source, line in lines:
+        verdict = classify_stream_event(source, line)
+        verdicts.append({"source": source, "verdict": verdict})
+        if verdict != "benign" and outcome == "clean":
+            outcome = verdict
+            break
+    exit_code = {
+        "clean": CLASSIFY_EXIT_CLEAN,
+        "auth_error": CLASSIFY_EXIT_AUTH_ERROR,
+        "internal_failure": CLASSIFY_EXIT_INTERNAL_FAILURE,
+    }[outcome]
+    return {"outcome": outcome, "exit_code": exit_code, "verdicts": verdicts}
+
+
+# ---------------------------------------------------------------------------
+# Frozen routing descriptor
+# ---------------------------------------------------------------------------
+
+# Closed schema. Anything not listed is rejected rather than persisted: this
+# object lives in the state file, so an open schema is a credential-leak path.
+DESCRIPTOR_FIELDS = frozenset(
+    {"provider", "model", "effort", "policy_overrides", "routing_fingerprint"}
+)
+ROUTING_FINGERPRINT_FIELDS = (
+    "base_url",
+    "wire_api",
+    "profile",
+    "codex_home",
+    "routing_env",
+)
+ALLOWLISTED_POLICY_OVERRIDE_KEYS = frozenset({"model_reasoning_effort"})
+# Credential-source category is observability only and deliberately NOT part of
+# the frozen comparison: a normal `none -> oauth` re-login must be able to clear
+# a human:codex-login block instead of permanently mismatching.
+CREDENTIAL_SOURCE_CATEGORIES = frozenset({"oauth", "env_key", "none"})
+_SECRET_SHAPED_KEY = re.compile(
+    r"(?i)(key|token|secret|password|credential|authorization|cookie)"
+)
+
+
+def routing_fingerprint(routing: dict[str, Any]) -> str:
+    """Digest sanitized, non-secret routing configuration.
+
+    A provider NAME is not a route: the same name can point at a different base
+    URL, profile, or CODEX_HOME after a resume.  Values are URL-stripped and
+    secret-shaped keys are dropped BEFORE digesting, so no credential material
+    reaches the digest input.
+    """
+
+    canonical: dict[str, Any] = {}
+    for field in ROUTING_FINGERPRINT_FIELDS:
+        value = routing.get(field)
+        if value is None:
+            continue
+        if field == "routing_env":
+            if not isinstance(value, dict):
+                raise ValueError("routing_env must be an object")
+            canonical[field] = {
+                str(k): strip_url_secrets(str(v))
+                for k, v in sorted(value.items())
+                if not _SECRET_SHAPED_KEY.search(str(k))
+            }
+        else:
+            canonical[field] = strip_url_secrets(str(value))
+    payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def build_descriptor(
+    provider: str,
+    model: str,
+    effort: str,
+    routing: dict[str, Any],
+    policy_overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the closed, non-secret execution descriptor."""
+
+    overrides = policy_overrides or {}
+    unknown = set(overrides) - ALLOWLISTED_POLICY_OVERRIDE_KEYS
+    if unknown:
+        raise ValueError(f"policy override keys not allowlisted: {sorted(unknown)}")
+    return {
+        "provider": strip_url_secrets(str(provider)),
+        "model": str(model),
+        "effort": str(effort),
+        "policy_overrides": {str(k): str(v) for k, v in sorted(overrides.items())},
+        "routing_fingerprint": routing_fingerprint(routing),
+    }
+
+
+def validate_descriptor(descriptor: Any) -> list[str]:
+    """Return schema errors for a persisted descriptor (empty list = valid)."""
+
+    if not isinstance(descriptor, dict):
+        return ["descriptor must be an object"]
+    errors: list[str] = []
+    unknown = set(descriptor) - DESCRIPTOR_FIELDS
+    if unknown:
+        errors.append(f"unknown descriptor fields: {sorted(unknown)}")
+    for field in ("provider", "model", "effort", "routing_fingerprint"):
+        if not isinstance(descriptor.get(field), str) or not descriptor.get(field):
+            errors.append(f"descriptor.{field} must be a non-empty string")
+    overrides = descriptor.get("policy_overrides", {})
+    if not isinstance(overrides, dict):
+        errors.append("descriptor.policy_overrides must be an object")
+    else:
+        not_allowed = set(overrides) - ALLOWLISTED_POLICY_OVERRIDE_KEYS
+        if not_allowed:
+            errors.append(f"policy override keys not allowlisted: {sorted(not_allowed)}")
+    for key in descriptor:
+        if _SECRET_SHAPED_KEY.search(str(key)):
+            errors.append(f"secret-shaped descriptor field rejected: {key}")
+    return errors
+
+
+def verify_frozen_selection(
+    frozen_model: str,
+    frozen_descriptor: dict[str, Any],
+    live_catalog: Any,
+    observed_descriptor: dict[str, Any],
+) -> dict[str, Any]:
+    """Verify a frozen selection still holds. Never re-selects.
+
+    Phase 2 re-probes cheaply and calls this: the frozen model must still be
+    catalog-eligible and the routing descriptor must still match.  A newer
+    eligible model appearing mid-run is deliberately NOT adopted -- it has not
+    been smoke-tested on this route -- so auto-forward waits for the next
+    workflow entry.
+    """
+
+    schema_errors = validate_descriptor(frozen_descriptor) + validate_descriptor(
+        observed_descriptor
+    )
+    if schema_errors:
+        return {
+            "state": "blocked",
+            "reason_code": "invalid_descriptor",
+            "reason": "; ".join(schema_errors),
+            "next_action": "correct_observation_input",
+        }
+
+    if not _codex_model_is_eligible(frozen_model, live_catalog):
+        return {
+            "state": "blocked",
+            "reason_code": "frozen_model_ineligible",
+            "reason": (
+                f"The frozen model {frozen_model} is no longer present in the live "
+                f"catalog with {CODEX_EFFORT} reasoning"
+            ),
+            "next_action": "start_new_workflow_entry_preflight",
+        }
+
+    mismatched = sorted(
+        field
+        for field in DESCRIPTOR_FIELDS
+        if frozen_descriptor.get(field) != observed_descriptor.get(field)
+    )
+    if mismatched:
+        return {
+            "state": "blocked",
+            "reason_code": "descriptor_mismatch",
+            "reason": f"Execution descriptor changed since the entry smoke: {mismatched}",
+            "next_action": "start_new_workflow_entry_preflight",
+        }
+
+    return {
+        "state": "ready",
+        "reason_code": "frozen_selection_verified",
+        "reason": (
+            f"The frozen model {frozen_model} remains eligible and the routing "
+            "descriptor is unchanged"
+        ),
+        "next_action": "reuse_frozen_selection",
+        "selection": {"selected_model": frozen_model, "reason": "frozen_selection"},
+    }
+
+
+def apply_auth_recovery(
+    frozen_descriptor: dict[str, Any],
+    observed_descriptor: dict[str, Any],
+    previous_category: str,
+    observed_category: str,
+    smoke_status: str,
+) -> dict[str, Any]:
+    """Allow a credential-category change ONLY through the login verifier.
+
+    The ``human:codex-login`` postcondition is "the user re-authenticated and a
+    fresh smoke succeeds on the same route".  Routing must be unchanged; the
+    category may change (that is the recovery).  A category change observed
+    anywhere else is an anomaly, not a recovery.
+    """
+
+    schema_errors = validate_descriptor(frozen_descriptor) + validate_descriptor(
+        observed_descriptor
+    )
+    if schema_errors:
+        return {
+            "state": "blocked",
+            "reason_code": "invalid_descriptor",
+            "reason": "; ".join(schema_errors),
+            "next_action": "correct_observation_input",
+        }
+
+    for category in (previous_category, observed_category):
+        if category not in CREDENTIAL_SOURCE_CATEGORIES:
+            return {
+                "state": "blocked",
+                "reason_code": "invalid_credential_category",
+                "reason": f"Unknown credential-source category: {category}",
+                "next_action": "correct_observation_input",
+            }
+
+    # Compare the WHOLE descriptor, exactly as verify_frozen_selection does: a
+    # smoke run on a different model, effort, provider, or override proves
+    # nothing about the frozen route.  Credential category is deliberately not
+    # in DESCRIPTOR_FIELDS — changing it is the recovery.
+    mismatched = sorted(
+        field
+        for field in DESCRIPTOR_FIELDS
+        if frozen_descriptor.get(field) != observed_descriptor.get(field)
+    )
+    if mismatched:
+        return {
+            "state": "blocked",
+            "reason_code": "descriptor_mismatch",
+            "reason": (
+                "Execution descriptor changed during authentication recovery: "
+                f"{mismatched}"
+            ),
+            "next_action": "start_new_workflow_entry_preflight",
+        }
+
+    if smoke_status != "success":
+        return {
+            "state": "blocked",
+            "reason_code": "authentication_error",
+            "reason": "Authentication recovery smoke did not succeed",
+            "next_action": "repair_authentication",
+        }
+
+    return {
+        "state": "ready",
+        "reason_code": "authentication_recovered",
+        "reason": (
+            f"Credential source recovered from {previous_category} to "
+            f"{observed_category} on an unchanged route"
+        ),
+        "next_action": "clear_human_codex_login_block",
+        "credential_source": observed_category,
+    }
+
 
 def _access_failures(prefix: str, label: str) -> dict[Any, tuple[str, str]]:
     """Access-failure table for one leg, so the two legs cannot drift apart."""
@@ -332,6 +974,26 @@ def _supports_required_effort(model: dict[str, Any]) -> bool:
     return any(
         isinstance(level, dict) and level.get("effort") == CODEX_EFFORT
         for level in levels
+    )
+
+
+def _codex_model_is_eligible(slug: str, catalog: Any) -> bool:
+    """True when *slug* is present in *catalog* with the required effort.
+
+    Used by :func:`verify_frozen_selection` to re-check an already-frozen model
+    without re-running selection.
+    """
+
+    if not isinstance(catalog, dict):
+        return False
+    models = catalog.get("models")
+    if not isinstance(models, list):
+        return False
+    return any(
+        isinstance(model, dict)
+        and model.get("slug") == slug
+        and _supports_required_effort(model)
+        for model in models
     )
 
 
@@ -477,8 +1139,8 @@ def evaluate_codex(raw: Any) -> dict[str, Any]:
                 "state": "probe_required",
                 "reason_code": "first_real_invocation_required",
                 "reason": (
-                    "Run the first real Phase 2 invocation as the authoritative "
-                    "entitlement and quota test"
+                    "Run the entry smoke invocation as the authoritative access, "
+                    "entitlement, and quota test before any planning spend"
                 ),
                 "next_action": "run_first_real_invocation",
             }
@@ -490,7 +1152,7 @@ def evaluate_codex(raw: Any) -> dict[str, Any]:
             {
                 "state": "ready",
                 "reason_code": "authoritative_invocation_succeeded",
-                "reason": "The first real GPT-5.6 Sol invocation succeeded",
+                "reason": "The real GPT-5.6 Sol invocation succeeded",
                 "next_action": "continue",
             }
         )
