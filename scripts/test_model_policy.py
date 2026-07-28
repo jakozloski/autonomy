@@ -708,6 +708,29 @@ class ModelPolicyTest(unittest.TestCase):
                 self.assertEqual(result["state"], "ready")
                 self.assertEqual(result["execution_path"], "explicit_cli")
 
+    def test_cross_family_override_is_never_equivalent(self) -> None:
+        """Same floor eligibility does not make cross-family slugs one override.
+
+        Mythos sits at the base floor for SELECTION, but a Mythos override is a
+        different model than the selected Fable — and a Fable override is not
+        the Opus reviewer. Both directions must fall back to the explicit CLI.
+        """
+
+        for leg_key, fixture, override in (
+            ("claude", valid_base, "claude-mythos-5"),
+            ("claude", valid_base, "mythos"),
+            ("claude_reviewer", valid_reviewer, "claude-fable-5"),
+            ("claude_reviewer", valid_reviewer, "fable"),
+        ):
+            with self.subTest(leg=leg_key, override=override):
+                config = fixture(
+                    environment={"CLAUDE_CODE_SUBAGENT_MODEL": override}
+                )
+                kwargs = {"base" if fixture is valid_base else "reviewer": config}
+                result = evaluate_model_policy(request(**kwargs))[leg_key]
+                self.assertEqual(result["state"], "ready")
+                self.assertEqual(result["execution_path"], "explicit_cli")
+
     def test_cli_reads_json_and_writes_only_the_decision(self) -> None:
         payload = request()
         stdin = io.StringIO(json.dumps(payload))
