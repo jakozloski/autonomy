@@ -399,15 +399,15 @@ Re-invoke /autonomy to resume from this state.
 
 Long-running calls have aggregate deadlines, but no blocking wait may exceed 60 seconds. Start an async/session-backed command, poll it in `poll_chunk_seconds <= 60` chunks, and emit a brief progress update at least once per minute. Cancel or follow the documented failure policy when the aggregate deadline is reached.
 
-| Call                                 | Tool      | Timeout        | Notes                                                                    |
-| ------------------------------------ | --------- | -------------- | ------------------------------------------------------------------------ |
-| CI watch                             | async     | 540s aggregate | Poll command/check snapshot in ≤60s chunks; post progress each minute.   |
-| Dev server startup                   | Bash      | 60s            | Mandatory repository checks BLOCK on failure; advisory checks may waive. |
-| `codex exec` plan/code review        | async     | 540s aggregate | Run in a session and poll in ≤60s chunks; never one blocking 540s call.  |
-| `codex exec resume`                  | async     | 540s aggregate | Same chunked polling and progress rule.                                  |
-| `feature-dev:code-reviewer` subagent | Agent     | 1200s          | Agent tool has no harness cap; this is a soft budget.                    |
-| `general-purpose` fallback subagent  | Agent     | 1200s          | Same as above.                                                           |
-| gstack `/autoplan` (multi-phase)     | async × N | 1800s total    | Split phases and poll every ≤60s; track aggregate elapsed.               |
+| Call                                 | Tool      | Timeout         | Notes                                                                                                                                        |
+| ------------------------------------ | --------- | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| CI watch                             | async     | 540s aggregate  | Poll command/check snapshot in ≤60s chunks; post progress each minute.                                                                       |
+| Dev server startup                   | Bash      | 60s             | Mandatory repository checks BLOCK on failure; advisory checks may waive.                                                                     |
+| `codex exec` plan/code review        | async     | 1200s aggregate | Sized for max effort: healthy max reviews observed at ~13 min — the xhigh-era 540s kills them. Poll in ≤60s chunks; never one blocking call. |
+| `codex exec resume`                  | async     | 1200s aggregate | Same chunked polling and progress rule.                                                                                                      |
+| `feature-dev:code-reviewer` subagent | Agent     | 1200s           | Agent tool has no harness cap; this is a soft budget.                                                                                        |
+| `general-purpose` fallback subagent  | Agent     | 1200s           | Same as above.                                                                                                                               |
+| gstack `/autoplan` (multi-phase)     | async × N | 1800s total     | Split phases and poll every ≤60s; track aggregate elapsed.                                                                                   |
 
 When an aggregate deadline fires, log `<adapter>:timeout` in `attempt_log`. The mandatory Phase 2 Codex gate gets one retry and then BLOCKs; it never falls through to a lower model or Claude-only approval. Later optional review voices may use only their documented exact-model Claude fallback.
 
