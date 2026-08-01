@@ -28,9 +28,9 @@ while True:
   if loop_reason == "wait_repoll":
     poll_ticks += 1
     state.monitor_poll_ticks = poll_ticks
-    fetch fresh checks, feedback metadata (Phase A only — see Step 2), branch/protection state, head, grace clock
+    wait <= POLL_CHUNK with progress, THEN fetch fresh checks, feedback metadata (Phase A only — see Step 2), branch/protection state, head, grace clock — ONE sequential wait→refresh operation per tick, in a single tool round where the host permits composing them, never concurrent and never one round per query (see the Polling schedule cost note)
     if the exact clean wait condition still holds:
-      wait <= POLL_CHUNK with progress; continue
+      continue
     # Any failure, feedback, branch action, draft flip, terminal handoff, pause,
     # or completion needs mutation/state transition and must consume work.
     loop_reason = "work"
@@ -141,7 +141,7 @@ First run every step in the resolved `review_feedback_inventory_steps` list (if 
 
 **Catch-all rule:** REST `.user.type == "Bot"` identifies a bot. GraphQL typename is supplementary diagnostics only; a missing/conflicting REST join fails closed to `manual_unknown_feedback`. Never classify by login suffix.
 
-- **Phase A — metadata sweep (every pass, including `wait_repoll` ticks; token discipline, MANDATORY):** run the queries below exactly as written — projections deliberately EXCLUDE `body` for everyone except `authenticated_actor` (own top-level comments keep `body` for `<!-- ack:... -->` anchor rescans after a restart; reviews carry `body_len` so the empty/non-empty rules still work), because bodies of items already replied to or acknowledged at an unchanged edit timestamp are dead weight that would otherwise re-enter context on every pass — at CodeRabbit volume, the largest recurring token cost of this loop. Every identity, reply-detection, ack-staleness, unreplied-set, and Step 4 exit computation uses Phase A fields only: ids, authors, author types, timestamps, `in_reply_to_id`, thread resolution, review state. A `wait_repoll` tick is Phase A-only by definition; discovering a Phase B candidate promotes the pass to `work` (loop pseudocode).
+- **Phase A — metadata sweep (every pass, including `wait_repoll` ticks; token discipline, MANDATORY):** run the queries below exactly as written — projections deliberately EXCLUDE `body` for EVERYONE, including `authenticated_actor` on all but the FIRST Phase A pass of an invocation (that first pass keeps the actor's own top-level comment `body` for `<!-- ack:... -->` anchor rescans after a restart; afterwards the `acknowledged_*` state maps are primary and any actor comment that is new or edited since that scan gets a Phase B single-record fetch; reviews carry `body_len` so the empty/non-empty rules still work), because bodies of items already replied to or acknowledged at an unchanged edit timestamp are dead weight that would otherwise re-enter context on every pass — at CodeRabbit volume, the largest recurring token cost of this loop. Every identity, reply-detection, ack-staleness, unreplied-set, and Step 4 exit computation uses Phase A fields only: ids, authors, author types, timestamps, `in_reply_to_id`, thread resolution, review state. A `wait_repoll` tick is Phase A-only by definition; discovering a Phase B candidate promotes the pass to `work` (loop pseudocode).
 - **Phase B — targeted body fetch (work passes only):** fetch full bodies ONLY for records this pass must actually evaluate — inline roots in `unreplied_all` (including roots whose `updated_at` invalidated an earlier reply), top-level bot/human comments unacknowledged or edited since their ack, and review bodies that may hold unique actionable items and are unacknowledged or edited since their ack — via the single-record endpoints at the end of the block below. Never evaluate, fix from, or reply to a record whose body was not fetched at its current `updated_at`; if a Phase B response carries a newer `updated_at` than Phase A recorded, recompute staleness with the fresh value before acting.
 
 ```bash
@@ -151,7 +151,7 @@ OWNER=$(gh repo view --json owner --jq '.owner.login')
 REPO=$(gh repo view --json name --jq '.name')
 ACTOR=<authenticated_actor from state>  # see "Resolve the authenticated actor" below
 
-# Top-level PR comments (Issues API; PRs are issues). Phase A keeps body ONLY for the actor's own comments (ack-anchor rescans).
+# Top-level PR comments (Issues API; PRs are issues). Keep the actor-body clause below ONLY on the invocation's FIRST Phase A pass (ack-anchor rescan); on every later pass DROP the `+ (if ...)` clause — metadata only.
 gh api --paginate "repos/$OWNER/$REPO/issues/<PR_NUMBER>/comments" \
   --jq ".[] | {id, author: .user.login, author_type: .user.type, created_at, updated_at} + (if .user.login == \"$ACTOR\" then {body} else {} end)"
 
@@ -284,7 +284,7 @@ From the paginated Issues REST comments where `author_type == "Bot"` AND `author
 
 - GitHub PR conversation comments are **NOT threaded** — there is no "reply to comment" mechanism for top-level comments
 - **"Addressed" = agent has posted a PR comment containing `<!-- ack:comment:<bot_comment_id> -->` AND the bot comment has not been edited since the ack was posted**
-- Check `acknowledged_top_level_comments` in state, AND scan existing PR comments for the anchor tag from `authenticated_actor` (handles dedup on restart; own-comment bodies are present in the Phase A projection). If acknowledged but the bot comment's `updated_at` is newer than the ack comment's `created_at`, treat as unaddressed (bot may have updated its feedback).
+- Check `acknowledged_top_level_comments` in state, AND scan existing PR comments for the anchor tag from `authenticated_actor` (handles dedup on restart; own-comment bodies come from the invocation's first Phase A pass, then from Phase B fetches of new/edited actor comments). If acknowledged but the bot comment's `updated_at` is newer than the ack comment's `created_at`, treat as unaddressed (bot may have updated its feedback).
 - Log each attempt as `toplevel:<bot_comment_id>@<updated_at>:<issue_signature>`; exhaustion and its state key are scoped to that edit timestamp.
 - If unaddressed → fetch its body via Phase B; if it contains actionable feedback → fix, commit, post acknowledgment:
   ```text

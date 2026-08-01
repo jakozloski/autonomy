@@ -162,7 +162,7 @@ monitor_self_review_call_count: 0
 post_push_until: null # ISO 8601 timestamp string (e.g., "2026-03-02T19:30:00Z") or null. Set on every push that advances the remote AND on the draft→ready flip.
 last_observed_head_sha: null # Fresh PR headRefOid; any change clears polls and re-arms grace, including collaborator pushes.
 # Rolling list of { head_sha, observed_at } objects (max 2 — first and most recent).
-# Populated by Step 4 stable-poll gate after every pass that shows canonical unreplied_all == 0 AND grace_elapsed.
+# Populated by Step 4 stable-poll gate after every pass that shows canonical unreplied_all == 0 (grace runs concurrently; grace_elapsed stays a separate exit conjunct).
 # CLEARED on any push, on any dirty observation (including non-empty
 # manual_unknown_feedback), and on the draft→ready flip. Stable-poll satisfied =
 # 2 entries with (latest - earliest) >= BOT_GRACE_WINDOW.
@@ -292,8 +292,8 @@ decision_audit_trail: [] # append-only strings: THE authoritative Decision Audit
 - **`thread_reply_timestamps` gates only the INLINE-COMMENT branch of `all_feedback_addressed`.** Both maps use REST comment IDs as keys (since the REST-first migration). A REST comment ID in `last_processed_threads` but NOT in `thread_reply_timestamps` is one the agent saw but failed to reply to — it remains in `unreplied_all` and will be retried (up to the 3-strike limit).
 - **`all_feedback_addressed` (which gates Step 4 exits (a) and (d)) is a logical AND across all current surfaces:**
   1. `unreplied_all == 0` (inline bot comments) — driven by `thread_reply_timestamps`
-  2. All top-level bot comments acknowledged — driven by `acknowledged_top_level_comments` plus a live PR scan for `<!-- ack:comment:<id> -->` tags from `authenticated_actor`
-  3. All bot review summaries with unique actionable items acknowledged — driven by `acknowledged_top_level_reviews` plus a live PR scan for `<!-- ack:review:<id> -->` tags
+  2. All top-level bot comments acknowledged — driven by `acknowledged_top_level_comments` plus the ack-anchor scan for `<!-- ack:comment:<id> -->` tags (invocation's first Phase A pass + Phase B for new/edited actor comments)
+  3. All bot review summaries with unique actionable items acknowledged — driven by `acknowledged_top_level_reviews` plus the same ack-anchor scan for `<!-- ack:review:<id> -->` tags
   4. `unresolved_bot_threads == 0` after verified GraphQL resolution
   5. Every external-human top-level comment/review body is acknowledged at its current edit timestamp
   6. `exhausted_feedback` is empty

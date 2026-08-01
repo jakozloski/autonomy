@@ -57,7 +57,7 @@ An unsatisfied CI-config self-verification is a work item, never a wait state: l
 
 #### MANDATORY VERIFICATION GATE
 
-Before evaluating any exit condition that ends the loop (conditions a, c, d), you MUST execute and print a sanity-check verification block. This is a hard precondition: declaring exit without printing this block is a workflow violation. (Reminder: when `defect_evidence_mode != "none"`, the core Validation-Before-Push evidence re-bind — `evaluated_head_sha`/`analyzed_head_sha` equal to the push HEAD — applies to every monitor-loop push too; a monitor fix commit invalidates both until re-run.)
+Before EXECUTING the draft-PR flip or any exit condition that ends the loop (conditions a, c, d), you MUST execute and print a sanity-check verification block — run it after the pass's canonical evaluation selects that outcome and before performing it. This is a hard precondition: declaring exit (or flipping) without printing this block is a workflow violation. (Reminder: when `defect_evidence_mode != "none"`, the core Validation-Before-Push evidence re-bind — `evaluated_head_sha`/`analyzed_head_sha` equal to the push HEAD — applies to every monitor-loop push too; a monitor fix commit invalidates both until re-run.)
 
 **This block is a SANITY CHECK.** The canonical unreplied detection above (compute `unreplied_all` / `unreplied_actionable` from REST `in_reply_to_id` + `authenticated_actor` + edit-timestamp comparison + `thread_reply_timestamps` grace) is authoritative. This block must not diverge from it — if the simplified count here disagrees with the canonical values, trust the canonical values for gating decisions and log the discrepancy for investigation.
 
@@ -98,7 +98,7 @@ FEEDBACK GATE: unresolved_bot_threads=B unacked_human=H exhausted=E manual_unkno
 - If `unreplied_actionable == 0` AND `unreplied_all > 0` → this is terminal exhaustion. Fall through to exit-condition evaluation so condition (c) fires BLOCKED. Do NOT return to Step 2 (nothing more to do there).
 - If `unreplied_all == 0` → proceed to evaluate exit conditions below.
 - Any non-zero `unresolved_bot_threads`, unacknowledged current human item, `exhausted_feedback`, or `manual_unknown_feedback` count prevents exit regardless of the simplified inline count.
-- The verification block must be RE-RUN at the start of every Step 4 pass. Do NOT cache the result across iterations.
+- The verification block must be RE-RUN, fresh, for every flip or exit it gates; a pass that resolves to a (b)/(e) re-poll takes no externally visible action and skips it. Do NOT cache or reuse a prior pass's result.
 
 **Why this gate exists:** Without it, agents can mistakenly declare PAUSED while bot comments remain unreplied (observed failure mode: agent reports "all 30 replied" while 1 new Bugbot comment is open from a recent rescan). The sanity block gives a quick visual check; the canonical rules are the authority.
 
@@ -123,7 +123,7 @@ Condition (c) is checked FIRST so that terminal exhaustion, `CHANGES_REQUESTED`,
 
 - **(b) If `reviewDecision == "APPROVED"` BUT (NOT `grace_elapsed(post_push_until)` OR NOT `stable_poll_confirmed`):**
   - Bot reviewers may still post feedback after the recent push. Do NOT declare workflow complete.
-  - Track clean polls per the stable-poll gate below (append `{head_sha, observed_at}` only when canonical feedback is fully clean and grace elapsed); confirmation requires two observations of the same head separated by `BOT_GRACE_WINDOW`.
+  - Track clean polls per the stable-poll gate below (append `{head_sha, observed_at}` whenever canonical feedback is fully clean — grace need not have elapsed to record); confirmation requires two observations of the same head separated by `BOT_GRACE_WINDOW`.
   - Output:
     ```text
     ⏳ PR approved but bot grace window active (<M> min remaining) OR waiting on second clean poll. Re-polling to catch any late feedback.
@@ -281,11 +281,11 @@ Track `clean_poll_timestamps: []` as `{head_sha, observed_at}` records. This gat
 
 **Polling schedule:**
 
-A single long sleep would violate the host contract. Enforce the stable-poll gate by elapsed-time comparison across async/≤60s wait chunks and iteration re-entries, with a brief progress update at least once per minute. Keep every wait INSIDE the turn (an async wait polled in ≤60s chunks); never implement a wait by ending the turn or scheduling a wake-up longer than the provider's prompt-cache TTL (~5 minutes) — a turn-ending wait past the TTL forces the next pass to re-read the entire accumulated context at full input price, which costs far more than the poll it defers. The ≤60s chunk bound is therefore a cost invariant as well as a host-contract one: waiting changes when the next check runs, never what it evaluates.
+A single long sleep would violate the host contract. Enforce the stable-poll gate by elapsed-time comparison across async/≤60s wait chunks and iteration re-entries, with a brief progress update at least once per minute. Keep every wait INSIDE the turn; never implement a wait by ending the turn: a non-terminal turn end violates the core's Terminal-exit turn contract and strands the run on hosts without a guaranteed wake-up — that liveness guarantee, plus host portability, is the rationale. Cost is NOT the rationale: at these constants, chunked in-turn waiting at cache-read prices and a single post-TTL full re-read are the same order of magnitude, and every tick ROUND pays a cache-read of the whole accumulated context — which is why each tick MUST be one sequential wait→refresh operation in a single tool round where the host permits composing them, never concurrent and never one round per query. A wait primitive whose single call exceeds 60s is permissible only when it still yields a progress heartbeat at least once per minute — no uninterrupted silent interval may exceed 60 seconds — and stays under the ~5-minute prompt-cache TTL. Waiting changes when the next check runs, never what it evaluates.
 
 > **This schedule is reached only via conditions (b)/(e).** Every clean pre-grace or pre-stability wait sets `loop_reason = "wait_repoll"` before its ≤60s chunk. When grace matures, the passive read-only pass promotes back to `work` before draft flip, handoff, pause, or completion. Thus required waiting never consumes the logical-work cap.
 
-- After a Step 4 pass shows the canonical `unreplied_all == 0` AND `grace_elapsed(post_push_until)`:
+- After a Step 4 pass shows the canonical `unreplied_all == 0` (recording does NOT wait for `grace_elapsed` — grace and the stability window run CONCURRENTLY; `grace_elapsed(post_push_until)` remains an independent conjunct of every exit, so an exit still requires full grace AND a ≥`BOT_GRACE_WINDOW` observed-clean span on the exit head):
   1. Record `{head_sha: headRefOid, observed_at: now}` in `clean_poll_timestamps`:
      - If the list is empty → append (this becomes the FIRST observation; never overwritten until cleared).
      - If the list has exactly 1 entry → append (this becomes the MOST RECENT observation).
