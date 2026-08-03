@@ -260,16 +260,18 @@ Evaluated on every Step 4 pass, after condition (c) and before (a)/(b)/(d)/(e). 
 Action when it fires (state first, action second — crash-safe ordering):
 
 1. Persist `post_push_until = now + BOT_GRACE_WINDOW` and CLEAR `clean_poll_timestamps` in state. (If the session dies before step 2 completes, resume re-enters the loop with the PR still a draft and the grace window armed; the gate simply re-fires after fresh clean polls.)
-2. Flip the PR: `gh pr ready <PR_NUMBER>`. If the command fails, log `ready:flip` in `attempt_log` and return to Step 1 — 3 attempts with the same signature trigger the standard 3-strike BLOCK via condition (c).
+2. Flip the PR: `gh pr ready <PR_NUMBER>`. If the command fails, log `ready:flip` in `attempt_log` and return to Step 1 — 3 attempts with the same signature trigger the standard 3-strike BLOCK via condition (c). After a successful flip, request the human review the flip exists to invite: `gh pr edit <PR_NUMBER> --add-reviewer <login>` for each reviewer the repository's review-routing conventions or the user's standing routing guidance name for the diff's surfaces, and make those same logins the PR assignee set (assignee = who holds the ball; same atomic replacement the handoffs above use). When no convention resolves a reviewer, skip the request rather than guess — the (a)/(d) handoffs still route ownership at exit. A failed request or assignment appends `⚠️ Reviewer request failed: request <login> manually.` to the flip output but never un-flips, blocks, or re-drafts the PR.
 3. Output:
    ```text
    📣 PR #<number> marked ready for review — checks green, feedback addressed, branch current.
+   Review requested: <logins, or "none resolved by routing — ownership routes at exit">.
    Bugbot's single per-PR review triggers on this flip. Continuing monitor loop to catch its feedback.
    ```
 4. Return to Step 1, treating the flip exactly like a push event — the fresh grace window plus cleared clean polls give Bugbot's ~13-min scan the same coverage a post-push scan would get.
 
 Rules enforced by this gate:
 
+- The flip is autonomous. Its preconditions are the only authorization it needs: never pause a flip-eligible draft to ask the user whether to mark it ready or whom to ping, and never park a clean draft for the user to look over first — a stalled clean draft that pings nobody is exactly the failure this gate exists to remove (user directive, 2026-08-02).
 - Conditions (a) and (d) MUST NOT fire while `isDraft == true`. Exiting the loop with a draft PR would strand it: Bugbot never runs, and humans never see it marked ready.
 - If condition (c) fires (BLOCKED) while the PR is still a draft, LEAVE it as a draft. A blocked PR is by definition not ready for human review; the draft state is the correct signal to the team.
 - Never convert a ready PR back to draft (takeover or otherwise) — Bugbot's single run cannot be re-armed by flipping state.
