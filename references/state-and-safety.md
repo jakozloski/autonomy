@@ -68,7 +68,7 @@ resolved_conventions:
       gate_status: "pending"
       policy_decision: {}
     claude_reviewer:
-      # Reviewer leg (always-runs structured review + every Claude review fallback). Gating — a blocked gate stops the workflow.
+      # Reviewer leg (always-runs structured review + every Claude review fallback). Availability failures degrade onto the ready base lineage (recorded in policy_decision.degradation + the audit trail); malformed observations still block.
       model: "claude-opus-5"
       effort: "max"
       subagent_override: null

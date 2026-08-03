@@ -139,6 +139,12 @@ LAST_CHECK_ENUM = frozenset(("passing", "failing", "pending"))
 LEDGER_STATUS_ENUM = frozenset(
     ("open", "fixed", "false_positive", "escalated", "auto_closed")
 )
+# Voices that may raise a ledger finding — the documented enum from
+# references/state-and-safety.md, enforced so per-voice precision stays
+# measurable (which reviewer found what, fixed vs false_positive).
+LEDGER_REVIEWER_ENUM = frozenset(
+    ("gstack_review", "octo_review", "code_reviewer", "adversarial", "escalation_voice")
+)
 TERMINAL_MONITOR = frozenset(("complete", "paused", "blocked"))
 
 # Full top-level key inventory of the documented v1 schema.  Presence beyond
@@ -1113,6 +1119,11 @@ class _Validator:
                     self.error(
                         f"finding_ledger.entries[{position}].{str_key}: must be a non-empty string"
                     )
+            self.check_enum(
+                entry.get("reviewer"),
+                LEDGER_REVIEWER_ENUM,
+                f"finding_ledger.entries[{position}].reviewer",
+            )
             if not self.check_enum(
                 entry.get("status"), LEDGER_STATUS_ENUM, f"finding_ledger.entries[{position}].status"
             ):

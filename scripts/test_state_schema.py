@@ -868,10 +868,12 @@ class ValueContractTests(unittest.TestCase):
                 "    - seq_id: 1",
                 '      fingerprint: "a:b:c:d"',
                 '      session_id: "phase_4"',
+                '      reviewer: "code_reviewer"',
                 '      status: "open"',
                 "    - seq_id: 1",
                 '      fingerprint: "a:b:c:e"',
                 '      session_id: "phase_4"',
+                '      reviewer: "code_reviewer"',
                 '      status: "open"',
             )
         )
@@ -1118,6 +1120,78 @@ class MainEntryTests(unittest.TestCase):
         payload = json.loads(buffer.getvalue())
         self.assertEqual(payload["state"], SUSPECT)
         self.assertTrue(any("read or decoded" in e for e in payload["errors"]))
+
+
+LEDGER_ENTRY = "\n".join(
+    (
+        "  entries:",
+        "    - seq_id: 1",
+        '      fingerprint: "correctness:cache.service.ts:getRaw:silent-fallback"',
+        '      session_id: "phase_4"',
+        "      pass_number: 1",
+        '      phase: "phase_4"',
+        '      reviewer: "code_reviewer"',
+        '      status: "open"',
+        "      resolution_sha: null",
+        "      justification: null",
+        "      attempts: 1",
+        "      files_in_scope: []",
+    )
+)
+
+
+class FindingLedgerReviewerTests(unittest.TestCase):
+    """The documented reviewer enum is enforced, not just documented."""
+
+    def _with_entry(self, entry_block: str) -> str:
+        return _mutate(
+            FULL_STATE,
+            "finding_ledger:\n  next_seq_id: 1\n  entries: []",
+            "finding_ledger:\n  next_seq_id: 2\n" + entry_block,
+        )
+
+    def test_every_documented_reviewer_value_is_valid(self) -> None:
+        for reviewer in (
+            "gstack_review",
+            "octo_review",
+            "code_reviewer",
+            "adversarial",
+            "escalation_voice",
+        ):
+            with self.subTest(reviewer=reviewer):
+                text = self._with_entry(
+                    LEDGER_ENTRY.replace('"code_reviewer"', f'"{reviewer}"')
+                )
+                result = evaluate_state_text(text)
+                self.assertEqual(result["errors"], [])
+                self.assertEqual(result["state"], VALID)
+
+    def test_missing_reviewer_is_rejected(self) -> None:
+        text = self._with_entry(
+            LEDGER_ENTRY.replace('      reviewer: "code_reviewer"\n', "")
+        )
+        result = evaluate_state_text(text)
+        self.assertIn(
+            "finding_ledger.entries[0].reviewer: illegal value", result["errors"]
+        )
+
+    def test_unknown_reviewer_value_is_rejected(self) -> None:
+        text = self._with_entry(
+            LEDGER_ENTRY.replace('"code_reviewer"', '"codex_gpt"')
+        )
+        result = evaluate_state_text(text)
+        self.assertIn(
+            "finding_ledger.entries[0].reviewer: illegal value", result["errors"]
+        )
+
+    def test_non_string_reviewer_is_rejected(self) -> None:
+        text = self._with_entry(
+            LEDGER_ENTRY.replace('reviewer: "code_reviewer"', "reviewer: 7")
+        )
+        result = evaluate_state_text(text)
+        self.assertIn(
+            "finding_ledger.entries[0].reviewer: illegal value", result["errors"]
+        )
 
 
 if __name__ == "__main__":

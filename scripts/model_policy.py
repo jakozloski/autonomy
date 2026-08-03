@@ -77,13 +77,24 @@ stdout/stderr pipe handles concurrently and kills the process group on the
 first ``auth_error``.  This module still makes no vendor calls and never spawns
 Codex; the caller supplies the process handles and the kill callback.
 
-Three legs are evaluated, and all three are gating: a failure on any leg
-blocks the workflow.  ``claude`` is the base leg — the working side: the
-implementing lineage, explorers, delegated work, and the fresh-context
+Three legs are evaluated.  The base and Codex legs are gating: a failure on
+either blocks the workflow.  ``claude`` is the base leg — the working side:
+the implementing lineage, explorers, delegated work, and the fresh-context
 escalation voice.  ``claude_reviewer`` is the reviewer leg — the always-runs
 structured review and every Claude review fallback: one of the two reviewers
 in every review discussion, next to the Codex verdict.  The separation is the
 point: the model that writes the code is not a model that approves it.
+
+The reviewer leg degrades instead of gating.  An availability-class reviewer
+failure (CLI missing/too old, access, entitlement, provider policy, ZDR) with
+no explicit waiver does not block: when the base leg is ``ready``, the
+aggregate rewrites the reviewer decision to state ``degraded`` — every Claude
+review voice falls back to the selected base model in a fresh read-only
+context, and the run continues with the degradation recorded (Claude review
+is no longer cross-lineage from the base for that run).  Malformed reviewer
+observations still block — garbage input is corrected, never degraded around
+— an unverified observation ("unknown" access/ZDR) blocks until probed, and
+an explicit reviewer waiver still preempts auto-degradation.
 
 Model selection is floor-based, not pinned.  From the observed facts the
 helper selects the newest eligible model at or above each floor: for Codex,
@@ -120,7 +131,7 @@ import time
 from typing import IO, Any, Callable, Iterable, Mapping, NamedTuple
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 CODEX_MODEL = "gpt-5.6-sol"  # floor: newest eligible catalog model >= this wins
 CODEX_FLOOR_VERSION = (5, 6)
@@ -880,6 +891,22 @@ _BASE_ZDR_FAILURES = _zdr_failures("Claude Fable 5")
 _REVIEWER_ACCESS_FAILURES = _access_failures("opus", "Claude Opus 5")
 _REVIEWER_ZDR_FAILURES = _zdr_failures("Claude Opus 5")
 
+# Observed-unavailability reason codes the reviewer leg may degrade around.
+# The *_unverified codes are deliberately absent: an unprobed observation
+# blocks until it is probed — auto-degrading on "unknown" would let a caller
+# skip the reviewer without ever checking whether Opus was available.
+_DEGRADABLE_OBSERVED_FAILURES = frozenset(
+    (
+        "cli_missing",
+        "version_unparseable",
+        "cli_too_old",
+        "opus_unavailable",
+        "opus_entitlement_denied",
+        "opus_provider_policy_denied",
+        "zdr_incompatible",
+    )
+)
+
 _ACCESS_STATUS_VALUES = (
     "available, unavailable, entitlement_denied, provider_policy_denied, or unknown"
 )
@@ -1238,6 +1265,7 @@ class _ClaudeLegSpec(NamedTuple):
     ready_code: str
     agent_action: str
     cli_action: str
+    degrades_to_base: bool
 
 
 def _claude_leg_base(version: Any, spec: _ClaudeLegSpec) -> dict[str, Any]:
@@ -1265,6 +1293,7 @@ def _claude_leg_base(version: Any, spec: _ClaudeLegSpec) -> dict[str, Any]:
         "waiver_granted": False,
         "downgrade_allowed": False,
         "fallback_model": None,
+        "degradable_to_base": False,
         "selection": None,
     }
 
@@ -1464,6 +1493,15 @@ def _waive_or_block_claude(
             "reason": reason,
             "next_action": spec.restore_action,
             "waiver_required": True,
+            # Observed availability failure with no waiver engaged: the
+            # aggregate may rewrite this block into a recorded base-lineage
+            # degradation — reviewer leg only, observed failures only
+            # (unverified observations stay blocking until probed), and
+            # only onto a ready base.
+            "degradable_to_base": (
+                spec.degrades_to_base
+                and reason_code in _DEGRADABLE_OBSERVED_FAILURES
+            ),
         }
     )
     return decision
@@ -1694,6 +1732,7 @@ _BASE_LEG = _ClaudeLegSpec(
     ready_code="base_ready",
     agent_action="invoke_base_agent",
     cli_action="invoke_explicit_base_cli",
+    degrades_to_base=False,
 )
 
 _REVIEWER_LEG = _ClaudeLegSpec(
@@ -1721,6 +1760,7 @@ _REVIEWER_LEG = _ClaudeLegSpec(
     ready_code="reviewer_ready",
     agent_action="invoke_reviewer_agent",
     cli_action="invoke_explicit_reviewer_cli",
+    degrades_to_base=True,
 )
 
 
@@ -1734,6 +1774,65 @@ def evaluate_claude_reviewer(raw: Any) -> dict[str, Any]:
     """Evaluate the reviewer Opus/max leg — the standing Claude review voice."""
 
     return _evaluate_claude_leg(raw, _REVIEWER_LEG)
+
+
+def _degrade_reviewer_to_base(
+    reviewer: dict[str, Any], base: dict[str, Any]
+) -> dict[str, Any]:
+    """Rewrite a blocked reviewer decision as a recorded base-lineage fallback.
+
+    Only availability-class failures arrive here (the no-waiver branch of
+    ``_waive_or_block_claude`` marks them ``degradable_to_base``), and only a
+    ``ready`` base hosts the fallback: the degraded voice reuses exactly the
+    execution decision the base leg already proved out, under the same
+    read-only review boundary.  A ``waived`` base never hosts it — that would
+    put one substitute model on both sides of every review discussion, which
+    is the cross-model property this gate exists to protect.  Degradation is
+    a recorded state, not a silent repair: the caller logs it in the Decision
+    Audit Trail, because for this run Claude review is no longer
+    cross-lineage from the base.
+    """
+
+    degraded = dict(reviewer)
+    degraded.update(
+        {
+            "state": "degraded",
+            "blocking": False,
+            "reason_code": "reviewer_degraded_to_base",
+            "reason": (
+                f"{reviewer['reason']}; every Claude review voice falls back"
+                f" to the selected base model ({base['model']}) in a fresh"
+                " read-only context — Claude review is no longer"
+                " cross-lineage from the base for this run"
+            ),
+            "degradation": {
+                "reason_code": reviewer["reason_code"],
+                "reason": reviewer["reason"],
+                "fallback_leg": "claude",
+                "floor_model": REVIEWER_MODEL,
+            },
+            "model": base["model"],
+            "effort": REVIEWER_EFFORT,
+            "selection": {
+                "floor_model": REVIEWER_MODEL,
+                "selected_model": base["model"],
+                "reason": "reviewer_degraded_to_base",
+            },
+            "execution_path": base["execution_path"],
+            "arguments": list(base["arguments"]),
+            "environment_unset": list(base["environment_unset"]),
+            "subagent_model_override": base["subagent_model_override"],
+            "next_action": (
+                "invoke_reviewer_agent"
+                if base["execution_path"] == "agent_tool"
+                else "invoke_explicit_reviewer_cli"
+            ),
+            "waiver_required": False,
+            "degradable_to_base": False,
+            "fallback_model": base["model"],
+        }
+    )
+    return degraded
 
 
 def evaluate_model_policy(request: Any) -> dict[str, Any]:
@@ -1752,8 +1851,19 @@ def evaluate_model_policy(request: Any) -> dict[str, Any]:
     codex = evaluate_codex(request.get("codex"))
     claude = evaluate_claude(request.get("claude"))
     reviewer = evaluate_claude_reviewer(request.get("claude_reviewer"))
-    # All three legs gate: the base writes, and both reviewers must be able to
-    # judge what it wrote, so a failure on any leg blocks the workflow.
+    # The base and Codex legs gate: the base writes, and the cross-vendor
+    # verdict must be able to judge what it wrote.  The reviewer leg
+    # degrades instead of gating — an availability failure falls back onto
+    # the ready base lineage as a recorded degradation.  Malformed
+    # observations and engaged-but-invalid waivers keep their blocking
+    # semantics (they are never marked degradable), and a blocked or
+    # waived base never hosts the fallback.
+    if (
+        reviewer["state"] == "blocked"
+        and reviewer.get("degradable_to_base") is True
+        and claude["state"] == "ready"
+    ):
+        reviewer = _degrade_reviewer_to_base(reviewer, claude)
     states = {codex["state"], claude["state"], reviewer["state"]}
     if "blocked" in states:
         state = "blocked"
@@ -1763,6 +1873,8 @@ def evaluate_model_policy(request: Any) -> dict[str, Any]:
         state = "probe_required"
     elif "waived" in states:
         state = "waived"
+    elif "degraded" in states:
+        state = "degraded"
     else:
         state = "ready"
 

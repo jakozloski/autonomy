@@ -330,7 +330,7 @@ class ModelPolicyTest(unittest.TestCase):
                 self.assertFalse(result["downgrade_allowed"])
                 self.assertIsNone(result["fallback_model"])
 
-    def test_claude_legs_missing_and_old_cli_block_pending_waiver(self) -> None:
+    def test_claude_legs_missing_and_old_cli_gate_by_leg(self) -> None:
         for key, _, factory, _ in LEGS:
             cases = (
                 ({"installed": False}, "cli_missing"),
@@ -339,6 +339,14 @@ class ModelPolicyTest(unittest.TestCase):
             for config, reason_code in cases:
                 with self.subTest(leg=key, reason_code=reason_code):
                     result = evaluate_model_policy(leg_request(key, config))[key]
+                    if key == "claude_reviewer":
+                        # Observed CLI failures on the reviewer degrade onto
+                        # the ready base instead of blocking.
+                        self.assertEqual(result["state"], "degraded")
+                        self.assertEqual(
+                            result["degradation"]["reason_code"], reason_code
+                        )
+                        continue
                     self.assertEqual(result["state"], "blocked")
                     self.assertEqual(result["reason_code"], reason_code)
                     self.assertTrue(result["waiver_required"])
@@ -377,31 +385,47 @@ class ModelPolicyTest(unittest.TestCase):
                     f"base leg must report fable_* codes, got {result['reason_code']}",
                 )
 
-    def test_reviewer_opus_access_failures_block_pending_waiver(self) -> None:
-        for access in (
-            "unavailable",
-            "entitlement_denied",
-            "provider_policy_denied",
-            "unknown",
-        ):
+    def test_reviewer_opus_access_failures_degrade_observed_block_unverified(
+        self,
+    ) -> None:
+        for access in ("unavailable", "entitlement_denied", "provider_policy_denied"):
             with self.subTest(access=access):
                 result = evaluate_model_policy(
                     request(reviewer=valid_reviewer(opus_access=access))
                 )["claude_reviewer"]
-                self.assertEqual(result["state"], "blocked")
-                self.assertTrue(result["waiver_required"])
+                self.assertEqual(result["state"], "degraded")
+                self.assertEqual(
+                    result["reason_code"], "reviewer_degraded_to_base"
+                )
                 self.assertTrue(
-                    result["reason_code"].startswith("opus_"),
-                    f"reviewer leg must report opus_* codes, got {result['reason_code']}",
+                    result["degradation"]["reason_code"].startswith("opus_"),
+                    "reviewer leg must report opus_* codes, got "
+                    f"{result['degradation']['reason_code']}",
                 )
 
-    def test_claude_zdr_failures_block_pending_waiver(self) -> None:
+        unverified = evaluate_model_policy(
+            request(reviewer=valid_reviewer(opus_access="unknown"))
+        )["claude_reviewer"]
+        self.assertEqual(unverified["state"], "blocked")
+        self.assertTrue(unverified["waiver_required"])
+        self.assertEqual(unverified["reason_code"], "opus_access_unverified")
+
+    def test_claude_zdr_failures_gate_by_leg(self) -> None:
         for key, _, factory, _ in LEGS:
             for status in ("incompatible", "denied", "unknown"):
                 with self.subTest(leg=key, status=status):
                     result = evaluate_model_policy(
                         leg_request(key, factory(zero_data_retention=status))
                     )[key]
+                    if key == "claude_reviewer" and status != "unknown":
+                        # Observed ZDR failure on the reviewer degrades onto
+                        # the ready base instead of blocking.
+                        self.assertEqual(result["state"], "degraded")
+                        self.assertEqual(
+                            result["degradation"]["reason_code"],
+                            "zdr_incompatible",
+                        )
+                        continue
                     self.assertEqual(result["state"], "blocked")
                     self.assertTrue(result["waiver_required"])
                     self.assertIn(
@@ -451,11 +475,11 @@ class ModelPolicyTest(unittest.TestCase):
         self.assertEqual(waived["model"], "claude-opus-5")
         self.assertEqual(waived["execution_path"], "explicit_cli")
 
-    def test_reviewer_unavailability_can_only_continue_after_explicit_waiver(
+    def test_reviewer_unavailability_degrades_and_waiver_still_preempts(
         self,
     ) -> None:
         unavailable = valid_reviewer(opus_access="unavailable")
-        blocked = evaluate_model_policy(request(reviewer=unavailable))[
+        degraded = evaluate_model_policy(request(reviewer=unavailable))[
             "claude_reviewer"
         ]
 
@@ -471,9 +495,10 @@ class ModelPolicyTest(unittest.TestCase):
             "claude_reviewer"
         ]
 
-        self.assertEqual(blocked["state"], "blocked")
+        self.assertEqual(degraded["state"], "degraded")
+        self.assertEqual(degraded["model"], BASE_MODEL)
         self.assertEqual(
-            blocked["next_action"], "request_explicit_waiver_or_restore_opus_access"
+            degraded["degradation"]["reason_code"], "opus_unavailable"
         )
         self.assertEqual(waived["state"], "waived")
         self.assertTrue(waived["waiver_granted"])
@@ -988,7 +1013,7 @@ class AutoForwardSelectionTest(unittest.TestCase):
 
 
 class GatingAggregateTest(unittest.TestCase):
-    """All three legs gate: the base writes, both reviewers must be able to judge."""
+    """Base and Codex gate; the reviewer degrades onto a ready base instead."""
 
     def test_blocked_base_blocks_the_workflow(self) -> None:
         result = evaluate_model_policy(
@@ -1000,8 +1025,10 @@ class GatingAggregateTest(unittest.TestCase):
         self.assertEqual(result["claude"]["reason_code"], "fable_unavailable")
         self.assertTrue(result["claude"]["waiver_required"])
 
-    def test_blocked_reviewer_blocks_the_workflow(self) -> None:
-        """An unavailable reviewer is a block, not a recorded degradation."""
+    def test_unavailable_reviewer_degrades_onto_the_base_instead_of_blocking(
+        self,
+    ) -> None:
+        """An availability-class reviewer failure is a recorded degradation."""
 
         for field, value, reason_code in (
             ("opus_access", "unavailable", "opus_unavailable"),
@@ -1014,11 +1041,117 @@ class GatingAggregateTest(unittest.TestCase):
                     request(reviewer=valid_reviewer(**{field: value}))
                 )
 
-                self.assertEqual(result["state"], "blocked")
+                self.assertEqual(result["state"], "degraded")
                 reviewer = result["claude_reviewer"]
-                self.assertEqual(reviewer["state"], "blocked")
-                self.assertEqual(reviewer["reason_code"], reason_code)
-                self.assertTrue(reviewer["blocking"])
+                self.assertEqual(reviewer["state"], "degraded")
+                self.assertFalse(reviewer["blocking"])
+                self.assertEqual(
+                    reviewer["reason_code"], "reviewer_degraded_to_base"
+                )
+                self.assertEqual(
+                    reviewer["degradation"]["reason_code"], reason_code
+                )
+                self.assertEqual(reviewer["model"], BASE_MODEL)
+                self.assertEqual(reviewer["effort"], "max")
+                self.assertEqual(reviewer["fallback_model"], BASE_MODEL)
+                self.assertEqual(
+                    reviewer["next_action"], "invoke_reviewer_agent"
+                )
+                self.assertFalse(reviewer["waiver_required"])
+                self.assertEqual(result["claude"]["state"], "ready")
+
+    def test_reviewer_degradation_reuses_the_base_cli_decision(self) -> None:
+        """The degraded voice runs exactly what the base leg proved out."""
+
+        result = evaluate_model_policy(
+            request(
+                base=valid_base(host_capabilities={}),
+                reviewer=valid_reviewer(opus_access="unavailable"),
+            )
+        )
+
+        self.assertEqual(result["state"], "degraded")
+        reviewer = result["claude_reviewer"]
+        self.assertEqual(reviewer["execution_path"], "explicit_cli")
+        self.assertEqual(
+            reviewer["next_action"], "invoke_explicit_reviewer_cli"
+        )
+        self.assertEqual(reviewer["arguments"], result["claude"]["arguments"])
+        self.assertIn("--permission-mode", reviewer["arguments"])
+
+    def test_reviewer_never_degrades_onto_a_blocked_or_waived_base(self) -> None:
+        """No ready base, no degradation: both-Claude-legs-down still blocks."""
+
+        result = evaluate_model_policy(
+            request(
+                base=valid_base(fable_access="unavailable"),
+                reviewer=valid_reviewer(opus_access="unavailable"),
+            )
+        )
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["claude_reviewer"]["state"], "blocked")
+
+        waived_base = valid_base(
+            fable_access="unavailable",
+            explicit_waiver=True,
+            waiver_fallback={
+                "model": "claude-opus-5",
+                "effort": "max",
+                "available": True,
+                "explicitly_authorized": True,
+                "execution_path": "explicit_cli",
+            },
+        )
+        result = evaluate_model_policy(
+            request(
+                base=waived_base,
+                reviewer=valid_reviewer(opus_access="unavailable"),
+            )
+        )
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["claude_reviewer"]["state"], "blocked")
+        self.assertTrue(result["claude_reviewer"]["waiver_required"])
+
+    def test_malformed_reviewer_observations_still_block(self) -> None:
+        """Degradation never papers over garbage input."""
+
+        for overrides, reason_code in (
+            ({"installed": "yes"}, "invalid_installed_status"),
+            ({"opus_access": "sometimes"}, "invalid_opus_access"),
+            (
+                {"opus_access": "unavailable", "explicit_waiver": True},
+                "named_fallback_required",
+            ),
+        ):
+            with self.subTest(overrides=overrides):
+                result = evaluate_model_policy(
+                    request(reviewer=valid_reviewer(**overrides))
+                )
+
+                self.assertEqual(result["state"], "blocked")
+                self.assertEqual(
+                    result["claude_reviewer"]["reason_code"], reason_code
+                )
+
+    def test_reviewer_waiver_preempts_auto_degradation(self) -> None:
+        """An explicit waiver names the fallback; auto-degradation defers."""
+
+        reviewer = valid_reviewer(
+            opus_access="unavailable",
+            explicit_waiver=True,
+            waiver_fallback={
+                "model": "claude-fable-5",
+                "effort": "max",
+                "available": True,
+                "explicitly_authorized": True,
+                "execution_path": "explicit_cli",
+            },
+        )
+
+        result = evaluate_model_policy(request(reviewer=reviewer))
+
+        self.assertEqual(result["state"], "waived")
+        self.assertEqual(result["claude_reviewer"]["state"], "waived")
 
     def test_absent_leg_observation_blocks_instead_of_guessing(self) -> None:
         for missing in ("claude", "claude_reviewer"):
