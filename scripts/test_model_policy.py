@@ -6,11 +6,6 @@ import sys
 import unittest
 from unittest import mock
 
-import os
-import signal
-import subprocess
-import textwrap
-import time
 from typing import Any
 
 from model_policy import (
@@ -23,6 +18,7 @@ from model_policy import (
     CLASSIFY_EXIT_INTERNAL_FAILURE,
     CODEX_EFFORT,
     CODEX_MODEL,
+    LIVENESS_BACKOFF_LADDER_SECONDS,
     REVIEWER_EFFORT,
     REVIEWER_MODEL,
     REVIEWER_MODEL_ALIAS,
@@ -70,14 +66,18 @@ def valid_codex(
     *,
     status: str = "success",
     attempts: int | None = None,
+    quota_reset_at: object | None = None,
 ) -> dict:
     if attempts is None:
         attempts = 0 if status == "not_run" else 1
+    invocation: dict = {"status": status, "attempts": attempts}
+    if quota_reset_at is not None:
+        invocation["quota_reset_at"] = quota_reset_at
     return {
         "installed": True,
         "version": "codex-cli 0.144.0",
         "live_catalog": live_catalog(),
-        "first_real_invocation": {"status": status, "attempts": attempts},
+        "first_real_invocation": invocation,
     }
 
 
@@ -258,13 +258,16 @@ class ModelPolicyTest(unittest.TestCase):
         self.assertEqual(result["state"], "blocked")
         self.assertEqual(result["reason_code"], "invalid_invocation_status")
 
-    def test_codex_success_after_attempt_cap_is_rejected(self) -> None:
+    def test_codex_success_after_backoff_rounds_is_ready(self) -> None:
+        """Attempts are unbounded under wait-and-retry: a success on the Nth
+        try (after backoff waits) is a normal ready verdict, not a cap
+        violation."""
         result = evaluate_model_policy(
-            request(codex=valid_codex(status="success", attempts=3))
+            request(codex=valid_codex(status="success", attempts=7))
         )["codex"]
 
-        self.assertEqual(result["state"], "blocked")
-        self.assertEqual(result["reason_code"], "invalid_invocation_attempts")
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(result["reason_code"], "authoritative_invocation_succeeded")
 
     def test_codex_entitlement_denial_blocks_without_retry(self) -> None:
         result = evaluate_model_policy(
@@ -275,6 +278,22 @@ class ModelPolicyTest(unittest.TestCase):
         self.assertEqual(result["reason_code"], "entitlement_denied")
         self.assertEqual(result["retry"]["remaining"], 0)
 
+    def test_blocking_reasons_name_the_selected_model_not_the_floor(self) -> None:
+        """Auto-forward selection must reach the failure diagnostics: a newer
+        eligible model's runtime failure must not be reported as the floor's."""
+        codex = valid_codex(status="entitlement_denied")
+        codex["live_catalog"]["models"].append(
+            {
+                "slug": "gpt-9.9-sol",
+                "supported_reasoning_levels": [{"effort": "max"}],
+            }
+        )
+        result = evaluate_model_policy(request(codex=codex))["codex"]
+
+        self.assertEqual(result["model"], "gpt-9.9-sol")
+        self.assertIn("gpt-9.9-sol", result["reason"])
+        self.assertNotIn("GPT-5.6 Sol", result["reason"])
+
     def test_codex_quota_exhaustion_blocks_until_reset_or_access_change(self) -> None:
         result = evaluate_model_policy(
             request(codex=valid_codex(status="quota_exhausted"))
@@ -284,8 +303,94 @@ class ModelPolicyTest(unittest.TestCase):
         self.assertEqual(result["reason_code"], "quota_exhausted")
         self.assertEqual(result["next_action"], "wait_for_quota_reset_or_change_access")
 
+    def test_codex_quota_exhaustion_with_reported_reset_waits_not_blocks(self) -> None:
+        """SKILL.md failure matrix: quota with a USABLE reported reset WAITS
+        and continues automatically; only a reset-less exhaustion (or a
+        repeated-elapsed streak) blocks. SCHEMA_VERSION 6 contract: the
+        observation carries observed_at and the post_invocation history."""
+        codex = valid_codex(
+            status="quota_exhausted",
+            quota_reset_at="2026-08-03T21:00:00Z",
+        )
+        codex["first_real_invocation"]["observed_at"] = "2026-08-03T20:30:00Z"
+        codex["post_invocation"] = []
+        full = evaluate_model_policy(request(codex=codex))
+        result = full["codex"]
+
+        self.assertEqual(full["state"], "retry")  # caller-visible, not blocked
+        self.assertEqual(result["state"], "retry")
+        self.assertEqual(result["reason_code"], "quota_wait_for_reset")
+        self.assertEqual(result["next_action"], "wait_for_quota_reset")
+        self.assertEqual(result["quota"]["reset_at"], "2026-08-03T21:00:00Z")
+        self.assertEqual(
+            _parse_ts(result["quota"]["wait_until"]),
+            _parse_ts("2026-08-03T21:00:00Z"),  # inside floor..ceiling: the reset itself
+        )
+        self.assertIs(result["quota"]["clamped"], False)
+        self.assertIs(result["quota"]["reset_elapsed"], False)
+        self.assertNotIn("wait_until_reset", result["quota"])
+        self.assertEqual(
+            (result["model"], result["effort"]), (CODEX_MODEL, CODEX_EFFORT)
+        )
+        self.assertFalse(result["downgrade_allowed"])
+        self.assertIsNone(result["fallback_model"])
+
+    def test_codex_quota_reset_time_must_parse_or_the_observation_blocks(self) -> None:
+        """A present-but-unparseable reset time is a malformed observation to
+        correct, never a value to guess a wait from."""
+        for bad_reset in ("soon", 12345, "2026-99-99T25:61:61Z"):
+            with self.subTest(quota_reset_at=bad_reset):
+                result = evaluate_model_policy(
+                    request(
+                        codex=valid_codex(
+                            status="quota_exhausted", quota_reset_at=bad_reset
+                        )
+                    )
+                )["codex"]
+
+                self.assertEqual(result["state"], "blocked")
+                self.assertEqual(result["reason_code"], "invalid_quota_reset_at")
+                self.assertEqual(result["next_action"], "correct_observation_input")
+
+    def test_runaway_is_liveness_class_retry_then_backoff_never_downgrade(self) -> None:
+        """A PER_ATTEMPT_CEILING kill is liveness-class exactly like an
+        idle-stall: immediate retry first, then the backoff ladder — and the
+        backoff branch fires at attempts == CODEX_MAX_ATTEMPTS, not above it."""
+        ladder = LIVENESS_BACKOFF_LADDER_SECONDS
+
+        full = evaluate_model_policy(
+            request(codex=valid_codex(status="runaway", attempts=1))
+        )
+        self.assertEqual(full["state"], "retry")  # caller-visible, not blocked
+        first = full["codex"]
+        self.assertEqual(first["state"], "retry")
+        self.assertEqual(first["next_action"], "retry_same_invocation_once")
+
+        at_max = evaluate_model_policy(
+            request(codex=valid_codex(status="runaway", attempts=2))
+        )["codex"]
+        self.assertEqual(at_max["state"], "retry")
+        self.assertEqual(at_max["next_action"], "wait_and_retry_with_backoff")
+        self.assertEqual(at_max["backoff"]["rung"], 0)
+        self.assertEqual(at_max["backoff"]["wait_seconds"], ladder[0])
+
+        late = evaluate_model_policy(
+            request(codex=valid_codex(status="runaway", attempts=5))
+        )["codex"]
+        self.assertEqual(late["next_action"], "wait_and_retry_with_backoff")
+        self.assertEqual(late["backoff"]["rung"], len(ladder) - 1)
+        self.assertEqual(late["backoff"]["wait_seconds"], ladder[-1])
+        self.assertTrue(late["backoff"]["last_rung_repeats"])
+
+        for result in (first, at_max, late):
+            self.assertEqual(
+                (result["model"], result["effort"]), (CODEX_MODEL, CODEX_EFFORT)
+            )
+            self.assertFalse(result["downgrade_allowed"])
+            self.assertIsNone(result["fallback_model"])
+
     def test_retryable_failures_retry_once_with_no_downgrade(self) -> None:
-        for failure in ("timeout", "transport_error"):
+        for failure in ("timeout", "transport_error", "runaway"):
             with self.subTest(failure=failure):
                 result = evaluate_model_policy(
                     request(codex=valid_codex(status=failure, attempts=1))
@@ -301,16 +406,34 @@ class ModelPolicyTest(unittest.TestCase):
                 self.assertIsNone(result["fallback_model"])
                 self.assertEqual(result["retry"]["remaining"], 1)
 
-    def test_retryable_failures_block_after_the_single_retry(self) -> None:
-        for failure in ("timeout", "transport_error"):
-            with self.subTest(failure=failure):
-                result = evaluate_model_policy(
-                    request(codex=valid_codex(status=failure, attempts=2))
-                )["codex"]
+    def test_retryable_failures_backoff_instead_of_blocking(self) -> None:
+        """Liveness-class failures NEVER terminally block: once the immediate
+        retry is spent they climb the backoff ladder, whose last rung repeats
+        forever."""
+        ladder = LIVENESS_BACKOFF_LADDER_SECONDS
+        for failure in ("timeout", "transport_error", "runaway"):
+            for attempts, rung in ((2, 0), (3, 1), (4, 2), (5, 3), (9, 3)):
+                with self.subTest(failure=failure, attempts=attempts):
+                    result = evaluate_model_policy(
+                        request(codex=valid_codex(status=failure, attempts=attempts))
+                    )["codex"]
 
-                self.assertEqual(result["state"], "blocked")
-                self.assertEqual(result["reason_code"], f"{failure}_retry_exhausted")
-                self.assertEqual(result["retry"]["remaining"], 0)
+                    self.assertEqual(result["state"], "retry")
+                    self.assertEqual(result["reason_code"], f"{failure}_backoff")
+                    self.assertEqual(
+                        result["next_action"], "wait_and_retry_with_backoff"
+                    )
+                    self.assertEqual(result["backoff"]["rung"], rung)
+                    self.assertEqual(
+                        result["backoff"]["wait_seconds"], ladder[rung]
+                    )
+                    self.assertTrue(result["backoff"]["last_rung_repeats"])
+                    self.assertEqual(
+                        (result["model"], result["effort"]),
+                        (CODEX_MODEL, CODEX_EFFORT),
+                    )
+                    self.assertFalse(result["downgrade_allowed"])
+                    self.assertEqual(result["retry"]["remaining"], 0)
 
     def test_codex_never_downgrades_for_any_failure_matrix_row(self) -> None:
         cases = [
@@ -1333,6 +1456,19 @@ class ExcerptRedactionTests(unittest.TestCase):
         self.assertLessEqual(len(excerpt.encode("utf-8")), MAX_EXCERPT_BYTES)
 
 
+class _SteppingClock:
+    """Deterministic time.monotonic stand-in: each call advances a fixed step."""
+
+    def __init__(self, step: float) -> None:
+        self._now = 0.0
+        self._step = step
+
+    def __call__(self) -> float:
+        now = self._now
+        self._now += self._step
+        return now
+
+
 class _FakePipe:
     """Byte pipe stub that yields chunks then EOF, mimicking a real read()."""
 
@@ -1444,137 +1580,66 @@ class SuperviseStreamTests(unittest.TestCase):
         self.assertEqual(result["outcome"], "internal_failure")
         self.assertEqual(killed, [True])
 
+    def test_runaway_ceiling_kills_stream_that_never_goes_idle(self) -> None:
+        """PER_ATTEMPT_CEILING is a TOTAL-runtime backstop: a byte-emitting
+        child resets the idle clock forever, so only the ceiling can stop it."""
+        import model_policy as mp
 
-@unittest.skipUnless(hasattr(os, "killpg"), "requires POSIX process groups")
-class SuperviseStreamLiveProcessTests(unittest.TestCase):
-    """Integration: the real API against a real child process.
-
-    Covers the deadlock case the reviewer flagged — one channel flooded past
-    kernel pipe capacity while the auth event arrives on the other.
-    """
-
-    def test_flooding_one_channel_does_not_prevent_prompt_termination(self) -> None:
-        script = textwrap.dedent(
-            """
-            import json, sys, time
-            # Flood stderr well past a pipe buffer, then emit the auth event on
-            # stdout. A sequential reader would deadlock here.
-            sys.stderr.write("flood line\\n" * 40000)
-            sys.stderr.flush()
-            sys.stdout.write(json.dumps({"type": "error", "status": 401}) + "\\n")
-            sys.stdout.flush()
-            time.sleep(120)
-            """
+        line = (
+            json.dumps({"type": "assistant_message", "message": "tick"}).encode()
+            + b"\n"
         )
-        process = subprocess.Popen(
-            [sys.executable, "-c", script],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
+        stdout = _FakePipe([line] * 500)
+        killed = []
+        with mock.patch.object(mp.time, "monotonic", _SteppingClock(10.0)):
+            result = supervise_stream(
+                stdout,
+                None,
+                lambda: killed.append(True),
+                idle_timeout_seconds=180,
+                max_runtime_seconds=25,
+            )
 
-        def kill_group() -> None:
-            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        self.assertEqual(result["outcome"], "runaway")
+        self.assertEqual(result["exit_code"], mp.CLASSIFY_EXIT_RUNAWAY)
+        self.assertEqual(killed, [True])
 
-        started = time.monotonic()
-        try:
-            result = supervise_stream(process.stdout, process.stderr, kill_group)
-            elapsed = time.monotonic() - started
+    def test_ceiling_wins_over_idle_when_both_deadlines_have_expired(self) -> None:
+        """Deterministic tie-break: the runaway check runs before the idle
+        check, so a pass that finds both expired reports the ceiling."""
+        import model_policy as mp
 
-            self.assertEqual(result["outcome"], "auth_error")
-            self.assertLess(elapsed, 30, "supervisor deadlocked instead of terminating")
-            self.assertEqual(process.wait(timeout=10), -signal.SIGKILL)
-        finally:
-            if process.poll() is None:  # pragma: no cover - cleanup safety
-                kill_group()
-                process.wait(timeout=10)
-            for pipe in (process.stdout, process.stderr):
-                if pipe is not None:
-                    pipe.close()
+        stdout = _FakePipe([b'{"type": "assistant_message", "message": "x"}\n'])
+        killed = []
+        with mock.patch.object(mp.time, "monotonic", _SteppingClock(10.0)):
+            result = supervise_stream(
+                stdout,
+                None,
+                lambda: killed.append(True),
+                idle_timeout_seconds=5,
+                max_runtime_seconds=5,
+            )
 
+        self.assertEqual(result["outcome"], "runaway")
+        self.assertEqual(killed, [True])
 
-@unittest.skipUnless(hasattr(os, "killpg"), "requires POSIX process groups")
-class SuperviseStreamDeadlineTests(unittest.TestCase):
-    """A silent child must not park the supervisor forever."""
+    def test_unreached_ceiling_leaves_clean_stream_clean(self) -> None:
+        import model_policy as mp
 
-    def test_slow_but_alive_stream_is_not_killed(self) -> None:
-        """The bound is on SILENCE, not runtime.
-
-        An xhigh review legitimately streams for many minutes; a total-runtime
-        cap would SIGKILL healthy reviews, which is worse than the hang it
-        replaced. This child outruns the idle window in total while never
-        pausing longer than it.
-        """
-
-        script = textwrap.dedent(
-            """
-            import json, sys, time
-            for _ in range(8):
-                sys.stdout.write(json.dumps({"type": "token_count"}) + "\\n")
-                sys.stdout.flush()
-                time.sleep(0.25)
-            """
-        )
-        process = subprocess.Popen(
-            [sys.executable, "-c", script],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
+        stdout = _FakePipe(
+            [json.dumps({"type": "assistant_message", "message": "ok"}).encode() + b"\n"]
         )
         killed = []
-
-        try:
-            # Total runtime ~2s exceeds the 1s bound; no single gap does.
+        with mock.patch.object(mp.time, "monotonic", _SteppingClock(10.0)):
             result = supervise_stream(
-                process.stdout,
-                process.stderr,
+                stdout,
+                None,
                 lambda: killed.append(True),
-                idle_timeout_seconds=1.0,
+                max_runtime_seconds=10_000,
             )
 
-            self.assertEqual(result["outcome"], "clean")
-            self.assertEqual(killed, [])
-        finally:
-            if process.poll() is None:  # pragma: no cover - cleanup safety
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-            process.wait(timeout=10)
-            for pipe in (process.stdout, process.stderr):
-                if pipe is not None:
-                    pipe.close()
-
-    def test_silent_child_hits_the_deadline_and_is_killed(self) -> None:
-        script = "import time; time.sleep(120)"  # never writes, never exits
-        process = subprocess.Popen(
-            [sys.executable, "-c", script],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-
-        def kill_group() -> None:
-            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-
-        started = time.monotonic()
-        try:
-            result = supervise_stream(
-                process.stdout,
-                process.stderr,
-                kill_group,
-                idle_timeout_seconds=1.0,
-            )
-            elapsed = time.monotonic() - started
-
-            self.assertEqual(result["outcome"], "timeout")
-            self.assertEqual(result["exit_code"], CLASSIFY_EXIT_TIMEOUT)
-            self.assertLess(elapsed, 30, "supervisor ignored its deadline")
-            self.assertEqual(process.wait(timeout=10), -signal.SIGKILL)
-        finally:
-            if process.poll() is None:  # pragma: no cover - cleanup safety
-                kill_group()
-                process.wait(timeout=10)
-            for pipe in (process.stdout, process.stderr):
-                if pipe is not None:
-                    pipe.close()
+        self.assertEqual(result["outcome"], "clean")
+        self.assertEqual(killed, [])
 
 
 class AuthRecoveryDescriptorTests(unittest.TestCase):
@@ -1754,6 +1819,360 @@ class AuthRecoveryTests(unittest.TestCase):
 
         self.assertEqual(result["state"], "blocked")
         self.assertEqual(result["reason_code"], "descriptor_mismatch")
+
+
+class BlockingBranchCoverageTests(unittest.TestCase):
+    """Gate-blocking branches flagged as uncovered in review."""
+
+    def test_codex_rejects_non_object_invocation(self) -> None:
+        codex = valid_codex()
+        codex["first_real_invocation"] = []
+        result = evaluate_model_policy(request(codex=codex))["codex"]
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["reason_code"], "invalid_invocation_observation")
+
+    def test_codex_rejects_unknown_invocation_status(self) -> None:
+        result = evaluate_model_policy(request(codex=valid_codex(status="teapot")))[
+            "codex"
+        ]
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["reason_code"], "unknown_invocation_status")
+
+    def test_waiver_without_named_fallback_blocks(self) -> None:
+        for key, _, factory, access_field in LEGS:
+            with self.subTest(leg=key):
+                config = factory(
+                    explicit_waiver=True, **{access_field: "unavailable"}
+                )
+                result = evaluate_model_policy(leg_request(key, config))[key]
+                self.assertEqual(result["state"], "blocked")
+                self.assertEqual(result["reason_code"], "named_fallback_required")
+
+    def test_non_boolean_waiver_blocks(self) -> None:
+        for key, _, factory, _ in LEGS:
+            with self.subTest(leg=key):
+                result = evaluate_model_policy(
+                    leg_request(key, factory(explicit_waiver="yes"))
+                )[key]
+                self.assertEqual(result["state"], "blocked")
+                self.assertEqual(result["reason_code"], "invalid_waiver_value")
+
+    def test_non_mapping_host_capabilities_blocks(self) -> None:
+        for key, _, factory, _ in LEGS:
+            with self.subTest(leg=key):
+                result = evaluate_model_policy(
+                    leg_request(key, factory(host_capabilities="broken"))
+                )[key]
+                self.assertEqual(result["state"], "blocked")
+                self.assertEqual(result["reason_code"], "invalid_host_capabilities")
+
+    def test_incidental_401_is_not_an_auth_signature(self) -> None:
+        from model_policy import _has_auth_signature
+
+        for text in (
+            "read timeout after 401ms",
+            "backoff 401ms then retry",
+            "received 401 bytes on stream",
+            "unauthorized_count=0",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(_has_auth_signature(text))
+
+    def test_incorrect_api_key_diagnostic_is_auth(self) -> None:
+        from model_policy import _has_auth_signature
+
+        self.assertTrue(
+            _has_auth_signature("incorrect api key provided: sk-proj-abc...xyz")
+        )
+
+    def test_response_failed_nested_error_is_auth_scoped(self) -> None:
+        from model_policy import _auth_scope_text
+
+        scoped = _auth_scope_text(
+            {
+                "type": "response.failed",
+                "response": {
+                    "status": 401,
+                    "error": {"message": "Incorrect API key provided"},
+                },
+            }
+        )
+        self.assertIn("status=401", scoped)
+        self.assertIn("Incorrect API key provided", scoped)
+
+    def test_frozen_verification_rejects_below_floor_and_excluded_models(self) -> None:
+        from model_policy import _codex_model_is_eligible
+
+        catalog = live_catalog()
+        catalog["models"].extend(
+            {
+                "slug": slug,
+                "supported_reasoning_levels": [{"effort": CODEX_EFFORT}],
+            }
+            for slug in ("gpt-5.4", "gpt-5.6-mini", "gpt-4o-mini")
+        )
+        for slug in ("gpt-5.4", "gpt-5.6-mini", "gpt-4o-mini"):
+            with self.subTest(slug=slug):
+                self.assertFalse(_codex_model_is_eligible(slug, catalog))
+        self.assertTrue(_codex_model_is_eligible(CODEX_MODEL, catalog))
+
+    def test_frozen_descriptor_must_pin_frozen_model_and_effort(self) -> None:
+        descriptor = build_descriptor(
+            "quotio",
+            "gpt-4o-mini",
+            "low",
+            {"base_url": "http://127.0.0.1:8317/v1", "wire_api": "responses"},
+        )
+        result = verify_frozen_selection(
+            CODEX_MODEL, descriptor, live_catalog(), descriptor
+        )
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["reason_code"], "descriptor_model_mismatch")
+
+    def test_supervise_stream_with_no_channels_fails_closed(self) -> None:
+        result = supervise_stream(None, None, lambda: None)
+        self.assertEqual(result["outcome"], "internal_failure")
+
+    def test_frozen_descriptor_rejects_contradicting_effort_override(self) -> None:
+        descriptor = build_descriptor(
+            "quotio",
+            CODEX_MODEL,
+            CODEX_EFFORT,
+            {"base_url": "http://127.0.0.1:8317/v1", "wire_api": "responses"},
+            policy_overrides={"model_reasoning_effort": "low"},
+        )
+        result = verify_frozen_selection(
+            CODEX_MODEL, descriptor, live_catalog(), descriptor
+        )
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["reason_code"], "descriptor_model_mismatch")
+
+    def test_contextual_401_is_an_auth_signature(self) -> None:
+        from model_policy import _has_auth_signature
+
+        for text in (
+            "HTTP/1.1 401",
+            "http 401 returned by provider",
+            "status=401",
+            "status code: 401",
+            "error 401 from upstream",
+            "401 Unauthorized",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(_has_auth_signature(text))
+
+    # The non-UTF-8 stdin CLI test lives in test_cli_fail_closed.py: the skill
+    # scanner forbids pairing subprocess with eval-substring call names here.
+
+
+
+
+def quota_request(
+    *,
+    reset: object,
+    observed_at: object = "2026-08-04T12:00:00+00:00",
+    history: object = "OMIT",
+) -> dict:
+    """Codex observation for the quota-wait bound contract (SCHEMA_VERSION 6).
+
+    ``observed_at`` rides on the invocation record; ``post_invocation`` is the
+    codex-level durable history feed.  ``history="OMIT"`` leaves the key out
+    entirely — absence and an empty list are distinct tested cases.
+    """
+
+    codex = valid_codex(status="quota_exhausted", quota_reset_at=reset)
+    if observed_at is not None:
+        codex["first_real_invocation"]["observed_at"] = observed_at
+    if history != "OMIT":
+        codex["post_invocation"] = history
+    return request(codex=codex)
+
+
+def _parse_ts(value: str):
+    from datetime import datetime
+
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+class QuotaWaitBoundTests(unittest.TestCase):
+    """R3-F2: the quota-with-reset wait is bounded IN CODE and the terminal
+    no-usable-reset streak is decided by the helper from the fed records."""
+
+    T = "2026-08-04T12:00:00+00:00"
+
+    def _quota_record(self, *, reset: str, observed_at: object) -> dict:
+        record = {"status": "quota_exhausted", "quota_reset_at": reset}
+        if observed_at is not None:
+            record["observed_at"] = observed_at
+        return record
+
+    def test_far_future_reset_is_clamped_to_the_single_wait_ceiling(self) -> None:
+        result = evaluate_model_policy(
+            quota_request(reset="2026-09-03T12:00:00+00:00", history=[])
+        )["codex"]
+
+        self.assertEqual(result["state"], "retry")
+        quota = result.get("quota") or {}
+        self.assertIn("wait_until", quota)
+        self.assertEqual(
+            _parse_ts(quota["wait_until"]),
+            _parse_ts("2026-08-04T13:00:00+00:00"),  # observed_at + 3600s
+        )
+        self.assertIs(quota.get("clamped"), True)
+        self.assertIs(quota.get("reset_elapsed"), False)
+        self.assertEqual(quota.get("reset_at"), "2026-09-03T12:00:00+00:00")
+        self.assertNotIn("wait_until_reset", quota)
+        self.assertIn("clamp", result["reason"])
+
+    def test_near_future_reset_floors_at_the_first_ladder_rung(self) -> None:
+        result = evaluate_model_policy(
+            quota_request(reset="2026-08-04T12:00:30+00:00", history=[])
+        )["codex"]
+
+        self.assertEqual(result["state"], "retry")
+        quota = result.get("quota") or {}
+        self.assertIn("wait_until", quota)
+        self.assertEqual(
+            _parse_ts(quota["wait_until"]),
+            _parse_ts("2026-08-04T12:01:00+00:00"),  # observed_at + 60s floor
+        )
+        self.assertIs(quota.get("clamped"), False)
+
+    def test_reset_exactly_at_the_ceiling_is_unclamped(self) -> None:
+        result = evaluate_model_policy(
+            quota_request(reset="2026-08-04T13:00:00+00:00", history=[])
+        )["codex"]
+
+        self.assertEqual(result["state"], "retry")
+        quota = result.get("quota") or {}
+        self.assertIn("wait_until", quota)
+        self.assertEqual(
+            _parse_ts(quota["wait_until"]), _parse_ts("2026-08-04T13:00:00+00:00")
+        )
+        self.assertIs(quota.get("clamped"), False)
+
+    def test_reset_at_observed_time_is_elapsed_and_floors(self) -> None:
+        result = evaluate_model_policy(
+            quota_request(reset=self.T, history=[])
+        )["codex"]
+
+        self.assertEqual(result["state"], "retry")
+        quota = result.get("quota") or {}
+        self.assertIs(quota.get("reset_elapsed"), True)
+        self.assertIn("wait_until", quota)
+        self.assertEqual(
+            _parse_ts(quota["wait_until"]), _parse_ts("2026-08-04T12:01:00+00:00")
+        )
+
+    def test_missing_observed_at_blocks_as_malformed_observation(self) -> None:
+        result = evaluate_model_policy(
+            quota_request(reset="2026-08-04T13:00:00+00:00", observed_at=None, history=[])
+        )["codex"]
+
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["reason_code"], "invalid_quota_observation")
+        self.assertEqual(result["next_action"], "correct_observation_input")
+
+    def test_omitted_history_blocks_as_malformed_observation(self) -> None:
+        """Absence and an empty list are distinct: a [] default would silently
+        preserve the omission path that disables the streak terminal."""
+        result = evaluate_model_policy(
+            quota_request(reset="2026-08-04T13:00:00+00:00")  # history OMITTED
+        )["codex"]
+
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["reason_code"], "invalid_quota_observation")
+        self.assertEqual(result["next_action"], "correct_observation_input")
+
+    def test_streak_terminal_survives_all_liveness_noise_statuses(self) -> None:
+        history = [
+            self._quota_record(
+                reset="2026-08-04T10:00:00+00:00", observed_at="2026-08-04T11:00:00+00:00"
+            ),
+            {"status": "timeout", "observed_at": "2026-08-04T11:10:00+00:00"},
+            {"status": "transport_error", "observed_at": "2026-08-04T11:20:00+00:00"},
+            {"status": "runaway", "observed_at": "2026-08-04T11:30:00+00:00"},
+        ]
+        result = evaluate_model_policy(
+            quota_request(reset="2026-08-04T11:50:00+00:00", history=history)
+        )["codex"]
+
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["reason_code"], "quota_exhausted")
+        self.assertEqual(
+            result["next_action"], "wait_for_quota_reset_or_change_access"
+        )
+        self.assertIn("elapsed", result["reason"])
+
+    def test_success_between_quota_events_breaks_the_streak(self) -> None:
+        history = [
+            self._quota_record(
+                reset="2026-08-04T10:00:00+00:00", observed_at="2026-08-04T11:00:00+00:00"
+            ),
+            {"status": "success", "observed_at": "2026-08-04T11:30:00+00:00"},
+        ]
+        result = evaluate_model_policy(
+            quota_request(reset="2026-08-04T11:50:00+00:00", history=history)
+        )["codex"]
+
+        self.assertEqual(result["state"], "retry")
+
+    def test_prior_nonelapsed_reset_does_not_form_a_streak(self) -> None:
+        """The prior record's elapsed-ness is judged at ITS OWN observed_at."""
+        nonelapsed_prior = self._quota_record(
+            reset="2026-08-04T11:30:00+00:00", observed_at="2026-08-04T11:00:00+00:00"
+        )
+        result = evaluate_model_policy(
+            quota_request(reset="2026-08-04T11:50:00+00:00", history=[nonelapsed_prior])
+        )["codex"]
+        self.assertEqual(result["state"], "retry")
+
+        elapsed_second = self._quota_record(
+            reset="2026-08-04T11:50:00+00:00", observed_at="2026-08-04T11:55:00+00:00"
+        )
+        result = evaluate_model_policy(
+            quota_request(
+                reset="2026-08-04T11:56:00+00:00",
+                history=[nonelapsed_prior, elapsed_second],
+            )
+        )["codex"]
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["reason_code"], "quota_exhausted")
+
+    def test_unjudgeable_prior_record_conservatively_breaks_the_streak(self) -> None:
+        history = [self._quota_record(reset="2026-08-04T10:00:00+00:00", observed_at=None)]
+        result = evaluate_model_policy(
+            quota_request(reset="2026-08-04T11:50:00+00:00", history=history)
+        )["codex"]
+
+        self.assertEqual(result["state"], "retry")
+
+    def test_structurally_malformed_history_entry_blocks(self) -> None:
+        result = evaluate_model_policy(
+            quota_request(reset="2026-08-04T13:00:00+00:00", history=["garbage"])
+        )["codex"]
+
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["next_action"], "correct_observation_input")
+
+    def test_far_future_observed_at_blocks_instead_of_crashing(self) -> None:
+        """A parseable year-9999 observed_at must fail closed, not overflow
+        inside the timedelta arithmetic and escape as a traceback."""
+        result = evaluate_model_policy(
+            quota_request(
+                reset="9999-12-31T23:00:00+00:00",
+                observed_at="9999-12-31T23:59:59+00:00",
+                history=[],
+            )
+        )["codex"]
+
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["reason_code"], "invalid_quota_observation")
+        self.assertEqual(result["next_action"], "correct_observation_input")
+
+    def test_schema_version_is_bumped_for_the_quota_contract(self) -> None:
+        result = evaluate_model_policy(request())
+        self.assertEqual(result["version"], 6)  # literal pin, not the constant
 
 
 if __name__ == "__main__":

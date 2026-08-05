@@ -7,7 +7,13 @@ import hashlib
 import json
 import unittest
 
-from state_schema import SUSPECT, VALID, evaluate_state_text
+from state_schema import (
+    SUSPECT,
+    VALID,
+    evaluate_state_text,
+    validate_operation_collection,
+    validate_operation_result_record,
+)
 
 SHA_A = "a" * 40
 SHA_B = "b" * 40
@@ -407,11 +413,14 @@ class PhaseInvariantTests(unittest.TestCase):
 
 class HandoffInvariantTests(unittest.TestCase):
     OPS_TWO = '    operations: ["github_assignees", "tracker_assign"]'
+    # Every record carries attempts: the write-ahead contract persists
+    # "status pending, incremented attempts, started_at" before any call.
     RESULT_FIRST_PENDING = "\n".join(
         (
             "    operation_results:",
             '      "github_assignees":',
             '        status: "pending"',
+            "        attempts: 1",
             '        started_at: "2026-07-14T17:00:00Z"',
         )
     )
@@ -420,12 +429,18 @@ class HandoffInvariantTests(unittest.TestCase):
             "    operation_results:",
             '      "github_assignees":',
             '        status: "complete"',
+            "        attempts: 1",
+            '        started_at: "2026-07-14T16:58:00Z"',
             '        verified_at: "2026-07-14T17:00:00Z"',
-            '        evidence: "assignee array verified"',
+            "        evidence:",
+            '          verified: "assignee array verified"',
             '      "tracker_assign":',
             '        status: "complete"',
+            "        attempts: 1",
+            '        started_at: "2026-07-14T16:59:00Z"',
             '        verified_at: "2026-07-14T17:01:00Z"',
-            '        evidence: "ticket owner verified"',
+            "        evidence:",
+            '          verified: "ticket owner verified"',
         )
     )
 
@@ -477,9 +492,10 @@ class HandoffInvariantTests(unittest.TestCase):
         self.assertEqual(evaluate_state_text(text)["state"], SUSPECT)
 
     def test_complete_with_failed_result_is_suspect(self) -> None:
-        results = self.RESULTS_BOTH_COMPLETE.replace(
-            '        status: "complete"\n        verified_at: "2026-07-14T17:01:00Z"\n        evidence: "ticket owner verified"',
-            '        status: "failed"\n        verified_at: "2026-07-14T17:01:00Z"\n        error: "boom"',
+        results = _mutate(
+            self.RESULTS_BOTH_COMPLETE,
+            '        status: "complete"\n        attempts: 1\n        started_at: "2026-07-14T16:59:00Z"\n        verified_at: "2026-07-14T17:01:00Z"\n        evidence:\n          verified: "ticket owner verified"',
+            '        status: "failed"\n        attempts: 1\n        started_at: "2026-07-14T16:59:00Z"\n        verified_at: "2026-07-14T17:01:00Z"\n        error: "boom"',
         )
         text = _qa_handoff(self.OPS_TWO, results, "complete")
         result = evaluate_state_text(text)
@@ -738,6 +754,60 @@ class ValueContractTests(unittest.TestCase):
         result = evaluate_state_text(text)
         self.assertEqual(result["state"], SUSPECT)
 
+    def test_next_retry_at_absent_stays_valid_for_pre_liveness_states(self) -> None:
+        """Older full-tier state files predate the liveness wait timestamp; the
+        key must be known-but-optional, or every pre-liveness resume breaks."""
+        for key in ("next_retry_at", "hold_started_at"):
+            with self.subTest(key=key):
+                self.assertNotIn(key, FULL_STATE)
+        self.assertEqual(evaluate_state_text(FULL_STATE)["state"], VALID)
+
+    def test_next_retry_at_null_and_valid_iso_accepted(self) -> None:
+        for key in ("next_retry_at", "hold_started_at"):
+            for value in (
+                "null",
+                '"2026-08-03T21:00:00Z"',
+                '"2026-08-03T17:00:00+00:00"',
+            ):
+                with self.subTest(key=key, value=value):
+                    # hold_started_at is a live-monitor hold span, so its
+                    # non-null acceptance cases run under an in-progress
+                    # monitor (lifecycle invariant vii); next_retry_at and
+                    # both null cases stay on the pending-monitor fixture.
+                    base = (
+                        _in_progress_monitor_state()
+                        if key == "hold_started_at" and value != "null"
+                        else FULL_STATE
+                    )
+                    text = _mutate(
+                        base,
+                        "post_push_until: null",
+                        f"post_push_until: null\n{key}: {value}",
+                    )
+                    self.assertEqual(
+                        evaluate_state_text(text)["state"], VALID,
+                        evaluate_state_text(text)["errors"],
+                    )
+
+    def test_next_retry_at_rejects_non_iso_values_with_exact_field_error(self) -> None:
+        for key in ("next_retry_at", "hold_started_at"):
+            for value in ('"soon"', "12345", '"2026-99-99T25:61:61Z"'):
+                with self.subTest(key=key, value=value):
+                    text = _mutate(
+                        FULL_STATE,
+                        "post_push_until: null",
+                        f"post_push_until: null\n{key}: {value}",
+                    )
+                    result = evaluate_state_text(text)
+                    self.assertEqual(result["state"], SUSPECT)
+                    self.assertTrue(
+                        any(
+                            f"{key}: must be an ISO 8601 timestamp with timezone"
+                            in error
+                            for error in result["errors"]
+                        )
+                    )
+
     def test_waived_runtime_verification_requires_reason(self) -> None:
         text = _mutate(FULL_STATE, '    status: "pending"\n    reason: null', '    status: "waived"\n    reason: null')
         result = evaluate_state_text(text)
@@ -749,11 +819,16 @@ class ValueContractTests(unittest.TestCase):
             "    operation_results:",
             '      "github_assignees":',
             '        status: "complete"',
+            "        attempts: 1",
+            '        started_at: "2026-07-16T10:59:00Z"',
             '        verified_at: "2026-07-16T11:00:00Z"',
             '      "tracker_assign":',
             '        status: "complete"',
+            "        attempts: 1",
+            '        started_at: "2026-07-16T10:59:30Z"',
             '        verified_at: "2026-07-16T11:01:00Z"',
-            '        evidence: "assignee list verified"',
+            "        evidence:",
+            '          verified: "assignee list verified"',
         )
     )
 
@@ -761,7 +836,10 @@ class ValueContractTests(unittest.TestCase):
         text = _qa_handoff(HandoffInvariantTests.OPS_TWO, self.COMPLETE_NO_EVIDENCE, "complete")
         result = evaluate_state_text(text)
         self.assertEqual(result["state"], SUSPECT)
-        self.assertTrue(any("requires non-empty evidence" in error for error in result["errors"]))
+        self.assertTrue(
+            any("complete state requires verification evidence" in error for error in result["errors"]),
+            result["errors"],
+        )
 
     def test_failed_and_retryable_operations_require_error(self) -> None:
         # Aggregate derivations are kept consistent so ONLY the error-contract
@@ -776,9 +854,13 @@ class ValueContractTests(unittest.TestCase):
                         "    operation_results:",
                         '      "github_assignees":',
                         f'        status: "{status}"',
+                        "        attempts: 1" if status == "failed" else "        attempts: 2",
+                        '        started_at: "2026-07-16T10:59:00Z"',
                         '        verified_at: "2026-07-16T11:00:00Z"',
                         '      "tracker_assign":',
                         '        status: "failed"',
+                        "        attempts: 1",
+                        '        started_at: "2026-07-16T10:59:30Z"',
                         '        verified_at: "2026-07-16T11:01:00Z"',
                         '        error: "postcondition absent"',
                     )
@@ -788,24 +870,38 @@ class ValueContractTests(unittest.TestCase):
                     text = _mutate(text, '  monitor: "paused"', monitor_fix)
                 result = evaluate_state_text(text)
                 self.assertTrue(
-                    any(f"{status} requires a non-empty error" in e for e in result["errors"]),
+                    any(f"{status} state requires error evidence" in e for e in result["errors"]),
                     result["errors"],
                 )
 
     def test_operation_timestamps_must_be_iso(self) -> None:
+        bad_verified = "\n".join(
+            (
+                "    operation_results:",
+                '      "github_assignees":',
+                '        status: "complete"',
+                "        attempts: 1",
+                '        started_at: "2026-07-16T10:59:00Z"',
+                '        verified_at: "yesterday"',
+                "        evidence:",
+                '          verified: "ok"',
+                '      "tracker_assign":',
+                '        status: "complete"',
+                "        attempts: 1",
+                '        started_at: "2026-07-16T10:59:30Z"',
+                '        verified_at: "2026-07-16T11:01:00Z"',
+                "        evidence:",
+                '          verified: "assignee list verified"',
+            )
+        )
         for field, payload in (
-            ("verified_at", self.COMPLETE_NO_EVIDENCE.replace(
-                '        verified_at: "2026-07-16T11:01:00Z"\n        evidence: "assignee list verified"',
-                '        verified_at: "yesterday"\n        evidence: "assignee list verified"',
-            ).replace(
-                '      "github_assignees":\n        status: "complete"\n        verified_at: "2026-07-16T11:00:00Z"',
-                '      "github_assignees":\n        status: "complete"\n        verified_at: "2026-07-16T11:00:00Z"\n        evidence: "ok"',
-            )),
+            ("verified_at", bad_verified),
             ("started_at", "\n".join(
                 (
                     "    operation_results:",
                     '      "github_assignees":',
                     '        status: "pending"',
+                    "        attempts: 1",
                     '        started_at: "not-a-time"',
                 )
             )),
@@ -1102,6 +1198,497 @@ class TaintTests(unittest.TestCase):
         self.assertIn(f"key<{expected_digest}>", serialized)
 
 
+class MergeReadinessTests(unittest.TestCase):
+    """Phase 4b blocks are optional (pre-4b states stay valid) but shape-checked."""
+
+    _AC_BLOCK = "\n".join(
+        (
+            "acceptance_criteria:",
+            '  - id: "AC-1"',
+            '    text: "User can save the form"',
+            '    source: "description"',
+            '    verdict: "pending"',
+            "    evidence: null",
+            "merge_readiness:",
+            '  deploy_order: "pending"',
+            "  applied_state: {}",
+            '  dependencies: "pending"',
+            '  ac_conformance: "pending"',
+            "  claims_audit:",
+            "    audited: 0",
+            "    rewritten: 0",
+            "decision_audit_trail: []",
+        )
+    )
+
+    def _with_blocks(self) -> str:
+        return _mutate(FULL_STATE, "decision_audit_trail: []", self._AC_BLOCK)
+
+    def test_full_state_with_phase_4b_blocks_is_valid(self) -> None:
+        text = _mutate(
+            self._with_blocks(),
+            '  monitor: "pending"',
+            '  monitor: "pending"\n  merge_readiness: "pending"',
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["state"], VALID)
+
+    def test_acceptance_criteria_unavailable_string_is_valid(self) -> None:
+        text = _mutate(
+            FULL_STATE,
+            "decision_audit_trail: []",
+            'acceptance_criteria: "unavailable"\ndecision_audit_trail: []',
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["state"], VALID)
+
+    def test_acceptance_criteria_rejects_bad_verdict(self) -> None:
+        text = _mutate(self._with_blocks(), '    verdict: "pending"', '    verdict: "done"')
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("acceptance_criteria[0].verdict" in error for error in result["errors"])
+        )
+
+    def test_acceptance_criteria_rejects_non_list_scalar(self) -> None:
+        text = _mutate(
+            FULL_STATE,
+            "decision_audit_trail: []",
+            'acceptance_criteria: "partial"\ndecision_audit_trail: []',
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+
+    def test_merge_readiness_rejects_bad_enum_and_unknown_key(self) -> None:
+        text = _mutate(
+            self._with_blocks(), '  deploy_order: "pending"', '  deploy_order: "documented"'
+        )
+        text = _mutate(
+            text, '  dependencies: "pending"', '  dependencies: "pending"\n  extra_check: "pass"'
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("merge_readiness.deploy_order" in error for error in result["errors"])
+        )
+        self.assertTrue(
+            any("merge_readiness: unknown key" in error for error in result["errors"])
+        )
+
+    def test_merge_readiness_claims_audit_rejects_negative_count(self) -> None:
+        text = _mutate(self._with_blocks(), "    audited: 0", "    audited: -1")
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("claims_audit.audited" in error for error in result["errors"])
+        )
+
+    def test_dependencies_enum_accepts_check_2_completed_outcomes(self) -> None:
+        # 28e13163ef: hazard_documented (merged-but-not-live, ordering
+        # documented) and unverified (control plane / unreadable live state)
+        # are completed-check outcomes, same as Check 1's.
+        for outcome in ("hazard_documented", "unverified"):
+            with self.subTest(outcome=outcome):
+                text = _mutate(
+                    self._with_blocks(),
+                    '  dependencies: "pending"',
+                    f'  dependencies: "{outcome}"',
+                )
+                result = evaluate_state_text(text)
+                self.assertEqual(result["errors"], [])
+                self.assertEqual(result["state"], VALID)
+
+    def test_hazard_direction_valid_values_accepted_with_hazard(self) -> None:
+        for direction in ("additive", "destructive", "mixed"):
+            with self.subTest(direction=direction):
+                text = _mutate(
+                    self._with_blocks(),
+                    '  deploy_order: "pending"',
+                    '  deploy_order: "hazard_documented"\n'
+                    f'  hazard_direction: "{direction}"',
+                )
+                result = evaluate_state_text(text)
+                self.assertEqual(result["errors"], [])
+                self.assertEqual(result["state"], VALID)
+
+    def test_hazard_documented_requires_a_direction(self) -> None:
+        # A missing or null direction would silently default the
+        # direction-aware holds wrong — force Check 1 reclassification.
+        for replacement in (
+            '  deploy_order: "hazard_documented"',
+            '  deploy_order: "hazard_documented"\n  hazard_direction: null',
+        ):
+            with self.subTest(replacement=replacement):
+                text = _mutate(
+                    self._with_blocks(), '  deploy_order: "pending"', replacement
+                )
+                result = evaluate_state_text(text)
+                self.assertEqual(result["state"], SUSPECT)
+                self.assertTrue(
+                    any("hazard_direction" in error for error in result["errors"])
+                )
+
+    def test_hazard_direction_rejects_unknown_token(self) -> None:
+        text = _mutate(
+            self._with_blocks(),
+            '  deploy_order: "pending"',
+            '  deploy_order: "hazard_documented"\n  hazard_direction: "sideways"',
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("hazard_direction" in error for error in result["errors"])
+        )
+
+    def test_hazard_direction_absent_or_null_without_hazard_is_valid(self) -> None:
+        for replacement in (
+            '  deploy_order: "pass"',
+            '  deploy_order: "pass"\n  hazard_direction: null',
+        ):
+            with self.subTest(replacement=replacement):
+                text = _mutate(
+                    self._with_blocks(), '  deploy_order: "pending"', replacement
+                )
+                result = evaluate_state_text(text)
+                self.assertEqual(result["errors"], [])
+                self.assertEqual(result["state"], VALID)
+
+    def test_phases_merge_readiness_is_known_not_unknown(self) -> None:
+        text = _mutate(
+            FULL_STATE,
+            '  monitor: "pending"',
+            '  monitor: "pending"\n  merge_readiness: "pending"',
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["state"], VALID)
+
+    def test_merge_readiness_phase_requires_complete_self_review(self) -> None:
+        text = _mutate(
+            FULL_STATE,
+            '  monitor: "pending"',
+            '  monitor: "pending"\n  merge_readiness: "in_progress"',
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any(
+                "phases.merge_readiness is non-pending but phases.self_review" in error
+                for error in result["errors"]
+            )
+        )
+
+    def test_current_phase_merge_readiness_is_legal(self) -> None:
+        text = FULL_STATE
+        for old, new in (
+            ('current_phase: "plan"', 'current_phase: "merge_readiness"'),
+            ('  plan: "in_progress"', '  plan: "complete"'),
+            ('  plan_review: "pending"', '  plan_review: "complete"'),
+            ('  implementation: "pending"', '  implementation: "complete"'),
+            ('  self_review: "pending"', '  self_review: "complete"'),
+            (
+                '  monitor: "pending"',
+                '  monitor: "pending"\n  merge_readiness: "in_progress"',
+            ),
+        ):
+            text = _mutate(text, old, new)
+        result = evaluate_state_text(text)
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["state"], VALID)
+
+    def test_current_phase_merge_readiness_without_its_phase_entry_is_suspect(
+        self,
+    ) -> None:
+        text = FULL_STATE
+        for old, new in (
+            ('current_phase: "plan"', 'current_phase: "merge_readiness"'),
+            ('  plan: "in_progress"', '  plan: "complete"'),
+            ('  plan_review: "pending"', '  plan_review: "complete"'),
+            ('  implementation: "pending"', '  implementation: "complete"'),
+            ('  self_review: "pending"', '  self_review: "complete"'),
+        ):
+            text = _mutate(text, old, new)
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any(
+                'current_phase \'merge_readiness\' requires a phases.merge_readiness entry'
+                in error
+                for error in result["errors"]
+            )
+        )
+
+    def test_aborted_at_merge_readiness_requires_blocked_status(self) -> None:
+        text = FULL_STATE
+        for old, new in (
+            ('current_phase: "plan"', 'current_phase: "aborted_at_merge_readiness"'),
+            ('  plan: "in_progress"', '  plan: "complete"'),
+            ('  plan_review: "pending"', '  plan_review: "complete"'),
+            ('  implementation: "pending"', '  implementation: "complete"'),
+            ('  self_review: "pending"', '  self_review: "complete"'),
+            (
+                '  monitor: "pending"',
+                '  monitor: "pending"\n  merge_readiness: "in_progress"',
+            ),
+        ):
+            text = _mutate(text, old, new)
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any(
+                "requires phases.merge_readiness to be blocked" in error
+                for error in result["errors"]
+            )
+        )
+
+
+class ResumeValueContractCoverageTests(unittest.TestCase):
+    """Value-contract branches flagged as uncovered in review — each guards a
+    resume-time trust decision."""
+
+    def test_head_sha_and_stash_ref_must_be_full_hex(self) -> None:
+        for key in ("last_observed_head_sha", "stash_ref"):
+            with self.subTest(key=key):
+                text = _mutate(FULL_STATE, f"{key}: null", f'{key}: "abc123"')
+                result = evaluate_state_text(text)
+                self.assertEqual(result["state"], SUSPECT)
+                self.assertTrue(
+                    any("full-length hex" in error for error in result["errors"])
+                )
+
+    def test_monitor_counters_reject_negative_values(self) -> None:
+        for key in (
+            "monitor_iterations",
+            "monitor_poll_ticks",
+            "monitor_self_review_call_count",
+        ):
+            with self.subTest(key=key):
+                text = _mutate(FULL_STATE, f"{key}: 0", f"{key}: -1")
+                result = evaluate_state_text(text)
+                self.assertEqual(result["state"], SUSPECT)
+                self.assertTrue(
+                    any("non-negative integer" in error for error in result["errors"])
+                )
+
+    def test_last_check_status_enum_is_enforced(self) -> None:
+        text = _mutate(
+            FULL_STATE, 'last_check_status: "pending"', 'last_check_status: "green"'
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("last_check_status" in error for error in result["errors"])
+        )
+
+    def test_clean_poll_records_require_hex_and_timestamp(self) -> None:
+        text = _mutate(
+            FULL_STATE,
+            "clean_poll_timestamps: []",
+            'clean_poll_timestamps:\n  - head_sha: "short"\n    observed_at: "not-a-time"',
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("clean_poll_timestamps[0]" in error for error in result["errors"])
+        )
+
+    def test_human_roundtrip_reviewers_must_be_a_mapping(self) -> None:
+        text = _mutate(FULL_STATE, "  reviewers: {}", "  reviewers: []")
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+
+    def test_mid_scalar_hash_is_not_a_comment(self) -> None:
+        # YAML treats an unseparated '#' as scalar content; stripping it here
+        # would hide the remainder from the taint scan while standard-YAML
+        # consumers still see it.  The parser must fail closed instead.
+        text = _mutate(
+            FULL_STATE,
+            'description: "Full workflow"',
+            "description: safe#hidden-content-other-parsers-would-see",
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+
+    def test_bug_fix_change_type_requires_runtime_bug_fix_mode(self) -> None:
+        text = _mutate(FULL_STATE, '  change_type: "feature"', '  change_type: "bug_fix"')
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any(
+                "change_type bug_fix requires defect_evidence_mode" in error
+                for error in result["errors"]
+            )
+        )
+
+    def test_backslash_test_paths_are_rejected(self) -> None:
+        text = _mutate(
+            FULL_STATE, "  test_paths: []", '  test_paths: ["..\\\\secret"]'
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("forward slashes" in error for error in result["errors"])
+        )
+
+    def test_entry_tier_forbids_later_phase_progress(self) -> None:
+        text = _mutate(FULL_STATE, 'current_phase: "plan"', 'current_phase: "entry"')
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("forbids non-pending" in error for error in result["errors"])
+        )
+
+    def test_complete_merge_readiness_forbids_blocked_checks_and_unmet_acs(self) -> None:
+        text = FULL_STATE
+        for old, new in (
+            ('  plan: "in_progress"', '  plan: "complete"'),
+            ('  plan_review: "pending"', '  plan_review: "complete"'),
+            ('  implementation: "pending"', '  implementation: "complete"'),
+            ('  self_review: "pending"', '  self_review: "complete"'),
+            (
+                '  monitor: "pending"',
+                '  monitor: "pending"\n  merge_readiness: "complete"',
+            ),
+            (
+                "decision_audit_trail: []",
+                'merge_readiness:\n  deploy_order: "blocked"\ndecision_audit_trail: []',
+            ),
+        ):
+            text = _mutate(text, old, new)
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("invariant(v)" in error for error in result["errors"])
+        )
+
+    def test_terminal_monitor_forbids_pending_present_gate(self) -> None:
+        # A post-4b run (gate key present) cannot reach a terminal monitor with
+        # the gate still pending; pr in_progress beside a pending gate stays
+        # legal (the documented Phase 5 recovery route), as does key absence.
+        text = _mutate(_terminal_monitor_state(), '  pr: "complete"', '  pr: "complete"')
+        text = _mutate(
+            text,
+            '  monitor: "paused"',
+            '  monitor: "paused"\n  merge_readiness: "pending"',
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any(
+                "requires the present phases.merge_readiness gate to be terminal"
+                in error
+                for error in result["errors"]
+            )
+        )
+
+    def test_blocked_gate_forbids_clean_monitor_exits_but_not_blocked_ones(self) -> None:
+        base = _mutate(
+            _terminal_monitor_state(),
+            '  monitor: "paused"',
+            '  monitor: "paused"\n  merge_readiness: "blocked"',
+        )
+        result = evaluate_state_text(base)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any(
+                "requires a non-blocked phases.merge_readiness gate" in error
+                for error in result["errors"]
+            )
+        )
+        # The same blocked gate beside a blocked monitor is the legitimate
+        # world-state-refresh outcome and must stay valid.
+        blocked_monitor = _mutate(
+            base, '  monitor: "paused"', '  monitor: "blocked"'
+        )
+        blocked_monitor = _mutate(
+            blocked_monitor,
+            'current_phase: "monitor"',
+            'current_phase: "aborted_at_monitor"',
+        )
+        result = evaluate_state_text(blocked_monitor)
+        self.assertNotIn(
+            "requires a non-blocked phases.merge_readiness gate",
+            " ".join(result["errors"]),
+        )
+
+    def test_recovery_route_pr_in_progress_with_pending_gate_stays_valid(self) -> None:
+        text = FULL_STATE
+        for old, new in (
+            ('current_phase: "plan"', 'current_phase: "pr"'),
+            ('  plan: "in_progress"', '  plan: "complete"'),
+            ('  plan_review: "pending"', '  plan_review: "complete"'),
+            ('  implementation: "pending"', '  implementation: "complete"'),
+            ('  self_review: "pending"', '  self_review: "complete"'),
+            ('    status: "pending"\n    reason: null', '    status: "waived"\n    reason: "deferred to human QA"'),
+            ('  status: "pending"\n  root_cause: null', '  status: "not_applicable"\n  root_cause: null'),
+            ('  status: "pending"\n  search_patterns: []', '  status: "skipped"\n  search_patterns: []'),
+            ("  skipped_reason: null", '  skipped_reason: "mode none: no defect evidence"'),
+            ('  pr: "pending"', '  pr: "in_progress"'),
+            (
+                '  monitor: "pending"',
+                '  monitor: "pending"\n  merge_readiness: "pending"',
+            ),
+        ):
+            text = _mutate(text, old, new)
+        result = evaluate_state_text(text)
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["state"], VALID)
+
+    def test_complete_merge_readiness_requires_recorded_outcomes(self) -> None:
+        # An EMPTY gate (or pending AC verdicts) with a complete phase is the
+        # bypass the gate exists to prevent: checks that never ran.
+        text = FULL_STATE
+        for old, new in (
+            ('  plan: "in_progress"', '  plan: "complete"'),
+            ('  plan_review: "pending"', '  plan_review: "complete"'),
+            ('  implementation: "pending"', '  implementation: "complete"'),
+            ('  self_review: "pending"', '  self_review: "complete"'),
+            (
+                '  monitor: "pending"',
+                '  monitor: "pending"\n  merge_readiness: "complete"',
+            ),
+            (
+                "decision_audit_trail: []",
+                "merge_readiness: {}\ndecision_audit_trail: []",
+            ),
+        ):
+            text = _mutate(text, old, new)
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any(
+                "requires a terminal non-blocked" in error
+                or "requires a recorded claims_audit" in error
+                for error in result["errors"]
+            )
+        )
+
+    def test_operation_attempts_above_cap_are_rejected(self) -> None:
+        text = _mutate(
+            FULL_STATE,
+            '  qa:\n    scenario: null\n    status: "idle"',
+            '  qa:\n    scenario: "approved_qa"\n    status: "pending"',
+        )
+        text = _mutate(
+            text,
+            "    operations: []\n    operation_results: {}\n  review_roundtrip:",
+            '    operations:\n      - "qa.github.replace_assignees"\n'
+            "    operation_results:\n"
+            '      "qa.github.replace_assignees":\n'
+            '        status: "pending"\n'
+            "        attempts: 7\n"
+            '        started_at: "2026-07-30T19:30:00Z"\n'
+            "  review_roundtrip:",
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("attempts must be between 1 and 3" in error for error in result["errors"])
+        )
+
+
 class MainEntryTests(unittest.TestCase):
     def test_undecodable_state_file_fails_closed(self) -> None:
         import io
@@ -1191,6 +1778,632 @@ class FindingLedgerReviewerTests(unittest.TestCase):
         result = evaluate_state_text(text)
         self.assertIn(
             "finding_ledger.entries[0].reviewer: illegal value", result["errors"]
+        )
+
+
+
+
+def _in_progress_monitor_state() -> str:
+    """Full state advanced to a chain-consistent in-progress monitor."""
+    text = _terminal_monitor_state()
+    return _mutate(text, '  monitor: "paused"', '  monitor: "in_progress"')
+
+
+class WaitKeyLifecycleTests(unittest.TestCase):
+    """R3-F3/F12 + review rounds: next_retry_at / hold_started_at lifecycle."""
+
+    PAST = "2026-08-04T10:00:00Z"
+    FAR_FUTURE = "2999-01-01T00:00:00Z"
+
+    def _with_key(self, text: str, key: str, value: str) -> str:
+        return _mutate(text, "post_push_until: null", f'post_push_until: null\n{key}: "{value}"')
+
+    def test_terminal_monitor_forbids_pending_next_retry_at(self) -> None:
+        for terminal in ("paused", "complete", "blocked"):
+            with self.subTest(monitor=terminal):
+                text = _mutate(
+                    _terminal_monitor_state(), '  monitor: "paused"', f'  monitor: "{terminal}"'
+                )
+                text = self._with_key(text, "next_retry_at", self.PAST)
+                result = evaluate_state_text(text)
+                self.assertEqual(result["state"], SUSPECT)
+                self.assertTrue(
+                    any("next_retry_at" in error for error in result["errors"]),
+                    result["errors"],
+                )
+
+    def test_in_progress_monitor_permits_next_retry_at(self) -> None:
+        text = self._with_key(_in_progress_monitor_state(), "next_retry_at", self.PAST)
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], VALID, result["errors"])
+
+    def test_entry_state_permits_next_retry_at(self) -> None:
+        text = _mutate(
+            _entry_state(),
+            'current_phase: "entry"',
+            f'current_phase: "entry"\nnext_retry_at: "{self.PAST}"',
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], VALID, result["errors"])
+
+    def test_far_future_next_retry_at_is_suspect(self) -> None:
+        text = self._with_key(_in_progress_monitor_state(), "next_retry_at", self.FAR_FUTURE)
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("next_retry_at" in error for error in result["errors"]), result["errors"]
+        )
+
+    def test_hold_started_at_valid_only_under_live_monitor(self) -> None:
+        in_progress = self._with_key(
+            _in_progress_monitor_state(), "hold_started_at", self.PAST
+        )
+        self.assertEqual(evaluate_state_text(in_progress)["state"], VALID)
+
+        blocked = self._with_key(
+            _mutate(_terminal_monitor_state(), '  monitor: "paused"', '  monitor: "blocked"'),
+            "hold_started_at",
+            self.PAST,
+        )
+        self.assertEqual(evaluate_state_text(blocked)["state"], VALID)
+
+        for dead in ("paused", "complete"):
+            with self.subTest(monitor=dead):
+                text = self._with_key(
+                    _mutate(
+                        _terminal_monitor_state(), '  monitor: "paused"', f'  monitor: "{dead}"'
+                    ),
+                    "hold_started_at",
+                    self.PAST,
+                )
+                result = evaluate_state_text(text)
+                self.assertEqual(result["state"], SUSPECT)
+                self.assertTrue(
+                    any("hold_started_at" in error for error in result["errors"]),
+                    result["errors"],
+                )
+
+    def test_pending_monitor_forbids_hold_started_at(self) -> None:
+        text = self._with_key(FULL_STATE, "hold_started_at", self.PAST)
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("hold_started_at" in error for error in result["errors"]), result["errors"]
+        )
+
+    def test_entry_state_forbids_hold_started_at(self) -> None:
+        text = _mutate(
+            _entry_state(),
+            'current_phase: "entry"',
+            f'current_phase: "entry"\nhold_started_at: "{self.PAST}"',
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("hold_started_at" in error for error in result["errors"]), result["errors"]
+        )
+
+    def test_future_hold_started_at_is_suspect(self) -> None:
+        text = self._with_key(
+            _in_progress_monitor_state(), "hold_started_at", self.FAR_FUTURE
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("hold_started_at" in error for error in result["errors"]), result["errors"]
+        )
+
+
+class OperationResultContractRedTests(unittest.TestCase):
+    """R3-F11: the canonical operation-result contract (strict union of the
+    schema and resume-helper rules), pinned on the schema side.
+
+    Non-terminal fixtures (in-progress monitor) are used for the collection
+    and in-flight cases so the pre-existing terminal-monitor invariant cannot
+    mask them — these tests must be able to fail against the exact rule they
+    pin, not pass via an unrelated rejection."""
+
+    OPS_TWO = '    operations: ["github_assignees", "tracker_assign"]'
+
+    @staticmethod
+    def _qa_handoff_live(operations: str, results: str, status: str) -> str:
+        text = _in_progress_monitor_state()
+        text = _mutate(
+            text,
+            '    status: "idle"\n    repository_name_with_owner: null',
+            f'    status: "{status}"\n    repository_name_with_owner: null',
+        )
+        text = _mutate(
+            text, "    operations: []\n    operation_results: {}", f"{operations}\n{results}"
+        )
+        return text
+
+    def _results(self, first: str, second: str) -> str:
+        return "\n".join(
+            (
+                "    operation_results:",
+                '      "github_assignees":',
+                first,
+                '      "tracker_assign":',
+                second,
+            )
+        )
+
+    COMPLETE_OK = "\n".join(
+        (
+            '        status: "complete"',
+            "        attempts: 1",
+            '        started_at: "2026-07-14T16:59:00Z"',
+            '        verified_at: "2026-07-14T17:00:00Z"',
+            "        evidence:",
+            '          verified: "assignee array verified"',
+        )
+    )
+
+    def test_complete_without_started_at_is_suspect(self) -> None:
+        broken = "\n".join(
+            (
+                '        status: "complete"',
+                "        attempts: 1",
+                '        verified_at: "2026-07-14T17:00:00Z"',
+                "        evidence:",
+                '          verified: "ticket owner verified"',
+            )
+        )
+        text = _qa_handoff(self.OPS_TWO, self._results(self.COMPLETE_OK, broken), "complete")
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("started_at" in error for error in result["errors"]), result["errors"]
+        )
+
+    def test_string_evidence_is_suspect(self) -> None:
+        broken = "\n".join(
+            (
+                '        status: "complete"',
+                "        attempts: 1",
+                '        started_at: "2026-07-14T16:59:00Z"',
+                '        verified_at: "2026-07-14T17:00:00Z"',
+                '        evidence: "ticket owner verified"',
+            )
+        )
+        text = _qa_handoff(self.OPS_TWO, self._results(self.COMPLETE_OK, broken), "complete")
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("evidence" in error for error in result["errors"]), result["errors"]
+        )
+
+    def test_verified_before_started_is_suspect(self) -> None:
+        broken = "\n".join(
+            (
+                '        status: "complete"',
+                "        attempts: 1",
+                '        started_at: "2026-07-14T18:00:00Z"',
+                '        verified_at: "2026-07-14T17:00:00Z"',
+                "        evidence:",
+                '          verified: "ticket owner verified"',
+            )
+        )
+        text = _qa_handoff(self.OPS_TWO, self._results(self.COMPLETE_OK, broken), "complete")
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("verified_at" in error for error in result["errors"]), result["errors"]
+        )
+
+    def test_unknown_field_is_suspect(self) -> None:
+        broken = "\n".join(
+            (
+                '        status: "complete"',
+                "        attempts: 1",
+                '        started_at: "2026-07-14T16:59:00Z"',
+                '        verified_at: "2026-07-14T17:00:00Z"',
+                "        evidence:",
+                '          verified: "ticket owner verified"',
+                '        surprise: "field"',
+            )
+        )
+        text = _qa_handoff(self.OPS_TWO, self._results(self.COMPLETE_OK, broken), "complete")
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+
+    def test_retryable_at_the_attempt_cap_is_suspect(self) -> None:
+        broken = "\n".join(
+            (
+                '        status: "retryable"',
+                "        attempts: 3",
+                '        started_at: "2026-07-14T16:59:00Z"',
+                '        verified_at: "2026-07-14T17:00:00Z"',
+                '        error: "boom"',
+            )
+        )
+        text = self._qa_handoff_live(
+            self.OPS_TWO, self._results(self.COMPLETE_OK, broken), "pending"
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+
+    def test_two_in_flight_results_are_suspect(self) -> None:
+        pending = "\n".join(
+            (
+                '        status: "pending"',
+                "        attempts: 1",
+                '        started_at: "2026-07-14T16:59:00Z"',
+            )
+        )
+        text = self._qa_handoff_live(self.OPS_TWO, self._results(pending, pending), "pending")
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+
+    def test_non_prefix_results_are_suspect(self) -> None:
+        """A result for the second operation with the first unfinished breaks
+        the write-ahead prefix ordering."""
+        second_only = "\n".join(
+            (
+                "    operation_results:",
+                '      "tracker_assign":',
+                self.COMPLETE_OK,
+            )
+        )
+        text = self._qa_handoff_live(self.OPS_TWO, second_only, "pending")
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+
+
+class SingleSourceRebindTests(unittest.TestCase):
+    """R3-F5 + review rounds: constants are single-sourced in state_schema and
+    REBOUND (not re-declared) by their consumers — pinned structurally because
+    small-int interning makes identity/equality assertions vacuous."""
+
+    def test_state_schema_owns_the_canonical_constants(self) -> None:
+        import state_schema
+
+        self.assertEqual(getattr(state_schema, "MAX_OPERATION_ATTEMPTS", None), 3)
+        self.assertEqual(getattr(state_schema, "MAX_QUOTA_WAIT_SECONDS", None), 3600)
+
+    def test_handoff_decision_rebinds_the_attempt_cap(self) -> None:
+        import inspect
+        import handoff_decision
+
+        source = inspect.getsource(handoff_decision)
+        self.assertIn(
+            "MAX_OPERATION_ATTEMPTS = state_schema.MAX_OPERATION_ATTEMPTS", source
+        )
+        self.assertNotIn("MAX_OPERATION_ATTEMPTS = 3", source)
+        self._assert_live_binding("handoff_decision", "MAX_OPERATION_ATTEMPTS")
+
+    def test_model_policy_rebinds_the_quota_wait_ceiling(self) -> None:
+        import inspect
+        import model_policy
+
+        source = inspect.getsource(model_policy)
+        self.assertIn(
+            "MAX_QUOTA_WAIT_SECONDS = state_schema.MAX_QUOTA_WAIT_SECONDS", source
+        )
+        self._assert_live_binding("model_policy", "MAX_QUOTA_WAIT_SECONDS")
+
+    def _assert_live_binding(self, module_name: str, constant: str) -> None:
+        """Prove the consumer's constant is EXECUTABLY derived from
+        state_schema, not a coincident literal shadowed by a marker-satisfying
+        comment: patch the canonical value, reload the consumer, and observe
+        the change propagate (then restore both)."""
+        import importlib
+        import state_schema
+
+        module = importlib.import_module(module_name)
+        original = getattr(state_schema, constant)
+        try:
+            setattr(state_schema, constant, original + 1111)
+            importlib.reload(module)
+            self.assertEqual(getattr(module, constant), original + 1111)
+        finally:
+            setattr(state_schema, constant, original)
+            importlib.reload(module)
+            self.assertEqual(getattr(module, constant), original)
+
+
+class OperationContractDifferentialTests(unittest.TestCase):
+    """R3-F11 differential guarantee: state_schema and handoff_decision decide
+    every operation-result shape identically — a state file that validates
+    clean can never be rejected by the resume planner, and vice versa."""
+
+    @staticmethod
+    def _schema_verdict(record) -> bool:
+        _, errors = validate_operation_result_record(record, label="probe")
+        return not errors
+
+    @staticmethod
+    def _planner_verdict(record) -> bool:
+        import handoff_decision
+
+        _, errors = handoff_decision._operation_results(
+            {"operation_results": {"probe_op": record}}
+        )
+        return not errors
+
+    def _record(self, status="complete", **overrides):
+        record = {
+            "status": status,
+            "attempts": 1,
+            "started_at": "2026-07-14T16:59:00Z",
+            "verified_at": "2026-07-14T17:00:00Z",
+        }
+        if status == "complete":
+            record["evidence"] = {"postcondition": "verified"}
+        if status in ("retryable", "failed"):
+            record["error"] = "boom"
+        for key, value in overrides.items():
+            if value is _OMIT:
+                record.pop(key, None)
+            else:
+                record[key] = value
+        return record
+
+    def test_every_divergence_axis_agrees(self) -> None:
+        cases = {
+            "valid complete": (self._record(), True),
+            "valid pending": (self._record("pending", verified_at=_OMIT, evidence=_OMIT), True),
+            "valid failed": (self._record("failed", evidence=_OMIT), True),
+            "valid retryable below cap": (
+                self._record("retryable", attempts=2, evidence=_OMIT),
+                True,
+            ),
+            "complete without started_at": (self._record(started_at=_OMIT), False),
+            "string evidence": (self._record(evidence="just words"), False),
+            "verified before started": (
+                self._record(verified_at="2026-07-14T16:00:00Z"),
+                False,
+            ),
+            "unknown field": (self._record(surprise="field"), False),
+            "retryable at the cap": (
+                self._record("retryable", attempts=3, evidence=_OMIT),
+                False,
+            ),
+            "pending with invalid verified_at": (
+                self._record("pending", verified_at="yesterday", evidence=_OMIT),
+                False,
+            ),
+            "non-string error on failed": (
+                self._record("failed", error=123, evidence=_OMIT),
+                False,
+            ),
+        }
+        for name, (record, expected_ok) in cases.items():
+            with self.subTest(case=name):
+                schema_ok = self._schema_verdict(record)
+                planner_ok = self._planner_verdict(record)
+                self.assertEqual(schema_ok, planner_ok, name)
+                self.assertIs(schema_ok, expected_ok, name)
+
+    def test_collection_rules_agree_with_the_planner(self) -> None:
+        import handoff_decision
+
+        base_request = {
+            "scenario": "human_review_roundtrip",
+            "repository": {"nameWithOwner": "Keeper-Dating/matchmaking"},
+            "pull_request_number": 7,
+            "authenticated_actor": "jakozloski",
+            "reviewers": [
+                {
+                    "login": login,
+                    "account_type": "User",
+                    "deleted": False,
+                    # Eligibility requires evaluated/replied feedback evidence
+                    # (same shape as test_handoff_decision.reviewer()).
+                    "review_bodies": {
+                        "review-1": {
+                            "updated_at": "2026-07-09T20:09:07Z",
+                            "evaluated_updated_at": "2026-07-09T20:09:07Z",
+                            "evaluated_at": "2026-07-09T20:09:07Z",
+                            "acknowledgment_id": "ack-1",
+                            "acknowledgment_author": "jakozloski",
+                        }
+                    },
+                    "inline_roots": {
+                        "comment-1": {
+                            "updated_at": "2026-07-09T20:09:07Z",
+                            "replied_to_updated_at": "2026-07-09T20:09:07Z",
+                            "reply_id": "reply-1",
+                            "replied_at": "2026-07-09T20:09:07Z",
+                            "reply_author": "jakozloski",
+                        }
+                    },
+                    "current_review_body_ids": ["review-1"],
+                    "current_inline_root_ids": ["comment-1"],
+                    "fix_shas": ["1111111111111111111111111111111111111111"],
+                    "pushed_fix_shas": ["1111111111111111111111111111111111111111"],
+                    "pushed_through_sha": "2222222222222222222222222222222222222222",
+                    "blocker_remaining": False,
+                }
+                for login in ("alice", "zoe")
+            ],
+        }
+        planned = handoff_decision.plan_handoff(dict(base_request))
+        operation_ids = [operation["id"] for operation in planned["operations"]]
+        self.assertGreaterEqual(len(operation_ids), 2, planned)
+
+        pending = {
+            "status": "pending",
+            "attempts": 1,
+            "started_at": "2026-07-14T16:59:00Z",
+        }
+        two_pending = dict(base_request)
+        two_pending["operation_results"] = {
+            operation_ids[0]: dict(pending),
+            operation_ids[1]: dict(pending),
+        }
+        plan = handoff_decision.plan_handoff(two_pending)
+        self.assertEqual(plan["state"], "blocked")
+        self.assertIn(
+            "only one operation may be pending or retryable at a time", plan["errors"]
+        )
+        statuses = {operation_ids[0]: "pending", operation_ids[1]: "pending"}
+        schema_errors = validate_operation_collection(
+            operation_ids, statuses, label="probe"
+        )
+        self.assertTrue(
+            any("only one operation may be pending or retryable" in e for e in schema_errors)
+        )
+
+        out_of_order = dict(base_request)
+        complete = dict(pending, status="complete",
+                        verified_at="2026-07-14T17:00:00Z",
+                        evidence={"postcondition": "verified"})
+        out_of_order["operation_results"] = {operation_ids[1]: complete}
+        plan = handoff_decision.plan_handoff(out_of_order)
+        self.assertEqual(plan["state"], "blocked")
+        self.assertIn(
+            "operation results must form a prefix with at most one in-flight tail",
+            plan["errors"],
+        )
+        schema_errors = validate_operation_collection(
+            operation_ids, {operation_ids[1]: "complete"}, label="probe"
+        )
+        self.assertTrue(
+            any("prefix with at most one in-flight tail" in e for e in schema_errors)
+        )
+
+
+_OMIT = object()
+
+
+class WaitKeyClockBoundaryTests(unittest.TestCase):
+    """Controlled-clock literal boundary pins for the wait-key rules: the 300s
+    tolerance is INCLUSIVE and the next_retry_at ceiling is MAX+tolerance —
+    a drifted constant or an exclusive comparison fails these exactly."""
+
+    FIXED_NOW = "2026-08-04T12:00:00+00:00"
+
+    def setUp(self) -> None:
+        import state_schema
+        from datetime import datetime
+
+        self._saved_utcnow = state_schema._utcnow
+        fixed = datetime.fromisoformat(self.FIXED_NOW)
+        state_schema._utcnow = lambda: fixed
+
+    def tearDown(self) -> None:
+        import state_schema
+
+        state_schema._utcnow = self._saved_utcnow
+
+    def _with_key(self, text: str, key: str, value: str) -> str:
+        return _mutate(text, "post_push_until: null", f'post_push_until: null\n{key}: "{value}"')
+
+    def test_hold_started_at_tolerance_is_inclusive_at_exactly_300s(self) -> None:
+        text = self._with_key(
+            _in_progress_monitor_state(), "hold_started_at", "2026-08-04T12:05:00+00:00"
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], VALID, result["errors"])
+
+    def test_hold_started_at_rejected_at_301s_ahead(self) -> None:
+        text = self._with_key(
+            _in_progress_monitor_state(), "hold_started_at", "2026-08-04T12:05:01+00:00"
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("hold_started_at" in error for error in result["errors"]), result["errors"]
+        )
+
+    def test_next_retry_at_ceiling_is_inclusive_at_max_plus_tolerance(self) -> None:
+        # 3600 (MAX_QUOTA_WAIT_SECONDS) + 300 (tolerance) = 13:05:00
+        text = self._with_key(
+            _in_progress_monitor_state(), "next_retry_at", "2026-08-04T13:05:00+00:00"
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], VALID, result["errors"])
+
+    def test_next_retry_at_rejected_one_second_past_the_ceiling(self) -> None:
+        text = self._with_key(
+            _in_progress_monitor_state(), "next_retry_at", "2026-08-04T13:05:01+00:00"
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("next_retry_at" in error for error in result["errors"]), result["errors"]
+        )
+
+
+class PostPushUntilCeilingTests(unittest.TestCase):
+    """R4-F1: post_push_until is the third deadline key and gets the same
+    resume-ceiling treatment as its siblings — bounded by the declared grace
+    window (state override honored) plus the inclusive skew tolerance."""
+
+    FIXED_NOW = "2026-08-04T12:00:00+00:00"
+
+    def setUp(self) -> None:
+        import state_schema
+        from datetime import datetime
+
+        self._saved_utcnow = state_schema._utcnow
+        fixed = datetime.fromisoformat(self.FIXED_NOW)
+        state_schema._utcnow = lambda: fixed
+
+    def tearDown(self) -> None:
+        import state_schema
+
+        state_schema._utcnow = self._saved_utcnow
+
+    def _with_push_until(self, value: str, *, window_override: int | None = None) -> str:
+        text = _mutate(FULL_STATE, "post_push_until: null", f'post_push_until: "{value}"')
+        if window_override is not None:
+            text = _mutate(
+                text,
+                "resolved_conventions:\n  quality_check_steps: []",
+                "resolved_conventions:\n  quality_check_steps: []\n  monitor_constants:\n"
+                f"    bot_grace_window_seconds: {window_override}",
+            )
+        return text
+
+    def test_normal_grace_window_value_stays_valid(self) -> None:
+        result = evaluate_state_text(self._with_push_until("2026-08-04T12:15:00+00:00"))
+        self.assertEqual(result["state"], VALID, result["errors"])
+
+    def test_ceiling_is_inclusive_at_window_plus_tolerance(self) -> None:
+        # 900 (default BOT_GRACE_WINDOW) + 300 (tolerance) = 12:20:00
+        result = evaluate_state_text(self._with_push_until("2026-08-04T12:20:00+00:00"))
+        self.assertEqual(result["state"], VALID, result["errors"])
+
+    def test_rejected_one_second_past_the_ceiling(self) -> None:
+        result = evaluate_state_text(self._with_push_until("2026-08-04T12:20:01+00:00"))
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("post_push_until" in error for error in result["errors"]), result["errors"]
+        )
+
+    def test_far_future_value_is_suspect(self) -> None:
+        result = evaluate_state_text(self._with_push_until("2999-01-01T00:00:00Z"))
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("post_push_until" in error for error in result["errors"]), result["errors"]
+        )
+
+    def test_absurd_window_override_falls_back_and_never_tracebacks(self) -> None:
+        """A state-supplied window beyond the one-day sanity bound is garbage:
+        it must not neuter the ceiling and must not overflow the timedelta
+        arithmetic into a traceback — the validator always returns a verdict."""
+        text = self._with_push_until(
+            "2999-01-01T00:00:00Z", window_override=90000000000000
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("post_push_until" in error for error in result["errors"]), result["errors"]
+        )
+
+    def test_declared_window_override_extends_the_ceiling(self) -> None:
+        # Documented per-project override: bot_grace_window_seconds: 1800.
+        # 1800 + 300 = 12:35:00 valid inclusive; one second past rejected.
+        ok = self._with_push_until("2026-08-04T12:35:00+00:00", window_override=1800)
+        self.assertEqual(evaluate_state_text(ok)["state"], VALID, evaluate_state_text(ok)["errors"])
+        over = self._with_push_until("2026-08-04T12:35:01+00:00", window_override=1800)
+        result = evaluate_state_text(over)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("post_push_until" in error for error in result["errors"]), result["errors"]
         )
 
 

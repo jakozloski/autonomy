@@ -12,11 +12,12 @@ import argparse
 import re
 import sys
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import model_policy  # noqa: E402  (sibling module; path set immediately above)
+import model_policy
+import state_schema  # noqa: E402  (sibling module; path set immediately above)
 
 
 ALLOWED_FRONTMATTER_KEYS = frozenset({"name", "description"})
@@ -36,6 +37,7 @@ REVIEW_MODEL_FLAGS = (
 REQUIRED_REFERENCE_FILES = (
     "references/project-and-entry.md",
     "references/phases-1-5.md",
+    "references/merge-readiness.md",
     "references/monitor-ci-feedback.md",
     "references/monitor-exit-handoffs.md",
     "references/state-and-safety.md",
@@ -47,8 +49,10 @@ REQUIRED_SCRIPT_FILES = (
     "scripts/validate_package.py",
     "scripts/test_handoff_decision.py",
     "scripts/test_model_policy.py",
+    "scripts/test_model_policy_supervision.py",
     "scripts/test_state_schema.py",
     "scripts/test_validate_package.py",
+    "scripts/test_cli_fail_closed.py",
 )
 
 # Evidence-gate and state-hardening content contracts.  Each marker is an
@@ -58,10 +62,22 @@ REQUIRED_SCRIPT_FILES = (
 REQUIRED_GATE_MARKERS = {
     "SKILL.md": (
         "state_schema.py",
+        # R2 F1 + R3 F2 — the failure-matrix quota row: bounded helper wait,
+        # constant-derived ceiling (a value bump in state_schema fails
+        # validation until this prose catches up), helper-decided streak.
+        "WAIT until the helper-computed `quota.wait_until`",
+        "`MAX_QUOTA_WAIT_SECONDS` ("
+        + str(model_policy.MAX_QUOTA_WAIT_SECONDS)
+        + "s)",
+        "decided by the helper from the fed `post_invocation` records",
         "red/green regression evidence",
         "evaluated_head_sha",
         "Prompt Ledger",
         "prompt-trail:stale",
+        "merge-readiness.md",
+        "phases.merge_readiness",
+        "direction-aware merge-readiness hold",
+        "Never trade a test for a green review",
         # Follow-through contracts: fail-fast gate, terminal turn, salvage.
         "Model-Gate Entry Preflight",
         "Deterministic authentication failure",
@@ -69,6 +85,14 @@ REQUIRED_GATE_MARKERS = {
         "branch-established:",
         "validation-before-push:",
         "Stranded work",
+        # Derived policy pins — the Claude floors and CLI minimums must appear
+        # in the core, under the same single-source contract as the codex flag
+        # strings (a floor bump in model_policy.py fails validation until the
+        # prose catches up).
+        model_policy.BASE_MODEL,
+        model_policy.REVIEWER_MODEL,
+        ">= " + ".".join(str(part) for part in model_policy.MIN_CLAUDE_VERSION),
+        ">= " + ".".join(str(part) for part in model_policy.MIN_CODEX_VERSION),
     ),
     "references/phases-1-5.md": (
         "Red/green regression evidence (mandatory when",
@@ -80,14 +104,61 @@ REQUIRED_GATE_MARKERS = {
         "Root cause & scope decision",
         "one sanitized checkbox per AC",
         "CI evidence: pending for head",
+        "test-integrity tripwire",
+        "Review-response fixes never tier Small",
+        "Merge Readiness Gate",
+        "re-run merge-readiness Check 3 against the just-created ticket",
         # Authentication detection must stay structured-channel only.
         "Authentication detection (every real Codex invocation",
+        # R2 F1/F2 + R3 F2 — the quota-wait dispatch: helper-computed bounded
+        # wait, helper-decided streak over the fed records, and the
+        # concretely-passed runaway ceiling.
+        "wait_for_quota_reset",
+        "quota_reset_at",
+        "clamped to `MAX_QUOTA_WAIT_SECONDS` per sleep",
+        "the HELPER takes the terminal no-usable-reset block",
+        "judged at its own `observed_at`",
+        "max_runtime_seconds="
+        + str(model_policy.PER_ATTEMPT_CEILING_SECONDS),
         "supervise_stream(stdout_pipe, stderr_pipe, kill_callback)",
         "verify_frozen_selection()",
         "attempts are per-invocation and reset each round",
     ),
+    "references/merge-readiness.md": (
+        "Deploy-Order Safety",
+        "Dependency Merge-State",
+        "AC Conformance",
+        "Claims Audit",
+        "test-integrity tripwire",
+        "never tier Small",
+        "merge_readiness.deploy_order",
+        "Zero-caller implementations are NOT met",
+        "Merged-but-not-live is the same ordering hazard as unmerged",
+        # 28e13163ef direction-aware generation — a regeneration that drops
+        # these loses the destructive-direction fix and the ready-PR signal.
+        "merge_readiness.hazard_direction",
+        'merge_readiness.dependencies: "hazard_documented"',
+        "posts the `### Deploy order`",
+        "return to the caller",
+    ),
     "references/state-and-safety.md": (
         "Resume trust model",
+        # R2 liveness contracts — dropping any of these regressions F2/F3/B:
+        # the ceiling parameter, the schema-legal wait timestamp and its
+        # reset-path clear, and the stale-reset clamp.
+        "max_runtime_seconds="
+        + str(model_policy.PER_ATTEMPT_CEILING_SECONDS),
+        "persist `next_retry_at`",
+        "hold_started_at",
+        "`next_retry_at`, and phase-specific blocked status fields",
+        # R4 F1 — the grace window is canonical in state_schema; the template
+        # line must carry the derived value or a bump silently splits the
+        # loop's armed window from the validator's resume ceiling.
+        "bot_grace_window_seconds: "
+        + str(state_schema.BOT_GRACE_WINDOW_SECONDS),
+        "takes the terminal quota block",
+        "clamped to `MAX_QUOTA_WAIT_SECONDS` per sleep",
+        "`MAX_QUOTA_WAIT_SECONDS` resume ceiling",
         "regression_evidence:",
         "variant_analysis:",
         "state_schema_version",
@@ -95,23 +166,69 @@ REQUIRED_GATE_MARKERS = {
         "audit-only",
         "defect_evidence_mode",
         "pr_artifacts",
+        "acceptance_criteria:",
+        "merge_readiness:",
+        "hazard_direction",
         "Stranded work",
         "postcondition-bound",
+    ),
+    "references/monitor-ci-feedback.md": (
+        "world-state refresh",
+        # R4 F1 — the pseudocode constant derives from state_schema.
+        "BOT_GRACE_WINDOW = " + str(state_schema.BOT_GRACE_WINDOW_SECONDS),
+        "merge-readiness holds are clear",
+        "reviewable files (code, config, tests, skills/docs",
+        # R2 F4 — hold-waits are poll ticks with a bounded human-dependency
+        # exit; dropping any line reverts holds to cap-burning hot polls or
+        # an unbounded silent strand.
+        "Live merge-readiness hold",
+        "human:deploy-hold",
+        "hold_started_at",
     ),
     "references/monitor-exit-handoffs.md": (
         "diff-triggered review focus lines",
         "CI-config self-verification",
         "QA rehearsal (advisory, non-blocking",
+        "deploy-hold",
+        "ready:dependency-hold",
+        "exit:deploy-hold",
+        'A `"destructive"`-direction hazard does NOT hold the flip',
+        "never the Small tier",
         # Human-only dependency grammar: forms select fixed verifiers.
         "closed, package-authored grammar",
         "human:codex-login",
         "human:user-confirm",
         "fires on PRESENCE",
         "Degraded terminal path",
+        # R2 F4 — the hold sites route to wait_repoll and carry the bounded
+        # human-dependency backstop with its persisted span and its own
+        # grammar rows (fixed applied/live-state verifiers).
+        'set `loop_reason = "wait_repoll"`',
+        "human:deploy-hold",
+        "human:dependency-hold",
+        # Row-unique verifier text: the key substrings above also occur in
+        # hold prose, so deleting the grammar table rows alone would still
+        # pass without these.
+        "applied-state query for the held migration",
+        "clears when the dependency verifies live",
+        "BOT_GRACE_WINDOW` of continuous hold time",
+        "hold_started_at",
+    ),
+    "scripts/handoff_decision.py": (
+        # R3 F5 — the attempt cap is REBOUND from state_schema, never a second
+        # literal (interning makes equality tests vacuous; the source line is
+        # the pin).
+        "MAX_OPERATION_ATTEMPTS = state_schema.MAX_OPERATION_ATTEMPTS",
+    ),
+    "scripts/model_policy.py": (
+        # R3 F2/r6 — the quota-wait ceiling is REBOUND from state_schema so
+        # the helper clamp and the validator's resume bound cannot drift.
+        "MAX_QUOTA_WAIT_SECONDS = state_schema.MAX_QUOTA_WAIT_SECONDS",
     ),
     "references/project-and-entry.md": (
         "red/green + variant evidence gate",
         "defect_evidence_mode",
+        "Capture acceptance criteria",
         "Real access smoke test (authoritative)",
         "Path-inheritance invariant",
         "routing_fingerprint",
@@ -229,6 +346,17 @@ BUILTIN_EXPECTED_HEADINGS: Mapping[str, tuple[str, ...]] = {
         "### Adapter Architecture",
         "### Security Model (Autonomous Mode)",
     ),
+    "references/merge-readiness.md": (
+        "## Phase 4b: Merge Readiness Gate (World-State Checks)",
+        "### AC Capture (Entry A step 5 / Entry B step 5)",
+        "### Check 1: Deploy-Order Safety (migrations & runtime schema)",
+        "### Check 2: Dependency Merge-State (cross-repo & sibling PRs)",
+        "### Check 3: AC Conformance",
+        "### Check 4: Claims Audit (PR body, comments, docstrings)",
+        "### Review-Fix Integrity (tripwire, tier floor, consumer widening)",
+        "### Monitor-Loop World-State Refresh (Phase 6 Step 2, step 12 — canonical definition)",
+        "### Phase 4b State",
+    ),
     "references/phases-1-5.md": (
         "## Phase 1: Plan",
         "## Phase 2: Review the Plan",
@@ -244,6 +372,7 @@ BUILTIN_EXPECTED_HEADINGS: Mapping[str, tuple[str, ...]] = {
         "## Phase 5: Create / Update PR",
         "### PR Body Template (MANDATORY)",
         "### Issue Tracker Enforcement (Conditional on `ISSUE_TRACKER.type`)",
+        "### PR labels (Keeper-Dating org repos)",
         "### If no PR exists yet:",
         "### If PR already exists (takeover):",
     ),
@@ -277,13 +406,6 @@ BUILTIN_EXPECTED_HEADINGS: Mapping[str, tuple[str, ...]] = {
         "## Rules",
     ),
 }
-
-def _display_path(path: Path, package_dir: Path) -> str:
-    try:
-        return path.relative_to(package_dir).as_posix()
-    except ValueError:
-        return str(path)
-
 
 def _parse_frontmatter(skill_text: str) -> tuple[dict[str, str], list[str]]:
     errors: list[str] = []
@@ -324,6 +446,16 @@ def _parse_frontmatter(skill_text: str) -> tuple[dict[str, str], list[str]]:
                 )
                 continue
             scalar = scalar[1:-1]
+        elif re.search(r":(?:[ \t]|$)", scalar):
+            # An unquoted plain scalar containing ':' before whitespace or at
+            # end-of-line is invalid YAML; a lenient regex accepting it here
+            # would pass validation while the real skill loader fails to parse
+            # the frontmatter.
+            errors.append(
+                f"SKILL.md:{line_number}: frontmatter key {key!r} must quote "
+                "scalars containing ': '"
+            )
+            continue
         values[key] = scalar
 
     unknown = sorted(set(values) - ALLOWED_FRONTMATTER_KEYS)
@@ -535,6 +667,7 @@ def _validate_openai_yaml(package_dir: Path) -> list[str]:
         (index, line.strip())
         for index, line in enumerate(lines)
         if line.strip() and not line.lstrip().startswith("#") and not line[0].isspace()
+        and line.strip() not in {"---", "..."}
     ]
     interface_entries = [
         index for index, value in root_entries if value == "interface:"

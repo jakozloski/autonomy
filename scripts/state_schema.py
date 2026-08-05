@@ -49,6 +49,10 @@ Cross-field invariants (source of truth for the reference text)
       requires ``runtime_verification: complete|waived``; ``monitor``
       requires ``pr: complete``. A blocked predecessor never authorizes a
       successor (Entry B bootstrap marks skipped phases complete first).
+      ``merge_readiness`` non-pending requires ``self_review: complete`` —
+      a forward edge only: no later phase lists the optional gate as its
+      predecessor, preserving pre-4b states and the Phase 5 run-the-gate-now
+      recovery route.
       ``pr: complete`` additionally requires a non-null top-level
       ``pr_number``.
 (iii) Per-handoff derived status, every tier: result keys are a SUBSET of
@@ -58,7 +62,15 @@ Cross-field invariants (source of truth for the reference text)
       require result keys to exactly equal planned IDs (``complete`` = all
       complete; ``failed`` = all terminal, at least one failed); operation
       IDs valid and unique. Terminal monitor (complete|paused|blocked)
-      additionally prohibits missing/pending/retryable results.
+      additionally prohibits missing/pending/retryable results. Each record
+      satisfies the canonical operation-result contract
+      (``validate_operation_result_record`` — the strict union shared with
+      handoff_decision: started_at always; every supplied timestamp parses;
+      verified_at >= started_at; non-empty mapping evidence on complete;
+      non-empty string error on retryable/failed; no unknown fields;
+      retryable below the attempt cap) and the collection satisfies
+      ``validate_operation_collection`` (single in-flight; prefix with at
+      most one in-flight tail).
 (iv)  Evidence consistency per ``defect_evidence_mode``:
       ``runtime_bug_fix`` requires ``change_type: bug_fix``;
       ``skill_helper_defect`` requires ``change_type: skill_only``. Once
@@ -77,6 +89,12 @@ Cross-field invariants (source of truth for the reference text)
 (vi)  Freshness fields when evidence is terminal: ``evaluated_head_sha``
       (regression complete|exempt) and ``analyzed_head_sha`` (variants
       complete) are full-length hex object IDs.
+(vii) Wait-key lifecycle: a terminal monitor (complete|paused|blocked)
+      forbids a non-null ``next_retry_at``; a non-null ``next_retry_at``
+      is bounded by now + MAX_QUOTA_WAIT_SECONDS + the 300s inclusive skew
+      tolerance (beyond it the resume point is suspect); a non-null
+      ``hold_started_at`` requires ``phases.monitor`` in_progress|blocked
+      and must not be in the future (same tolerance).
 
 Persisted evidence ``argv`` is AUDIT-ONLY and is never an execution source;
 ``test_paths`` entries are shape-checked here (repository-relative, no
@@ -88,7 +106,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import re
 import sys
 from typing import Any
@@ -115,11 +133,21 @@ PHASE_NAMES = (
     "pr",
     "monitor",
 )
+# Phase 4b (merge readiness) shipped after v1 state files existed in the wild.
+# Its phase entry is OPTIONAL: a pre-4b state without it stays valid, and the
+# workflow initializes it on resume and re-runs the gate before Phase 5 (see
+# references/merge-readiness.md).  Listing it in PHASE_NAMES instead would make
+# every old state suspect via the missing-key check.
+OPTIONAL_PHASE_NAMES = ("merge_readiness",)
 ENTRY_PHASES = ("entry", "takeover")
 LEGAL_CURRENT_PHASES = frozenset(
     ENTRY_PHASES
     + PHASE_NAMES
-    + tuple(f"aborted_at_{name}" for name in ENTRY_PHASES + PHASE_NAMES)
+    + OPTIONAL_PHASE_NAMES
+    + tuple(
+        f"aborted_at_{name}"
+        for name in ENTRY_PHASES + PHASE_NAMES + OPTIONAL_PHASE_NAMES
+    )
 )
 
 SIMPLE_PHASE_ENUM = frozenset(("pending", "in_progress", "complete", "blocked"))
@@ -135,6 +163,36 @@ DEFECT_MODE_ENUM = frozenset(("runtime_bug_fix", "skill_helper_defect", "none"))
 CHANGE_TYPE_ENUM = frozenset(("bug_fix", "feature", "refactor", "skill_only"))
 HANDOFF_STATUS_ENUM = frozenset(("idle", "pending", "complete", "failed"))
 OPERATION_STATUS_ENUM = frozenset(("pending", "retryable", "complete", "failed"))
+OPERATION_RESULT_ALLOWED_KEYS = frozenset(
+    ("status", "attempts", "started_at", "verified_at", "response_id", "error", "evidence")
+)
+
+# Canonical cross-helper constants — single source of truth. Consumers REBIND
+# these names (handoff_decision.MAX_OPERATION_ATTEMPTS and
+# model_policy.MAX_QUOTA_WAIT_SECONDS) instead of re-declaring literals;
+# validate_package.py pins the exact rebind lines.
+MAX_OPERATION_ATTEMPTS = 3
+# Ceiling on ONE quota sleep (model_policy clamps wait_until to it; this
+# validator bounds a persisted next_retry_at with it so a pre-fix or corrupted
+# far-future resume point cannot re-open the unbounded wait through state).
+MAX_QUOTA_WAIT_SECONDS = 3600
+# Wall-clock skew tolerance (inclusive) for the time-dependent checks below.
+# Time-dependent validation is deliberate: a future hold span-start or an
+# over-ceiling retry instant is an error at write time, whatever the clock
+# later says.
+CLOCK_SKEW_TOLERANCE_SECONDS = 300
+# Default bot-grace window — canonical here so the post_push_until resume
+# ceiling and the monitor prose derive from one value; a per-project
+# monitor_constants.bot_grace_window_seconds override (validated positive int
+# within the sanity bound below) extends the ceiling with it, because the
+# window the loop arms is the window the ceiling must honor.
+BOT_GRACE_WINDOW_SECONDS = 900
+# Overrides beyond one day are garbage, not configuration: an unbounded
+# state-supplied window would both neuter the resume ceiling and overflow the
+# timedelta arithmetic (the model_policy observed_at lesson) — out-of-bound
+# values fall back to the default, keeping the arithmetic provably safe with
+# no dead exception handler.
+MAX_GRACE_WINDOW_OVERRIDE_SECONDS = 86400
 LAST_CHECK_ENUM = frozenset(("passing", "failing", "pending"))
 LEDGER_STATUS_ENUM = frozenset(
     ("open", "fixed", "false_positive", "escalated", "auto_closed")
@@ -146,6 +204,33 @@ LEDGER_REVIEWER_ENUM = frozenset(
     ("gstack_review", "octo_review", "code_reviewer", "adversarial", "escalation_voice")
 )
 TERMINAL_MONITOR = frozenset(("complete", "paused", "blocked"))
+# Phase 4b (merge readiness) value contracts — see references/merge-readiness.md.
+AC_VERDICT_ENUM = frozenset(("pending", "met", "unmet", "deferred", "n_a"))
+AC_ENTRY_KEYS = frozenset(("id", "text", "source", "verdict", "evidence"))
+DEPLOY_ORDER_ENUM = frozenset(
+    ("pending", "pass", "hazard_documented", "blocked", "n_a")
+)
+DEPENDENCIES_ENUM = frozenset(
+    # hazard_documented (merged-but-not-live, ordering documented) and
+    # unverified (external control plane / unreadable live state) are
+    # completed-check outcomes, same as Check 1's — see merge-readiness.md.
+    ("pending", "pass", "hazard_documented", "unverified", "blocked", "n_a")
+)
+HAZARD_DIRECTION_ENUM = frozenset(("additive", "destructive", "mixed"))
+AC_CONFORMANCE_ENUM = frozenset(
+    ("pending", "pass", "blocked", "n_a", "unavailable")
+)
+APPLIED_STATE_ENUM = frozenset(("applied", "pending", "unverified"))
+MERGE_READINESS_KEYS = frozenset(
+    (
+        "deploy_order",
+        "hazard_direction",
+        "applied_state",
+        "dependencies",
+        "ac_conformance",
+        "claims_audit",
+    )
+)
 
 # Full top-level key inventory of the documented v1 schema.  Presence beyond
 # the tier's required set is fine as long as the key is known.
@@ -183,6 +268,8 @@ KNOWN_TOP_LEVEL_KEYS = frozenset(
         "monitor_poll_ticks",
         "monitor_self_review_call_count",
         "post_push_until",
+        "next_retry_at",
+        "hold_started_at",
         "last_observed_head_sha",
         "clean_poll_timestamps",
         "attempt_log",
@@ -190,12 +277,24 @@ KNOWN_TOP_LEVEL_KEYS = frozenset(
         "finding_ledger",
         "phases",
         "decision_audit_trail",
+        "acceptance_criteria",
+        "merge_readiness",
     )
+)
+
+# Same migration rule as OPTIONAL_PHASE_NAMES: the Phase 4b blocks are known
+# (so states carrying them validate) but never required (so pre-4b states stay
+# valid).  New workflows initialize both at entry per project-and-entry.md.
+# next_retry_at follows the same rule for pre-liveness states: it is the
+# liveness-wait resume point (Timeout Heuristics), written only while a
+# model-gate wait is pending, so most states legitimately omit it.
+OPTIONAL_TOP_LEVEL_KEYS = frozenset(
+    ("acceptance_criteria", "merge_readiness", "next_retry_at", "hold_started_at")
 )
 
 MINIMAL_REQUIRED = ("state_schema_version", "workflow_id", "description", "current_phase")
 TAKEOVER_REQUIRED = MINIMAL_REQUIRED + ("pr_number", "base_branch")
-FULL_REQUIRED = tuple(sorted(KNOWN_TOP_LEVEL_KEYS))
+FULL_REQUIRED = tuple(sorted(KNOWN_TOP_LEVEL_KEYS - OPTIONAL_TOP_LEVEL_KEYS))
 
 # Conservative instruction-pattern heuristics.  Advisory: a tainted string is
 # surfaced (path + truncated digest), never echoed and never obeyed; taint
@@ -275,7 +374,16 @@ def _strip_comment(text: str, line_number: int) -> str:
             out.append(ch)
             continue
         if ch == "#":
-            break
+            # YAML starts a comment only at line start or after whitespace.
+            # Stripping a mid-scalar '#' would hide the remainder from THIS
+            # parser while standard-YAML consumers still see it — a parser
+            # differential that could smuggle content past the taint scan.
+            # Keeping the '#' routes such scalars into the forbidden-character
+            # rejection instead (fail closed, no differential).
+            if not out or out[-1] in " \t":
+                break
+            out.append(ch)
+            continue
         out.append(ch)
     if in_string:
         raise StructuralError(f"line {line_number}: unterminated quoted string")
@@ -504,22 +612,141 @@ def _type_name(value: Any) -> str:
     return type(value).__name__
 
 
-def _is_iso_timestamp(value: Any) -> bool:
-    """Shape AND calendar validity, timezone required (not just regex shape)."""
+def normalize_iso_timestamp(value: Any) -> datetime | None:
+    """Parse a strict ISO-8601 timestamp, or None when the value fails.
+
+    The single source of truth for shape, calendar validity, the
+    timezone-required rule, AND the fractional-second normalization that makes
+    the verdict identical on every interpreter (pre-3.11 fromisoformat only
+    accepts 3- or 6-digit fractions; 3.11+ accepts any length).  Callers that
+    order or compare timestamps (e.g. handoff_decision's eligibility gate)
+    MUST use this instead of re-implementing the normalization, so both sides
+    can never decide the same string differently.
+    """
+
     if not isinstance(value, str) or not _ISO_TS.match(value):
-        return False
+        return None
     normalized = value.replace("Z", "+00:00")
-    # Normalize fractional seconds to exactly 6 digits so the verdict is
-    # identical on every interpreter (pre-3.11 fromisoformat only accepts
-    # 3- or 6-digit fractions; 3.11+ accepts any length).
     normalized = re.sub(
         r"\.(\d+)", lambda m: "." + m.group(1)[:6].ljust(6, "0"), normalized, count=1
     )
     try:
         parsed = datetime.fromisoformat(normalized)
     except ValueError:
-        return False
-    return parsed.tzinfo is not None
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _is_iso_timestamp(value: Any) -> bool:
+    """Shape AND calendar validity, timezone required (not just regex shape)."""
+    return normalize_iso_timestamp(value) is not None
+
+
+def _utcnow() -> datetime:
+    """Validation clock seam — tests monkeypatch this to pin boundaries."""
+    return datetime.now(timezone.utc)
+
+
+def validate_operation_result_record(record: Any, *, label: str) -> tuple[str | None, list[str]]:
+    """Canonical per-record operation-result contract (STRICT UNION).
+
+    The single source of truth shared by this validator and
+    ``handoff_decision``'s resume planner, so a state file can never validate
+    clean and then be rejected on resume (or vice versa). The contract is the
+    strict union of both sides' historic rules: every SUPPLIED timestamp must
+    parse at every status (this module's rule), and the write-ahead lifecycle
+    fields are required per status with ``verified_at >= started_at``, a
+    non-empty mapping ``evidence`` on complete, a non-empty string ``error``
+    on retryable/failed, no unknown fields, and ``retryable`` strictly below
+    the attempt cap (the planner's rules). Message texts are the planner's
+    historic phrasings, parameterized by ``label``.
+
+    Returns ``(status, errors)`` — ``status`` is None when the record is too
+    malformed to classify. Short-circuits at the first failed check per
+    record, mirroring the planner's per-record precedence.
+    """
+
+    if not isinstance(record, dict):
+        return None, [f"{label} must be an object"]
+    unknown_keys = sorted(set(record) - OPERATION_RESULT_ALLOWED_KEYS)
+    if unknown_keys:
+        return None, [f"{label} has unknown field(s): " + ", ".join(str(k) for k in unknown_keys)]
+    status = record.get("status")
+    if not isinstance(status, str) or status not in OPERATION_STATUS_ENUM:
+        return None, [
+            f"{label}.status must be one of: complete, failed, pending, retryable"
+        ]
+    attempts = record.get("attempts")
+    if (
+        not isinstance(attempts, int)
+        or isinstance(attempts, bool)
+        or attempts < 1  # a persisted record proves a started attempt
+        or attempts > MAX_OPERATION_ATTEMPTS
+    ):
+        return status, [
+            f"{label}.attempts must be between 1 and {MAX_OPERATION_ATTEMPTS}"
+        ]
+    raw_started = record.get("started_at")
+    started_at = normalize_iso_timestamp(raw_started)
+    if started_at is None:
+        if raw_started is not None:
+            return status, [f"{label}.started_at: must be an ISO 8601 timestamp"]
+        return status, [f"{label} requires the write-ahead started_at timestamp"]
+    raw_verified = record.get("verified_at")
+    verified_at = normalize_iso_timestamp(raw_verified)
+    if raw_verified is not None and verified_at is None:
+        # Strict-union rule: a supplied-but-unparseable timestamp is invalid
+        # at EVERY status, including pending.
+        return status, [f"{label}.verified_at: must be an ISO 8601 timestamp"]
+    if status in ("retryable", "complete", "failed") and verified_at is None:
+        return status, [f"{label} {status} state requires verified_at"]
+    if verified_at is not None and verified_at < started_at:
+        return status, [f"{label}.verified_at cannot precede started_at"]
+    if status in ("retryable", "failed") and (
+        not isinstance(record.get("error"), str) or not record["error"]
+    ):
+        return status, [f"{label} {status} state requires error evidence"]
+    if status == "complete" and (
+        not isinstance(record.get("evidence"), dict) or not record["evidence"]
+    ):
+        return status, [f"{label} complete state requires verification evidence"]
+    if status == "retryable" and attempts >= MAX_OPERATION_ATTEMPTS:
+        return status, [f"{label} exhausted the three-attempt limit"]
+    return status, []
+
+
+def validate_operation_collection(
+    operations: list, result_statuses: dict, *, label: str
+) -> list[str]:
+    """Canonical collection contract shared with the resume planner.
+
+    Two portable rules (the planner's scenario-specific checks stay with the
+    planner): at most ONE in-flight (pending|retryable) result, and results
+    form a PREFIX of the planned operations with at most one in-flight tail —
+    the write-ahead protocol executes one operation at a time in order, so any
+    other shape cannot have been produced by it.
+    """
+
+    errors: list[str] = []
+    prefix = f"{label}: " if label else ""
+    in_flight = {
+        operation_id
+        for operation_id, status in result_statuses.items()
+        if status in ("pending", "retryable")
+    }
+    if len(in_flight) > 1:
+        errors.append(f"{prefix}only one operation may be pending or retryable at a time")
+    saw_unfinished = False
+    for operation_id in operations:
+        has_result = operation_id in result_statuses
+        if saw_unfinished and has_result:
+            errors.append(
+                f"{prefix}operation results must form a prefix with at most one in-flight tail"
+            )
+            break
+        if operation_id in in_flight or not has_result:
+            saw_unfinished = True
+    return errors
 
 
 def _is_full_hex(value: Any) -> bool:
@@ -531,6 +758,8 @@ def _check_test_path(path_value: Any) -> str | None:
         return "must be a non-empty string"
     if _CONTROL_CHARS.search(path_value):
         return "contains control characters"
+    if "\\" in path_value:
+        return "must use forward slashes only"
     if path_value.startswith(("/", "-")) or re.match(r"^[A-Za-z]:[\\/]", path_value):
         return "must be repository-relative and must not start with '-'"
     segments = path_value.split("/")
@@ -622,8 +851,89 @@ class _Validator:
             if value is not None and sha_key in state and not _is_full_hex(value):
                 self.error(f"{sha_key}: must be a full-length hex object ID")
         if "post_push_until" in state and state.get("post_push_until") is not None:
-            if not _is_iso_timestamp(state.get("post_push_until")):
+            parsed_push = normalize_iso_timestamp(state.get("post_push_until"))
+            if parsed_push is None:
                 self.error("post_push_until: must be an ISO 8601 timestamp with timezone")
+            else:
+                # Third deadline key, same resume-ceiling treatment as its
+                # siblings: grace_elapsed(post_push_until) is a conjunct of
+                # every monitor exit, and passive poll ticks never consume the
+                # work cap — an unbounded far-future value would strand the
+                # loop at in_progress forever. The declared per-project window
+                # override extends the ceiling; garbage overrides fall back to
+                # the default.
+                conventions = state.get("resolved_conventions")
+                constants = (
+                    conventions.get("monitor_constants")
+                    if isinstance(conventions, dict)
+                    else None
+                )
+                declared = (
+                    constants.get("bot_grace_window_seconds")
+                    if isinstance(constants, dict)
+                    else None
+                )
+                window = (
+                    declared
+                    if isinstance(declared, int)
+                    and not isinstance(declared, bool)
+                    and 0 < declared <= MAX_GRACE_WINDOW_OVERRIDE_SECONDS
+                    else BOT_GRACE_WINDOW_SECONDS
+                )
+                ceiling = _utcnow() + timedelta(
+                    seconds=window + CLOCK_SKEW_TOLERANCE_SECONDS
+                )
+                if parsed_push > ceiling:
+                    self.error(
+                        "post_push_until: exceeds the grace-window resume ceiling"
+                        " (declared window + skew) — re-arm the window on resume"
+                    )
+        wait_phases = state.get("phases")
+        wait_monitor = wait_phases.get("monitor") if isinstance(wait_phases, dict) else None
+        if "next_retry_at" in state and state.get("next_retry_at") is not None:
+            parsed_retry = normalize_iso_timestamp(state.get("next_retry_at"))
+            if parsed_retry is None:
+                self.error("next_retry_at: must be an ISO 8601 timestamp with timezone")
+            else:
+                # Lifecycle: the wait clears before ready/blocked lands, so no
+                # terminal monitor may still carry a pending model-gate wait.
+                if isinstance(wait_monitor, str) and wait_monitor in TERMINAL_MONITOR:
+                    self.error(
+                        "next_retry_at: a terminal monitor forbids a pending model-gate wait"
+                    )
+                # Resume ceiling: a persisted retry instant beyond one bounded
+                # sleep (+ skew) is a suspect resume point — re-derive by
+                # re-running the gate observation, never sleep toward it.
+                ceiling = _utcnow() + timedelta(
+                    seconds=MAX_QUOTA_WAIT_SECONDS + CLOCK_SKEW_TOLERANCE_SECONDS
+                )
+                if parsed_retry > ceiling:
+                    self.error(
+                        "next_retry_at: exceeds the MAX_QUOTA_WAIT_SECONDS single-wait"
+                        " ceiling (+ skew) — re-derive the wait, never sleep toward it"
+                    )
+        if "hold_started_at" in state and state.get("hold_started_at") is not None:
+            parsed_hold = normalize_iso_timestamp(state.get("hold_started_at"))
+            if parsed_hold is None:
+                self.error("hold_started_at: must be an ISO 8601 timestamp with timezone")
+            else:
+                # A merge-readiness hold span exists only under a live monitor
+                # (in_progress) or a hold-blocked exit (blocked); pending,
+                # paused, complete, and phase-less tiers cannot carry one.
+                if not (
+                    isinstance(wait_monitor, str)
+                    and wait_monitor in ("in_progress", "blocked")
+                ):
+                    self.error(
+                        "hold_started_at: hold spans exist only under a live monitor"
+                        " (in_progress or blocked)"
+                    )
+                # A future span-start would defer the BOT_GRACE_WINDOW hold
+                # backstop indefinitely (tolerance inclusive).
+                if parsed_hold > _utcnow() + timedelta(
+                    seconds=CLOCK_SKEW_TOLERANCE_SECONDS
+                ):
+                    self.error("hold_started_at: must not be in the future")
         for counter in (
             "monitor_iterations",
             "monitor_poll_ticks",
@@ -668,6 +978,80 @@ class _Validator:
             self.validate_gstack(state.get("gstack_integration"), tier_name)
         if "clean_poll_timestamps" in state:
             self.validate_clean_polls(state.get("clean_poll_timestamps"))
+        if "acceptance_criteria" in state:
+            self.validate_acceptance_criteria(state.get("acceptance_criteria"))
+        if "merge_readiness" in state:
+            self.validate_merge_readiness(state.get("merge_readiness"))
+        # (v) a complete merge-readiness phase cannot coexist with a blocked
+        # check outcome or an unmet acceptance criterion — the workflow blocks
+        # the phase in exactly those cases.  (The "unavailable"-with-waiver
+        # nuance stays prose-enforced: the waiver lives in the audit trail.)
+        phases_for_gate = state.get("phases")
+        if (
+            isinstance(phases_for_gate, dict)
+            and phases_for_gate.get("merge_readiness") == "complete"
+        ):
+            gate = state.get("merge_readiness")
+            if not isinstance(gate, dict):
+                self.error(
+                    "invariant(v): phases.merge_readiness complete requires a "
+                    "merge_readiness mapping with recorded check outcomes"
+                )
+            else:
+                # Completion means every check RAN and landed non-blocked:
+                # absent or still-pending outcomes are the empty-gate bypass.
+                # ("unavailable" stays schema-legal: its mandatory user waiver
+                # lives in the audit trail, which the schema cannot read.)
+                for check_key in ("deploy_order", "dependencies", "ac_conformance"):
+                    check_value = gate.get(check_key)
+                    if check_value in (None, "pending", "blocked"):
+                        self.error(
+                            "invariant(v): phases.merge_readiness complete requires "
+                            f"a terminal non-blocked merge_readiness.{check_key}"
+                        )
+                audit = gate.get("claims_audit")
+                if not isinstance(audit, dict) or not all(
+                    isinstance(audit.get(count_key), int)
+                    and not isinstance(audit.get(count_key), bool)
+                    for count_key in ("audited", "rewritten")
+                ):
+                    self.error(
+                        "invariant(v): phases.merge_readiness complete requires a "
+                        "recorded claims_audit with audited/rewritten counts"
+                    )
+            criteria = state.get("acceptance_criteria")
+            if "acceptance_criteria" not in state:
+                # A complete gate proves AC Capture ran; only pre-4b states may
+                # omit the key, and they cannot carry this phase at all.
+                self.error(
+                    "invariant(v): phases.merge_readiness complete requires "
+                    "acceptance_criteria to be present"
+                )
+            if isinstance(criteria, list) and any(
+                isinstance(entry, dict)
+                and entry.get("verdict") in ("unmet", "pending")
+                for entry in criteria
+            ):
+                self.error(
+                    "invariant(v): phases.merge_readiness complete forbids "
+                    "pending or unmet acceptance criteria"
+                )
+        # A pre-Phase-1 tier claiming later-phase progress is contradictory:
+        # every transition writes current_phase together with the status, so
+        # entry/takeover states carry only pending phases (when initialized).
+        if tier_name != "full" and isinstance(state.get("phases"), dict):
+            for phase_name, phase_value in state["phases"].items():
+                phase_status = (
+                    phase_value.get("status")
+                    if isinstance(phase_value, dict)
+                    else phase_value
+                )
+                if phase_status not in (None, "pending"):
+                    self.error(
+                        f"invariant(i): tier {tier_name} forbids non-pending "
+                        f"phases.{_safe_key(str(phase_name))}"
+                    )
+                    break
         # human_roundtrip's mapping check lives in validate_human_roundtrip;
         # listing it here would duplicate the diagnostic.
         for structured_key in (
@@ -699,7 +1083,7 @@ class _Validator:
             if name not in phases:
                 self.error(f"phases.{name}: missing")
         for name in phases:
-            if name not in PHASE_NAMES:
+            if name not in PHASE_NAMES and name not in OPTIONAL_PHASE_NAMES:
                 self.error(f"phases: unknown key {_safe_key(str(name))!r}")
 
         def status_of(name: str) -> str | None:
@@ -721,31 +1105,71 @@ class _Validator:
                 return None
             return value
 
-        statuses = {name: status_of(name) for name in PHASE_NAMES if name in phases}
+        all_phase_names = PHASE_NAMES + OPTIONAL_PHASE_NAMES
+        statuses = {name: status_of(name) for name in all_phase_names if name in phases}
 
         # (i) current_phase / phase-status agreement
-        if current_phase in PHASE_NAMES:
+        if current_phase in all_phase_names:
             status = statuses.get(current_phase)
+            if current_phase in OPTIONAL_PHASE_NAMES and current_phase not in phases:
+                self.error(
+                    f"invariant(i): current_phase {current_phase!r} requires a "
+                    f"phases.{current_phase} entry"
+                )
             if status == "pending":
                 self.error(
                     f"invariant(i): current_phase {current_phase!r} disagrees with a pending phase status"
                 )
         elif current_phase.startswith("aborted_at_"):
             aborted = current_phase.removeprefix("aborted_at_")
-            if aborted in PHASE_NAMES and statuses.get(aborted) != "blocked":
+            if aborted in all_phase_names and statuses.get(aborted) != "blocked":
                 self.error(
                     f"invariant(i): {current_phase!r} requires phases.{aborted} to be blocked"
                 )
 
-        # (ii) successful-predecessor chain
+        # (ii) successful-predecessor chain.  merge_readiness carries only its
+        # FORWARD edge (it needs a complete self_review); no later phase lists
+        # it as a predecessor, because a pre-4b state legitimately has
+        # runtime_verification/pr non-pending with no merge_readiness key at
+        # all, and the documented Phase 5 recovery route ("go run Phase 4b
+        # now") legitimately holds pr in_progress beside a pending gate.  The
+        # gate itself is enforced by the workflow's Phase 5 precondition, not
+        # by schema shape.
         chain = (
             ("plan_review", "plan", ("complete",)),
             ("implementation", "plan_review", ("complete",)),
             ("self_review", "implementation", ("complete",)),
+            ("merge_readiness", "self_review", ("complete",)),
             ("runtime_verification", "self_review", ("complete",)),
             ("pr", "runtime_verification", ("complete", "waived")),
             ("monitor", "pr", ("complete",)),
         )
+        # A run that KNOWS about the gate (the optional phase key is present)
+        # cannot finish around it: a completed pr phase or any non-pending
+        # monitor state beside a still-pending/in-progress gate is the bypass.
+        # pr in_progress/blocked stays legal — that is the documented Phase 5
+        # "go run Phase 4b now" recovery route — and key ABSENCE stays legal
+        # for pre-4b states.
+        gate_status = statuses.get("merge_readiness")
+        monitor_state = statuses.get("monitor")
+        if gate_status in ("pending", "in_progress"):
+            if statuses.get("pr") == "complete" or (
+                monitor_state and monitor_state != "pending"
+            ):
+                self.error(
+                    "invariant(ii): pr completion or monitor progress requires the "
+                    "present phases.merge_readiness gate to be terminal"
+                )
+        elif gate_status == "blocked" and monitor_state in ("paused", "complete"):
+            # A blocked gate may legally coexist with a blocked monitor (the
+            # monitor-loop world-state refresh blocks exactly as Phase 4b
+            # would) and with a completed pr (the refresh runs post-creation),
+            # but never with a CLEAN exit: paused/complete assert the world
+            # is safe, which a blocked gate denies.
+            self.error(
+                "invariant(ii): a clean monitor exit (paused/complete) requires a "
+                "non-blocked phases.merge_readiness gate"
+            )
         for successor, predecessor, allowed in chain:
             successor_status = statuses.get(successor)
             predecessor_status = statuses.get(predecessor)
@@ -828,6 +1252,13 @@ class _Validator:
             if mode == "skill_helper_defect" and change_type != "skill_only":
                 self.error(
                     "invariant(iv): defect_evidence_mode skill_helper_defect requires change_type skill_only"
+                )
+            # The classifier is deterministic in BOTH directions: Scope
+            # Analysis maps change_type bug_fix to runtime_bug_fix, so a
+            # bug_fix carrying mode "none" would skip the red/green gate.
+            if change_type == "bug_fix" and mode != "runtime_bug_fix":
+                self.error(
+                    "invariant(iv): change_type bug_fix requires defect_evidence_mode runtime_bug_fix"
                 )
             if isinstance(pr_status, str) and pr_status != "pending":
                 if mode == "none":
@@ -1015,31 +1446,20 @@ class _Validator:
                 if not isinstance(record, dict):
                     self.error(f"handoffs.{safe_kind}.operation_results.{safe_op}: must be a mapping")
                     continue
-                op_status = record.get("status")
-                if not self.check_enum(
-                    op_status,
-                    OPERATION_STATUS_ENUM,
-                    f"handoffs.{safe_kind}.operation_results.{safe_op}.status",
-                ):
+                op_path = f"handoffs.{safe_kind}.operation_results.{safe_op}"
+                op_status, record_errors = validate_operation_result_record(
+                    record, label=op_path
+                )
+                for message in record_errors:
+                    self.error(message)
+                if op_status is None:
                     continue
                 result_statuses[op_id] = op_status
-                op_path = f"handoffs.{safe_kind}.operation_results.{safe_op}"
-                for ts_field in ("started_at", "verified_at"):
-                    ts_value = record.get(ts_field)
-                    if ts_value is not None and not _is_iso_timestamp(ts_value):
-                        self.error(f"{op_path}.{ts_field}: must be an ISO 8601 timestamp")
-                if op_status == "pending" and not record.get("started_at"):
-                    self.error(f"{op_path}: pending requires started_at")
-                if op_status == "complete":
-                    if not record.get("verified_at"):
-                        self.error(f"{op_path}: complete requires verified_at")
-                    if not record.get("evidence"):
-                        self.error(f"{op_path}: complete requires non-empty evidence")
-                if op_status in ("failed", "retryable"):
-                    if not record.get("verified_at"):
-                        self.error(f"{op_path}: {op_status} requires verified_at")
-                    if not record.get("error"):
-                        self.error(f"{op_path}: {op_status} requires a non-empty error")
+
+            for message in validate_operation_collection(
+                operations, result_statuses, label=f"handoffs.{safe_kind}"
+            ):
+                self.error(message)
 
             missing = [op for op in operations if op not in result_statuses]
             nonterminal = [
@@ -1255,6 +1675,102 @@ class _Validator:
                 self.error(
                     f"clean_poll_timestamps[{position}].observed_at: must be an ISO 8601 timestamp"
                 )
+
+    def validate_acceptance_criteria(self, value: Any) -> None:
+        if value == "unavailable":
+            return
+        if not isinstance(value, list):
+            self.error(
+                'acceptance_criteria: must be a list or the string "unavailable"'
+            )
+            return
+        for index, entry in enumerate(value):
+            path = f"acceptance_criteria[{index}]"
+            if not isinstance(entry, dict):
+                self.error(f"{path}: must be a mapping")
+                continue
+            for key in entry:
+                if key not in AC_ENTRY_KEYS:
+                    self.error(f"{path}: unknown key {_safe_key(str(key))!r}")
+            for key in ("id", "text", "source"):
+                self.require_string(entry, key, path)
+            self.check_enum(entry.get("verdict"), AC_VERDICT_ENUM, f"{path}.verdict")
+            evidence = entry.get("evidence")
+            if evidence is not None and (not isinstance(evidence, str) or not evidence):
+                self.error(f"{path}.evidence: must be a non-empty string or null")
+
+    def validate_merge_readiness(self, value: Any) -> None:
+        if not isinstance(value, dict):
+            self.error("merge_readiness: must be a mapping")
+            return
+        for key in value:
+            if key not in MERGE_READINESS_KEYS:
+                self.error(f"merge_readiness: unknown key {_safe_key(str(key))!r}")
+        if "deploy_order" in value:
+            self.check_enum(
+                value.get("deploy_order"), DEPLOY_ORDER_ENUM, "merge_readiness.deploy_order"
+            )
+        # Direction gates the direction-aware holds: a documented hazard with a
+        # missing/null direction would silently default those holds wrong, so
+        # it is a validation error (forcing Check 1 reclassification on resume).
+        direction = value.get("hazard_direction")
+        if value.get("deploy_order") == "hazard_documented":
+            if direction is None:
+                self.error(
+                    "merge_readiness.hazard_direction: required (non-null) when "
+                    "deploy_order is 'hazard_documented' — re-run Check 1 step 3"
+                )
+            else:
+                self.check_enum(
+                    direction, HAZARD_DIRECTION_ENUM, "merge_readiness.hazard_direction"
+                )
+        elif direction is not None:
+            self.check_enum(
+                direction, HAZARD_DIRECTION_ENUM, "merge_readiness.hazard_direction"
+            )
+        if "dependencies" in value:
+            self.check_enum(
+                value.get("dependencies"), DEPENDENCIES_ENUM, "merge_readiness.dependencies"
+            )
+        if "ac_conformance" in value:
+            self.check_enum(
+                value.get("ac_conformance"),
+                AC_CONFORMANCE_ENUM,
+                "merge_readiness.ac_conformance",
+            )
+        if "applied_state" in value:
+            applied = value.get("applied_state")
+            if not isinstance(applied, dict):
+                self.error("merge_readiness.applied_state: must be a mapping")
+            else:
+                for env, migrations in applied.items():
+                    env_path = f"merge_readiness.applied_state.{_safe_key(str(env))}"
+                    if not isinstance(migrations, dict):
+                        self.error(f"{env_path}: must be a mapping")
+                        continue
+                    for migration, status in migrations.items():
+                        self.check_enum(
+                            status,
+                            APPLIED_STATE_ENUM,
+                            f"{env_path}.{_safe_key(str(migration))}",
+                        )
+        if "claims_audit" in value:
+            audit = value.get("claims_audit")
+            if not isinstance(audit, dict):
+                self.error("merge_readiness.claims_audit: must be a mapping")
+            else:
+                for key in audit:
+                    if key not in ("audited", "rewritten"):
+                        self.error(
+                            f"merge_readiness.claims_audit: unknown key {_safe_key(str(key))!r}"
+                        )
+                for key in ("audited", "rewritten"):
+                    if key in audit:
+                        count = audit.get(key)
+                        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+                            self.error(
+                                f"merge_readiness.claims_audit.{key}: must be a non-negative integer"
+                            )
 
 
 # ---------------------------------------------------------------------------

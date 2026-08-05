@@ -17,7 +17,11 @@ Expected input shape::
             "supported_reasoning_levels": [{"effort": "max"}]
           }]
         },
-        "first_real_invocation": {"status": "success", "attempts": 1}
+        "first_real_invocation": {"status": "success", "attempts": 1,
+                                 "quota_reset_at": "2026-08-03T21:00:00Z",
+                                 "observed_at": "2026-08-03T20:30:00Z"},
+        "post_invocation": [{"status": "timeout",
+                             "observed_at": "2026-08-03T20:00:00Z"}]
       },
       "claude": {
         "installed": true,
@@ -61,8 +65,23 @@ of surfacing after Phase 1.  ``first_real_invocation`` therefore carries the
 MOST RECENT real-invocation observation (the entry smoke first, then each
 Phase 2 review round); its ``attempts`` are scoped to that one invocation's
 retry sequence and reset every round, never accumulated across stages.  A
-timeout or transport failure may retry once with the exact same model and
-effort; every other Codex failure blocks, and no path proposes a downgrade.
+timeout, transport, or runaway-ceiling failure is LIVENESS-CLASS: one
+immediate retry with the exact same model and effort, then unbounded
+wait-and-retry on the escalating backoff ladder — a slow or briefly-unavailable
+route needs patience, not a human, so liveness-class failures never produce a
+terminal block.  A ``quota_exhausted`` observation may carry the
+provider-reported reset as ``quota_reset_at`` (timezone-aware ISO 8601): with
+it, the observation MUST also carry ``observed_at`` and the codex-level
+``post_invocation`` history list (canonical record fields ``status``,
+``quota_reset_at``, ``observed_at``; empty on the first observation — absence
+of either blocks as a malformed observation), and the verdict is a BOUNDED
+wait to ``quota.wait_until`` = min(max(reset, observed_at + first ladder
+rung), observed_at + ``MAX_QUOTA_WAIT_SECONDS``) — re-observed at wake, with
+the helper itself taking the terminal no-usable-reset block on a second
+consecutive elapsed raw reset (liveness-noise records skipped).  Without a
+reported reset, quota blocks.
+Every deterministic Codex failure (auth, entitlement, catalog, CLI) still
+blocks immediately, and no path proposes a downgrade.
 
 Once the entry smoke succeeds, its selection is FROZEN for the workflow.
 ``verify_frozen_selection`` re-checks a frozen model against a fresh catalog
@@ -81,9 +100,13 @@ Three legs are evaluated.  The base and Codex legs are gating: a failure on
 either blocks the workflow.  ``claude`` is the base leg — the working side:
 the implementing lineage, explorers, delegated work, and the fresh-context
 escalation voice.  ``claude_reviewer`` is the reviewer leg — the always-runs
-structured review and every Claude review fallback: one of the two reviewers
-in every review discussion, next to the Codex verdict.  The separation is the
-point: the model that writes the code is not a model that approves it.
+structured review and every Claude review fallback: the Claude reviewer next
+to the mandatory Phase 2 Codex verdict (Phase 4 Codex participation is
+tiered — Small and skill-only passes are Claude-only by design).  The
+separation is the point: the model that writes the code is not a model that
+approves it — under the nominal configuration; a reviewer degradation or an
+explicit same-lineage waiver collapses the Claude legs onto one lineage, and
+Codex then remains the independent cross-model verdict.
 
 The reviewer leg degrades instead of gating.  An availability-class reviewer
 failure (CLI missing/too old, access, entitlement, provider policy, ZDR) with
@@ -128,16 +151,42 @@ import re
 import selectors
 import sys
 import time
-from typing import IO, Any, Callable, Iterable, Mapping, NamedTuple
+from datetime import timedelta
+from collections.abc import Callable, Mapping
+from typing import IO, Any, NamedTuple
+
+import state_schema
+from state_schema import normalize_iso_timestamp
 
 
-SCHEMA_VERSION = 4
+# Version 6: quota-with-reset observations REQUIRE observed_at and the
+# post_invocation history list; the wait verdict payload is
+# {reset_at, wait_until, clamped, reset_elapsed} (wait_until_reset removed);
+# the no-usable-reset streak is decided here from the fed records.
+SCHEMA_VERSION = 6
 
 CODEX_MODEL = "gpt-5.6-sol"  # floor: newest eligible catalog model >= this wins
 CODEX_FLOOR_VERSION = (5, 6)
 CODEX_EFFORT = "max"  # deepest non-delegating tier on the floor model; never ultra
 MIN_CODEX_VERSION = (0, 144, 0)
-CODEX_MAX_ATTEMPTS = 2
+CODEX_MAX_ATTEMPTS = 2  # immediate same-config retries before backoff pacing kicks in
+# Escalating wait-and-retry ladder for liveness-class failures (timeout /
+# transport) once the immediate-retry budget is spent.  The last rung repeats
+# forever: the gate waits instead of blocking, because waiting — spaced, with
+# progress updates — is what "autonomous until done" means for a route that is
+# merely slow or briefly down.  Deterministic failures never reach this ladder.
+LIVENESS_BACKOFF_LADDER_SECONDS = (60, 300, 900, 1800)
+# Single source of truth for the quota-wait ceiling is state_schema (the
+# validator bounds persisted next_retry_at with the same value); this module
+# REBINDS the name rather than re-declaring the literal.
+MAX_QUOTA_WAIT_SECONDS = state_schema.MAX_QUOTA_WAIT_SECONDS
+# Every quota wait is floored at the first backoff rung, elapsed resets
+# included — derived, never a second literal.
+QUOTA_WAIT_FLOOR_SECONDS = LIVENESS_BACKOFF_LADDER_SECONDS[0]
+# Runaway backstop: the TOTAL-runtime ceiling per attempt (Timeout Heuristics
+# PER_ATTEMPT_CEILING).  A byte-emitting child resets the idle clock forever,
+# so only this bound can stop it; a kill here is liveness-class, not terminal.
+PER_ATTEMPT_CEILING_SECONDS = 2700
 # Variant tokens that mark down-tier siblings, never auto-forward targets.
 CODEX_EXCLUDED_VARIANT_TOKENS = ("mini", "nano", "lite", "chat")
 
@@ -195,20 +244,22 @@ _FABLE_SLUG = re.compile(
     r"claude-(?P<family>fable|mythos)-(?P<version>\d+(?:-\d+)*)"
 )
 
+# Reasons template on {model}: these rows fire AFTER auto-forward selection,
+# so the message must name the model actually invoked, not the floor literal.
 _CODEX_BLOCKING_FAILURES = {
     "entitlement_denied": (
         "entitlement_denied",
-        "GPT-5.6 Sol entitlement was denied by the real invocation",
+        "{model} entitlement was denied by the real invocation",
         "request_access",
     ),
     "quota_exhausted": (
         "quota_exhausted",
-        "GPT-5.6 Sol usage quota is exhausted",
+        "{model} usage quota is exhausted and the provider reported no usable reset time",
         "wait_for_quota_reset_or_change_access",
     ),
     "model_unavailable": (
         "model_unavailable",
-        "GPT-5.6 Sol was unavailable to the real invocation",
+        "{model} was unavailable to the real invocation",
         "request_access",
     ),
     "authentication_error": (
@@ -218,12 +269,12 @@ _CODEX_BLOCKING_FAILURES = {
     ),
     "error": (
         "invocation_error",
-        "The real GPT-5.6 Sol invocation failed",
+        "The real {model} invocation failed",
         "inspect_error_and_block",
     ),
 }
 
-_CODEX_RETRYABLE_FAILURES = {"timeout", "transport_error"}
+_CODEX_RETRYABLE_FAILURES = {"timeout", "transport_error", "runaway"}
 
 # ---------------------------------------------------------------------------
 # Stream supervision (authentication boundary)
@@ -255,6 +306,25 @@ _AUTH_SIGNATURES = (
     "token has expired",
     "token expired",
     "credentials have been revoked",
+    "incorrect api key",
+)
+
+# Word-bounded so identifier-embedded fragments ("unauthorized_count=0") never
+# match: "_" is a word character, so \b refuses the boundary inside it.
+_AUTH_SIGNATURE_RE = re.compile(
+    "|".join(rf"\b{re.escape(signature)}\b" for signature in _AUTH_SIGNATURES)
+)
+
+# Context-anchored HTTP 401 forms for _has_auth_signature.  "401 unauthorized"
+# is already caught by the "unauthorized" signature above; these cover bare
+# status renderings ("HTTP/1.1 401", "http 401", "status=401", "status code:
+# 401", "error 401") without matching incidental numbers like "401ms".
+_HTTP_401_CONTEXT = re.compile(
+    r"\bhttps?/[0-9.]+\s+401(?!\d)"
+    r"|\bhttp\s+401(?!\d)"
+    r"|\bstatus(?:[ _]code)?\s*[=:]?\s*401(?!\d)"
+    r"|\berror\s*[=:]?\s*401(?!\d)"
+    r"|\b401\s+unauthorized\b"
 )
 
 # A raw record larger than this means framing is broken (or hostile): bound the
@@ -268,6 +338,7 @@ CLASSIFY_EXIT_CLEAN = 0
 CLASSIFY_EXIT_AUTH_ERROR = 3
 CLASSIFY_EXIT_INTERNAL_FAILURE = 4
 CLASSIFY_EXIT_TIMEOUT = 5
+CLASSIFY_EXIT_RUNAWAY = 6
 
 _URL_TAIL = re.compile(r"(?P<url>[a-zA-Z][a-zA-Z0-9+.-]*://[^\s'\"]*)")
 _URL_USERINFO = re.compile(r"(?P<scheme>[a-zA-Z][a-zA-Z0-9+.-]*://)[^/@\s]*@")
@@ -354,6 +425,24 @@ def _auth_scope_text(event: dict[str, Any]) -> str:
                     nested_status, bool
                 ):
                     parts.append(f"status={nested_status}")
+    # response.failed events nest their payload under "response": walk its
+    # status and error fields too, or a nested invalid-key error reads benign.
+    response = event.get("response")
+    if isinstance(response, dict):
+        for status_key in ("status", "status_code"):
+            response_status = response.get(status_key)
+            if isinstance(response_status, (int, str)) and not isinstance(
+                response_status, bool
+            ):
+                parts.append(f"status={response_status}")
+        response_error = response.get("error")
+        if isinstance(response_error, str):
+            parts.append(response_error)
+        elif isinstance(response_error, dict):
+            for nested_key in ("code", "message", "type", "reason"):
+                nested = response_error.get(nested_key)
+                if isinstance(nested, str):
+                    parts.append(nested)
     return " ".join(parts)
 
 
@@ -365,9 +454,14 @@ def _has_auth_signature(text: str) -> bool:
     """
 
     lowered = text.lower()
-    if any(signature in lowered for signature in _AUTH_SIGNATURES):
+    if _AUTH_SIGNATURE_RE.search(lowered):
         return True
-    return bool(re.search(r"(?<!\d)401(?!\d)", lowered))
+    # A bare 401 is NOT enough: transport messages legitimately contain
+    # incidental numbers ("read timeout after 401ms", "backoff 401ms"), and
+    # misclassifying one as auth converts a retryable transient failure into a
+    # non-retryable kill.  Require an HTTP/status/error context or the literal
+    # "401 unauthorized" phrase.
+    return bool(_HTTP_401_CONTEXT.search(lowered))
 
 
 def bounded_excerpt(existing: str, addition: str) -> str:
@@ -447,6 +541,7 @@ def supervise_stream(
     *,
     read_size: int = 65536,
     idle_timeout_seconds: float | None = None,
+    max_runtime_seconds: float | None = None,
 ) -> dict[str, Any]:
     """Supervise a running Codex process's real pipes; kill it on auth failure.
 
@@ -457,15 +552,22 @@ def supervise_stream(
     cannot terminate promptly, which is the whole point of this function.
 
     Returns ``{"outcome", "exit_code", "excerpts", "auth_line_source"}`` where
-    outcome is ``clean``/``auth_error``/``internal_failure``/``timeout``.
-    Every failure outcome kills the process group; the caller then BLOCKs.
+    outcome is ``clean``/``auth_error``/``internal_failure``/``timeout``/
+    ``runaway``.  Every failure outcome kills the process group; what happens
+    next is outcome-dependent — ``auth_error`` and ``internal_failure`` follow
+    the blocking failure matrix, while ``timeout`` and ``runaway`` are
+    liveness-class (immediate retry, then the backoff ladder — never terminal).
     ``idle_timeout_seconds`` bounds SILENCE, not total runtime: the clock
-    resets on every byte received, so a slow-but-alive stream is never killed.
-    That distinction is the whole point — a max-effort review legitimately runs for
-    many minutes, and a total-runtime cap would SIGKILL healthy reviews.  It
-    defaults to ``None`` (no internal bound) because the caller owns the
-    aggregate deadline; pass a value only to detect a child that has gone
-    completely silent.  This function
+    resets on every byte received, so a slow-but-alive stream is never killed
+    for being slow — a max-effort review legitimately runs for many minutes.
+    ``max_runtime_seconds`` is the orthogonal runaway backstop (Timeout
+    Heuristics ``PER_ATTEMPT_CEILING``, canonically
+    ``PER_ATTEMPT_CEILING_SECONDS``): it bounds TOTAL runtime, because a
+    byte-emitting runaway holds the idle clock at zero forever; when both
+    deadlines have expired the ceiling wins the tie.  A non-positive ceiling is
+    already expired: the first supervision pass reports ``runaway``.  Both
+    default to ``None`` (no internal bound) because the caller owns both
+    deadlines.  This function
     never spawns a process and never inspects credentials.
     """
 
@@ -483,6 +585,10 @@ def supervise_stream(
         if pipe is not None:
             selector.register(pipe, selectors.EVENT_READ, source)
             registered += 1
+    if registered == 0:
+        # Zero observable channels means zero supervision: fail closed instead
+        # of reporting a clean (never-supervised) invocation.
+        outcome = "internal_failure"
 
     def _next_deadline() -> float | None:
         if idle_timeout_seconds is None:
@@ -490,16 +596,40 @@ def supervise_stream(
         return time.monotonic() + idle_timeout_seconds
 
     deadline = _next_deadline()
+    total_deadline = (
+        None
+        if max_runtime_seconds is None
+        else time.monotonic() + max_runtime_seconds
+    )
     try:
         while registered and outcome == "clean":
-            remaining = None if deadline is None else deadline - time.monotonic()
-            if remaining is not None and remaining <= 0:
+            now = time.monotonic()
+            # Ceiling before idle: on a tie the runaway backstop wins, because
+            # a byte-emitting child can hold the idle clock at zero forever.
+            if total_deadline is not None and now >= total_deadline:
+                outcome = "runaway"
+                break
+            idle_remaining = None if deadline is None else deadline - now
+            if idle_remaining is not None and idle_remaining <= 0:
                 outcome = "timeout"
                 break
+            total_remaining = (
+                None if total_deadline is None else total_deadline - now
+            )
+            candidates = [
+                r for r in (idle_remaining, total_remaining) if r is not None
+            ]
+            remaining = min(candidates) if candidates else None
             ready = selector.select(remaining)
             if not ready:
-                # Nothing readable for a whole idle window: the child is silent.
-                outcome = "timeout"
+                # Nothing readable for the whole window; attribute the expiry.
+                if (
+                    total_deadline is not None
+                    and time.monotonic() >= total_deadline
+                ):
+                    outcome = "runaway"
+                else:
+                    outcome = "timeout"
                 break
             # Activity: restart the idle clock, so a long-but-alive stream
             # (a max-effort review emitting over several minutes) is never killed.
@@ -548,6 +678,7 @@ def supervise_stream(
         "auth_error": CLASSIFY_EXIT_AUTH_ERROR,
         "internal_failure": CLASSIFY_EXIT_INTERNAL_FAILURE,
         "timeout": CLASSIFY_EXIT_TIMEOUT,
+        "runaway": CLASSIFY_EXIT_RUNAWAY,
     }[outcome]
     return {
         "outcome": outcome,
@@ -581,30 +712,6 @@ def _apply_verdict(
         # are assistant/tool/unknown payloads and never persisted.
         excerpts[source] = bounded_excerpt(excerpts[source], line)
     return outcome, auth_line_source, excerpts
-
-
-def classify_tagged_lines(lines: Iterable[tuple[str, str]]) -> dict[str, Any]:
-    """Diagnostic/test-only helper behind ``--classify-stream``.
-
-    The live path is :func:`supervise_stream`, which derives provenance from
-    real file descriptors.  This helper accepts caller-supplied tags and exists
-    for offline inspection and tests only.
-    """
-
-    verdicts: list[dict[str, str]] = []
-    outcome = "clean"
-    for source, line in lines:
-        verdict = classify_stream_event(source, line)
-        verdicts.append({"source": source, "verdict": verdict})
-        if verdict != "benign" and outcome == "clean":
-            outcome = verdict
-            break
-    exit_code = {
-        "clean": CLASSIFY_EXIT_CLEAN,
-        "auth_error": CLASSIFY_EXIT_AUTH_ERROR,
-        "internal_failure": CLASSIFY_EXIT_INTERNAL_FAILURE,
-    }[outcome]
-    return {"outcome": outcome, "exit_code": exit_code, "verdicts": verdicts}
 
 
 # ---------------------------------------------------------------------------
@@ -732,6 +839,33 @@ def verify_frozen_selection(
             "reason_code": "invalid_descriptor",
             "reason": "; ".join(schema_errors),
             "next_action": "correct_observation_input",
+        }
+
+    # The descriptor must pin the very model/effort being verified: matching
+    # frozen/observed descriptors that both name a DIFFERENT model or a lower
+    # effort would otherwise re-verify a route the smoke never proved.
+    frozen_overrides = frozen_descriptor.get("policy_overrides")
+    override_contradicts = (
+        isinstance(frozen_overrides, dict)
+        and "model_reasoning_effort" in frozen_overrides
+        # An explicit null is as disqualifying as a wrong value: the override
+        # key, when present, must pin the required effort.
+        and frozen_overrides.get("model_reasoning_effort") != CODEX_EFFORT
+    )
+    if (
+        frozen_descriptor.get("model") != frozen_model
+        or frozen_descriptor.get("effort") != CODEX_EFFORT
+        or override_contradicts
+    ):
+        return {
+            "state": "blocked",
+            "reason_code": "descriptor_model_mismatch",
+            "reason": (
+                f"The frozen descriptor must pin {frozen_model} at {CODEX_EFFORT} "
+                "(including any model_reasoning_effort override); it names a "
+                "different model or effort"
+            ),
+            "next_action": "start_new_workflow_entry_preflight",
         }
 
     if not _codex_model_is_eligible(frozen_model, live_catalog):
@@ -1004,13 +1138,39 @@ def _supports_required_effort(model: dict[str, Any]) -> bool:
     )
 
 
+def _slug_meets_floor_policy(slug: str) -> bool:
+    """GPT-family slug at/above the floor with no down-tier variant token.
+
+    The single eligibility predicate shared by selection and frozen
+    re-verification: at exactly the floor version only the known floor slug
+    qualifies, and ``-mini``-style variants never do.  Without this shared
+    check, a tampered frozen state naming a below-floor or excluded model
+    would re-verify on catalog membership alone.
+    """
+
+    match = _GPT_SLUG.fullmatch(slug)
+    if match is None:
+        return False
+    version = (int(match.group("major")), int(match.group("minor") or 0))
+    variant = match.group("variant") or ""
+    if version < CODEX_FLOOR_VERSION:
+        return False
+    if version == CODEX_FLOOR_VERSION and slug != CODEX_MODEL:
+        return False
+    return not any(
+        token in variant.split("-") for token in CODEX_EXCLUDED_VARIANT_TOKENS
+    )
+
+
 def _codex_model_is_eligible(slug: str, catalog: Any) -> bool:
-    """True when *slug* is present in *catalog* with the required effort.
+    """True when *slug* satisfies floor policy AND is in *catalog* with the required effort.
 
     Used by :func:`verify_frozen_selection` to re-check an already-frozen model
     without re-running selection.
     """
 
+    if not isinstance(slug, str) or not _slug_meets_floor_policy(slug):
+        return False
     if not isinstance(catalog, dict):
         return False
     models = catalog.get("models")
@@ -1047,22 +1207,13 @@ def _select_codex_model(catalog: Any) -> str | None:
         slug = model.get("slug")
         if not isinstance(slug, str):
             continue
-        match = _GPT_SLUG.fullmatch(slug)
-        if match is None:
-            continue
-        version = (int(match.group("major")), int(match.group("minor") or 0))
-        variant = match.group("variant") or ""
-        if version < CODEX_FLOOR_VERSION:
-            continue
-        if version == CODEX_FLOOR_VERSION and slug != CODEX_MODEL:
-            continue
-        if any(
-            token in variant.split("-")
-            for token in CODEX_EXCLUDED_VARIANT_TOKENS
-        ):
+        if not _slug_meets_floor_policy(slug):
             continue
         if not _supports_required_effort(model):
             continue
+        match = _GPT_SLUG.fullmatch(slug)
+        version = (int(match.group("major")), int(match.group("minor") or 0))
+        variant = match.group("variant") or ""
         variant_rank = 2 if variant == "sol" else 1 if variant == "" else 0
         key = (version, variant_rank, slug)
         if best is None or key > best[0]:
@@ -1144,14 +1295,13 @@ def evaluate_codex(raw: Any) -> dict[str, Any]:
         not isinstance(attempts, int)
         or isinstance(attempts, bool)
         or attempts < 0
-        or attempts > CODEX_MAX_ATTEMPTS
         or (status == "not_run" and attempts != 0)
         or (status != "not_run" and attempts < 1)
     ):
         return _block_codex(
             decision,
             "invalid_invocation_attempts",
-            "Invocation attempts must be zero before the probe and between one and two afterward",
+            "Invocation attempts must be zero before the probe and at least one afterward",
             "correct_observation_input",
         )
     decision["retry"] = {
@@ -1179,11 +1329,132 @@ def evaluate_codex(raw: Any) -> dict[str, Any]:
             {
                 "state": "ready",
                 "reason_code": "authoritative_invocation_succeeded",
-                "reason": "The real GPT-5.6 Sol invocation succeeded",
+                "reason": f"The real {decision['model']} invocation succeeded",
                 "next_action": "continue",
             }
         )
         return decision
+
+    if status == "quota_exhausted":
+        reset_at = invocation.get("quota_reset_at")
+        if reset_at is not None:
+            parsed_reset = normalize_iso_timestamp(reset_at)
+            if parsed_reset is None:
+                return _block_codex(
+                    decision,
+                    "invalid_quota_reset_at",
+                    "quota_reset_at must be a timezone-aware ISO 8601 "
+                    "timestamp when present",
+                    "correct_observation_input",
+                )
+            observed_at = normalize_iso_timestamp(invocation.get("observed_at"))
+            if observed_at is None:
+                return _block_codex(
+                    decision,
+                    "invalid_quota_observation",
+                    "quota_exhausted with a reported reset requires a "
+                    "timezone-aware ISO 8601 observed_at on the invocation "
+                    "observation — the wait bound is computed from it",
+                    "correct_observation_input",
+                )
+            history = config.get("post_invocation")
+            if not isinstance(history, list):
+                # Absence and an empty list are DISTINCT: an omitted history
+                # (or any non-list) blocks, because defaulting it to [] would
+                # silently disable the no-usable-reset terminal for every
+                # caller that forgot to feed the records.
+                return _block_codex(
+                    decision,
+                    "invalid_quota_observation",
+                    "quota_exhausted with a reported reset requires the "
+                    "post_invocation history list (empty on the first "
+                    "observation) so the consecutive-elapsed decision is "
+                    "made here, not in prose",
+                    "correct_observation_input",
+                )
+            prior_elapsed = False
+            for record in reversed(history):
+                if not isinstance(record, dict) or not isinstance(
+                    record.get("status"), str
+                ):
+                    return _block_codex(
+                        decision,
+                        "invalid_quota_observation",
+                        "post_invocation history entries must be mappings "
+                        "with a string status",
+                        "correct_observation_input",
+                    )
+                record_status = record["status"]
+                if record_status in _CODEX_RETRYABLE_FAILURES:
+                    # Liveness noise (timeout/transport_error/runaway) neither
+                    # forms nor breaks the streak — Dawid's R3 path 2.
+                    continue
+                if record_status == "quota_exhausted":
+                    record_reset = normalize_iso_timestamp(
+                        record.get("quota_reset_at")
+                    )
+                    record_observed = normalize_iso_timestamp(
+                        record.get("observed_at")
+                    )
+                    if record_reset is not None and record_observed is not None:
+                        # Elapsed-ness is judged at the record's OWN
+                        # observation time, never the current clock.
+                        prior_elapsed = record_reset <= record_observed
+                    # An unjudgeable prior (pre-fix record shape) breaks the
+                    # streak conservatively: the terminal block requires
+                    # clean evidence.
+                break
+            reset_elapsed = parsed_reset <= observed_at
+            try:
+                floor = observed_at + timedelta(seconds=QUOTA_WAIT_FLOOR_SECONDS)
+                ceiling = observed_at + timedelta(seconds=MAX_QUOTA_WAIT_SECONDS)
+            except OverflowError:
+                # A parseable-but-absurd observed_at (year 9999) must produce
+                # a fail-closed verdict, never a traceback.
+                return _block_codex(
+                    decision,
+                    "invalid_quota_observation",
+                    "observed_at is too far in the future to bound a wait",
+                    "correct_observation_input",
+                )
+            if reset_elapsed and prior_elapsed:
+                return _block_codex(
+                    decision,
+                    "quota_exhausted",
+                    f"{decision['model']} usage quota reports repeated "
+                    "already-elapsed resets — no usable reset time",
+                    "wait_for_quota_reset_or_change_access",
+                )
+            wait_until = min(max(parsed_reset, floor), ceiling)
+            clamped = ceiling < parsed_reset
+            reason = (
+                f"{decision['model']} usage quota is exhausted with a "
+                f"provider-reported reset at {reset_at}; wait until "
+                f"{wait_until.isoformat()} (chunked, with progress) and retry "
+                "the exact same configuration — never block, never downgrade"
+            )
+            if clamped:
+                reason += (
+                    "; the reset exceeds one bounded sleep, so the wait is "
+                    "clamped to the MAX_QUOTA_WAIT_SECONDS ceiling and the "
+                    "route is re-observed at wake"
+                )
+            decision.update(
+                {
+                    "state": "retry",
+                    "reason_code": "quota_wait_for_reset",
+                    "reason": reason,
+                    "next_action": "wait_for_quota_reset",
+                    "quota": {
+                        "reset_at": reset_at,
+                        "wait_until": wait_until.isoformat(),
+                        "clamped": clamped,
+                        "reset_elapsed": reset_elapsed,
+                    },
+                }
+            )
+            return decision
+        # No reported reset: fall through to the terminal quota block below.
 
     if status in _CODEX_RETRYABLE_FAILURES:
         if attempts < CODEX_MAX_ATTEMPTS:
@@ -1193,22 +1464,48 @@ def evaluate_codex(raw: Any) -> dict[str, Any]:
                     "reason_code": status,
                     "reason": (
                         "Transient Codex failure; retry once with the exact same "
-                        f"GPT-5.6 Sol/{CODEX_EFFORT} configuration"
+                        f"{decision['model']}/{CODEX_EFFORT} configuration"
                     ),
                     "next_action": "retry_same_invocation_once",
                 }
             )
             return decision
-        return _block_codex(
-            decision,
-            f"{status}_retry_exhausted",
-            "The one permitted Codex retry also failed",
-            "block_and_report_failure",
+        # Liveness-class wait-and-retry: the immediate-retry budget is spent,
+        # so pace further attempts along the escalating backoff ladder instead
+        # of blocking.  attempts counts every try so far; the first backoff
+        # wait uses rung 0, and the ladder's last rung repeats forever.
+        rung = min(
+            attempts - CODEX_MAX_ATTEMPTS,
+            len(LIVENESS_BACKOFF_LADDER_SECONDS) - 1,
         )
+        decision.update(
+            {
+                "state": "retry",
+                "reason_code": f"{status}_backoff",
+                "reason": (
+                    "Liveness-class Codex failure persists after the immediate "
+                    f"retry; wait {LIVENESS_BACKOFF_LADDER_SECONDS[rung]}s "
+                    "(chunked, with progress) and retry the exact same "
+                    f"{decision['model']}/{CODEX_EFFORT} configuration — never "
+                    "block, never downgrade"
+                ),
+                "next_action": "wait_and_retry_with_backoff",
+                "backoff": {
+                    "wait_seconds": LIVENESS_BACKOFF_LADDER_SECONDS[rung],
+                    "ladder_seconds": list(LIVENESS_BACKOFF_LADDER_SECONDS),
+                    "rung": rung,
+                    "last_rung_repeats": True,
+                },
+            }
+        )
+        return decision
 
     blocking = _CODEX_BLOCKING_FAILURES.get(status)
     if blocking is not None:
-        return _block_codex(decision, *blocking)
+        code, reason, action = blocking
+        return _block_codex(
+            decision, code, reason.format(model=decision["model"]), action
+        )
     return _block_codex(
         decision,
         "unknown_invocation_status",
@@ -1481,7 +1778,9 @@ def _waive_or_block_claude(
                 "environment_unset": list(CLAUDE_READ_ONLY_ENV_UNSET),
                 "next_action": "invoke_explicit_named_fallback",
                 "waiver_granted": True,
-                "downgrade_allowed": True,
+                # A named waiver fallback is floor-enforced substitution, not a
+                # downgrade: the flag stays False everywhere.
+                "downgrade_allowed": False,
                 "fallback_model": fallback_model,
             }
         )
@@ -1891,7 +2190,7 @@ def evaluate_model_policy(request: Any) -> dict[str, Any]:
 def main() -> int:
     try:
         request = json.load(sys.stdin)
-    except (json.JSONDecodeError, OSError) as error:
+    except (ValueError, OSError) as error:
         result = {
             "version": SCHEMA_VERSION,
             "state": "blocked",

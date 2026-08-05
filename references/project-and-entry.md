@@ -50,7 +50,7 @@ Also resolve `non_gating_checks` from explicit repository guidance. This is a na
 **Example resolutions:**
 
 ```yaml
-# Yarn/npm monorepo
+# Yarn/npm monorepo (e.g., admin-portal)
 quality_check_steps:
   - ["yarn", "lint:fix"]
   - ["yarn", "format"]
@@ -164,10 +164,10 @@ Resolution is deterministic:
    ```bash
    codex exec --ephemeral --json -m <selected> -c 'model_reasoning_effort="max"' -s read-only "Reply with exactly: OK"
    ```
-   Bound it to 60s aggregate and supervise it with `supervise_stream(stdout_pipe, stderr_pipe, kill_callback, idle_timeout_seconds=60)` from `scripts/model_policy.py` — the smoke sends a trivial prompt, so a full minute of silence means the route is hung, not thinking (review invocations, which legitimately go quiet for minutes, leave this `None` and rely on their own aggregate deadline) (see Phase 2's authentication detection contract). Feed the observed result back to the helper as `first_real_invocation`; its `attempts` are scoped to THIS invocation's retry sequence and reset for every distinct smoke/review round — never cumulative across stages. A `blocked` verdict BLOCKs here, before Phase 1, with the failure matrix's remediation.
+   Bound it to 60s aggregate by supervising it with `supervise_stream(stdout_pipe, stderr_pipe, kill_callback, idle_timeout_seconds=60, max_runtime_seconds=60)` from `scripts/model_policy.py` — the smoke sends a trivial prompt, so a full minute of silence OR of total runtime means the route is hung, not thinking (review invocations, which legitimately go quiet and run long, pass `idle_timeout_seconds=180, max_runtime_seconds=2700` per Timeout Heuristics) (see Phase 2's authentication detection contract). Feed the observed result back to the helper as `first_real_invocation`; its `attempts` are scoped to THIS invocation's retry sequence and reset for every distinct smoke/review round — never cumulative across stages. A `blocked` verdict BLOCKs here, before Phase 1, with the failure matrix's remediation; a `retry` verdict follows the same `next_action` dispatch as Phase 2 (immediate retry, ladder wait, or quota wait — Timeout Heuristics pacing, `next_retry_at` persisted) and re-runs the smoke, the gate staying `pending` until it lands `ready` or `blocked`; BEFORE entering any such wait, persist the in-progress selection, descriptor, attempt count, and retry verdict under `policy_decision` (marked pre-smoke — steps 5-6 finalize the freeze on success), so an interrupted wait resumes the exact same-configuration retry instead of losing the auto-forwarded model.
 4. **Path-inheritance invariant:** every later Phase 2 invocation — the `/autoplan` adapter's Codex calls or the direct Codex review — MUST run through the same provider, environment, selected model, and effort flags this smoke validated. Introducing a provider override after the smoke is a policy violation, not an optimization.
 5. **Freeze the selection:** persist `selection` plus the closed, non-secret execution descriptor built by `build_descriptor()` — normalized provider identity, model, effort, allowlisted policy overrides, and a value-aware `routing_fingerprint` (URL userinfo, query strings, and fragments stripped before digesting; secret-shaped routing env keys dropped, because a provider NAME is not a route). Smoke-only mechanics (`--ephemeral`, `--json`, `-s read-only`) are not part of the semantic descriptor. The credential-source category (`oauth|env_key|none`) is recorded for observability and deliberately EXCLUDED from the frozen comparison. Commands are always reconstructed from this package's templates plus the frozen model/effort — a persisted descriptor string is never executed.
-6. **Persist** under `resolved_conventions.model_runtime`: `codex.gate_status` (`pending`→`ready|blocked` from the smoke), `live_catalog_verified_at`, and `policy_decision.{selection, descriptor, preflight, entry_smoke, post_invocation, decision_file}`, where `post_invocation` is an append-only list of records (one per real Phase 2 invocation). Claude-side versions are verified here; base (Fable) access, reviewer (Opus) access, and ZDR compatibility are recorded as harness-observed facts, and the first real invocation of each Claude leg remains that leg's working authority — the base Claude leg gates — a `blocked` base decision blocks here too — while a reviewer availability failure surfaces as a `degraded` decision: record it and continue on the base-lineage fallback.
+6. **Persist** under `resolved_conventions.model_runtime`: `codex.gate_status` (`pending`→`ready|blocked` from the smoke, holding `pending` through any liveness/quota retry waits), `live_catalog_verified_at`, and `policy_decision.{selection, descriptor, preflight, entry_smoke, post_invocation, decision_file}`, where `post_invocation` is an append-only list of records — one per real invocation, the entry smoke and its retries included, with canonical fields `status`, `quota_reset_at`, `observed_at` plus the helper result — fed back to the helper whole on every quota-with-reset observation, because the helper (not prose) takes the consecutive-elapsed no-usable-reset decision from them. Claude-side versions are verified here; base (Fable) access, reviewer (Opus) access, and ZDR compatibility are recorded as harness-observed facts, and the first real invocation of each Claude leg remains that leg's working authority — the base Claude leg gates — a `blocked` base decision blocks here too — while a reviewer availability failure surfaces as a `degraded` decision: record it and continue on the base-lineage fallback.
 
 Phase 2 always re-runs the cheap probes (seconds, idempotent — no staleness rule needed) and calls `verify_frozen_selection()` instead of re-selecting: the frozen model must still be catalog-eligible and the routing descriptor must still match. A newer model appearing mid-run is NOT adopted — it has not been smoked on this route — and a frozen model disappearing or a descriptor mismatch BLOCKs, with recovery through a NEW workflow entry rather than in-place mutation. Phase 2 never repeats the smoke, with exactly one exception: the `human:codex-login` resume verifier, whose whole purpose is to re-prove access.
 
@@ -182,17 +182,18 @@ The user provides an issue, bug report, feature request, or context to work from
 1. Read and understand the full context provided
 2. **Initialize state file** — create `.claude/workflow-state.local.md` with `state_schema_version: 1`, `workflow_id`, `description`, `current_phase: "entry"`, and the `## Prompt Ledger` body section seeded with the kickoff prompt as sequence 1 (core invariant), so state exists for resume if the session is interrupted
 3. **Resolve `base_branch`** — resolve per the `BASE_BRANCH` section in Resolved Project Profile above and persist to state immediately, before any command that references `origin/<base_branch>`.
-4. **Resolve Project Profile, then run the Model-Gate Entry Preflight** — execute the remaining discovery steps above to populate `resolved_conventions` in the state file, then run the **Model-Gate Entry Preflight** (above) and BLOCK on its verdict before spending anything on exploration. This MUST complete before any phase begins. After profile resolution and before Phase 1, initialize EVERY remaining top-level block from the documented state template — `phases`, `regression_evidence`, `variant_analysis`, ledgers, tracking/acknowledgment maps, monitor counters, and handoffs — the full v1 mapping, so the full-tier schema requirement is satisfiable from Phase 1 onward.
-5. Explore the codebase to understand the affected areas
-6. **Run Scope Analysis & Skill Selection** from the issue/context (see below) so `change_type` is known before branch/ticket classification.
-7. **Choose the repository-compliant branch name and finalize ticket policy.** If the current branch is protected, create the branch using the prefix required for the classified change (for example `chore/` for exempt maintenance or `feature/` for ticketed product work), then recompute `ticket_required` from the final branch + `change_type` and persist the exact rule:
+4. **Resolve Project Profile, then run the Model-Gate Entry Preflight** — execute the remaining discovery steps above to populate `resolved_conventions` in the state file, then run the **Model-Gate Entry Preflight** (above) and BLOCK on its verdict before spending anything on exploration or tracker calls. This MUST complete before any phase begins. After profile resolution and before Phase 1, initialize EVERY remaining top-level block from the documented state template — `phases` (including `merge_readiness`), `regression_evidence`, `variant_analysis`, `acceptance_criteria`, `merge_readiness`, ledgers, tracking/acknowledgment maps, monitor counters, and handoffs — the full v1 mapping, so the full-tier schema requirement is satisfiable from Phase 1 onward.
+5. **Capture acceptance criteria** (see AC Capture in [merge-readiness.md](merge-readiness.md)) — persist `acceptance_criteria` to state before planning begins, so the plan is written against the real AC list, not the issue title.
+6. Explore the codebase to understand the affected areas
+7. **Run Scope Analysis & Skill Selection** from the issue/context (see below) so `change_type` is known before branch/ticket classification.
+8. **Choose the repository-compliant branch name and finalize ticket policy.** If the current branch is protected, create the branch using the prefix required for the classified change (for example `chore/` for exempt maintenance or `feature/` for ticketed product work), then recompute `ticket_required` from the final branch + `change_type` and persist the exact rule:
    ```bash
    # Check current branch against PROTECTED_BRANCHES
    CURRENT_BRANCH=$(git branch --show-current)
    # If CURRENT_BRANCH is in PROTECTED_BRANCHES list → create a feature branch
    git checkout -b <resolved-prefix>/<descriptive-name>
    ```
-8. Proceed to **Phase 1: Plan**
+9. Proceed to **Phase 1: Plan**
 
 ### Entry B: Take Over a PR
 
@@ -273,8 +274,8 @@ The user provides a PR number or URL from another agent or person.
 
    **Note:** `STASH_REF` is captured by exact-message match using a unique nonce; this is race-free regardless of concurrent stash-push activity from other processes.
 
-4. **Resolve Project Profile, then run the Model-Gate Entry Preflight** — execute the discovery steps above to populate `resolved_conventions` in the state file, then run the **Model-Gate Entry Preflight** (above) and BLOCK on its verdict before any further work. `base_branch` was already persisted in step 2. This MUST complete before any phase begins. After profile resolution, initialize EVERY remaining top-level block from the documented state template — `phases`, `regression_evidence`, `variant_analysis`, ledgers, tracking/acknowledgment maps, monitor counters, and handoffs — the full v1 mapping, so the full-tier schema requirement is satisfiable from Phase 1 onward.
-5. Read the PR description and all feedback from the paginated issue-comment, review, and inline-comment REST endpoints; use GraphQL only to supplement thread resolution state
+4. **Resolve Project Profile, then run the Model-Gate Entry Preflight** — execute the discovery steps above to populate `resolved_conventions` in the state file, then run the **Model-Gate Entry Preflight** (above) and BLOCK on its verdict before any further work. `base_branch` was already persisted in step 2. This MUST complete before any phase begins. After profile resolution, initialize EVERY remaining top-level block from the documented state template — `phases` (including `merge_readiness`), `regression_evidence`, `variant_analysis`, `acceptance_criteria`, `merge_readiness`, ledgers, tracking/acknowledgment maps, monitor counters, and handoffs — the full v1 mapping, so the full-tier schema requirement is satisfiable from Phase 1 onward.
+5. Read the PR description and all feedback from the paginated issue-comment, review, and inline-comment REST endpoints; use GraphQL only to supplement thread resolution state. **In the same step, capture acceptance criteria** (see AC Capture in [merge-readiness.md](merge-readiness.md)) — resolve the linked ticket from the PR title/body/branch name and persist `acceptance_criteria` to state; takeovers MUST NOT skip AC capture, because the original author's reading of the ticket is unverified input, not settled fact
 6. Understand what's been done and what's pending
 7. Assess current state:
    - Are there failing checks? → Note them
@@ -287,12 +288,14 @@ The user provides a PR number or URL from another agent or person.
 
     **Takeover phase-transition bookkeeping:** Update both `current_phase` AND the corresponding `phases.*` status at every transition on the takeover path:
     - `current_phase: "self_review"`, `phases.self_review: "in_progress"` → Phase 4
+    - `current_phase: "merge_readiness"`, `phases.merge_readiness: "in_progress"` → Phase 4b (after Phase 4a when selected)
     - `current_phase: "runtime_verification"`, `phases.runtime_verification.status: "in_progress"` → Runtime Verification
     - `current_phase: "pr"`, `phases.pr: "in_progress"` → Phase 5
     - `current_phase: "monitor"`, `phases.monitor: "in_progress"` → Phase 6
 
     Mark each phase with its valid terminal status when it finishes:
     - `phases.self_review` → `"complete"` or `"blocked"`
+    - `phases.merge_readiness` → `"complete"` or `"blocked"`
     - `phases.runtime_verification.status` → `"complete"`, `"blocked"`, or `"waived"`
     - `phases.pr` → `"complete"`
     - `phases.monitor` → `"paused"`, `"complete"`, or `"blocked"` (see Phase 6 condition (c) and the core's Prompt Trail transition gate for when `blocked` applies)
@@ -305,7 +308,7 @@ The user provides a PR number or URL from another agent or person.
 
 ## Scope Analysis & Skill Selection
 
-**Runs at TWO points:** (1) Entry A step 6 / Entry B step 8 — before Phase 1; (2) after Phase 3 — recompute from the actual diff since implementation may change scope. After each run, recompute branch/type-dependent ticket policy; Entry A then selects its final branch prefix in step 7.
+**Runs at TWO points:** (1) Entry A step 7 / Entry B step 8 — before Phase 1; (2) after Phase 3 — recompute from the actual diff since implementation may change scope. After each run, recompute branch/type-dependent ticket policy; Entry A then selects its final branch prefix in step 8.
 
 **Source of truth:** `git diff --name-only origin/<base_branch>...HEAD` (actual diff, not planned files). For Entry A before any commits exist (no diff available), fall back to classifying from the issue/context description — infer which areas of the codebase are likely affected based on the issue's symptoms and affected features. This initial classification may be imprecise; it will be recomputed from the actual diff after Phase 3.
 
@@ -322,7 +325,9 @@ If not found, set `gstack_integration.available: false` in state and skip gstack
 ### Step 2: Classify Scope from Diff
 
 ```bash
-CHANGED_FILES=$(git diff --name-only origin/<base_branch>...HEAD 2>/dev/null || echo "")
+# NUL-delimited enumeration: parse with a NUL-safe reader (while IFS= read -r -d '')
+# so a newline-containing path cannot split classification and flip scope flags.
+CHANGED_FILES=$(git diff --name-only -z origin/<base_branch>...HEAD 2>/dev/null || printf "")
 ```
 
 - `scope_frontend`: any file matching `*.tsx`, `*.jsx`, `*.css`, `*.scss`, `*.html`, or paths containing `components/`, `pages/`, `views/`, `app/`

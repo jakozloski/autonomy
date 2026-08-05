@@ -33,7 +33,7 @@ def _valid_skill_text() -> str:
             f"Use `codex exec {EXEC_MODEL_FLAGS}` for Codex execution.",
             f"Use `codex review {REVIEW_MODEL_FLAGS}` for Codex review.",
             f"The codex floor model is {CODEX_FLOOR_MODEL}; newer eligible models auto-forward.",
-            "This skill owns orchestration; do not substitute the separate ultracode mode.",
+            "Conductor owns orchestration; do not substitute the separate ultracode mode.",
             *(
                 f"Gate marker: {marker}"
                 for marker in REQUIRED_GATE_MARKERS.get("SKILL.md", ())
@@ -77,7 +77,7 @@ class PackageFixture:
             "\n".join(
                 (
                     "interface:",
-                    '  display_name: "Autonomy"',
+                    '  display_name: "Conductor Autonomy"',
                     '  short_description: "Run a full autonomous workflow"',
                     '  default_prompt: "Use $autonomy to finish this task."',
                     "",
@@ -86,8 +86,14 @@ class PackageFixture:
             encoding="utf-8",
         )
         for relative_path in REQUIRED_SCRIPT_FILES:
+            # Script fixtures are written AFTER the marker-append loop above,
+            # so any gate markers targeting a script path must be baked in
+            # here or the overwrite silently drops them (R3 round-8 finding).
+            script_lines = ["# package fixture"]
+            for marker in REQUIRED_GATE_MARKERS.get(relative_path, ()):
+                script_lines.append(marker)
             (self.root / relative_path).write_text(
-                "# package fixture\n", encoding="utf-8"
+                "\n".join(script_lines) + "\n", encoding="utf-8"
             )
 
     def close(self) -> None:
@@ -322,7 +328,7 @@ class ValidatePackageTests(unittest.TestCase):
 
     def test_openai_yaml_rejects_root_level_interface_fields(self) -> None:
         (self.package.root / "agents" / "openai.yaml").write_text(
-            "display_name: Autonomy\n"
+            "display_name: Conductor\n"
             "short_description: Autonomous workflow\n"
             "default_prompt: Use $autonomy.\n",
             encoding="utf-8",
@@ -339,7 +345,7 @@ class ValidatePackageTests(unittest.TestCase):
         (self.package.root / "agents" / "openai.yaml").write_text(
             "interface:\n"
             "  nested:\n"
-            "    display_name: Autonomy\n"
+            "    display_name: Conductor\n"
             "    short_description: Autonomous workflow\n"
             "    default_prompt: Use $autonomy.\n",
             encoding="utf-8",
@@ -368,11 +374,61 @@ class ValidatePackageTests(unittest.TestCase):
             errors,
         )
 
+    def test_frontmatter_rejects_unquoted_colon_space_scalar(self) -> None:
+        skill_path = self.package.root / "SKILL.md"
+        text = skill_path.read_text(encoding="utf-8")
+        skill_path.write_text(
+            text.replace(
+                "description: Run the complete autonomous engineering workflow.",
+                "description: bad: value",
+            ),
+            encoding="utf-8",
+        )
+
+        errors = validate_package(self.package.root)
+
+        self.assertTrue(
+            any("must quote scalars containing" in error for error in errors)
+        )
+
+    def test_frontmatter_rejects_colon_tab_and_trailing_colon_scalars(self) -> None:
+        for bad_value in ("bad:\tvalue", "bad:"):
+            with self.subTest(value=bad_value):
+                skill_path = self.package.root / "SKILL.md"
+                skill_path.write_text(
+                    _valid_skill_text().replace(
+                        "description: Run the complete autonomous engineering workflow.",
+                        f"description: {bad_value}",
+                    ),
+                    encoding="utf-8",
+                )
+                errors = validate_package(self.package.root)
+                self.assertTrue(
+                    any("must quote scalars containing" in error for error in errors)
+                )
+
+    def test_openai_yaml_accepts_document_start_marker(self) -> None:
+        (self.package.root / "agents" / "openai.yaml").write_text(
+            "---\n"
+            "interface:\n"
+            '  display_name: "Conductor Autonomy"\n'
+            '  short_description: "Run a full autonomous workflow"\n'
+            '  default_prompt: "Use $autonomy to finish this task."\n',
+            encoding="utf-8",
+        )
+
+        errors = validate_package(self.package.root)
+
+        self.assertNotIn(
+            "agents/openai.yaml must contain exactly one root interface mapping",
+            errors,
+        )
+
     def test_cli_validates_the_default_package_directory(self) -> None:
         output = io.StringIO()
 
         with redirect_stdout(output):
-            exit_code = main([str(self.package.root)])
+            exit_code = main([])
 
         self.assertEqual(exit_code, 0)
         self.assertIn("package validation passed", output.getvalue())

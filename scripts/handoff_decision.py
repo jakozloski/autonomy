@@ -23,7 +23,12 @@ import json
 import re
 import sys
 from datetime import datetime
+from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import state_schema  # noqa: E402  (sibling module; path set immediately above)
 
 
 SCHEMA_VERSION = 1
@@ -38,28 +43,28 @@ GITHUB_LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?")
 GIT_OBJECT_ID = re.compile(r"[0-9a-fA-F]{7,64}")
 LINEAR_WRITE_PATHS = {"environment_tool", "local_api", "none"}
 ISSUE_TRACKER_TYPES = {"linear", "jira", "github", "none"}
-OPERATION_RESULT_STATUSES = {"pending", "retryable", "complete", "failed"}
-MAX_OPERATION_ATTEMPTS = 3
+# Single source of truth: the attempt cap lives in state_schema (dependency
+# root); this module REBINDS the name rather than re-declaring the literal.
+MAX_OPERATION_ATTEMPTS = state_schema.MAX_OPERATION_ATTEMPTS
 
 # Match nameWithOwner exactly.  Repository basename matching would incorrectly
-# hand off forks such as another-owner/web-app.  The entries below are
-# placeholder examples — replace them with your organization's mapping.
+# hand off forks such as another-owner/matchmaking.
 QA_OWNER_BY_REPOSITORY = {
-    "example-org/admin-portal": {
-        "github_login": "bob-qa",
-        "linear_name": "Bob Example",
+    "Keeper-Dating/admin-portal": {
+        "github_login": "shafqatukhan",
+        "linear_name": "Shafqat",
     },
-    "example-org/api-service": {
-        "github_login": "alice-qa",
-        "linear_name": "Alice Example",
+    "Keeper-Dating/calculator-api": {
+        "github_login": "tjkeeper",
+        "linear_name": "Timothy Jhon Pascual",
     },
-    "example-org/marketing-site": {
-        "github_login": "alice-qa",
-        "linear_name": "Alice Example",
+    "Keeper-Dating/keeper-lead-generator": {
+        "github_login": "tjkeeper",
+        "linear_name": "Timothy Jhon Pascual",
     },
-    "example-org/web-app": {
-        "github_login": "alice-qa",
-        "linear_name": "Alice Example",
+    "Keeper-Dating/matchmaking": {
+        "github_login": "tjkeeper",
+        "linear_name": "Timothy Jhon Pascual",
     },
 }
 
@@ -69,11 +74,10 @@ QA_OWNER_BY_REPOSITORY = {
 # reading as in-progress after QA already owned them.  Workflow-state IDs are
 # team-scoped, so callers resolve the ID by this exact name within the
 # ticket's own team and pass it as ``issue_tracker.qa_state``.  Teams absent
-# from this map get no state operation.  The shipped team keys and state
-# names are placeholder examples — replace them with your tracker's values.
+# from this map get no state operation.
 QA_STATE_NAME_BY_TEAM = {
-    "ADM": "Ready for QA",
-    "WEB": "Preview QA",
+    "ADM": "Dev - Ready for QA",
+    "WEB": "Vercel Preview QA",
 }
 
 
@@ -113,14 +117,11 @@ def _idle(scenario: str, reason: str) -> dict[str, Any]:
 
 
 def _iso_timestamp(value: Any) -> datetime | None:
-    if not isinstance(value, str) or not value:
-        return None
-    candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
-    try:
-        parsed = datetime.fromisoformat(candidate)
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo is not None else None
+    # Single source of truth: state_schema.normalize_iso_timestamp owns the
+    # strict shape check AND the fractional-second normalization, so this
+    # eligibility gate can never accept or reject a timestamp the state
+    # validator decides the other way.
+    return state_schema.normalize_iso_timestamp(value)
 
 
 def _is_stripped_nonempty_string(value: Any) -> bool:
@@ -752,87 +753,18 @@ def _operation_results(
 
     results: dict[str, dict[str, Any]] = {}
     errors: list[str] = []
-    allowed_keys = {
-        "status",
-        "attempts",
-        "started_at",
-        "response_id",
-        "verified_at",
-        "error",
-        "evidence",
-    }
+    allowed_keys = state_schema.OPERATION_RESULT_ALLOWED_KEYS
     for operation_id, raw_result in raw_results.items():
         if not isinstance(operation_id, str) or not operation_id:
             errors.append("operation_results keys must be non-empty strings")
             continue
-        if not isinstance(raw_result, dict):
-            errors.append(f"operation_results[{operation_id!r}] must be an object")
-            continue
-        unknown_keys = sorted(set(raw_result) - allowed_keys)
-        if unknown_keys:
-            errors.append(
-                f"operation_results[{operation_id!r}] has unknown field(s): "
-                + ", ".join(unknown_keys)
-            )
-            continue
-        status = raw_result.get("status")
-        attempts = raw_result.get("attempts")
-        if not isinstance(status, str) or status not in OPERATION_RESULT_STATUSES:
-            errors.append(
-                f"operation_results[{operation_id!r}].status must be one of: "
-                "complete, failed, pending, retryable"
-            )
-            continue
-        if (
-            not isinstance(attempts, int)
-            or isinstance(attempts, bool)
-            or attempts < 1
-            or attempts > MAX_OPERATION_ATTEMPTS
-        ):
-            errors.append(
-                f"operation_results[{operation_id!r}].attempts must be between 1 and 3"
-            )
-            continue
-        started_at = _iso_timestamp(raw_result.get("started_at"))
-        if started_at is None:
-            errors.append(
-                f"operation_results[{operation_id!r}] requires the write-ahead started_at timestamp"
-            )
-            continue
-        verified_at = _iso_timestamp(raw_result.get("verified_at"))
-        if status in {"retryable", "complete", "failed"} and verified_at is None:
-            errors.append(
-                f"operation_results[{operation_id!r}] {status} state requires verified_at"
-            )
-            continue
-        if (
-            status in {"retryable", "complete", "failed"}
-            and verified_at is not None
-            and verified_at < started_at
-        ):
-            errors.append(
-                f"operation_results[{operation_id!r}].verified_at cannot precede started_at"
-            )
-            continue
-        if status in {"retryable", "failed"} and (
-            not isinstance(raw_result.get("error"), str) or not raw_result["error"]
-        ):
-            errors.append(
-                f"operation_results[{operation_id!r}] {status} state requires error evidence"
-            )
-            continue
-        if status == "complete" and (
-            not isinstance(raw_result.get("evidence"), dict)
-            or not raw_result["evidence"]
-        ):
-            errors.append(
-                f"operation_results[{operation_id!r}] complete state requires verification evidence"
-            )
-            continue
-        if status == "retryable" and attempts >= MAX_OPERATION_ATTEMPTS:
-            errors.append(
-                f"operation_results[{operation_id!r}] exhausted the three-attempt limit"
-            )
+        # Canonical per-record contract — shared with state_schema so a state
+        # file can never validate clean and then be rejected here on resume.
+        _, record_errors = state_schema.validate_operation_result_record(
+            raw_result, label=f"operation_results[{operation_id!r}]"
+        )
+        if record_errors:
+            errors.extend(record_errors)
             continue
         results[operation_id] = {
             key: copy.deepcopy(raw_result[key])
@@ -897,8 +829,6 @@ def _apply_operation_state(
         for operation_id, result in result_records.items()
         if result["status"] in {"pending", "retryable"}
     }
-    if len(in_flight) > 1:
-        errors.append("only one operation may be pending or retryable at a time")
     invalid_completed = canonical_complete & automatic_failure_ids
     if invalid_completed:
         errors.append(
@@ -908,18 +838,21 @@ def _apply_operation_state(
 
     completed_all = canonical_complete
     failed_all = canonical_failed
-    terminal_ids = completed_all | failed_all
-    saw_unfinished = False
-    for operation in operation_specs:
-        operation_id = operation["id"]
-        has_result = operation_id in terminal_ids or operation_id in in_flight
-        if saw_unfinished and has_result:
-            errors.append(
-                "operation results must form a prefix with at most one in-flight tail"
-            )
-            break
-        if operation_id in in_flight or not has_result:
-            saw_unfinished = True
+    # Portable collection rules (single in-flight; prefix with one in-flight
+    # tail) are DELEGATED to the canonical validator so the two sides cannot
+    # drift; the label is empty because this module's historic messages carry
+    # no prefix. Scenario-specific checks (unavailable-op completion above)
+    # stay here — they need planner context the schema does not have.
+    errors.extend(
+        state_schema.validate_operation_collection(
+            [operation["id"] for operation in operation_specs],
+            {
+                operation_id: result_records[operation_id]["status"]
+                for operation_id in result_records
+            },
+            label="",
+        )
+    )
 
     if errors:
         return _blocked(scenario, *errors)
@@ -1142,6 +1075,26 @@ def plan_handoff(request: Any) -> dict[str, Any]:
             request, name_with_owner, pull_request_number
         )
         if not errors and not operations:
+            # Route through _operation_results so a malformed (non-dict)
+            # ledger fails closed exactly like the QA path, instead of
+            # falling through to silent idle (R4-F3).
+            persisted, ledger_errors = _operation_results(request)
+            if ledger_errors:
+                return _blocked(scenario, *ledger_errors)
+            if persisted:
+                # A zero-operation plan must not silently orphan persisted
+                # write-ahead records: a pending record marks a mutation that
+                # may already have fired remotely, and even a terminal record
+                # is evidence of a mutation whose target is no longer
+                # plannable. Fail closed so the resume verifies postconditions
+                # instead of reporting nothing-to-do.
+                return _blocked(
+                    scenario,
+                    "no eligible reviewers remain, but "
+                    f"{len(persisted)} persisted operation result(s) exist - "
+                    "verify the prior mutation's postcondition before "
+                    "abandoning the roundtrip",
+                )
             return _idle(scenario, "no eligible reviewers remain after actor exclusion")
 
     if errors:
@@ -1152,7 +1105,7 @@ def plan_handoff(request: Any) -> dict[str, Any]:
 def main() -> int:
     try:
         request = json.load(sys.stdin)
-    except (json.JSONDecodeError, OSError) as error:
+    except (ValueError, OSError) as error:
         plan = _blocked(None, f"input must be valid JSON: {error}")
     else:
         plan = plan_handoff(request)

@@ -15,22 +15,22 @@ from handoff_decision import (
 )
 
 
-REPOSITORY = {"nameWithOwner": "example-org/web-app"}
+REPOSITORY = {"nameWithOwner": "Keeper-Dating/matchmaking"}
 PR_NUMBER = 3219
 TIMESTAMP = "2026-07-09T20:09:07Z"
 FIX_SHA = "a" * 40
 REMOTE_HEAD_SHA = "b" * 40
 LINEAR_QA_ASSIGNEE = {
-    "provider_id": "linear-user-alice-qa",
-    "name": "Alice Example",
+    "provider_id": "linear-user-tjkeeper",
+    "name": "Timothy Jhon Pascual",
 }
 LINEAR_QA_STATE_WEB = {
     "provider_id": "linear-state-vercel-preview-qa",
-    "name": "Preview QA",
+    "name": "Vercel Preview QA",
 }
 LINEAR_QA_STATE_ADM = {
     "provider_id": "linear-state-dev-ready-for-qa",
-    "name": "Ready for QA",
+    "name": "Dev - Ready for QA",
 }
 
 
@@ -56,7 +56,7 @@ def reviewer(
                 "evaluated_updated_at": TIMESTAMP,
                 "evaluated_at": TIMESTAMP,
                 "acknowledgment_id": "ack-1",
-                "acknowledgment_author": "dev-author",
+                "acknowledgment_author": "jakozloski",
             }
         }
     )
@@ -69,7 +69,7 @@ def reviewer(
                 "replied_to_updated_at": TIMESTAMP,
                 "reply_id": "reply-1",
                 "replied_at": TIMESTAMP,
-                "reply_author": "dev-author",
+                "reply_author": "jakozloski",
             }
         }
     )
@@ -109,7 +109,7 @@ def github_operation(
         "action": action,
         "depends_on": depends_on or [],
         "payload": {
-            "nameWithOwner": "example-org/web-app",
+            "nameWithOwner": "Keeper-Dating/matchmaking",
             "pull_request_number": PR_NUMBER,
             **payload,
         },
@@ -136,21 +136,21 @@ class HandoffDecisionTest(unittest.TestCase):
         self.assertEqual(
             QA_OWNER_BY_REPOSITORY,
             {
-                "example-org/admin-portal": {
-                    "github_login": "bob-qa",
-                    "linear_name": "Bob Example",
+                "Keeper-Dating/admin-portal": {
+                    "github_login": "shafqatukhan",
+                    "linear_name": "Shafqat",
                 },
-                "example-org/api-service": {
-                    "github_login": "alice-qa",
-                    "linear_name": "Alice Example",
+                "Keeper-Dating/calculator-api": {
+                    "github_login": "tjkeeper",
+                    "linear_name": "Timothy Jhon Pascual",
                 },
-                "example-org/marketing-site": {
-                    "github_login": "alice-qa",
-                    "linear_name": "Alice Example",
+                "Keeper-Dating/keeper-lead-generator": {
+                    "github_login": "tjkeeper",
+                    "linear_name": "Timothy Jhon Pascual",
                 },
-                "example-org/web-app": {
-                    "github_login": "alice-qa",
-                    "linear_name": "Alice Example",
+                "Keeper-Dating/matchmaking": {
+                    "github_login": "tjkeeper",
+                    "linear_name": "Timothy Jhon Pascual",
                 },
             },
         )
@@ -160,7 +160,7 @@ class HandoffDecisionTest(unittest.TestCase):
             "scenario": "approved_qa",
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
-            "existing_assignees": ["stale-owner", "dev-author", "stale-owner"],
+            "existing_assignees": ["stale-owner", "jakozloski", "stale-owner"],
             "issue_tracker": {
                 "type": "linear",
                 "qa_assignee": LINEAR_QA_ASSIGNEE,
@@ -175,13 +175,13 @@ class HandoffDecisionTest(unittest.TestCase):
         github = github_operation(
             "qa.github.replace_assignees",
             "replace_pull_request_assignees",
-            {"assignees": ["alice-qa"]},
+            {"assignees": ["tjkeeper"]},
             "pending",
         )
         verify_github = github_operation(
             "qa.github.verify_assignees",
             "verify_pull_request_assignees",
-            {"expected_assignees": ["alice-qa"]},
+            {"expected_assignees": ["tjkeeper"]},
             "waiting",
             ["qa.github.replace_assignees"],
         )
@@ -193,8 +193,8 @@ class HandoffDecisionTest(unittest.TestCase):
             "payload": {
                 "ticket_identifier": "WEB-8877",
                 "ticket_provider_id": "linear-ticket-web-8877",
-                "assignee_id": "linear-user-alice-qa",
-                "assignee_name": "Alice Example",
+                "assignee_id": "linear-user-tjkeeper",
+                "assignee_name": "Timothy Jhon Pascual",
                 "write_path": "environment_tool",
             },
             "status": "waiting",
@@ -207,8 +207,8 @@ class HandoffDecisionTest(unittest.TestCase):
             "payload": {
                 "ticket_identifier": "WEB-8877",
                 "ticket_provider_id": "linear-ticket-web-8877",
-                "expected_assignee_id": "linear-user-alice-qa",
-                "expected_assignee_name": "Alice Example",
+                "expected_assignee_id": "linear-user-tjkeeper",
+                "expected_assignee_name": "Timothy Jhon Pascual",
                 "write_path": "environment_tool",
             },
             "status": "waiting",
@@ -222,7 +222,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 "ticket_identifier": "WEB-8877",
                 "ticket_provider_id": "linear-ticket-web-8877",
                 "state_id": "linear-state-vercel-preview-qa",
-                "state_name": "Preview QA",
+                "state_name": "Vercel Preview QA",
                 "write_path": "environment_tool",
             },
             "status": "waiting",
@@ -236,7 +236,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 "ticket_identifier": "WEB-8877",
                 "ticket_provider_id": "linear-ticket-web-8877",
                 "expected_state_id": "linear-state-vercel-preview-qa",
-                "expected_state_name": "Preview QA",
+                "expected_state_name": "Vercel Preview QA",
                 "write_path": "environment_tool",
             },
             "status": "waiting",
@@ -249,7 +249,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 "state": "pending",
                 "reason": None,
                 "targets": {
-                    "assignees": ["alice-qa"],
+                    "assignees": ["tjkeeper"],
                     "reviewers": [],
                     "linear_assignee": LINEAR_QA_ASSIGNEE,
                 },
@@ -271,8 +271,8 @@ class HandoffDecisionTest(unittest.TestCase):
         self.assertEqual(
             QA_STATE_NAME_BY_TEAM,
             {
-                "ADM": "Ready for QA",
-                "WEB": "Preview QA",
+                "ADM": "Dev - Ready for QA",
+                "WEB": "Vercel Preview QA",
             },
         )
 
@@ -300,7 +300,7 @@ class HandoffDecisionTest(unittest.TestCase):
             for operation in plan["operations"]
             if operation["id"] == "qa.linear.set_ticket_state"
         )
-        self.assertEqual(set_state["payload"]["state_name"], "Ready for QA")
+        self.assertEqual(set_state["payload"]["state_name"], "Dev - Ready for QA")
         self.assertEqual(
             set_state["payload"]["state_id"], "linear-state-dev-ready-for-qa"
         )
@@ -329,7 +329,7 @@ class HandoffDecisionTest(unittest.TestCase):
             plan["errors"],
             [
                 "issue_tracker.qa_state.name must resolve exactly to "
-                "'Ready for QA' for team 'ADM'"
+                "'Dev - Ready for QA' for team 'ADM'"
             ],
         )
 
@@ -355,7 +355,7 @@ class HandoffDecisionTest(unittest.TestCase):
             plan["errors"],
             [
                 "issue_tracker.qa_state must contain the resolved "
-                "'Preview QA' workflow state for team 'WEB'; "
+                "'Vercel Preview QA' workflow state for team 'WEB'; "
                 "pass qa_state_unresolved_reason to record a manual state move"
             ],
         )
@@ -395,7 +395,7 @@ class HandoffDecisionTest(unittest.TestCase):
         self.assertEqual(record["status"], "failed")
         self.assertEqual(record["error"], "state renamed in Linear")
         self.assertEqual(
-            record["payload"]["expected_state_name"], "Preview QA"
+            record["payload"]["expected_state_name"], "Vercel Preview QA"
         )
         self.assertEqual(
             plan["warnings"],
@@ -462,7 +462,7 @@ class HandoffDecisionTest(unittest.TestCase):
             "scenario": "approved_qa",
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
-            "existing_assignees": ["stale-owner", "dev-author"],
+            "existing_assignees": ["stale-owner", "jakozloski"],
             "issue_tracker": {
                 "type": "linear",
                 "qa_assignee": LINEAR_QA_ASSIGNEE,
@@ -485,7 +485,7 @@ class HandoffDecisionTest(unittest.TestCase):
             plan_handoff(
                 {
                     "scenario": "clean_unapproved",
-                    "repository": {"nameWithOwner": "another-owner/web-app"},
+                    "repository": {"nameWithOwner": "another-owner/matchmaking"},
                     "pull_request_number": PR_NUMBER,
                 }
             ),
@@ -738,7 +738,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 "state": "failed",
                 "reason": None,
                 "targets": {
-                    "assignees": ["alice-qa"],
+                    "assignees": ["tjkeeper"],
                     "reviewers": [],
                     "linear_assignee": None,
                 },
@@ -746,13 +746,13 @@ class HandoffDecisionTest(unittest.TestCase):
                     github_operation(
                         "qa.github.replace_assignees",
                         "replace_pull_request_assignees",
-                        {"assignees": ["alice-qa"]},
+                        {"assignees": ["tjkeeper"]},
                         "complete",
                     ),
                     github_operation(
                         "qa.github.verify_assignees",
                         "verify_pull_request_assignees",
-                        {"expected_assignees": ["alice-qa"]},
+                        {"expected_assignees": ["tjkeeper"]},
                         "complete",
                         ["qa.github.replace_assignees"],
                     ),
@@ -764,8 +764,8 @@ class HandoffDecisionTest(unittest.TestCase):
                         "payload": {
                             "ticket_identifier": "WEB-8877",
                             "ticket_provider_id": "linear-ticket-web-8877",
-                            "expected_assignee_name": "Alice Example",
-                            "expected_state_name": "Preview QA",
+                            "expected_assignee_name": "Timothy Jhon Pascual",
+                            "expected_state_name": "Vercel Preview QA",
                             "write_path": "none",
                         },
                         "status": "failed",
@@ -815,7 +815,7 @@ class HandoffDecisionTest(unittest.TestCase):
             plan_handoff(
                 {
                     "scenario": "approved_qa",
-                    "repository": {"nameWithOwner": "another-owner/web-app"},
+                    "repository": {"nameWithOwner": "another-owner/matchmaking"},
                     "pull_request_number": PR_NUMBER,
                 }
             ),
@@ -841,10 +841,10 @@ class HandoffDecisionTest(unittest.TestCase):
             "scenario": "human_review_roundtrip",
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
-            "authenticated_actor": "dev-author",
+            "authenticated_actor": "jakozloski",
             "reviewers": [
                 reviewer("zoe"),
-                reviewer("dev-author"),
+                reviewer("jakozloski"),
                 reviewer("alice"),
                 reviewer("zoe"),
             ],
@@ -943,7 +943,7 @@ class HandoffDecisionTest(unittest.TestCase):
             "scenario": "human_review_roundtrip",
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
-            "authenticated_actor": "dev-author",
+            "authenticated_actor": "jakozloski",
             "reviewers": [reviewer("zoe"), reviewer("alice")],
             "operation_results": {
                 "roundtrip.github.request_review:alice": operation_result("complete"),
@@ -1253,7 +1253,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 "state": "failed",
                 "reason": None,
                 "targets": {
-                    "assignees": ["alice-qa"],
+                    "assignees": ["tjkeeper"],
                     "reviewers": [],
                     "linear_assignee": LINEAR_QA_ASSIGNEE,
                 },
@@ -1261,13 +1261,13 @@ class HandoffDecisionTest(unittest.TestCase):
                     github_operation(
                         "qa.github.replace_assignees",
                         "replace_pull_request_assignees",
-                        {"assignees": ["alice-qa"]},
+                        {"assignees": ["tjkeeper"]},
                         "complete",
                     ),
                     github_operation(
                         "qa.github.verify_assignees",
                         "verify_pull_request_assignees",
-                        {"expected_assignees": ["alice-qa"]},
+                        {"expected_assignees": ["tjkeeper"]},
                         "complete",
                         ["qa.github.replace_assignees"],
                     ),
@@ -1279,8 +1279,8 @@ class HandoffDecisionTest(unittest.TestCase):
                         "payload": {
                             "ticket_identifier": "WEB-8877",
                             "ticket_provider_id": "linear-ticket-web-8877",
-                            "assignee_id": "linear-user-alice-qa",
-                            "assignee_name": "Alice Example",
+                            "assignee_id": "linear-user-tjkeeper",
+                            "assignee_name": "Timothy Jhon Pascual",
                             "write_path": "environment_tool",
                         },
                         "status": "failed",
@@ -1293,8 +1293,8 @@ class HandoffDecisionTest(unittest.TestCase):
                         "payload": {
                             "ticket_identifier": "WEB-8877",
                             "ticket_provider_id": "linear-ticket-web-8877",
-                            "expected_assignee_id": "linear-user-alice-qa",
-                            "expected_assignee_name": "Alice Example",
+                            "expected_assignee_id": "linear-user-tjkeeper",
+                            "expected_assignee_name": "Timothy Jhon Pascual",
                             "write_path": "environment_tool",
                         },
                         "status": "failed",
@@ -1308,7 +1308,7 @@ class HandoffDecisionTest(unittest.TestCase):
                             "ticket_identifier": "WEB-8877",
                             "ticket_provider_id": "linear-ticket-web-8877",
                             "state_id": "linear-state-vercel-preview-qa",
-                            "state_name": "Preview QA",
+                            "state_name": "Vercel Preview QA",
                             "write_path": "environment_tool",
                         },
                         "status": "failed",
@@ -1322,7 +1322,7 @@ class HandoffDecisionTest(unittest.TestCase):
                             "ticket_identifier": "WEB-8877",
                             "ticket_provider_id": "linear-ticket-web-8877",
                             "expected_state_id": "linear-state-vercel-preview-qa",
-                            "expected_state_name": "Preview QA",
+                            "expected_state_name": "Vercel Preview QA",
                             "write_path": "environment_tool",
                         },
                         "status": "failed",
@@ -1353,7 +1353,7 @@ class HandoffDecisionTest(unittest.TestCase):
                         "scenario": "human_review_roundtrip",
                         "repository": REPOSITORY,
                         "pull_request_number": PR_NUMBER,
-                        "authenticated_actor": "dev-author",
+                        "authenticated_actor": "jakozloski",
                         "reviewers": [invalid],
                     }
                 )
@@ -1368,7 +1368,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 "scenario": "human_review_roundtrip",
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
-                "authenticated_actor": "dev-author",
+                "authenticated_actor": "jakozloski",
                 "reviewers": [
                     reviewer(
                         "alice",
@@ -1378,7 +1378,7 @@ class HandoffDecisionTest(unittest.TestCase):
                                 "replied_to_updated_at": TIMESTAMP,
                                 "reply_id": "reply-1",
                                 "replied_at": "2026-07-09T21:00:00Z",
-                                "reply_author": "dev-author",
+                                "reply_author": "jakozloski",
                             }
                         },
                     )
@@ -1399,7 +1399,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 "scenario": "human_review_roundtrip",
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
-                "authenticated_actor": "dev-author",
+                "authenticated_actor": "jakozloski",
                 "reviewers": [
                     reviewer(
                         "alice",
@@ -1409,7 +1409,7 @@ class HandoffDecisionTest(unittest.TestCase):
                                 "replied_to_updated_at": TIMESTAMP,
                                 "reply_id": None,
                                 "replied_at": TIMESTAMP,
-                                "reply_author": "dev-author",
+                                "reply_author": "jakozloski",
                             }
                         },
                     )
@@ -1425,7 +1425,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 "scenario": "human_review_roundtrip",
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
-                "authenticated_actor": "dev-author",
+                "authenticated_actor": "jakozloski",
                 "reviewers": [
                     reviewer(
                         "alice",
@@ -1435,7 +1435,7 @@ class HandoffDecisionTest(unittest.TestCase):
                                 "evaluated_updated_at": TIMESTAMP,
                                 "evaluated_at": None,
                                 "acknowledgment_id": "ack-1",
-                                "acknowledgment_author": "dev-author",
+                                "acknowledgment_author": "jakozloski",
                             }
                         },
                     )
@@ -1451,7 +1451,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 "scenario": "human_review_roundtrip",
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
-                "authenticated_actor": "dev-author",
+                "authenticated_actor": "jakozloski",
                 "reviewers": [
                     reviewer(
                         "alice",
@@ -1461,7 +1461,7 @@ class HandoffDecisionTest(unittest.TestCase):
                                 "replied_to_updated_at": TIMESTAMP,
                                 "reply_id": "reply-1",
                                 "replied_at": "2026-07-09T19:00:00Z",
-                                "reply_author": "dev-author",
+                                "reply_author": "jakozloski",
                             }
                         },
                     )
@@ -1477,7 +1477,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 "scenario": "human_review_roundtrip",
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
-                "authenticated_actor": "dev-author",
+                "authenticated_actor": "jakozloski",
                 "reviewers": [
                     reviewer(
                         "alice",
@@ -1500,7 +1500,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 "scenario": "human_review_roundtrip",
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
-                "authenticated_actor": "dev-author",
+                "authenticated_actor": "jakozloski",
                 "reviewers": [root],
             }
         )
@@ -1513,7 +1513,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 "scenario": "human_review_roundtrip",
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
-                "authenticated_actor": "dev-author",
+                "authenticated_actor": "jakozloski",
                 "reviewers": [
                     reviewer("alice", fix_shas=[FIX_SHA], pushed_fix_shas=[])
                 ],
@@ -1528,7 +1528,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 "scenario": "human_review_roundtrip",
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
-                "authenticated_actor": "dev-author",
+                "authenticated_actor": "jakozloski",
                 "reviewers": [reviewer("alice", blocker_remaining=True)],
             }
         )
@@ -1541,7 +1541,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 "scenario": "human_review_roundtrip",
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
-                "authenticated_actor": "dev-author",
+                "authenticated_actor": "jakozloski",
                 "reviewers": [reviewer("alice", fix_shas=[{"bad": "shape"}])],
             }
         )
@@ -1566,7 +1566,7 @@ class HandoffDecisionTest(unittest.TestCase):
                         "scenario": "human_review_roundtrip",
                         "repository": REPOSITORY,
                         "pull_request_number": PR_NUMBER,
-                        "authenticated_actor": "dev-author",
+                        "authenticated_actor": "jakozloski",
                         "reviewers": [reviewer_record],
                     }
                 )
@@ -1641,7 +1641,7 @@ class HandoffDecisionTest(unittest.TestCase):
             tracker = dict(base_tracker)
             tracker["qa_assignee"] = dict(LINEAR_QA_ASSIGNEE)
             if field == "qa_assignee":
-                tracker["qa_assignee"]["provider_id"] = " linear-user-alice-qa "
+                tracker["qa_assignee"]["provider_id"] = " linear-user-tjkeeper "
                 expected_field = "qa_assignee.provider_id"
             else:
                 tracker[field] = " "
@@ -1750,7 +1750,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 "scenario": "human_review_roundtrip",
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
-                "authenticated_actor": "dev-author",
+                "authenticated_actor": "jakozloski",
                 "reviewers": [reviewer("alice"), reviewer("zoe")],
                 "operation_results": {
                     "roundtrip.github.replace_assignees": operation_result("complete")
@@ -1765,10 +1765,48 @@ class HandoffDecisionTest(unittest.TestCase):
             ["operation results must form a prefix with at most one in-flight tail"],
         )
 
+    def test_zero_reviewer_roundtrip_with_persisted_results_fails_closed(self) -> None:
+        """A resumed roundtrip whose reviewer set emptied (actor exclusion /
+        ineligibility) must not silently orphan a persisted write-ahead
+        record - the mutation it marks may already have fired remotely."""
+        plan = plan_handoff(
+            {
+                "scenario": "human_review_roundtrip",
+                "repository": REPOSITORY,
+                "pull_request_number": PR_NUMBER,
+                "authenticated_actor": "alice",
+                "reviewers": [],
+                "operation_results": {
+                    "roundtrip.github.request_review:alice": {
+                        "status": "pending",
+                        "attempts": 1,
+                        "started_at": TIMESTAMP,
+                    }
+                },
+            }
+        )
+        self.assertEqual(plan["state"], "blocked")
+        self.assertTrue(
+            any("persisted operation result" in error for error in plan["errors"]),
+            plan["errors"],
+        )
+
+    def test_zero_reviewer_roundtrip_without_results_stays_idle(self) -> None:
+        plan = plan_handoff(
+            {
+                "scenario": "human_review_roundtrip",
+                "repository": REPOSITORY,
+                "pull_request_number": PR_NUMBER,
+                "authenticated_actor": "alice",
+                "reviewers": [],
+            }
+        )
+        self.assertEqual(plan["state"], "idle")
+
     def test_cli_reads_json_and_writes_only_the_plan(self) -> None:
         request = {
             "scenario": "clean_unapproved",
-            "repository": {"nameWithOwner": "another-owner/web-app"},
+            "repository": {"nameWithOwner": "another-owner/matchmaking"},
             "pull_request_number": PR_NUMBER,
         }
         stdin = io.StringIO(json.dumps(request))
@@ -1823,9 +1861,7 @@ class QaOwnerDocumentationSyncTest(unittest.TestCase):
             if not stripped.startswith("|"):
                 continue
             cells = [cell.strip() for cell in stripped.strip("|").split("|")]
-            # Mapping rows carry a backticked `org/repo` slug; the header,
-            # divider, and "anything else" rows do not.
-            if len(cells) != 3 or not cells[0].startswith("`") or "/" not in cells[0]:
+            if len(cells) != 3 or not cells[0].startswith("`Keeper-Dating/"):
                 continue
             documented[cells[0].strip("`")] = {
                 "github_login": cells[1].strip("`"),
@@ -1837,6 +1873,91 @@ class QaOwnerDocumentationSyncTest(unittest.TestCase):
     def test_qa_state_names_match_module_mapping(self) -> None:
         for team_key, state_name in QA_STATE_NAME_BY_TEAM.items():
             self.assertIn(f'`{team_key}` → **"{state_name}"**', self.reference_text)
+
+
+class RetryGuardCoverageTests(unittest.TestCase):
+    """The two invariants that prevent a blind fourth mutation."""
+
+    def test_retryable_at_attempt_cap_blocks(self) -> None:
+        plan = plan_handoff(
+            {
+                "scenario": "approved_qa",
+                "repository": REPOSITORY,
+                "pull_request_number": PR_NUMBER,
+                "operation_results": {
+                    "qa.github.replace_assignees": {
+                        "status": "retryable",
+                        "attempts": 3,
+                        "started_at": TIMESTAMP,
+                        "verified_at": TIMESTAMP,
+                        "error": "postcondition absent",
+                    }
+                },
+            }
+        )
+        self.assertEqual(plan["state"], "blocked")
+
+    def test_two_in_flight_operations_block(self) -> None:
+        plan = plan_handoff(
+            {
+                "scenario": "approved_qa",
+                "repository": REPOSITORY,
+                "pull_request_number": PR_NUMBER,
+                "operation_results": {
+                    "qa.github.replace_assignees": {
+                        "status": "pending",
+                        "attempts": 1,
+                        "started_at": TIMESTAMP,
+                    },
+                    "qa.github.verify_assignees": {
+                        "status": "pending",
+                        "attempts": 1,
+                        "started_at": TIMESTAMP,
+                    },
+                },
+            }
+        )
+        self.assertEqual(plan["state"], "blocked")
+
+    def test_fractional_second_timestamps_match_state_schema_verdict(self) -> None:
+        from handoff_decision import _iso_timestamp
+
+        for ts in (
+            "2026-07-30T19:30:00.1Z",
+            "2026-07-30T19:30:00.12345Z",
+            "2026-07-30T19:30:00.123456789+00:00",
+        ):
+            with self.subTest(ts=ts):
+                self.assertIsNotNone(_iso_timestamp(ts))
+        for ts in ("2026-07-30T19:30:00", "2026-07-30 19:30:00Z", "not-a-time"):
+            with self.subTest(ts=ts):
+                self.assertIsNone(_iso_timestamp(ts))
+
+    # The non-UTF-8 stdin CLI test lives in test_cli_fail_closed.py: the skill
+    # scanner forbids pairing subprocess with eval-substring call names here.
+
+
+
+
+class MalformedLedgerZeroReviewerTests(unittest.TestCase):
+    """R4-F3: a malformed operation_results (non-dict) on the zero-reviewer
+    roundtrip path must fail closed like the QA path, never silent idle."""
+
+    def test_non_dict_ledger_shapes_fail_closed(self) -> None:
+        for malformed in (["not", "a", "dict"], "not-a-dict", 7):
+            with self.subTest(shape=type(malformed).__name__):
+                plan = plan_handoff(
+                    {
+                        "scenario": "human_review_roundtrip",
+                        "repository": REPOSITORY,
+                        "pull_request_number": PR_NUMBER,
+                        "authenticated_actor": "alice",
+                        "reviewers": [],
+                        "operation_results": malformed,
+                    }
+                )
+                self.assertEqual(plan["state"], "blocked", plan)
+                self.assertTrue(plan["errors"], plan)
 
 
 if __name__ == "__main__":

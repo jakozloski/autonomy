@@ -28,7 +28,7 @@ while True:
   if loop_reason == "wait_repoll":
     poll_ticks += 1
     state.monitor_poll_ticks = poll_ticks
-    wait <= POLL_CHUNK with progress, THEN fetch fresh checks, feedback metadata (Phase A only — see Step 2), branch/protection state, head, grace clock — ONE sequential wait→refresh operation per tick, in a single tool round where the host permits composing them, never concurrent and never one round per query (see the Polling schedule cost note)
+    wait <= POLL_CHUNK with progress, THEN fetch fresh checks, feedback metadata (Phase A only — see Step 2), branch/protection state, head, grace clock, and — when a merge-readiness deploy/dependency hold set this tick — that hold's applied/live state (the direction-aware rechecks) — ONE sequential wait→refresh operation per tick, in a single tool round where the host permits composing them, never concurrent and never one round per query (see the Polling schedule cost note)
     if the exact clean wait condition still holds:
       continue
     # Any failure, feedback, branch action, draft flip, terminal handoff, pause,
@@ -53,19 +53,18 @@ while True:
      # Condition (c) MUST be checked first so terminal-exhaustion / CHANGES_REQUESTED /
      # unresolved human threads can't be bypassed by an APPROVED match in (a)/(b).
      c. If stuck (CI, conflict, branch-state, ready-flip 3+ attempts) OR exhausted_feedback/manual_unknown_feedback/manual_branch_protection_blockers non-empty OR CHANGES_REQUESTED OR unresolved_human_threads > 0 OR any `human:` key present (fires on presence) → run only eligible roundtrip work, then persist blocked + stranded-work report. If draft, leave it draft.
-     ▸ Draft-PR gate (not an exit; see Step 4): if isDraft AND post_push_until is not null AND the clean-pass
+     ▸ Draft-PR gate (not an exit; see Step 4): if isDraft AND post_push_until is not null AND merge-readiness holds are clear (direction-aware deploy/dependency rechecks — see the gate definition in monitor-exit-handoffs.md) AND the clean-pass
         preconditions hold (gating checks passing + all_feedback_addressed + branch_pause_ready + grace_elapsed + CI-config self-verification when applicable, draft-unrunnable ready-only workflows excluded at flip)
-        # NOTE: no stable_poll_confirmed here — the flip is not an exit, so it fires on the
-        #       first grace-elapsed clean pass instead of waiting for the two-poll convergence.
-        #       post_push_until is armed for every monitored draft (Phase 5 create / takeover),
-        #       so grace_elapsed here is a real ~15min wait for CodeRabbit's draft review — never
-        #       null-trivial. Do NOT flip on a null post_push_until.
+        # NOTE: no stable_poll_confirmed here — the flip is not an exit, so it fires on the first grace-elapsed clean pass instead of waiting for the two-poll convergence.
+        #       post_push_until is armed for every monitored draft (Phase 5 create / takeover), so grace_elapsed here is a real ~15min CodeRabbit wait — never flip on a null post_push_until.
         → persist post_push_until = now + BOT_GRACE_WINDOW, clear clean_poll_timestamps,
           then gh pr ready <PR_NUMBER>, go to 1   # flip triggers Bugbot's single per-PR review
-     a. If approved AND gating checks passing AND grace_elapsed(post_push_until) AND all_feedback_addressed AND stable_poll_confirmed AND NOT isDraft AND branch_completion_ready AND CI-config self-verification satisfied (when applicable) → persist QA handoff operations (verify, don't re-execute, if a prior paused exit recorded them complete); only then complete
+     ▸ Live merge-readiness hold (draft gate or exits a/d): the only unmet conjunct being a deploy/dependency hold is a WAIT — set loop_reason = "wait_repoll" (tick refresh re-verifies the held check; hold note + Deploy-order comment per monitor-exit-handoffs.md), go to 1;
+        never burn work iterations hot-polling a hold — and past BOT_GRACE_WINDOW of continuous hold time (hold_started_at, set on first held tick, cleared when no hold is live), record human:deploy-hold / human:dependency-hold and exit via (c) (a hold needing a human is a dependency, not a wait).
+     a. If approved AND gating checks passing AND grace_elapsed(post_push_until) AND all_feedback_addressed AND stable_poll_confirmed AND NOT isDraft AND branch_completion_ready AND CI-config self-verification satisfied (when applicable) AND merge-readiness holds are clear → persist QA handoff operations (verify, don't re-execute, if a prior paused exit recorded them complete); only then complete
      b. If approved AND gating checks passing BUT (NOT grace_elapsed(post_push_until) OR NOT stable_poll_confirmed)
         → set loop_reason = "wait_repoll"; wait ≤60s per stable-poll schedule, go to 1
-     d. If everything is clean AND all_feedback_addressed AND stable_poll_confirmed AND NOT isDraft AND branch_pause_ready AND CI-config self-verification satisfied (when applicable) (see Step 4)
+     d. If everything is clean AND all_feedback_addressed AND stable_poll_confirmed AND NOT isDraft AND branch_pause_ready AND CI-config self-verification satisfied (when applicable) AND merge-readiness holds are clear (see Step 4)
         → run the QA handoff (same operations/ledger as (a), scenario clean_unapproved;
           skip execution if already recorded complete), then set phases.monitor = "paused",
           output WORKFLOW PAUSED, end loop
@@ -110,13 +109,14 @@ Classify this snapshot through `resolved_conventions.non_gating_checks` before a
   7. Capture the canonical pre-check boundary with `TOUCHED_FILES` from this iteration's fix commits (`origin/<branch>..HEAD`), then run ALL steps in `QUALITY_CHECK_STEPS` sequentially.
   8. Apply the canonical post-check boundary above.
   9. **Diff-scoped self-review.** This is a top-level step, not a sub-bullet of step 8. Apply this single decision tree:
-     - **If steps 5–6 committed any code-changing fix(es)** → run `PHASE_6_SELF_REVIEW("phase_6_ci", REVIEW_BASE)` where `REVIEW_BASE` is the commit SHA immediately before step 5's first fix commit. If the self-review produces additional commits, re-union `TOUCHED_FILES` before proceeding to push. (Run this regardless of whether step 8 also produced an auto-fix commit — the semantic fix is what needs review.)
+     - **If steps 5–6 committed any fix(es) touching reviewable files (code, config, tests, skills/docs — anything but comment replies/ack posts)** → run `PHASE_6_SELF_REVIEW("phase_6_ci", REVIEW_BASE)` where `REVIEW_BASE` is the commit SHA immediately before step 5's first fix commit. If the self-review produces additional commits, re-union `TOUCHED_FILES` before proceeding to push. (Run this regardless of whether step 8 also produced an auto-fix commit — the semantic fix is what needs review.)
      - **Else if steps 5–6 committed nothing but step 8 produced an auto-fix commit on TOUCHED_FILES** → skip. Auto-fix commits are formatting-only; the boundary check in step 8 already verified they touched only iteration-touched files.
      - **Else (no commits this iteration at all)** → skip. Nothing to review.
   10. Apply Phase 6 Re-Verification to touched files. Matching repository-mandatory verification must complete or be explicitly waived before push.
-  11. Push
-  12. If push advanced remote (not "Everything up-to-date"): set `post_push_until = now + BOT_GRACE_WINDOW` in state. CLEAR `clean_poll_timestamps`.
-  13. Return to the top of the main loop.
+  11. **World-state refresh** on this iteration's fix commits — run Step 2's canonical refresh (merge-readiness.md) if any fix commit added a migration or a Check-2 contract reference, or invalidated a PR-body statement.
+  12. Push
+  13. If push advanced remote (not "Everything up-to-date"): set `post_push_until = now + BOT_GRACE_WINDOW` in state. CLEAR `clean_poll_timestamps`.
+  14. Return to the top of the main loop.
 
 Every failing `GATING_CHECK` must be investigated and either fixed or BLOCKed via the 3-strike rule. Do not invent a failure category to bypass it. A repository-declared non-gating result is not renamed “pre-existing” or “flaky”: record the exact policy, prove its touched-file condition is satisfied, and continue without changing unrelated files.
 
@@ -149,11 +149,11 @@ First run every step in the resolved `review_feedback_inventory_steps` list (if 
 # Detect repo owner/name dynamically (works for forks and other repos)
 OWNER=$(gh repo view --json owner --jq '.owner.login')
 REPO=$(gh repo view --json name --jq '.name')
-ACTOR=<authenticated_actor from state>  # see "Resolve the authenticated actor" below
+export ACTOR=<authenticated_actor from state>  # exported so jq reads it via env.ACTOR; see "Resolve the authenticated actor" below
 
-# Top-level PR comments (Issues API; PRs are issues). Keep the actor-body clause below ONLY on the invocation's FIRST Phase A pass (ack-anchor rescan); on every later pass DROP the `+ (if ...)` clause — metadata only.
+# Top-level PR comments (Issues API; PRs are issues). Keep the actor-body clause below ONLY on the invocation's FIRST Phase A pass (ack-anchor rescan); on every later pass DROP the `+ (if ...)` clause — metadata only. The jq program is single-quoted and reads env.ACTOR — never interpolate state values into the program text.
 gh api --paginate "repos/$OWNER/$REPO/issues/<PR_NUMBER>/comments" \
-  --jq ".[] | {id, author: .user.login, author_type: .user.type, created_at, updated_at} + (if .user.login == \"$ACTOR\" then {body} else {} end)"
+  --jq '.[] | {id, author: .user.login, author_type: .user.type, created_at, updated_at} + (if .user.login == env.ACTOR then {body} else {} end)'
 
 # Review summaries — metadata only; body_len preserves the empty/non-empty distinction the rules below need.
 gh api --paginate "repos/$OWNER/$REPO/pulls/<PR_NUMBER>/reviews" \
@@ -213,7 +213,7 @@ gh api "repos/$OWNER/$REPO/pulls/<PR_NUMBER>/reviews/<review_id>" --jq '{id, bod
 **For replying to inline comments (in order of preference):**
 
 1. `gh api` REST: `POST /repos/$OWNER/$REPO/pulls/<PR_NUMBER>/comments/{comment_id}/replies`
-2. The session's configured GitHub MCP reply tool — resolve it against what the repository documents (CLAUDE.md, contributor docs, or the Project Profile) rather than assuming a name: organizations often configure a dedicated server/tool for review replies; where only the GitHub plugin is present, `mcp__plugin_github_github__add_reply_to_pull_request_comment` is the equivalent
+2. The session's configured GitHub MCP reply tool — resolve it against what this repository documents rather than assuming a name: in matchmaking that is `reply_to_review_comment` on the `user-github` server (see `libs/scripts/src/fetch-pr-comments/RESPONDING.md` and the PR-review section of `CLAUDE.md`); where only the GitHub plugin is present, `mcp__plugin_github_github__add_reply_to_pull_request_comment` is the equivalent
 3. `gh pr comment` for general (non-inline) replies
 
 This loop **auto-resolves bot-authored threads only**. It still evaluates, fixes, and replies to every external human feedback surface; it never marks a human thread resolved on the reviewer's behalf. Human reviewer feedback is gated as follows:
@@ -355,9 +355,9 @@ From the paginated Pull Reviews REST results where `author_type == "Bot"` AND `a
    ```
 9. Run ALL steps in `QUALITY_CHECK_STEPS` sequentially
 10. Apply the canonical quality-check boundary above, including its tracked + untracked `POSTCHECK_FILES` union.
-    10a. **Diff-scoped self-review:** If steps 4-7 committed any code fixes (not just comment replies or ack posts), capture `REVIEW_BASE` = `origin/<branch>` (commits since last push) and run `PHASE_6_SELF_REVIEW("phase_6_bot", REVIEW_BASE)`. If additional commits are produced, re-union `TOUCHED_FILES` (from step 8) before proceeding. If no code was changed this iteration (only comment replies / ack posts): skip this step entirely.
+    10a. **Diff-scoped self-review:** If steps 4-7 committed any fixes touching reviewable files (code, config, tests, skills/docs — not just comment replies or ack posts), capture `REVIEW_BASE` = `origin/<branch>` (commits since last push) and run `PHASE_6_SELF_REVIEW("phase_6_bot", REVIEW_BASE)`. If additional commits are produced, re-union `TOUCHED_FILES` (from step 8) before proceeding. If no reviewable file was changed this iteration (only comment replies / ack posts): skip this step entirely.
 11. Apply Phase 6 Re-Verification to touched files; mandatory matching verification must complete or be explicitly waived.
-12. Push
+12. Apply the merge-readiness world-state refresh (merge-readiness.md) — re-run the affected checks when this iteration's fix commits touched migrations or cross-PR/cross-repo contracts, or invalidated PR-body statements; a BLOCK outcome there blocks exactly as at Phase 4b. Then push.
 13. If push advanced remote (not "Everything up-to-date"): set `post_push_until = now + BOT_GRACE_WINDOW` in state. CLEAR `clean_poll_timestamps`.
 14. Update the processed-ID maps with current edit timestamps.
 15. If an attempt crosses three, persist edit-versioned exhaustion, warn, and skip further attempts for that version; condition (c) still blocks.
@@ -375,7 +375,7 @@ From the paginated Pull Reviews REST results where `author_type == "Bot"` AND `a
 ```bash
 # Preflight: ensure clean working tree before rebase
 git status --porcelain
-# If dirty: commit or stash before proceeding
+# If dirty with changes this workflow did not itself create: STOP and preserve them (report the exact status; never commit or stash unknown work) — only commit/stash changes this workflow produced this iteration.
 ```
 
 ```bash
@@ -394,7 +394,7 @@ gh pr view <PR_NUMBER> --json mergeStateStatus,mergeable,headRefOid
   3. Apply the canonical post-check boundary above.
      3a. **Diff-scoped self-review:** If the rebase required manual conflict resolution (not a clean fast-forward or auto-merge), capture `REVIEW_BASE` = merge-base of HEAD and `origin/<base_branch>` after rebase, then run `PHASE_6_SELF_REVIEW("phase_6_rebase", REVIEW_BASE)`. Re-union touched files before proceeding. If the rebase was clean (no conflicts, no manual resolution): skip.
   4. Apply Phase 6 Re-Verification to manually resolved files; mandatory matching verification must complete or be explicitly waived.
-  5. `git push --force-with-lease`
+  5. **World-state refresh** — run Step 2's canonical refresh (merge-readiness.md) if the rebase changed a migration file or a Check-2 contract reference, or invalidated a PR-body statement (a rebase can pull base-branch migrations into conflict with this PR's); then `git push --force-with-lease`
   6. If push advanced remote: set `post_push_until = now + BOT_GRACE_WINDOW` in state. CLEAR `clean_poll_timestamps`.
   7. Return to the top of the main loop.
 
@@ -492,7 +492,7 @@ If **merge conflicts** exist, follow the dedicated subsection below instead of t
 
 10. Apply Phase 6 Re-Verification to resolved files; mandatory matching verification must complete or be explicitly waived.
 
-11. `git push --force-with-lease`.
+11. **World-state refresh** — run Step 2's canonical refresh (merge-readiness.md) if conflict resolution changed a migration file, a Check-2 contract reference, or invalidated a PR-body statement; then `git push --force-with-lease`.
 
 12. If push advanced remote (not "Everything up-to-date"): set `post_push_until = now + BOT_GRACE_WINDOW` in state. CLEAR `clean_poll_timestamps`.
 
