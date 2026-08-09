@@ -12,6 +12,7 @@ from handoff_decision import (
     QA_STATE_NAME_BY_TEAM,
     main,
     plan_handoff,
+    roundtrip_generation,
 )
 
 
@@ -552,15 +553,15 @@ class HandoffDecisionTest(unittest.TestCase):
                 "qa.github.replace_assignees": "complete",
                 "qa.github.verify_assignees": "complete",
                 "qa.linear.assign_ticket": "failed",
-                "qa.linear.verify_ticket_assignee": "failed",
-                "qa.linear.set_ticket_state": "failed",
-                "qa.linear.verify_ticket_state": "failed",
+                "qa.linear.verify_ticket_assignee": "skipped_dependency",
+                "qa.linear.set_ticket_state": "skipped_dependency",
+                "qa.linear.verify_ticket_state": "skipped_dependency",
             },
         )
         errors_by_id = {
             op["id"]: op.get("error")
             for op in plan["operations"]
-            if op["status"] == "failed"
+            if op["status"] in ("failed", "skipped_dependency")
         }
         self.assertEqual(
             errors_by_id,
@@ -582,6 +583,78 @@ class HandoffDecisionTest(unittest.TestCase):
                 "Operation qa.linear.verify_ticket_state not executed "
                 "(dependency failed: qa.linear.set_ticket_state); complete it manually.",
             ],
+        )
+
+    def test_cascade_descendants_render_skipped_dependency(self) -> None:
+        # R2 round-2 finding 3737466456, empirically verified: descendants
+        # rendered "failed" with no persistable record — the schema derives
+        # missing records as pending and rejects the terminal monitor, so
+        # the planner's own terminal answer could not be persisted
+        # truthfully in ANY monitor state. Never-attempted descendants now
+        # render "skipped_dependency", whose record proves a non-attempt.
+        plan = plan_handoff(
+            self._qa_request_with_results(
+                {
+                    "qa.github.replace_assignees": operation_result("complete"),
+                    "qa.github.verify_assignees": operation_result("complete"),
+                    "qa.linear.assign_ticket": operation_result(
+                        "failed", error="Linear returned 500"
+                    ),
+                }
+            )
+        )
+        self.assertEqual(plan["state"], "failed")
+        statuses = {op["id"]: op["status"] for op in plan["operations"]}
+        self.assertEqual(statuses["qa.linear.assign_ticket"], "failed")
+        for descendant in (
+            "qa.linear.verify_ticket_assignee",
+            "qa.linear.set_ticket_state",
+            "qa.linear.verify_ticket_state",
+        ):
+            self.assertEqual(statuses[descendant], "skipped_dependency")
+
+    def test_skipped_dependency_records_replan_to_same_terminal_state(
+        self,
+    ) -> None:
+        # The persistence round-trip's planner side: records persisted at
+        # the rendered statuses — attempts 0 and no attempt evidence for
+        # the skipped descendants — must be accepted on re-plan and derive
+        # the same terminal failed state with an empty call plan.
+        plan = plan_handoff(
+            self._qa_request_with_results(
+                {
+                    "qa.github.replace_assignees": operation_result("complete"),
+                    "qa.github.verify_assignees": operation_result("complete"),
+                    "qa.linear.assign_ticket": operation_result(
+                        "failed", error="Linear returned 500"
+                    ),
+                    "qa.linear.verify_ticket_assignee": {
+                        "status": "skipped_dependency",
+                        "attempts": 0,
+                        "error": "dependency failed: qa.linear.assign_ticket",
+                    },
+                    "qa.linear.set_ticket_state": {
+                        "status": "skipped_dependency",
+                        "attempts": 0,
+                        "error": (
+                            "dependency failed:"
+                            " qa.linear.verify_ticket_assignee"
+                        ),
+                    },
+                    "qa.linear.verify_ticket_state": {
+                        "status": "skipped_dependency",
+                        "attempts": 0,
+                        "error": "dependency failed: qa.linear.set_ticket_state",
+                    },
+                }
+            )
+        )
+        self.assertEqual(plan["state"], "failed")
+        self.assertEqual(plan["call_plan"], [])
+        self.assertEqual(plan["errors"], [])
+        statuses = {op["id"]: op["status"] for op in plan["operations"]}
+        self.assertEqual(
+            statuses["qa.linear.verify_ticket_state"], "skipped_dependency"
         )
 
     def test_descendant_result_after_failed_dependency_is_blocked(self) -> None:
@@ -850,49 +923,50 @@ class HandoffDecisionTest(unittest.TestCase):
             ],
         }
 
+        generation = roundtrip_generation(request, ["alice", "zoe"])
         alice = github_operation(
-            "roundtrip.github.request_review:alice",
+            f"roundtrip.github.request_review:alice:g{generation}",
             "request_pull_request_review",
             {"reviewer": "alice"},
             "pending",
         )
         verify_alice = github_operation(
-            "roundtrip.github.verify_review_request:alice",
+            f"roundtrip.github.verify_review_request:alice:g{generation}",
             "verify_pull_request_review_request",
             {"expected_reviewer": "alice"},
             "waiting",
-            ["roundtrip.github.request_review:alice"],
+            [f"roundtrip.github.request_review:alice:g{generation}"],
         )
         zoe = github_operation(
-            "roundtrip.github.request_review:zoe",
+            f"roundtrip.github.request_review:zoe:g{generation}",
             "request_pull_request_review",
             {"reviewer": "zoe"},
             "waiting",
-            ["roundtrip.github.verify_review_request:alice"],
+            [f"roundtrip.github.verify_review_request:alice:g{generation}"],
         )
         verify_zoe = github_operation(
-            "roundtrip.github.verify_review_request:zoe",
+            f"roundtrip.github.verify_review_request:zoe:g{generation}",
             "verify_pull_request_review_request",
             {"expected_reviewer": "zoe"},
             "waiting",
-            ["roundtrip.github.request_review:zoe"],
+            [f"roundtrip.github.request_review:zoe:g{generation}"],
         )
         replace = github_operation(
-            "roundtrip.github.replace_assignees",
+            f"roundtrip.github.replace_assignees:g{generation}",
             "replace_pull_request_assignees",
             {"assignees": ["alice", "zoe"]},
             "waiting",
             [
-                "roundtrip.github.verify_review_request:alice",
-                "roundtrip.github.verify_review_request:zoe",
+                f"roundtrip.github.verify_review_request:alice:g{generation}",
+                f"roundtrip.github.verify_review_request:zoe:g{generation}",
             ],
         )
         verify_assignees = github_operation(
-            "roundtrip.github.verify_assignees",
+            f"roundtrip.github.verify_assignees:g{generation}",
             "verify_pull_request_assignees",
             {"expected_assignees": ["alice", "zoe"]},
             "waiting",
-            ["roundtrip.github.replace_assignees"],
+            [f"roundtrip.github.replace_assignees:g{generation}"],
         )
         self.assertEqual(
             plan_handoff(request),
@@ -936,6 +1010,183 @@ class HandoffDecisionTest(unittest.TestCase):
             plan["errors"], ["authenticated_actor must be a valid GitHub login"]
         )
 
+    def test_second_round_feedback_mints_fresh_operations(self) -> None:
+        # R2 round-2 finding 3737466450, verified by executing it: with
+        # operation IDs keyed only by reviewer identity, a completed
+        # first-round ledger satisfied the second round's entire plan —
+        # state "complete", empty call_plan, nobody re-pinged. Fresh
+        # feedback must mint operations no earlier ledger can satisfy,
+        # and the prior round's terminal records must be ignored (with a
+        # warning), not treated as unknown IDs.
+        first_round = {
+            "scenario": "human_review_roundtrip",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+            "authenticated_actor": "jakozloski",
+            "reviewers": [reviewer("alice")],
+        }
+        first_plan = plan_handoff(first_round)
+        self.assertEqual(first_plan["state"], "pending")
+        first_ids = [
+            operation["id"] for operation in first_plan["operations"]
+        ]
+
+        second_round = {
+            "scenario": "human_review_roundtrip",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+            "authenticated_actor": "jakozloski",
+            "reviewers": [
+                reviewer(
+                    "alice",
+                    review_bodies={
+                        "review-2": {
+                            "updated_at": "2026-07-10T09:00:00Z",
+                            "evaluated_updated_at": "2026-07-10T09:00:00Z",
+                            "evaluated_at": "2026-07-10T09:05:00Z",
+                            "acknowledgment_id": "ack-2",
+                            "acknowledgment_author": "jakozloski",
+                        }
+                    },
+                    current_review_body_ids=["review-2"],
+                )
+            ],
+            "operation_results": {
+                operation_id: operation_result("complete")
+                for operation_id in first_ids
+            },
+        }
+        second_plan = plan_handoff(second_round)
+
+        self.assertEqual(second_plan["state"], "pending")
+        self.assertNotEqual(second_plan["call_plan"], [])
+        second_ids = [
+            operation["id"] for operation in second_plan["operations"]
+        ]
+        self.assertEqual(set(first_ids) & set(second_ids), set())
+        self.assertTrue(
+            any(
+                "prior-generation" in warning
+                for warning in second_plan["warnings"]
+            )
+        )
+
+    def test_prior_generation_skipped_records_are_pruned_as_terminal(
+        self,
+    ) -> None:
+        # Series self-review finding: the pruner's terminal classifier
+        # said ("complete", "failed") while the sibling commit made
+        # skipped_dependency a first-class terminal status — so the
+        # standard partial-failure shape (failed head, skipped
+        # descendants) BLOCKED the next fresh round, telling the operator
+        # to verify postconditions of operations that provably never
+        # fired (attempts 0). Skipped orphans are that round's completed
+        # history: pruned with the warning, never in-flight.
+        first_round = {
+            "scenario": "human_review_roundtrip",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+            "authenticated_actor": "jakozloski",
+            "reviewers": [reviewer("alice")],
+        }
+        first_ids = [
+            operation["id"]
+            for operation in plan_handoff(first_round)["operations"]
+        ]
+
+        second_round = {
+            "scenario": "human_review_roundtrip",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+            "authenticated_actor": "jakozloski",
+            "reviewers": [
+                reviewer(
+                    "alice",
+                    review_bodies={
+                        "review-2": {
+                            "updated_at": "2026-07-10T09:00:00Z",
+                            "evaluated_updated_at": "2026-07-10T09:00:00Z",
+                            "evaluated_at": "2026-07-10T09:05:00Z",
+                            "acknowledgment_id": "ack-2",
+                            "acknowledgment_author": "jakozloski",
+                        }
+                    },
+                    current_review_body_ids=["review-2"],
+                )
+            ],
+            "operation_results": {
+                first_ids[0]: operation_result(
+                    "failed", error="GitHub returned 500"
+                ),
+                first_ids[1]: {
+                    "status": "skipped_dependency",
+                    "attempts": 0,
+                    "error": f"dependency failed: {first_ids[0]}",
+                },
+            },
+        }
+        second_plan = plan_handoff(second_round)
+
+        self.assertEqual(second_plan["state"], "pending")
+        self.assertNotEqual(second_plan["call_plan"], [])
+        self.assertTrue(
+            any(
+                "prior-generation" in warning
+                for warning in second_plan["warnings"]
+            )
+        )
+
+    def test_prior_generation_in_flight_record_blocks_fresh_round(
+        self,
+    ) -> None:
+        # The inverse guard: a prior-generation record still pending marks
+        # a mutation that may have fired remotely — a fresh round must not
+        # plan past it. The block names the sanctioned recovery (verify
+        # the postcondition, record a terminal result), not just "stop".
+        first_round = {
+            "scenario": "human_review_roundtrip",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+            "authenticated_actor": "jakozloski",
+            "reviewers": [reviewer("alice")],
+        }
+        first_ids = [
+            operation["id"]
+            for operation in plan_handoff(first_round)["operations"]
+        ]
+
+        second_round = {
+            "scenario": "human_review_roundtrip",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+            "authenticated_actor": "jakozloski",
+            "reviewers": [
+                reviewer(
+                    "alice",
+                    review_bodies={
+                        "review-2": {
+                            "updated_at": "2026-07-10T09:00:00Z",
+                            "evaluated_updated_at": "2026-07-10T09:00:00Z",
+                            "evaluated_at": "2026-07-10T09:05:00Z",
+                            "acknowledgment_id": "ack-2",
+                            "acknowledgment_author": "jakozloski",
+                        }
+                    },
+                    current_review_body_ids=["review-2"],
+                )
+            ],
+            "operation_results": {first_ids[0]: operation_result("pending")},
+        }
+        second_plan = plan_handoff(second_round)
+
+        self.assertEqual(second_plan["state"], "blocked")
+        self.assertTrue(
+            any(
+                "verify each mutation's postcondition" in error
+                for error in second_plan["errors"]
+            )
+        )
+
     def test_multi_reviewer_partial_resume_advances_one_operation_at_a_time(
         self,
     ) -> None:
@@ -945,57 +1196,60 @@ class HandoffDecisionTest(unittest.TestCase):
             "pull_request_number": PR_NUMBER,
             "authenticated_actor": "jakozloski",
             "reviewers": [reviewer("zoe"), reviewer("alice")],
-            "operation_results": {
-                "roundtrip.github.request_review:alice": operation_result("complete"),
-                "roundtrip.github.verify_review_request:alice": operation_result(
-                    "complete"
-                ),
-            },
+        }
+        generation = roundtrip_generation(request, ["alice", "zoe"])
+        request["operation_results"] = {
+            f"roundtrip.github.request_review:alice:g{generation}": (
+                operation_result("complete")
+            ),
+            f"roundtrip.github.verify_review_request:alice:g{generation}": (
+                operation_result("complete")
+            ),
         }
 
         alice = github_operation(
-            "roundtrip.github.request_review:alice",
+            f"roundtrip.github.request_review:alice:g{generation}",
             "request_pull_request_review",
             {"reviewer": "alice"},
             "complete",
         )
         verify_alice = github_operation(
-            "roundtrip.github.verify_review_request:alice",
+            f"roundtrip.github.verify_review_request:alice:g{generation}",
             "verify_pull_request_review_request",
             {"expected_reviewer": "alice"},
             "complete",
-            ["roundtrip.github.request_review:alice"],
+            [f"roundtrip.github.request_review:alice:g{generation}"],
         )
         zoe = github_operation(
-            "roundtrip.github.request_review:zoe",
+            f"roundtrip.github.request_review:zoe:g{generation}",
             "request_pull_request_review",
             {"reviewer": "zoe"},
             "pending",
-            ["roundtrip.github.verify_review_request:alice"],
+            [f"roundtrip.github.verify_review_request:alice:g{generation}"],
         )
         verify_zoe = github_operation(
-            "roundtrip.github.verify_review_request:zoe",
+            f"roundtrip.github.verify_review_request:zoe:g{generation}",
             "verify_pull_request_review_request",
             {"expected_reviewer": "zoe"},
             "waiting",
-            ["roundtrip.github.request_review:zoe"],
+            [f"roundtrip.github.request_review:zoe:g{generation}"],
         )
         replace = github_operation(
-            "roundtrip.github.replace_assignees",
+            f"roundtrip.github.replace_assignees:g{generation}",
             "replace_pull_request_assignees",
             {"assignees": ["alice", "zoe"]},
             "waiting",
             [
-                "roundtrip.github.verify_review_request:alice",
-                "roundtrip.github.verify_review_request:zoe",
+                f"roundtrip.github.verify_review_request:alice:g{generation}",
+                f"roundtrip.github.verify_review_request:zoe:g{generation}",
             ],
         )
         verify_assignees = github_operation(
-            "roundtrip.github.verify_assignees",
+            f"roundtrip.github.verify_assignees:g{generation}",
             "verify_pull_request_assignees",
             {"expected_assignees": ["alice", "zoe"]},
             "waiting",
-            ["roundtrip.github.replace_assignees"],
+            [f"roundtrip.github.replace_assignees:g{generation}"],
         )
         self.assertEqual(
             plan_handoff(request),
@@ -1024,12 +1278,18 @@ class HandoffDecisionTest(unittest.TestCase):
         )
 
         request["operation_results"] = {
-            "roundtrip.github.request_review:alice": operation_result("complete"),
-            "roundtrip.github.verify_review_request:alice": operation_result(
-                "complete"
+            f"roundtrip.github.request_review:alice:g{generation}": (
+                operation_result("complete")
             ),
-            "roundtrip.github.request_review:zoe": operation_result("complete"),
-            "roundtrip.github.verify_review_request:zoe": operation_result("complete"),
+            f"roundtrip.github.verify_review_request:alice:g{generation}": (
+                operation_result("complete")
+            ),
+            f"roundtrip.github.request_review:zoe:g{generation}": (
+                operation_result("complete")
+            ),
+            f"roundtrip.github.verify_review_request:zoe:g{generation}": (
+                operation_result("complete")
+            ),
         }
         resumed = plan_handoff(request)
         self.assertEqual(resumed["state"], "pending")
@@ -1037,13 +1297,13 @@ class HandoffDecisionTest(unittest.TestCase):
             resumed["call_plan"],
             [
                 github_operation(
-                    "roundtrip.github.replace_assignees",
+                    f"roundtrip.github.replace_assignees:g{generation}",
                     "replace_pull_request_assignees",
                     {"assignees": ["alice", "zoe"]},
                     "pending",
                     [
-                        "roundtrip.github.verify_review_request:alice",
-                        "roundtrip.github.verify_review_request:zoe",
+                        f"roundtrip.github.verify_review_request:alice:g{generation}",
+                        f"roundtrip.github.verify_review_request:zoe:g{generation}",
                     ],
                 )
             ],
@@ -1745,18 +2005,20 @@ class HandoffDecisionTest(unittest.TestCase):
         )
 
     def test_out_of_order_result_is_rejected(self) -> None:
-        plan = plan_handoff(
-            {
-                "scenario": "human_review_roundtrip",
-                "repository": REPOSITORY,
-                "pull_request_number": PR_NUMBER,
-                "authenticated_actor": "jakozloski",
-                "reviewers": [reviewer("alice"), reviewer("zoe")],
-                "operation_results": {
-                    "roundtrip.github.replace_assignees": operation_result("complete")
-                },
-            }
-        )
+        request = {
+            "scenario": "human_review_roundtrip",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+            "authenticated_actor": "jakozloski",
+            "reviewers": [reviewer("alice"), reviewer("zoe")],
+        }
+        generation = roundtrip_generation(request, ["alice", "zoe"])
+        request["operation_results"] = {
+            f"roundtrip.github.replace_assignees:g{generation}": (
+                operation_result("complete")
+            )
+        }
+        plan = plan_handoff(request)
         self.assertEqual(plan["state"], "blocked")
         self.assertEqual(plan["operations"], [])
         self.assertEqual(plan["call_plan"], [])

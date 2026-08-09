@@ -64,7 +64,7 @@ while True:
      a. If approved AND gating checks passing AND grace_elapsed(post_push_until) AND all_feedback_addressed AND stable_poll_confirmed AND NOT isDraft AND branch_completion_ready AND CI-config self-verification satisfied (when applicable) AND merge-readiness holds are clear → persist QA handoff operations (verify, don't re-execute, if a prior paused exit recorded them complete); only then complete
      b. If approved AND gating checks passing BUT (NOT grace_elapsed(post_push_until) OR NOT stable_poll_confirmed)
         → set loop_reason = "wait_repoll"; wait ≤60s per stable-poll schedule, go to 1
-     d. If everything is clean AND all_feedback_addressed AND stable_poll_confirmed AND NOT isDraft AND branch_pause_ready AND CI-config self-verification satisfied (when applicable) AND merge-readiness holds are clear (see Step 4)
+     d. If everything is clean AND all_feedback_addressed AND stable_poll_confirmed AND grace_elapsed(post_push_until) AND NOT isDraft AND branch_pause_ready AND CI-config self-verification satisfied (when applicable) AND merge-readiness holds are clear (see Step 4)
         → run the QA handoff (same operations/ledger as (a), scenario clean_unapproved;
           skip execution if already recorded complete), then set phases.monitor = "paused",
           output WORKFLOW PAUSED, end loop

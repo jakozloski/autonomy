@@ -538,6 +538,7 @@ def supervise_stream(
     stdout_pipe: IO[bytes] | None,
     stderr_pipe: IO[bytes] | None,
     kill_callback: Callable[[], None],
+    child_wait: Callable[[], int | None] | None = None,
     *,
     read_size: int = 65536,
     idle_timeout_seconds: float | None = None,
@@ -557,6 +558,13 @@ def supervise_stream(
     next is outcome-dependent — ``auth_error`` and ``internal_failure`` follow
     the blocking failure matrix, while ``timeout`` and ``runaway`` are
     liveness-class (immediate retry, then the backoff ladder — never terminal).
+    ``child_wait`` is the supervised process's own wait: when supplied and the
+    streams close clean, a nonzero child status lands as ``internal_failure``
+    instead of a false clean — EOF alone proves only that the pipes closed,
+    not that the invocation succeeded.  The kill itself is guarded:
+    ``ProcessLookupError`` means the child already died (the kill's goal
+    state), and any other cleanup failure returns as the structured
+    ``internal_failure`` this contract promises rather than raising.
     ``idle_timeout_seconds`` bounds SILENCE, not total runtime: the clock
     resets on every byte received, so a slow-but-alive stream is never killed
     for being slow — a max-effort review legitimately runs for many minutes.
@@ -671,7 +679,36 @@ def supervise_stream(
         selector.close()
 
     if outcome != "clean":
-        kill_callback()
+        # R2 round-2 finding 3737466443: the kill ran outside every guard,
+        # so a raising callback escaped with a raw traceback instead of the
+        # structured result the docstring promises — in exactly the failure
+        # states this function exists to report. ProcessLookupError means
+        # the child already died (a CLI that prints its error and exits
+        # races the kill decision; on Darwin even an un-reaped zombie
+        # raises it) — that is the kill's goal state, not a failure. Any
+        # other cleanup failure becomes the structured internal_failure.
+        try:
+            kill_callback()
+        except ProcessLookupError:
+            pass
+        except Exception:
+            outcome = "internal_failure"
+    elif child_wait is not None:
+        # R2 round-2 finding 3737466493: EOF only proves the streams
+        # closed. A child that emits benign output and exits nonzero (a
+        # config error, a post-stream crash) previously reported
+        # outcome "clean"/exit 0 and could pass a mandatory gate. When the
+        # caller supplies the process's wait, a nonzero child status after
+        # clean streams is an internal_failure (blocking failure matrix) —
+        # the streams gave no classifiable reason, so the tooling itself
+        # is broken from the gate's point of view.
+        try:
+            child_returncode = child_wait()
+        except Exception:
+            child_returncode = None
+            outcome = "internal_failure"
+        if outcome == "clean" and child_returncode not in (0, None):
+            outcome = "internal_failure"
 
     exit_code = {
         "clean": CLASSIFY_EXIT_CLEAN,
@@ -1086,7 +1123,19 @@ def _codex_arguments(model: str) -> list[str]:
     from ``CODEX_EFFORT`` so an effort repoint cannot leave a stale literal.
     """
 
-    return ["-m", model, "-c", f'model_reasoning_effort="{CODEX_EFFORT}"']
+    # R2 round-2 finding 3737466478: without the sandbox pin, an
+    # invocation reconstructed from this argv inherits the operator's
+    # ambient codex sandbox (workspace-write would let a review voice
+    # modify the implementation it judges). Pinned here so every
+    # exec-shaped consumer carries it by construction.
+    return [
+        "-m",
+        model,
+        "-c",
+        f'model_reasoning_effort="{CODEX_EFFORT}"',
+        "-s",
+        "read-only",
+    ]
 
 
 def _codex_base(version: Any) -> dict[str, Any]:
@@ -1511,6 +1560,87 @@ def evaluate_codex(raw: Any) -> dict[str, Any]:
         "unknown_invocation_status",
         f"Unknown Codex invocation status: {status!r}",
         "correct_observation_input",
+    )
+
+
+# Owner-pinned child execution (scripts/monitor_runner.py). The slice budget
+# keeps every runner invocation strictly inside the parent's own per-attempt
+# ceiling, with margin for verification and commit — the runner derives each
+# child's ceiling as min(PER_ATTEMPT_CEILING_SECONDS, slice deadline − now −
+# cleanup margin) and never launches below the minimum viable budget.
+MONITOR_SLICE_BUDGET_SECONDS = 2400
+MONITOR_SLICE_CLEANUP_MARGIN_SECONDS = 120
+MONITOR_CHILD_MIN_VIABLE_SECONDS = 240
+# Same silence bound as every supervised model-gate call (Timeout
+# Heuristics: liveness_idle_kill_seconds) — a monitor child that goes fully
+# silent this long is dead, not slow.
+MONITOR_CHILD_IDLE_TIMEOUT_SECONDS = 180
+
+
+def monitor_child_arguments(
+    model: str, effort: str = REVIEWER_EFFORT, resume_id: str | None = None
+) -> list[str]:
+    """Owner-pinned monitor-child argv tail — the WORKING sibling of
+    ``_explicit_cli_arguments``, defined once so the runner cannot drift.
+
+    Differences from the read-only voice tail are the contract: the child is
+    a working orchestrator (it dispatches write-capable base workers), so no
+    read-only clamp; its session PERSISTS (``--resume`` on later ticks is the
+    owner cache lineage); its output streams as JSON so the runner reads
+    session id and served model from protocol events, never from
+    model-authored text.
+    """
+
+    arguments = []
+    if resume_id is not None:
+        arguments += ["--resume", resume_id]
+    arguments += [
+        "-p",
+        "--model",
+        model,
+        "--effort",
+        effort,
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--disable-slash-commands",
+        "--no-chrome",
+    ]
+    return arguments
+
+
+def monitor_child_prompt(
+    skill_dir: str,
+    state_path: str,
+    candidate_path: str,
+    attempt_id: str,
+    tick_ordinal: int,
+) -> str:
+    """The single source of the child-tick contract (marker-pinned).
+
+    Every load-bearing clause lives here, not in per-call prose: the Loading
+    Contract reads, the one-iteration bound, the candidate-only write rule,
+    the runner-owned ``monitor_cli`` block, and the strict verdict schema.
+    """
+
+    return (
+        f"You are the Phase 6 monitor orchestrator for the autonomy workflow"
+        f" whose skill package is at {skill_dir}. First follow that package's"
+        f" SKILL.md Loading Contract for Phase 6 (read state-and-safety.md,"
+        f" monitor-ci-feedback.md, monitor-exit-handoffs.md completely)."
+        f" Then execute EXACTLY ONE monitor iteration per those references"
+        f" for the workflow state file at {state_path} — one pass, no second"
+        f" iteration, no waiting loop (the supervising runner owns waits)."
+        f" Persist the FULL updated state to {candidate_path} and NEVER"
+        f" write {state_path} itself; carry the monitor_cli block over"
+        f" value-identical (it is runner-owned). Compute the candidate"
+        f" digest with: python3 {skill_dir}/scripts/state_schema.py"
+        f" --monitor-digest {candidate_path} . Your final message must be"
+        f" ONLY this JSON object and nothing else:"
+        f' {{"schema_version": 1, "attempt_id": "{attempt_id}",'
+        f' "tick_ordinal": {tick_ordinal},'
+        f' "outcome": "continue"|"terminal"|"blocked",'
+        f' "post_workflow_digest": "<the digest>"}}'
     )
 
 
@@ -2132,6 +2262,201 @@ def _degrade_reviewer_to_base(
         }
     )
     return degraded
+
+
+def monitor_orchestrator_binding(
+    model_runtime: Any, session_model: Any = None
+) -> dict[str, Any]:
+    """Bind the Phase 6 monitor-session owner from the persisted gate record.
+
+    Input is the documented persisted contract —
+    ``resolved_conventions.model_runtime`` (each Claude leg carrying
+    ``model`` and ``gate_status``; see references/state-and-safety.md) —
+    because the binding runs at monitor entry from STATE, and state is
+    untrusted input: floors are re-checked here even though the gate
+    enforced them at selection time, so a hand-edited record can never
+    bind a below-floor owner.
+
+    A cost-shape REBIND, not a fourth selection: monitor orchestration
+    (poll, classify, draft, dispatch — the capability boundary lives in
+    references/monitor-exit-handoffs.md, Phase 6 Session Ownership) does
+    not need the base tier, while the monitor session's prompt-cache
+    lineage is the dominant long-run spend — so a landed-ready reviewer
+    leg owns the monitor session, and every substantive work item still
+    dispatches to the frozen BASE selection. Reviewer unavailability keeps
+    the monitor on the base lineage exactly as before this role existed
+    (reason-coded, recorded, never a new block).
+
+    ``session_model`` is the model of the session performing the binding.
+    Ownership converges at session boundaries only (never re-model a live
+    session): when the live session's model is a recorded leg other than
+    the nominal owner, the binding records THAT lineage truthfully with
+    ``reason_code: "orchestrator_continuity"`` and carries the nominal
+    owner in ``pending_owner`` for the next boundary. A session model
+    matching no recorded leg is a policy violation and fails closed —
+    ``invalid`` is a state problem, never a license to guess a model.
+    """
+
+    if not isinstance(model_runtime, dict):
+        return {
+            "state": "invalid",
+            "errors": ["model_runtime must be a JSON object"],
+        }
+
+    def _selection_evidence(leg: dict, model: str) -> bool:
+        # R2 round-2 finding 3737466436: cross-lineage tolerance without
+        # evidence let a hand-edited swap (opus on the base leg, fable on
+        # the reviewer leg) silently invert which lineage owns the
+        # session. A cross-floor model is legitimate only when the leg's
+        # own persisted policy_decision records it as the selection — the
+        # shape every waiver/degradation writer produces.
+        decision = leg.get("policy_decision")
+        selection = (
+            decision.get("selection") if isinstance(decision, dict) else None
+        )
+        selected = (
+            selection.get("selected_model")
+            if isinstance(selection, dict)
+            else None
+        )
+        return selected == model
+
+    def _landed_leg(leg: Any, own_floor: Any, other_floor: Any) -> str | None:
+        """Return the leg's model when its gate landed ready above a floor.
+
+        The leg's OWN floor needs no evidence; the other lineage's floor
+        (a waived/degraded substitute) is accepted only with the leg's own
+        recorded selection evidence. Anything below both floors is
+        untrusted garbage regardless of evidence.
+        """
+
+        if not isinstance(leg, dict):
+            return None
+        model = leg.get("model")
+        if not isinstance(model, str) or not model:
+            return None
+        if leg.get("gate_status") != "ready":
+            return None
+        if own_floor(model):
+            return model
+        if other_floor(model) and _selection_evidence(leg, model):
+            return model
+        return None
+
+    base_model = _landed_leg(
+        model_runtime.get("claude"),
+        _at_or_above_base_floor,
+        _at_or_above_reviewer_floor,
+    )
+    reviewer_model = _landed_leg(
+        model_runtime.get("claude_reviewer"),
+        _at_or_above_reviewer_floor,
+        _at_or_above_base_floor,
+    )
+    base_leg = model_runtime.get("claude")
+    # references/monitor-exit-handoffs.md makes a confirmed write-capable
+    # base worker a PREREQUISITE of reviewer ownership (R2 round-2 finding
+    # 3737466426: the veto lived in prose while this binder returned
+    # reviewer ownership for the routine unverified-host shape). The
+    # persisted flag is the host's per-agent enforcement verification;
+    # false is its initialized default, so absence never grants ownership.
+    base_write_verified = (
+        isinstance(base_leg, dict)
+        and base_leg.get("host_agent_selection_verified") is True
+    )
+
+    def _bound(
+        lineage: str, model: str, reason_code: str, reason: str, pending: str | None
+    ) -> dict[str, Any]:
+        return {
+            "state": "bound",
+            "lineage": lineage,
+            "model": model,
+            "effort": REVIEWER_EFFORT if lineage == "reviewer" else BASE_EFFORT,
+            "reason_code": reason_code,
+            "reason": reason,
+            "pending_owner": pending,
+        }
+
+    if reviewer_model is not None and base_write_verified:
+        nominal_lineage, nominal_model = "reviewer", reviewer_model
+        nominal_code = "orchestrator_on_reviewer"
+        nominal_reason = (
+            "the Phase 6 monitor session is owned by the reviewer-leg"
+            f" selection ({reviewer_model}); substantive work items dispatch"
+            " to the frozen base selection"
+        )
+    elif reviewer_model is not None and base_model is not None:
+        nominal_lineage, nominal_model = "base", base_model
+        nominal_code = "orchestrator_on_base"
+        nominal_reason = (
+            "the base leg's write path is not host-verified"
+            " (host_agent_selection_verified is not true), and reviewer"
+            " ownership requires a confirmed write-capable base worker —"
+            f" the monitor session stays on the base lineage ({base_model})"
+        )
+    elif reviewer_model is not None:
+        return {
+            "state": "invalid",
+            "errors": [
+                "reviewer ownership requires a confirmed write-capable base"
+                " worker, and no landed-ready above-floor base leg exists to"
+                " fall back to — re-run the model gate before entering"
+                " Phase 6"
+            ],
+        }
+    elif base_model is not None:
+        reviewer_leg = model_runtime.get("claude_reviewer")
+        reviewer_status = (
+            reviewer_leg.get("gate_status") if isinstance(reviewer_leg, dict) else None
+        )
+        if not isinstance(reviewer_status, str) or not reviewer_status:
+            reviewer_status = "missing"
+        nominal_lineage, nominal_model = "base", base_model
+        nominal_code = "orchestrator_on_base"
+        nominal_reason = (
+            "the reviewer leg has no landed-ready above-floor selection"
+            f" ({reviewer_status}); the monitor session stays on the base"
+            f" lineage ({base_model}) — ownership is a cost decision and"
+            " never a new way to block"
+        )
+    else:
+        return {
+            "state": "invalid",
+            "errors": [
+                "no landed-ready above-floor Claude leg can own the monitor"
+                " session — re-run the model gate before entering Phase 6"
+            ],
+        }
+
+    if session_model is None or session_model == nominal_model:
+        return _bound(
+            nominal_lineage, nominal_model, nominal_code, nominal_reason, None
+        )
+    if session_model == base_model:
+        live_lineage, live_model = "base", base_model
+    elif session_model == reviewer_model:
+        live_lineage, live_model = "reviewer", reviewer_model
+    else:
+        return {
+            "state": "invalid",
+            "errors": [
+                "session_model matches no landed leg of the persisted gate"
+                " record — a session on an unrecorded model must not monitor;"
+                " re-run the model gate"
+            ],
+        }
+    return _bound(
+        live_lineage,
+        live_model,
+        "orchestrator_continuity",
+        (
+            f"the live session ({live_model}) continues monitoring — a"
+            " mid-run model swap would re-write the warm cache; the nominal"
+            f" owner ({nominal_model}) takes over at the next session boundary"
+        ),
+        nominal_model,
+    )
 
 
 def evaluate_model_policy(request: Any) -> dict[str, Any]:

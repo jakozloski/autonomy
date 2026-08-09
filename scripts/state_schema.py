@@ -162,7 +162,9 @@ VARIANT_ENUM = frozenset(("pending", "complete", "skipped"))
 DEFECT_MODE_ENUM = frozenset(("runtime_bug_fix", "skill_helper_defect", "none"))
 CHANGE_TYPE_ENUM = frozenset(("bug_fix", "feature", "refactor", "skill_only"))
 HANDOFF_STATUS_ENUM = frozenset(("idle", "pending", "complete", "failed"))
-OPERATION_STATUS_ENUM = frozenset(("pending", "retryable", "complete", "failed"))
+OPERATION_STATUS_ENUM = frozenset(
+    ("pending", "retryable", "complete", "failed", "skipped_dependency")
+)
 OPERATION_RESULT_ALLOWED_KEYS = frozenset(
     ("status", "attempts", "started_at", "verified_at", "response_id", "error", "evidence")
 )
@@ -189,9 +191,10 @@ CLOCK_SKEW_TOLERANCE_SECONDS = 300
 BOT_GRACE_WINDOW_SECONDS = 900
 # Overrides beyond one day are garbage, not configuration: an unbounded
 # state-supplied window would both neuter the resume ceiling and overflow the
-# timedelta arithmetic (the model_policy observed_at lesson) — out-of-bound
-# values fall back to the default, keeping the arithmetic provably safe with
-# no dead exception handler.
+# timedelta arithmetic (the model_policy observed_at lesson) — a declared
+# out-of-bound value is rejected as its own loud error (R5-F1; recovery: fix
+# or remove the override), while the ceiling arithmetic still computes with
+# the default so it stays provably safe with no dead exception handler.
 MAX_GRACE_WINDOW_OVERRIDE_SECONDS = 86400
 LAST_CHECK_ENUM = frozenset(("passing", "failing", "pending"))
 LEDGER_STATUS_ENUM = frozenset(
@@ -204,6 +207,50 @@ LEDGER_REVIEWER_ENUM = frozenset(
     ("gstack_review", "octo_review", "code_reviewer", "adversarial", "escalation_voice")
 )
 TERMINAL_MONITOR = frozenset(("complete", "paused", "blocked"))
+# Phase 6 session ownership (cheap orchestrator, pinned workers — see
+# references/monitor-exit-handoffs.md). The block records which lineage owns
+# the monitor session; when present, every core field is required (a
+# versioned handoff fails closed on missing fields, never half-binds).
+# pending_owner is the one optional field: a continuity binding carries the
+# nominal owner it defers to the next session boundary, and MUST carry it.
+MONITOR_OWNERSHIP_LINEAGE_ENUM = frozenset(("reviewer", "base"))
+MONITOR_OWNERSHIP_REQUIRED_KEYS = frozenset(
+    ("lineage", "model", "bound_at", "reason_code")
+)
+MONITOR_OWNERSHIP_KEYS = MONITOR_OWNERSHIP_REQUIRED_KEYS | frozenset(
+    ("pending_owner",)
+)
+# Owner-pinned child execution (scripts/monitor_runner.py). The block is
+# RUNNER-OWNED: the runner is the sole writer, a child candidate must carry
+# it value-identical, and every field is required when the block is present
+# (fail closed — a half-written control block is corruption, not progress).
+MONITOR_CLI_SCHEMA_VERSION = 1
+MONITOR_CLI_KEYS = frozenset(
+    (
+        "schema_version",
+        "child_session_id",
+        "owner_model",
+        "last_completed_attempt_id",
+        "child_failures",
+        "in_flight",
+    )
+)
+MONITOR_CLI_IN_FLIGHT_KEYS = frozenset(
+    (
+        "attempt_id",
+        "tick_ordinal",
+        "started_at",
+        "deadline_at",
+        "child_pid",
+        "child_pgid",
+        "child_started_fingerprint",
+        "base_workflow_digest",
+    )
+)
+MONITOR_CHILD_FAILURE_KEYS = frozenset(("signature", "at"))
+# Same-signature child failures before the runner blocks (mirrors the
+# workflow's 3-strike rule; rebound nowhere — the runner reads it from here).
+MONITOR_CHILD_FAILURE_LIMIT = 3
 # Phase 4b (merge readiness) value contracts — see references/merge-readiness.md.
 AC_VERDICT_ENUM = frozenset(("pending", "met", "unmet", "deferred", "n_a"))
 AC_ENTRY_KEYS = frozenset(("id", "text", "source", "verdict", "evidence"))
@@ -267,6 +314,8 @@ KNOWN_TOP_LEVEL_KEYS = frozenset(
         "monitor_iterations",
         "monitor_poll_ticks",
         "monitor_self_review_call_count",
+        "monitor_ownership",
+        "monitor_cli",
         "post_push_until",
         "next_retry_at",
         "hold_started_at",
@@ -289,7 +338,14 @@ KNOWN_TOP_LEVEL_KEYS = frozenset(
 # liveness-wait resume point (Timeout Heuristics), written only while a
 # model-gate wait is pending, so most states legitimately omit it.
 OPTIONAL_TOP_LEVEL_KEYS = frozenset(
-    ("acceptance_criteria", "merge_readiness", "next_retry_at", "hold_started_at")
+    (
+        "acceptance_criteria",
+        "merge_readiness",
+        "monitor_ownership",
+        "monitor_cli",
+        "next_retry_at",
+        "hold_started_at",
+    )
 )
 
 MINIMAL_REQUIRED = ("state_schema_version", "workflow_id", "description", "current_phase")
@@ -674,8 +730,38 @@ def validate_operation_result_record(record: Any, *, label: str) -> tuple[str | 
     status = record.get("status")
     if not isinstance(status, str) or status not in OPERATION_STATUS_ENUM:
         return None, [
-            f"{label}.status must be one of: complete, failed, pending, retryable"
+            f"{label}.status must be one of: complete, failed, pending,"
+            " retryable, skipped_dependency"
         ]
+    if status == "skipped_dependency":
+        # A skipped record proves the OPPOSITE of an attempt: its declared
+        # dependency terminally failed, so the planner never queued it
+        # (R2 round-2 finding 3737466456 — before this status existed the
+        # planner's terminal failed answer had no truthful persistable
+        # form). Attempt-lifecycle fields on it would be fabricated
+        # evidence, so they are forbidden rather than merely optional.
+        skipped_attempts = record.get("attempts")
+        if skipped_attempts != 0 or isinstance(skipped_attempts, bool):
+            return status, [
+                f"{label}.attempts must be 0 for skipped_dependency"
+            ]
+        skipped_error = record.get("error")
+        if not isinstance(skipped_error, str) or not skipped_error.strip():
+            return status, [
+                f"{label} skipped_dependency requires a non-empty error"
+                " naming the failed dependency"
+            ]
+        evidence_fields = sorted(
+            key
+            for key in ("started_at", "verified_at", "response_id", "evidence")
+            if record.get(key) is not None
+        )
+        if evidence_fields:
+            return status, [
+                f"{label} skipped_dependency forbids attempt evidence: "
+                + ", ".join(evidence_fields)
+            ]
+        return status, []
     attempts = record.get("attempts")
     if (
         not isinstance(attempts, int)
@@ -713,6 +799,94 @@ def validate_operation_result_record(record: Any, *, label: str) -> tuple[str | 
     if status == "retryable" and attempts >= MAX_OPERATION_ATTEMPTS:
         return status, [f"{label} exhausted the three-attempt limit"]
     return status, []
+
+
+MODEL_RUNTIME_LEGS = ("codex", "claude", "claude_reviewer")
+MODEL_RUNTIME_LEG_KEYS = frozenset(
+    (
+        "model",
+        "effort",
+        "subagent_override",
+        "effort_override",
+        "host_agent_selection_verified",
+        "gate_status",
+        "policy_decision",
+        "live_catalog_verified_at",
+    )
+)
+
+
+def validate_model_runtime_shape(model_runtime: Any) -> list[str]:
+    """Closed-shape validation of the persisted model-gate record.
+
+    R2 round-2 finding 3737466436: this record was not shape-validated
+    anywhere — unknown legs, unknown fields, and wrong types validated
+    clean, leaving the binder's floor re-check as the only defense
+    against hand-edited state. Shape per
+    references/state-and-safety.md: the three legs plus the append-only
+    escalation_invocations audit list. policy_decision stays free-form
+    (it is the gate's own evidence record), and escalation entries may
+    carry extra audit keys — required keys checked, growth allowed.
+    """
+
+    if model_runtime is None:
+        return []
+    if not isinstance(model_runtime, dict):
+        return ["resolved_conventions.model_runtime: must be a mapping"]
+    errors: list[str] = []
+    allowed_top = set(MODEL_RUNTIME_LEGS) | {"escalation_invocations"}
+    for key in sorted(set(model_runtime) - allowed_top):
+        errors.append(
+            f"resolved_conventions.model_runtime.{key}: unknown leg"
+        )
+    for leg_name in MODEL_RUNTIME_LEGS:
+        leg = model_runtime.get(leg_name)
+        if leg is None:
+            continue
+        prefix = f"resolved_conventions.model_runtime.{leg_name}"
+        if not isinstance(leg, dict):
+            errors.append(f"{prefix}: must be a mapping")
+            continue
+        for key in sorted(set(leg) - MODEL_RUNTIME_LEG_KEYS):
+            errors.append(f"{prefix}.{key}: unknown field")
+        model = leg.get("model")
+        if model is not None and (not isinstance(model, str) or not model):
+            errors.append(f"{prefix}.model: must be a non-empty string")
+        gate_status = leg.get("gate_status")
+        if gate_status is not None and (
+            not isinstance(gate_status, str) or not gate_status
+        ):
+            errors.append(
+                f"{prefix}.gate_status: must be a non-empty string"
+            )
+        flag = leg.get("host_agent_selection_verified")
+        if flag is not None and not isinstance(flag, bool):
+            errors.append(
+                f"{prefix}.host_agent_selection_verified: must be a boolean"
+            )
+        decision = leg.get("policy_decision")
+        if decision is not None and not isinstance(decision, dict):
+            errors.append(f"{prefix}.policy_decision: must be a mapping")
+    invocations = model_runtime.get("escalation_invocations")
+    if invocations is not None:
+        if not isinstance(invocations, list):
+            errors.append(
+                "resolved_conventions.model_runtime.escalation_invocations:"
+                " must be a list"
+            )
+        else:
+            for position, entry in enumerate(invocations):
+                if not isinstance(entry, dict) or not {
+                    "trigger",
+                    "voice",
+                    "reason",
+                } <= set(entry):
+                    errors.append(
+                        "resolved_conventions.model_runtime"
+                        f".escalation_invocations[{position}]: must be a"
+                        " mapping with trigger/voice/reason"
+                    )
+    return errors
 
 
 def validate_operation_collection(
@@ -850,6 +1024,40 @@ class _Validator:
             value = state.get(sha_key)
             if value is not None and sha_key in state and not _is_full_hex(value):
                 self.error(f"{sha_key}: must be a full-length hex object ID")
+        # R5-F1: the per-project grace-window override is validated where it
+        # is DECLARED, not only where it is consumed — a silently-applied
+        # default would surface only as a confusing ceiling error at the
+        # first push, whose re-arm advice re-reads the same bad override and
+        # reproduces itself forever. Only this key is schema-consumed; the
+        # sibling monitor_constants are prose-consumed and stay unvalidated
+        # here by design.
+        conventions = state.get("resolved_conventions")
+        constants = (
+            conventions.get("monitor_constants")
+            if isinstance(conventions, dict)
+            else None
+        )
+        declared = (
+            constants.get("bot_grace_window_seconds")
+            if isinstance(constants, dict)
+            else None
+        )
+        declared_valid = (
+            isinstance(declared, int)
+            and not isinstance(declared, bool)
+            and 0 < declared <= MAX_GRACE_WINDOW_OVERRIDE_SECONDS
+        )
+        # Explicit null is the package-wide "unset" idiom (every template key
+        # initializes to null), not a declaration — it selects the default
+        # exactly like an absent key and is deliberately not an error.
+        if declared is not None and not declared_valid:
+            self.error(
+                "resolved_conventions.monitor_constants.bot_grace_window_seconds:"
+                " override must be an integer in"
+                f" (0, {MAX_GRACE_WINDOW_OVERRIDE_SECONDS}] — fix or remove the"
+                f" declared override (the {BOT_GRACE_WINDOW_SECONDS}s default"
+                " applies when absent)"
+            )
         if "post_push_until" in state and state.get("post_push_until") is not None:
             parsed_push = normalize_iso_timestamp(state.get("post_push_until"))
             if parsed_push is None:
@@ -859,34 +1067,19 @@ class _Validator:
                 # siblings: grace_elapsed(post_push_until) is a conjunct of
                 # every monitor exit, and passive poll ticks never consume the
                 # work cap — an unbounded far-future value would strand the
-                # loop at in_progress forever. The declared per-project window
-                # override extends the ceiling; garbage overrides fall back to
-                # the default.
-                conventions = state.get("resolved_conventions")
-                constants = (
-                    conventions.get("monitor_constants")
-                    if isinstance(conventions, dict)
-                    else None
-                )
-                declared = (
-                    constants.get("bot_grace_window_seconds")
-                    if isinstance(constants, dict)
-                    else None
-                )
-                window = (
-                    declared
-                    if isinstance(declared, int)
-                    and not isinstance(declared, bool)
-                    and 0 < declared <= MAX_GRACE_WINDOW_OVERRIDE_SECONDS
-                    else BOT_GRACE_WINDOW_SECONDS
-                )
+                # loop at in_progress forever. A VALID declared override
+                # extends the ceiling; an invalid one already errored above,
+                # and the arithmetic falls back to the default so it stays
+                # overflow-safe.
+                window = declared if declared_valid else BOT_GRACE_WINDOW_SECONDS
                 ceiling = _utcnow() + timedelta(
                     seconds=window + CLOCK_SKEW_TOLERANCE_SECONDS
                 )
                 if parsed_push > ceiling:
                     self.error(
                         "post_push_until: exceeds the grace-window resume ceiling"
-                        " (declared window + skew) — re-arm the window on resume"
+                        " (resolved window + skew) — re-arm post_push_until ="
+                        " now + the resolved grace window on resume"
                     )
         wait_phases = state.get("phases")
         wait_monitor = wait_phases.get("monitor") if isinstance(wait_phases, dict) else None
@@ -901,6 +1094,63 @@ class _Validator:
                     self.error(
                         "next_retry_at: a terminal monitor forbids a pending model-gate wait"
                     )
+                # R5-F2 wait-owner liveness: the model gate also runs before
+                # the monitor exists (entry preflight, plan review), and the
+                # documented lifecycle clears this key when the gate lands
+                # ready/blocked — so outside a live owner the key is a stale
+                # resume point that resume `continue` would sleep toward.
+                # ENTRY phases are always live owners (no phases entry to
+                # consult); the monitor's own case is the terminal-monitor
+                # rule above; every other current_phase must be in_progress —
+                # blocked, complete, aborted, and malformed owners all fail
+                # closed. Recovery: resume `reset` clears the key; `continue`
+                # must re-run the gate observation, never sleep toward it.
+                if phase not in ENTRY_PHASES and phase != "monitor":
+                    if phase.startswith("aborted_at_"):
+                        self.error(
+                            "next_retry_at: an aborted workflow cannot carry a"
+                            " pending model-gate wait — resume reset clears it;"
+                            " continue must re-run the gate observation instead"
+                            " of sleeping toward it"
+                        )
+                    elif (
+                        wait_phases.get(phase)
+                        if isinstance(wait_phases, dict)
+                        else None
+                    ) != "in_progress":
+                        self.error(
+                            "next_retry_at: a pending model-gate wait needs a live"
+                            f" owner — phases.{phase} must be in_progress (the wait"
+                            " clears when the gate lands ready/blocked); resume"
+                            " reset clears it, and continue must re-run the gate"
+                            " observation instead of sleeping toward it"
+                        )
+                # A LANDED-blocked gate is stale everywhere, entry included:
+                # the wait clears when the gate lands ready/blocked, so a
+                # persisted blocked gate_status beside a live wait means the
+                # clear never happened. Consulted only when the persisted
+                # record exists and says "blocked" — absence or malformed
+                # records add no error here (other checks own their shape).
+                runtime = (
+                    conventions.get("model_runtime")
+                    if isinstance(conventions, dict)
+                    else None
+                )
+                if isinstance(runtime, dict):
+                    for leg_name in ("codex", "claude", "claude_reviewer"):
+                        leg = runtime.get(leg_name)
+                        if (
+                            isinstance(leg, dict)
+                            and leg.get("gate_status") == "blocked"
+                        ):
+                            self.error(
+                                "next_retry_at: the"
+                                f" {leg_name} gate landed blocked — a landed"
+                                " gate clears its wait; resume reset clears"
+                                " it, and continue must re-run the gate"
+                                " observation instead of sleeping toward it"
+                            )
+                            break
                 # Resume ceiling: a persisted retry instant beyond one bounded
                 # sleep (+ skew) is a suspect resume point — re-derive by
                 # re-running the gate observation, never sleep toward it.
@@ -934,6 +1184,184 @@ class _Validator:
                     seconds=CLOCK_SKEW_TOLERANCE_SECONDS
                 ):
                     self.error("hold_started_at: must not be in the future")
+        if "monitor_ownership" in state and state.get("monitor_ownership") is not None:
+            ownership = state.get("monitor_ownership")
+            if not isinstance(ownership, dict):
+                self.error("monitor_ownership: must be a mapping")
+            else:
+                # A versioned handoff fails closed: when the block exists,
+                # every field is required — a half-bound ownership record
+                # cannot prove which lineage owns the session or when it was
+                # bound, so nothing may act on it.
+                for key in ownership:
+                    if key not in MONITOR_OWNERSHIP_KEYS:
+                        self.error(
+                            f"monitor_ownership: unknown key {_safe_key(str(key))!r}"
+                        )
+                for key in sorted(MONITOR_OWNERSHIP_REQUIRED_KEYS - set(ownership)):
+                    self.error(f"monitor_ownership: required key {key!r} is missing")
+                pending_owner = ownership.get("pending_owner")
+                if "pending_owner" in ownership and pending_owner is not None and (
+                    not isinstance(pending_owner, str) or not pending_owner
+                ):
+                    self.error(
+                        "monitor_ownership.pending_owner: must be a non-empty"
+                        " string or null"
+                    )
+                if ownership.get("reason_code") == "orchestrator_continuity" and not (
+                    isinstance(pending_owner, str) and pending_owner
+                ):
+                    self.error(
+                        "monitor_ownership: a continuity binding must carry the"
+                        " nominal owner in pending_owner"
+                    )
+                lineage = ownership.get("lineage")
+                if "lineage" in ownership and lineage not in MONITOR_OWNERSHIP_LINEAGE_ENUM:
+                    self.error(
+                        "monitor_ownership.lineage: must be one of"
+                        " reviewer|base"
+                    )
+                for field in ("model", "reason_code"):
+                    value = ownership.get(field)
+                    if field in ownership and (
+                        not isinstance(value, str) or not value
+                    ):
+                        self.error(
+                            f"monitor_ownership.{field}: must be a non-empty string"
+                        )
+                if "bound_at" in ownership:
+                    parsed_bound = normalize_iso_timestamp(ownership.get("bound_at"))
+                    if parsed_bound is None:
+                        self.error(
+                            "monitor_ownership.bound_at: must be an ISO 8601"
+                            " timestamp with timezone"
+                        )
+                    elif parsed_bound > _utcnow() + timedelta(
+                        seconds=CLOCK_SKEW_TOLERANCE_SECONDS
+                    ):
+                        self.error("monitor_ownership.bound_at: must not be in the future")
+        if "monitor_cli" in state and state.get("monitor_cli") is not None:
+            cli = state.get("monitor_cli")
+            if not isinstance(cli, dict):
+                self.error("monitor_cli: must be a mapping")
+            else:
+                # Runner-owned control block: every field required when the
+                # block exists (a half-written control block is corruption,
+                # not progress), nullable only where the protocol says so.
+                for key in cli:
+                    if key not in MONITOR_CLI_KEYS:
+                        self.error(f"monitor_cli: unknown key {_safe_key(str(key))!r}")
+                for key in sorted(MONITOR_CLI_KEYS - set(cli)):
+                    self.error(f"monitor_cli: required key {key!r} is missing")
+                if "schema_version" in cli and cli.get("schema_version") != MONITOR_CLI_SCHEMA_VERSION:
+                    self.error(
+                        "monitor_cli.schema_version: must be"
+                        f" {MONITOR_CLI_SCHEMA_VERSION}"
+                    )
+                for nullable in ("child_session_id", "last_completed_attempt_id"):
+                    value = cli.get(nullable)
+                    if nullable in cli and value is not None and (
+                        not isinstance(value, str) or not value
+                    ):
+                        self.error(
+                            f"monitor_cli.{nullable}: must be a non-empty string"
+                            " or null"
+                        )
+                owner = cli.get("owner_model")
+                if "owner_model" in cli and (
+                    not isinstance(owner, str) or not owner
+                ):
+                    self.error("monitor_cli.owner_model: must be a non-empty string")
+                failures = cli.get("child_failures")
+                if "child_failures" in cli:
+                    if not isinstance(failures, list):
+                        self.error("monitor_cli.child_failures: must be a list")
+                    else:
+                        for index, record in enumerate(failures):
+                            if not isinstance(record, dict) or set(record) != MONITOR_CHILD_FAILURE_KEYS:
+                                self.error(
+                                    f"monitor_cli.child_failures[{index}]: must be"
+                                    " a {signature, at} record"
+                                )
+                                continue
+                            if not isinstance(record.get("signature"), str) or not record.get("signature"):
+                                self.error(
+                                    f"monitor_cli.child_failures[{index}].signature:"
+                                    " must be a non-empty string"
+                                )
+                            if normalize_iso_timestamp(record.get("at")) is None:
+                                self.error(
+                                    f"monitor_cli.child_failures[{index}].at: must"
+                                    " be an ISO 8601 timestamp with timezone"
+                                )
+                in_flight = cli.get("in_flight")
+                if "in_flight" in cli and in_flight is not None:
+                    if not isinstance(in_flight, dict):
+                        self.error("monitor_cli.in_flight: must be a mapping or null")
+                    else:
+                        for key in in_flight:
+                            if key not in MONITOR_CLI_IN_FLIGHT_KEYS:
+                                self.error(
+                                    "monitor_cli.in_flight: unknown key"
+                                    f" {_safe_key(str(key))!r}"
+                                )
+                        for key in sorted(MONITOR_CLI_IN_FLIGHT_KEYS - set(in_flight)):
+                            self.error(
+                                f"monitor_cli.in_flight: required key {key!r} is missing"
+                            )
+                        for field in ("attempt_id", "child_started_fingerprint", "base_workflow_digest"):
+                            value = in_flight.get(field)
+                            if field in in_flight and (
+                                not isinstance(value, str) or not value
+                            ):
+                                self.error(
+                                    f"monitor_cli.in_flight.{field}: must be a"
+                                    " non-empty string"
+                                )
+                        ordinal = in_flight.get("tick_ordinal")
+                        if "tick_ordinal" in in_flight and (
+                            not isinstance(ordinal, int)
+                            or isinstance(ordinal, bool)
+                            or ordinal < 1
+                        ):
+                            self.error(
+                                "monitor_cli.in_flight.tick_ordinal: must be a"
+                                " positive integer"
+                            )
+                        for pid_field in ("child_pid", "child_pgid"):
+                            value = in_flight.get(pid_field)
+                            if pid_field in in_flight and (
+                                not isinstance(value, int)
+                                or isinstance(value, bool)
+                                or value <= 0
+                            ):
+                                self.error(
+                                    f"monitor_cli.in_flight.{pid_field}: must be a"
+                                    " positive integer"
+                                )
+                        pid_value = in_flight.get("child_pid")
+                        pgid_value = in_flight.get("child_pgid")
+                        if (
+                            isinstance(pid_value, int)
+                            and isinstance(pgid_value, int)
+                            and not isinstance(pid_value, bool)
+                            and not isinstance(pgid_value, bool)
+                            and pid_value != pgid_value
+                        ):
+                            self.error(
+                                "monitor_cli.in_flight: child_pid must equal"
+                                " child_pgid — the runner spawns session"
+                                " leaders (start_new_session), so an unequal"
+                                " pair is a forged or corrupt record"
+                            )
+                        for ts_field in ("started_at", "deadline_at"):
+                            if ts_field in in_flight and normalize_iso_timestamp(
+                                in_flight.get(ts_field)
+                            ) is None:
+                                self.error(
+                                    f"monitor_cli.in_flight.{ts_field}: must be an"
+                                    " ISO 8601 timestamp with timezone"
+                                )
         for counter in (
             "monitor_iterations",
             "monitor_poll_ticks",
@@ -1060,6 +1488,46 @@ class _Validator:
         ):
             if structured_key in state and not isinstance(state.get(structured_key), dict):
                 self.error(f"{structured_key}: must be a mapping")
+        ticket = state.get("validated_ticket")
+        if isinstance(ticket, dict):
+            # R2 round-2 finding 3737466471, the enforceable kernel: the
+            # handoff planner deliberately trusts pre-validated ticket
+            # state (it is a no-network pure function), so the validation
+            # evidence must be coherent HERE. All-null is a legitimate
+            # entry state; a provider_id without the rest of the evidence
+            # is the tamper shape the planner would then act on.
+            for field in ("tracker_type", "identifier", "provider_id", "source_fingerprint"):
+                value = ticket.get(field)
+                if value is not None and (not isinstance(value, str) or not value.strip()):
+                    self.error(
+                        f"validated_ticket.{field}: must be a non-empty string when set"
+                    )
+            validated_at = ticket.get("validated_at")
+            if validated_at is not None and normalize_iso_timestamp(validated_at) is None:
+                self.error(
+                    "validated_ticket.validated_at: must be an ISO 8601 timestamp"
+                )
+            if ticket.get("provider_id") is not None:
+                # Required set = the fields the documented persistence
+                # procedures actually write (identifier + provider_id +
+                # validation timestamp — phases-1-5.md / project-and-entry
+                # ticket validation). tracker_type and source_fingerprint
+                # are type-checked when present but not required here: the
+                # fingerprint hashes PR title/body linkage, which cannot
+                # exist before Phase 5 creates the PR, so requiring it
+                # would fail-close every issue-first workflow at entry
+                # (series self-review finding).
+                missing = sorted(
+                    field
+                    for field in ("identifier", "validated_at")
+                    if ticket.get(field) is None
+                )
+                if missing:
+                    self.error(
+                        "validated_ticket: provider_id requires the"
+                        " documented validation evidence; missing: "
+                        + ", ".join(missing)
+                    )
         conventions = state.get("resolved_conventions")
         if isinstance(conventions, dict):
             self.validate_conventions(conventions)
@@ -1133,8 +1601,10 @@ class _Validator:
         # runtime_verification/pr non-pending with no merge_readiness key at
         # all, and the documented Phase 5 recovery route ("go run Phase 4b
         # now") legitimately holds pr in_progress beside a pending gate.  The
-        # gate itself is enforced by the workflow's Phase 5 precondition, not
-        # by schema shape.
+        # gate itself is enforced by the workflow, not by schema shape: the
+        # Phase 5 precondition (phases-1-5.md) and the resume router's
+        # monitor bullet (project-and-entry.md), which sends a pre-4b
+        # current_phase: monitor resume through Phase 4b before Phase 6.
         chain = (
             ("plan_review", "plan", ("complete",)),
             ("implementation", "plan_review", ("complete",)),
@@ -1618,6 +2088,10 @@ class _Validator:
                         )
 
     def validate_conventions(self, conventions: dict) -> None:
+        for message in validate_model_runtime_shape(
+            conventions.get("model_runtime")
+        ):
+            self.error(message)
         steps = conventions.get("quality_check_steps")
         if steps is not None:
             if not isinstance(steps, list):
@@ -1847,14 +2321,115 @@ def evaluate_state_text(text: str) -> dict[str, Any]:
     }
 
 
+def monitor_digest(text: str) -> str | None:
+    """Workflow digest EXCLUDING the runner-owned ``monitor_cli`` block.
+
+    The digest binds a child's verdict to the exact candidate it produced,
+    while the runner's single-write finalization (session id, in_flight
+    clear) mutates only ``monitor_cli`` — excluding that block means the
+    finalization cannot invalidate the digest the verdict pinned.  Both
+    sides obtain the value from THIS helper (the child via the
+    ``--monitor-digest`` CLI mode), never by hand-rolling serialization.
+    """
+
+    try:
+        state, body_lines = parse_state_text(text)
+    except StructuralError:
+        return None
+    if not isinstance(state, dict):
+        return None
+    trimmed = {key: value for key, value in state.items() if key != "monitor_cli"}
+    payload = json.dumps(trimmed, sort_keys=True, ensure_ascii=False)
+    payload += "\n" + "\n".join(line.rstrip("\n") for line in body_lines)
+    return hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()
+
+
+def monitor_extract(text: str) -> dict[str, Any]:
+    """Runner-facing extract: the validation verdict plus every field
+    ``scripts/monitor_runner.py`` needs, from ONE parse.
+
+    The runner shells out to this CLI instead of importing the evaluator —
+    the package's structural rule keeps subprocess-using files free of the
+    evaluator call names (see test_cli_fail_closed.py's module docstring).
+    """
+
+    result = evaluate_state_text(text)
+    extract: dict[str, Any] = {
+        "version": SCHEMA_VERSION,
+        "state": result["state"],
+        "errors": result["errors"],
+        "digest": monitor_digest(text),
+        "monitor_cli": None,
+        "monitor_ownership": None,
+        "model_runtime": None,
+        "counters": {},
+        "current_phase": None,
+        "monitor_status": None,
+        "handoff_statuses": [],
+        "blocked_evidence_present": False,
+    }
+    try:
+        state, _ = parse_state_text(text)
+    except StructuralError:
+        return extract
+    if not isinstance(state, dict):
+        return extract
+    extract["current_phase"] = state.get("current_phase")
+    if isinstance(state.get("monitor_cli"), dict):
+        extract["monitor_cli"] = state["monitor_cli"]
+    if isinstance(state.get("monitor_ownership"), dict):
+        extract["monitor_ownership"] = state["monitor_ownership"]
+    conventions = state.get("resolved_conventions")
+    runtime = (
+        conventions.get("model_runtime") if isinstance(conventions, dict) else None
+    )
+    if isinstance(runtime, dict):
+        extract["model_runtime"] = runtime
+    for counter in ("monitor_iterations", "monitor_poll_ticks"):
+        value = state.get(counter)
+        if isinstance(value, int) and not isinstance(value, bool):
+            extract["counters"][counter] = value
+    phases = state.get("phases")
+    monitor_status = phases.get("monitor") if isinstance(phases, dict) else None
+    if isinstance(monitor_status, str):
+        extract["monitor_status"] = monitor_status
+    handoffs = state.get("handoffs")
+    statuses: list[str] = []
+    if isinstance(handoffs, dict):
+        for record in handoffs.values():
+            status = record.get("status") if isinstance(record, dict) else None
+            statuses.append(status if isinstance(status, str) else "malformed")
+    extract["handoff_statuses"] = statuses
+    extract["blocked_evidence_present"] = any(
+        isinstance(state.get(key), dict) and state.get(key)
+        for key in (
+            "exhausted_feedback",
+            "manual_unknown_feedback",
+            "manual_branch_protection_blockers",
+        )
+    )
+    return extract
+
+
+_CLI_USAGE = (
+    "usage: state_schema.py <state-file> | state_schema.py"
+    " --monitor-extract|--monitor-digest <state-file>"
+)
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) != 2:
+    mode = "validate"
+    args = argv[1:]
+    if args and args[0] in ("--monitor-extract", "--monitor-digest"):
+        mode = args[0]
+        args = args[1:]
+    if len(args) != 1:
         print(
             json.dumps(
                 {
                     "version": SCHEMA_VERSION,
                     "state": SUSPECT,
-                    "errors": ["usage: state_schema.py <state-file>"],
+                    "errors": [_CLI_USAGE],
                     "tainted": [],
                     "phase_requirements": "unparsed",
                 }
@@ -1862,7 +2437,7 @@ def main(argv: list[str]) -> int:
         )
         return 2
     try:
-        with open(argv[1], encoding="utf-8") as handle:
+        with open(args[0], encoding="utf-8") as handle:
             text = handle.read()
     except (OSError, UnicodeDecodeError):
         print(
@@ -1877,6 +2452,14 @@ def main(argv: list[str]) -> int:
             )
         )
         return 2
+    if mode == "--monitor-digest":
+        digest = monitor_digest(text)
+        print(json.dumps({"version": SCHEMA_VERSION, "digest": digest}))
+        return 0 if digest is not None else 1
+    if mode == "--monitor-extract":
+        extract = monitor_extract(text)
+        print(json.dumps(extract, sort_keys=True))
+        return 0 if extract["state"] == VALID else 1
     result = evaluate_state_text(text)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["state"] == VALID else 1

@@ -19,6 +19,7 @@ the handoff instead of silently requesting review on stale work.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import re
 import sys
@@ -675,6 +676,69 @@ def _roundtrip_targets(
     return targets, errors
 
 
+def roundtrip_generation(
+    request: dict[str, Any], reviewers: list[str]
+) -> str:
+    """Digest of the feedback evidence a roundtrip plan answers.
+
+    Embedded in every roundtrip operation ID so a completed earlier
+    round's ledger can never satisfy a later round: fresh feedback (a new
+    review ID, an edit timestamp, a newly pushed fix) changes the digest,
+    which mints operations no prior record matches (R2 round-2 finding
+    3737466450 — the identity-only IDs let the second round return
+    "complete" with an empty call plan while nobody was re-pinged).
+    Plan-level on purpose: the trailing assignee operations span the
+    whole reviewer set, so the plan re-mints as one atomic unit.
+    """
+
+    wanted = {login.casefold() for login in reviewers}
+    payload: list[dict[str, Any]] = []
+    raw_reviewers = request.get("reviewers")
+    for entry in raw_reviewers if isinstance(raw_reviewers, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        login = entry.get("login")
+        if not isinstance(login, str) or login.casefold() not in wanted:
+            continue
+        bodies = entry.get("review_bodies")
+        roots = entry.get("inline_roots")
+        pushed = entry.get("pushed_fix_shas")
+        payload.append(
+            {
+                "login": login.casefold(),
+                "review_bodies": {
+                    str(key): (
+                        value.get("updated_at")
+                        if isinstance(value, dict)
+                        else None
+                    )
+                    for key, value in bodies.items()
+                }
+                if isinstance(bodies, dict)
+                else None,
+                "inline_roots": {
+                    str(key): (
+                        value.get("updated_at")
+                        if isinstance(value, dict)
+                        else None
+                    )
+                    for key, value in roots.items()
+                }
+                if isinstance(roots, dict)
+                else None,
+                "pushed_through_sha": entry.get("pushed_through_sha"),
+                "pushed_fix_shas": sorted(
+                    sha for sha in pushed if isinstance(sha, str)
+                )
+                if isinstance(pushed, list)
+                else None,
+            }
+        )
+    payload.sort(key=lambda item: item["login"])
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+
+
 def _roundtrip_operations(
     request: dict[str, Any],
     name_with_owner: str,
@@ -689,13 +753,16 @@ def _roundtrip_operations(
     if errors or not reviewers:
         return targets, [], errors
 
+    generation = roundtrip_generation(request, reviewers)
     operations: list[dict[str, Any]] = []
     reviewer_verification_ids: list[str] = []
     previous_operation_id: str | None = None
     for login in reviewers:
         identity = login.casefold()
-        request_id = f"roundtrip.github.request_review:{identity}"
-        verify_id = f"roundtrip.github.verify_review_request:{identity}"
+        request_id = f"roundtrip.github.request_review:{identity}:g{generation}"
+        verify_id = (
+            f"roundtrip.github.verify_review_request:{identity}:g{generation}"
+        )
         operations.append(
             _github_operation(
                 request_id,
@@ -721,9 +788,10 @@ def _roundtrip_operations(
         reviewer_verification_ids.append(verify_id)
         previous_operation_id = verify_id
 
+    replace_id = f"roundtrip.github.replace_assignees:g{generation}"
     operations.append(
         _github_operation(
-            "roundtrip.github.replace_assignees",
+            replace_id,
             "replace_pull_request_assignees",
             name_with_owner,
             pull_request_number,
@@ -733,11 +801,11 @@ def _roundtrip_operations(
     )
     operations.append(
         _github_operation(
-            "roundtrip.github.verify_assignees",
+            f"roundtrip.github.verify_assignees:g{generation}",
             "verify_pull_request_assignees",
             name_with_owner,
             pull_request_number,
-            depends_on=["roundtrip.github.replace_assignees"],
+            depends_on=[replace_id],
             expected_assignees=reviewers,
         )
     )
@@ -824,6 +892,15 @@ def _apply_operation_state(
         for operation_id, result in result_records.items()
         if result["status"] == "failed"
     }
+    # Persisted skipped_dependency records are failed-CLASS for dependency
+    # propagation (their postcondition is known false) but render as their
+    # own status so a re-plan reproduces the terminal answer that was
+    # persisted, never upgrading a non-attempt into a failure record.
+    canonical_skipped = {
+        operation_id
+        for operation_id, result in result_records.items()
+        if result["status"] == "skipped_dependency"
+    }
     in_flight = {
         operation_id
         for operation_id, result in result_records.items()
@@ -860,7 +937,7 @@ def _apply_operation_state(
     # A local unavailable record is a known failure, not a remote operation.
     # It becomes terminal only once every preceding operation has reached a
     # terminal result, preserving the same crash-safe sequence as remote work.
-    effective_failed = set(failed_all)
+    effective_failed = set(failed_all) | set(canonical_skipped)
     preceding_terminal = True
     for spec in operation_specs:
         operation_id = spec["id"]
@@ -920,11 +997,21 @@ def _apply_operation_state(
         ),
         None,
     )
+    skipped_ids = canonical_skipped | set(dependency_failure_details)
     for spec in operation_specs:
         operation = copy.deepcopy(spec)
         operation_id = operation["id"]
         if operation_id in completed_all:
             operation["status"] = "complete"
+        elif operation_id in skipped_ids:
+            # Never attempted: the dependency chain above it terminally
+            # failed. Rendered as its own status so the caller persists a
+            # non-attempt record (attempts 0, error naming the dependency)
+            # instead of fabricating a failure it never observed.
+            operation["status"] = "skipped_dependency"
+            record = result_records.get(operation_id)
+            if record is not None and isinstance(record.get("error"), str):
+                operation["error"] = record["error"]
         elif operation_id in effective_failed:
             operation["status"] = "failed"
         elif operation_id == pending_id:
@@ -944,7 +1031,9 @@ def _apply_operation_state(
         if automatic_failure is not None and operation["status"] == "failed":
             operation["error"] = automatic_failure
         dependency_detail = dependency_failure_details.get(operation_id)
-        if dependency_detail is not None and operation["status"] == "failed":
+        if dependency_detail is not None and operation["status"] == (
+            "skipped_dependency"
+        ):
             operation["error"] = dependency_detail
         operations.append(operation)
 
@@ -961,12 +1050,15 @@ def _apply_operation_state(
 
     warnings = []
     for operation in operations:
-        if operation["status"] != "failed":
+        if operation["status"] not in ("failed", "skipped_dependency"):
             continue
-        if operation["id"] in dependency_failure_details:
+        if operation["status"] == "skipped_dependency":
+            detail = dependency_failure_details.get(operation["id"]) or (
+                operation.get("error") or "dependency failed"
+            )
             warnings.append(
                 f"Operation {operation['id']} not executed "
-                f"({dependency_failure_details[operation['id']]}); complete it manually."
+                f"({detail}); complete it manually."
             )
         elif operation["service"] == "local":
             warnings.append(
@@ -1096,6 +1188,67 @@ def plan_handoff(request: Any) -> dict[str, Any]:
                     "abandoning the roundtrip",
                 )
             return _idle(scenario, "no eligible reviewers remain after actor exclusion")
+        if not errors and operations:
+            # Generation-bound IDs make an earlier round's records orphans
+            # of the current plan. Terminal orphans are that round's
+            # completed history — ignore them (with a warning) instead of
+            # hard-erroring as unknown IDs. An IN-FLIGHT orphan marks a
+            # mutation that may already have fired remotely: fail closed
+            # with the recovery named. Non-roundtrip IDs stay unknown-ID
+            # errors downstream — the tolerance is scoped to this
+            # scenario's own generation turnover.
+            raw_results = request.get("operation_results")
+            if isinstance(raw_results, dict):
+                known_ids = {operation["id"] for operation in operations}
+                stale_terminal: list[str] = []
+                stale_in_flight: list[str] = []
+                for operation_id, record in raw_results.items():
+                    if not isinstance(operation_id, str):
+                        continue
+                    if operation_id in known_ids:
+                        continue
+                    if not operation_id.startswith("roundtrip."):
+                        continue
+                    status = (
+                        record.get("status")
+                        if isinstance(record, dict)
+                        else None
+                    )
+                    if status in ("complete", "failed", "skipped_dependency"):
+                        # skipped_dependency is terminal history too — its
+                        # record proves the operation NEVER fired, so there
+                        # is no remote postcondition to verify (series
+                        # self-review: omitting it here blocked legitimate
+                        # fresh rounds after any partial failure).
+                        stale_terminal.append(operation_id)
+                    else:
+                        stale_in_flight.append(operation_id)
+                if stale_in_flight:
+                    return _blocked(
+                        scenario,
+                        "prior-generation roundtrip operation(s) still in"
+                        " flight: "
+                        + ", ".join(sorted(stale_in_flight))
+                        + " - verify each mutation's postcondition and record"
+                        " a terminal result before planning fresh feedback",
+                    )
+                if stale_terminal:
+                    pruned = dict(request)
+                    pruned["operation_results"] = {
+                        operation_id: record
+                        for operation_id, record in raw_results.items()
+                        if operation_id not in set(stale_terminal)
+                    }
+                    plan = _apply_operation_state(
+                        scenario, targets, operations, pruned
+                    )
+                    plan["warnings"].append(
+                        "ignored "
+                        + str(len(stale_terminal))
+                        + " prior-generation terminal roundtrip record(s): "
+                        + ", ".join(sorted(stale_terminal))
+                    )
+                    return plan
 
     if errors:
         return _blocked(scenario, *errors)

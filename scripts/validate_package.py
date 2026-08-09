@@ -29,7 +29,15 @@ MAX_REFERENCE_LINES_EXCLUSIVE = 500
 # derives the strings it pins from those constants instead of restating them, so
 # a floor or effort change cannot leave the validator asserting the old policy.
 CODEX_FLOOR_MODEL = model_policy.CODEX_MODEL
-EXEC_MODEL_FLAGS = f"-m <selected> -c 'model_reasoning_effort=\"{model_policy.CODEX_EFFORT}\"'"
+# R2 round-2 finding 3737466478: the sandbox pin is part of the canonical
+# exec flags — an unpinned reconstruction inherits the operator's ambient
+# codex sandbox, and a review voice must never be able to write to the
+# implementation it judges. (`codex review` exposes no sandbox flag; the
+# pin applies to exec-shaped invocations.)
+EXEC_MODEL_FLAGS = (
+    f"-m <selected> -c 'model_reasoning_effort=\"{model_policy.CODEX_EFFORT}\"'"
+    " -s read-only"
+)
 REVIEW_MODEL_FLAGS = (
     f"-c 'model=\"<selected>\"' -c 'model_reasoning_effort=\"{model_policy.CODEX_EFFORT}\"'"
 )
@@ -53,6 +61,9 @@ REQUIRED_SCRIPT_FILES = (
     "scripts/test_state_schema.py",
     "scripts/test_validate_package.py",
     "scripts/test_cli_fail_closed.py",
+    "scripts/monitor_runner.py",
+    "scripts/monitor_child_wrapper.py",
+    "scripts/test_monitor_runner.py",
 )
 
 # Evidence-gate and state-hardening content contracts.  Each marker is an
@@ -62,6 +73,7 @@ REQUIRED_SCRIPT_FILES = (
 REQUIRED_GATE_MARKERS = {
     "SKILL.md": (
         "state_schema.py",
+        "monitor_runner.py",
         # R2 F1 + R3 F2 — the failure-matrix quota row: bounded helper wait,
         # constant-derived ceiling (a value bump in state_schema fails
         # validation until this prose catches up), helper-decided streak.
@@ -85,6 +97,10 @@ REQUIRED_GATE_MARKERS = {
         "branch-established:",
         "validation-before-push:",
         "Stranded work",
+        # Phase 6 session ownership — the role must stay documented in the
+        # core beside the legs it rebinds.
+        "Monitor orchestrator",
+        "monitor_orchestrator_binding",
         # Derived policy pins — the Claude floors and CLI minimums must appear
         # in the core, under the same single-source contract as the codex flag
         # strings (a floor bump in model_policy.py fails validation until the
@@ -120,7 +136,11 @@ REQUIRED_GATE_MARKERS = {
         "judged at its own `observed_at`",
         "max_runtime_seconds="
         + str(model_policy.PER_ATTEMPT_CEILING_SECONDS),
-        "supervise_stream(stdout_pipe, stderr_pipe, kill_callback)",
+        # R2 round-2 finding 3737466493: without the child's wait, a smoke
+        # child exiting nonzero after benign output read as clean/0 — the
+        # canonical wiring must pass child_wait so the gate observes the
+        # real return code.
+        "supervise_stream(stdout_pipe, stderr_pipe, kill_callback, child_wait",
         "verify_frozen_selection()",
         "attempts are per-invocation and reset each round",
     ),
@@ -134,6 +154,11 @@ REQUIRED_GATE_MARKERS = {
         "merge_readiness.deploy_order",
         "Zero-caller implementations are NOT met",
         "Merged-but-not-live is the same ordering hazard as unmerged",
+        # R2 round-2 finding 3737466485: the plain additive template is
+        # wrong when readers need populated rows, not just the schema —
+        # dropping this line reverts to deploying readers into the
+        # null/default window.
+        "readers depend on populated rows",
         # 28e13163ef direction-aware generation — a regeneration that drops
         # these loses the destructive-direction fix and the ready-PR signal.
         "merge_readiness.hazard_direction",
@@ -156,6 +181,17 @@ REQUIRED_GATE_MARKERS = {
         # loop's armed window from the validator's resume ceiling.
         "bot_grace_window_seconds: "
         + str(state_schema.BOT_GRACE_WINDOW_SECONDS),
+        # R5 F1 — the override bound is canonical in state_schema and the
+        # prose must state it (a silently-applied cap was the finding); the
+        # derived value keeps a constant bump from splitting prose and code.
+        "must be an integer in (0, "
+        + str(state_schema.MAX_GRACE_WINDOW_OVERRIDE_SECONDS)
+        + "]",
+        "never silently replaced",
+        # R5 F2 — the wait-owner liveness tie is part of the documented
+        # invariant list; dropping the mention decouples prose from the
+        # validator's enforced lifecycle.
+        "live-wait-owner",
         "takes the terminal quota block",
         "clamped to `MAX_QUOTA_WAIT_SECONDS` per sleep",
         "`MAX_QUOTA_WAIT_SECONDS` resume ceiling",
@@ -184,6 +220,10 @@ REQUIRED_GATE_MARKERS = {
         "Live merge-readiness hold",
         "human:deploy-hold",
         "hold_started_at",
+        # Takeover review round: pseudocode (d) mirrors the authoritative
+        # grace conjunct (stable-poll section: independent conjunct of every
+        # exit).
+        "stable_poll_confirmed AND grace_elapsed(post_push_until)",
     ),
     "references/monitor-exit-handoffs.md": (
         "diff-triggered review focus lines",
@@ -213,6 +253,54 @@ REQUIRED_GATE_MARKERS = {
         "clears when the dependency verifies live",
         "BOT_GRACE_WINDOW` of continuous hold time",
         "hold_started_at",
+        # R2 round-2 finding 3737466450: identity-only operation IDs let a
+        # completed first-round ledger satisfy the second round's plan
+        # (state "complete", empty call plan, nobody re-pinged). Dropping
+        # this line loses the contract that fresh feedback mints fresh
+        # operations.
+        "operation IDs embed the feedback generation",
+        # R2 round-2 finding 3737466456: without a persistable non-attempt
+        # record, the planner's terminal failed answer violated the schema
+        # in every monitor state (missing descendant records derive
+        # pending). Dropping this loses the persistence instruction.
+        "persists its rendered `skipped_dependency` record",
+        # Bugbot 2026-08-06 (thread 3729764470): condition (d) must carry the
+        # live-hold action itself — without it, a ready unapproved PR whose
+        # only remaining blocker is a live hold matches no condition ((a)
+        # needs APPROVED, (e) needs grace/stability unmet) and the pass falls
+        # through to hot-poll the 50-iteration work cap. Presence markers
+        # catch regeneration loss only; binding this text to (d)'s own line
+        # is REQUIRED_ANCHORED_MARKERS' job — a file-wide substring cannot
+        # see placement.
+        "the signal the hold exists to prevent. A live hold here takes"
+        " condition (a)'s own hold action, not a fall-through",
+        # Takeover review round: (d) carries grace_elapsed explicitly — the
+        # stable-poll section declares grace an independent conjunct of EVERY
+        # exit; this adjacency exists only in (d)'s conjunct list.
+        "stable_poll_confirmed` AND `grace_elapsed(post_push_until)`",
+        # Phase 6 session ownership — the binding call, the recorded
+        # fallback, the continuity contract, the capability boundary with
+        # its write-capable worker precondition, the trail marker, and the
+        # terminal audit; dropping any of these regresses the orchestrator
+        # role to an unrecorded model swap or strands fix work without a
+        # compliant actor.
+        "monitor_orchestrator_binding",
+        "orchestrator_on_base",
+        "orchestrator_continuity",
+        "pending_owner",
+        "never writes code/config/tests",
+        "write-capable base worker path",
+        "monitor-ownership:<lineage>:<model>",
+        "worker-dispatch:<trigger>",
+        "ONE read-only base-lineage audit",
+        # Owner-pinned runner contract — the execution locus, the commit
+        # protocol, and the no-inline rule; dropping any of these regresses
+        # automatic ownership to a manual model pick or a clobber-capable
+        # writer.
+        "scripts/monitor_runner.py",
+        "sole canonical committer",
+        "base_workflow_digest",
+        "NO inline fallback under a continuity binding",
     ),
     "scripts/handoff_decision.py": (
         # R3 F5 — the attempt cap is REBOUND from state_schema, never a second
@@ -233,13 +321,91 @@ REQUIRED_GATE_MARKERS = {
         "Path-inheritance invariant",
         "routing_fingerprint",
         "Package-root identity (evaluated BEFORE the empty-diff guard)",
+        # R2 round-2 finding 3737466502: a resume landing at
+        # current_phase: monitor bypassed the Phase 5 merge-readiness
+        # self-heal — pre-4b states reached clean exits with the gate
+        # never run. The resume router's monitor bullet must carry the
+        # same precondition Phase 5 enforces.
+        "then re-enter the monitor",
     ),
 }
+
+# Placement-anchored markers: the presence markers above are file-wide
+# substrings — right for regeneration-loss checking, blind to placement
+# (text relocated wholesale still matches). Each entry binds required
+# substrings to THE single operative line carrying its anchor core, in the
+# Markdown context the operative line actually occupies (`fenced` False =
+# ordinary prose: list-marker-tolerant, excluding fenced blocks and
+# 4-space-indented code; `fenced` True = the line's operative form lives
+# inside a fenced block, as the monitor pseudocode does). Exactly one such
+# line may exist, so reverting condition (d) while parking the marker text
+# elsewhere — in a fenced block of either family (tracking enforces
+# CommonMark's delimiter line grammar via _iter_fence_state, shared with
+# the heading scanner: family match, closing run at least opener-length
+# with a whitespace-only tail, closer indent absolute (<= 3 columns) for
+# openers at three or fewer and relative (opener + 3) for deeper
+# list-nested openers, backtick openers rejected when their info string
+# contains a backtick, unclosed fence at EOF an error), under a swapped
+# bullet marker, as code indented four-plus columns (tabs expand to
+# 4-column stops), or inside an HTML-comment block (pass-3/4/5/6/7
+# takeover review rounds) — fails validation. Known divergence, stated
+# as scope: openers are recognized at any absolute indentation because
+# in-list fences measure indent relative to the item's content column
+# (this package holds legitimate fences at four and five columns) and no
+# list context is modeled here; an over-indented hand-authored opener
+# can therefore classify visible prose as fenced (see the
+# _iter_fence_state docstring). Boundary, stated honestly:
+# this defends regeneration drift and text relocation through the Markdown
+# constructs above; no text-level check can bind an adversary who edits
+# the validator itself.
+REQUIRED_ANCHORED_MARKERS = {
+    "references/monitor-exit-handoffs.md": (
+        (
+            "**(d) If everything is clean AND",
+            False,
+            (
+                "`grace_elapsed(post_push_until)`",
+                "A live hold here takes condition (a)'s own hold action",
+                'set `loop_reason = "wait_repoll"`',
+            ),
+        ),
+    ),
+    "references/monitor-ci-feedback.md": (
+        (
+            "d. If everything is clean AND",
+            True,
+            ("grace_elapsed(post_push_until)",),
+        ),
+    ),
+}
+
+_LIST_MARKER_PREFIXES = ("- ", "* ", "+ ")
 
 REQUIRED_REDACTION_PATTERNS = {
     "aws_access_or_session_key": (
         r"(AKIA|ASIA)[0-9A-Z]{16}",
         ("AKIA" + "1234567890ABCDEF", "ASIA" + "1234567890ABCDEF"),
+    ),
+    # R2 round-2 finding 3737466468: model_policy.py's excerpt handling
+    # explicitly defers bare Authorization headers to "the package's
+    # format-anchored Secret/Token Redaction" — but the pattern list had
+    # no such pattern (a comment promising coverage that did not exist).
+    # Slack tokens are equally format-anchored; both fit the doc's own
+    # stated design rule. Labeled passwords stay out of scope by that
+    # same rule (too many false positives), as the doc already records.
+    "authorization_bearer_header": (
+        r"(?i)Authorization:\s*Bearer\s+[A-Za-z0-9._~+/-]{8,}=*",
+        (
+            "Authorization: Bearer " + "abc123def456ghi789",
+            "authorization: bearer " + "eyJhbGciOiJIUzI1NiJ9.payload.sig",
+        ),
+    ),
+    "slack_token": (
+        r"xox[baprs]-[A-Za-z0-9-]{10,}",
+        (
+            "xox" + "b-1234567890-abcdefghij",
+            "xox" + "p-9876543210-zyxwvutsrq",
+        ),
     ),
     "aws_secret_access_key": (
         r"""(?i)AWS_SECRET_ACCESS_KEY["']?\s*[:=]\s*["']?[A-Za-z0-9/+=]{40}["']?""",
@@ -388,6 +554,7 @@ BUILTIN_EXPECTED_HEADINGS: Mapping[str, tuple[str, ...]] = {
         "#### Merge Conflict Resolution (Step 3, conflicts branch)",
     ),
     "references/monitor-exit-handoffs.md": (
+        "### Phase 6 Session Ownership (cheap orchestrator, pinned workers)",
         "### Step 4: Evaluate Loop Exit",
         "#### MANDATORY VERIFICATION GATE",
         "#### Exit conditions",
@@ -476,23 +643,91 @@ def _parse_frontmatter(skill_text: str) -> tuple[dict[str, str], list[str]]:
     return values, errors
 
 
-def _markdown_headings(text: str) -> set[str]:
-    headings: set[str] = set()
+def _iter_fence_state(text: str):
+    """Yield (line, state) tracking CommonMark's fence-delimiter grammar.
+
+    ``state`` is None for a fence-delimiter line, True inside a fence, and
+    False outside; the generator's return value is the EOF fence state
+    (True = the text ends inside an unclosed fence). Delimiter rules
+    enforced, per CommonMark's line grammar: a fence closes only on a run
+    of its own family, at least as long as its opener, carrying nothing
+    but whitespace after the run, and indented at most three columns
+    (CommonMark's absolute closer rule) when its opener sits at three
+    columns or fewer — for deeper, list-nested openers the bound is
+    relative, opener indent plus three; a backtick opener whose info
+    string contains a backtick is not a fence line at all (tilde info
+    strings are unrestricted). Deliberate superset: openers are
+    recognized at any absolute indentation, because in-list fences
+    measure indent relative to the list item's content column (this
+    package legitimately holds fences at four and five columns) and this
+    validator does not model list context. Fail direction of that
+    superset, disclosed: an over-indented opener that CommonMark would
+    read as indented code opens a fence here, so visible prose after it
+    classifies as fenced — a hand-authored construction, not one
+    regeneration drift produces. Single source of truth for every
+    Markdown-context scan in this validator (headings and anchored
+    markers alike).
+    """
+
     in_fence = False
     fence_marker = ""
+    fence_len = 0
+    fence_indent = 0
     for line in text.splitlines():
         stripped = line.lstrip()
+        indent_cols = len(line[: len(line) - len(stripped)].expandtabs(4))
         fence_match = re.match(r"(`{3,}|~{3,})", stripped)
         if fence_match:
-            marker = fence_match.group(1)[0]
+            run = fence_match.group(1)
+            rest = stripped[len(run) :]
             if not in_fence:
-                in_fence = True
-                fence_marker = marker
-            elif marker == fence_marker:
+                if run[0] == "~" or "`" not in rest:
+                    in_fence = True
+                    fence_marker = run[0]
+                    fence_len = len(run)
+                    fence_indent = indent_cols
+                    yield line, None
+                    continue
+            elif (
+                run[0] == fence_marker
+                and len(run) >= fence_len
+                and not rest.strip()
+                and indent_cols
+                <= (3 if fence_indent <= 3 else fence_indent + 3)
+            ):
                 in_fence = False
                 fence_marker = ""
-            continue
-        if not in_fence and re.fullmatch(r"#{1,6}\s+.+", line):
+                fence_len = 0
+                fence_indent = 0
+                yield line, None
+                continue
+        yield line, in_fence
+    return in_fence
+
+
+def _scan_fence_states(text: str):
+    """Materialize ``_iter_fence_state`` rows plus the EOF fence state.
+
+    Returns ``(rows, ends_open)``: the full (line, state) sequence and
+    whether the text ends inside an unclosed fence — the signature of a
+    truncated regeneration, which must fail validation rather than
+    silently reclassify the tail of the file.
+    """
+
+    generator = _iter_fence_state(text)
+    rows = []
+    while True:
+        try:
+            rows.append(next(generator))
+        except StopIteration as stop:
+            return rows, bool(stop.value)
+
+
+def _markdown_headings(text: str) -> set[str]:
+    headings: set[str] = set()
+    rows, _ends_open = _scan_fence_states(text)
+    for line, state in rows:
+        if state is False and re.fullmatch(r"#{1,6}\s+.+", line):
             headings.add(line.rstrip())
     return headings
 
@@ -707,6 +942,111 @@ def _validate_openai_yaml(package_dir: Path) -> list[str]:
     return errors
 
 
+def _anchored_candidate(line: str, *, fenced: bool, in_fence: bool) -> str | None:
+    """Return the anchor-comparable form of an operative line, else None.
+
+    ``fenced`` False accepts ordinary prose only: a line inside a fenced
+    block or indented four-plus columns (Markdown code — tabs advance to
+    4-column stops) is display content, not the operative condition, and
+    one leading list marker is stripped so a renderer-equivalent bullet
+    swap cannot dodge the anchor. ``fenced`` True accepts fenced lines
+    only — the pseudocode's operative form.
+    """
+
+    if fenced != in_fence:
+        return None
+    stripped = line.lstrip()
+    if not fenced:
+        indent = line[: len(line) - len(stripped)]
+        if len(indent.expandtabs(4)) >= 4:
+            return None
+        for prefix in _LIST_MARKER_PREFIXES:
+            if stripped.startswith(prefix):
+                return stripped[len(prefix):]
+    return stripped
+
+
+def _anchored_matches(text: str, anchor: str, *, fenced: bool) -> list[str]:
+    """Collect operative lines matching an anchor in its declared context.
+
+    Fence state comes from ``_iter_fence_state`` (the heading scanner's
+    own tracker, enforcing CommonMark's delimiter line grammar), so mixed
+    ```/~~~ constructions, shorter runs, info-string-bearing or
+    over-indented "closers", and backtick-info fakes cannot
+    desynchronize classification. Outside fences, HTML-comment blocks are
+    display content: a line inside an unclosed ``<!--`` never matches.
+    """
+
+    matches: list[str] = []
+    in_comment = False
+    rows, _ends_open = _scan_fence_states(text)
+    for line, state in rows:
+        if state is None:
+            continue  # fence delimiter
+        if state is False:
+            if in_comment:
+                if "-->" in line:
+                    in_comment = False
+                continue
+            comparable = _anchored_candidate(line, fenced=fenced, in_fence=False)
+            if comparable is not None and comparable.startswith(anchor):
+                matches.append(line)
+            open_index = line.rfind("<!--")
+            if open_index != -1 and "-->" not in line[open_index:]:
+                in_comment = True
+            continue
+        comparable = _anchored_candidate(line, fenced=fenced, in_fence=True)
+        if comparable is not None and comparable.startswith(anchor):
+            matches.append(line)
+    return matches
+
+
+def _validate_anchored_markers(package_dir: Path) -> list[str]:
+    """Bind required substrings to the single operative anchored line.
+
+    Presence markers are file-wide substrings; this check is what makes a
+    placement claim true — reverting an anchored condition line while
+    parking its marker text elsewhere fails here, including decoys parked
+    in fenced blocks of either family (or behind a delimiter run that is
+    shorter than its opener, carries an info string, or is over-indented
+    relative to its opener — none of which close a fence), after a
+    backtick opener whose info string contains a backtick (not a fence
+    line at all), under swapped list markers, in code indented four-plus
+    columns by spaces or tabs, or inside HTML-comment blocks; a file
+    ending inside an open fence fails outright. Boundary: this
+    defends regeneration drift and relocation through those Markdown
+    constructs; it does not bind an adversary who edits the validator.
+    """
+
+    errors: list[str] = []
+    for relative_path, anchor_specs in sorted(REQUIRED_ANCHORED_MARKERS.items()):
+        candidate = package_dir / relative_path
+        if not candidate.is_file():
+            # Missing reference files are reported by their own checks.
+            continue
+        text = candidate.read_text(encoding="utf-8")
+        _rows, ends_open = _scan_fence_states(text)
+        if ends_open:
+            errors.append(
+                f"{relative_path}: unclosed code fence at end of file"
+            )
+        for anchor, fenced, required in anchor_specs:
+            matches = _anchored_matches(text, anchor, fenced=fenced)
+            if len(matches) != 1:
+                errors.append(
+                    f"{relative_path}: expected exactly one operative line"
+                    f" anchored by {anchor!r}, found {len(matches)}"
+                )
+                continue
+            for substring in required:
+                if substring not in matches[0]:
+                    errors.append(
+                        f"{relative_path}: anchored line {anchor!r} is"
+                        f" missing required text {substring!r}"
+                    )
+    return errors
+
+
 def validate_package(package_dir: Path) -> list[str]:
     """Return every validation error for ``package_dir`` in stable order."""
 
@@ -735,6 +1075,7 @@ def validate_package(package_dir: Path) -> list[str]:
             errors.append(f"missing required script file: {required_file}")
     errors.extend(_validate_policy_text(package_dir))
     errors.extend(_validate_gate_markers(package_dir))
+    errors.extend(_validate_anchored_markers(package_dir))
     errors.extend(_validate_openai_yaml(package_dir))
     return errors
 

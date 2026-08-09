@@ -32,11 +32,19 @@ from model_policy import (
     SOURCE_STDOUT_JSON,
     evaluate_model_policy,
     main,
+    monitor_orchestrator_binding,
     routing_fingerprint,
     strip_url_secrets,
     supervise_stream,
     validate_descriptor,
     verify_frozen_selection,
+    monitor_child_arguments,
+    monitor_child_prompt,
+    MONITOR_SLICE_BUDGET_SECONDS,
+    MONITOR_SLICE_CLEANUP_MARGIN_SECONDS,
+    MONITOR_CHILD_MIN_VIABLE_SECONDS,
+    MONITOR_CHILD_IDLE_TIMEOUT_SECONDS,
+    PER_ATTEMPT_CEILING_SECONDS,
 )
 
 
@@ -938,6 +946,20 @@ class AutoForwardSelectionTest(unittest.TestCase):
         self.assertEqual(result["model"], "gpt-5.7")
         self.assertEqual(result["arguments"][:2], ["-m", "gpt-5.7"])
         self.assertEqual(result["selection"]["reason"], "newer_model_auto_selected")
+
+    def test_generated_codex_arguments_pin_the_read_only_sandbox(self) -> None:
+        # R2 round-2 finding 3737466478, verified: only the entry smoke
+        # added `-s read-only` — the policy-generated argv pinned model and
+        # effort alone, so a reviewer invocation reconstructed from it
+        # inherited whatever sandbox the operator's ambient codex config
+        # set (workspace-write would let a review voice modify the
+        # implementation it judges). The generated argv itself now carries
+        # the pin.
+        result = evaluate_model_policy(request())["codex"]
+
+        arguments = result["arguments"]
+        self.assertIn("-s", arguments)
+        self.assertEqual(arguments[arguments.index("-s") + 1], "read-only")
 
     def test_newest_version_wins_and_sol_lineage_breaks_ties(self) -> None:
         codex = self.codex_with(
@@ -2173,6 +2195,260 @@ class QuotaWaitBoundTests(unittest.TestCase):
     def test_schema_version_is_bumped_for_the_quota_contract(self) -> None:
         result = evaluate_model_policy(request())
         self.assertEqual(result["version"], 6)  # literal pin, not the constant
+
+
+class MonitorChildInvocationTests(unittest.TestCase):
+    """Owner-pinned child invocation pins: the argv tail and the prompt are
+    single-source contracts — a drifted flag or dropped clause here is a
+    silently different execution boundary."""
+
+    def test_first_launch_argv_is_exactly_the_working_tail(self) -> None:
+        self.assertEqual(
+            monitor_child_arguments("claude-opus-5"),
+            [
+                "-p",
+                "--model",
+                "claude-opus-5",
+                "--effort",
+                "max",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--disable-slash-commands",
+                "--no-chrome",
+            ],
+        )
+
+    def test_resume_argv_prepends_the_session(self) -> None:
+        arguments = monitor_child_arguments("claude-opus-5", resume_id="sid-1")
+        self.assertEqual(arguments[:2], ["--resume", "sid-1"])
+        self.assertEqual(arguments[2:], monitor_child_arguments("claude-opus-5"))
+
+    def test_working_tail_never_carries_the_read_only_clamp(self) -> None:
+        arguments = monitor_child_arguments("claude-opus-5")
+        self.assertNotIn("--permission-mode", arguments)
+        self.assertNotIn("--allowedTools", arguments)
+        # The child session must PERSIST — resume is the owner cache lineage.
+        self.assertNotIn("--no-session-persistence", arguments)
+
+    def test_child_prompt_carries_every_load_bearing_clause(self) -> None:
+        prompt = monitor_child_prompt(
+            "/skill", "/state.md", "/state.md.attempt-abc.md", "abc123", 7
+        )
+        for clause in (
+            "EXACTLY ONE monitor iteration",
+            "NEVER write /state.md itself",
+            "/state.md.attempt-abc.md",
+            "--monitor-digest",
+            '"attempt_id": "abc123"',
+            '"tick_ordinal": 7',
+            "value-identical",
+            "Loading Contract",
+        ):
+            self.assertIn(clause, prompt)
+
+    def test_slice_constants_fit_inside_the_attempt_ceiling(self) -> None:
+        # Literal boundary pins: the slice must return before a parent's own
+        # 2700s attempt ceiling with margin to spare.
+        self.assertEqual(MONITOR_SLICE_BUDGET_SECONDS, 2400)
+        self.assertEqual(MONITOR_SLICE_CLEANUP_MARGIN_SECONDS, 120)
+        self.assertEqual(MONITOR_CHILD_MIN_VIABLE_SECONDS, 240)
+        self.assertEqual(MONITOR_CHILD_IDLE_TIMEOUT_SECONDS, 180)
+        self.assertLess(
+            MONITOR_SLICE_BUDGET_SECONDS + MONITOR_SLICE_CLEANUP_MARGIN_SECONDS,
+            PER_ATTEMPT_CEILING_SECONDS + 300,
+        )
+
+
+class MonitorOrchestratorBindingTests(unittest.TestCase):
+    """Phase 6 session ownership: the binding consumes the documented
+    persisted contract (resolved_conventions.model_runtime leg records),
+    re-checks floors because state is untrusted, records continuity
+    truthfully, and never re-selects, never invents a model, and never
+    turns ownership into a new block."""
+
+    @staticmethod
+    def _runtime(
+        reviewer_status: str = "ready",
+        base_status: str = "ready",
+        reviewer_model: str = "claude-opus-5",
+        base_model: str = "claude-fable-5",
+        base_write_verified: bool = True,
+    ) -> dict:
+        # The persisted shape from references/state-and-safety.md — each leg
+        # carries model + gate_status (policy_decision omitted for ON-FLOOR
+        # legs: the binding must not depend on it there; a CROSS-floor leg
+        # carries its selection evidence per the waiver contract). The base
+        # leg's host_agent_selection_verified flag is the write-capability
+        # prerequisite reviewer ownership consumes.
+        return {
+            "codex": {"model": "gpt-5.6-sol", "effort": "max", "gate_status": "ready"},
+            "claude": {
+                "model": base_model,
+                "gate_status": base_status,
+                "host_agent_selection_verified": base_write_verified,
+            },
+            "claude_reviewer": {
+                "model": reviewer_model,
+                "gate_status": reviewer_status,
+            },
+        }
+
+    def test_ready_reviewer_owns_the_monitor_session(self) -> None:
+        binding = monitor_orchestrator_binding(self._runtime())
+        self.assertEqual(binding["state"], "bound")
+        self.assertEqual(binding["lineage"], "reviewer")
+        # Literal pin: the owner is the reviewer leg's recorded selection,
+        # never a re-derived or invented slug.
+        self.assertEqual(binding["model"], "claude-opus-5")
+        self.assertEqual(binding["effort"], "max")
+        self.assertEqual(binding["reason_code"], "orchestrator_on_reviewer")
+        self.assertIsNone(binding["pending_owner"])
+
+    def test_below_floor_reviewer_model_never_binds_reviewer(self) -> None:
+        # State is untrusted: a hand-edited record naming a below-floor
+        # model must not own the session even with gate_status "ready".
+        binding = monitor_orchestrator_binding(
+            self._runtime(reviewer_model="claude-haiku-3")
+        )
+        self.assertEqual(binding["state"], "bound")
+        self.assertEqual(binding["lineage"], "base")
+        self.assertEqual(binding["model"], "claude-fable-5")
+
+    def test_below_floor_base_model_fails_closed(self) -> None:
+        binding = monitor_orchestrator_binding(
+            self._runtime(reviewer_status="degraded", base_model="claude-haiku-3")
+        )
+        self.assertEqual(binding["state"], "invalid")
+        self.assertTrue(binding["errors"])
+
+    def test_degraded_reviewer_keeps_the_monitor_on_base(self) -> None:
+        binding = monitor_orchestrator_binding(self._runtime(reviewer_status="degraded"))
+        self.assertEqual(binding["state"], "bound")
+        self.assertEqual(binding["lineage"], "base")
+        self.assertEqual(binding["model"], "claude-fable-5")
+        self.assertEqual(binding["reason_code"], "orchestrator_on_base")
+        self.assertIn("degraded", binding["reason"])
+
+    def test_pending_and_blocked_reviewer_bind_base(self) -> None:
+        for status in ("pending", "blocked"):
+            with self.subTest(reviewer_status=status):
+                binding = monitor_orchestrator_binding(
+                    self._runtime(reviewer_status=status)
+                )
+                self.assertEqual(binding["state"], "bound")
+                self.assertEqual(binding["lineage"], "base")
+
+    def test_opus_family_waived_base_still_hosts_the_monitor(self) -> None:
+        # The only base-waiver family the core allows is Opus — the base
+        # floor check accepts it WHEN the leg's own policy_decision records
+        # that model as its selection (the waiver evidence).
+        runtime = self._runtime(reviewer_status="blocked", base_model="claude-opus-5")
+        runtime["claude"]["policy_decision"] = {
+            "selection": {"selected_model": "claude-opus-5"}
+        }
+        binding = monitor_orchestrator_binding(runtime)
+        self.assertEqual(binding["state"], "bound")
+        self.assertEqual(binding["lineage"], "base")
+        self.assertEqual(binding["model"], "claude-opus-5")
+
+    def test_cross_lineage_swap_without_waiver_evidence_fails_closed(
+        self,
+    ) -> None:
+        # R2 round-2 finding 3737466436, empirically verified: a
+        # hand-edited record swapping the lineages (opus on the base leg,
+        # fable on the reviewer leg, both "ready", no policy_decision
+        # evidence) bound the BASE model as reviewer-lineage owner with no
+        # waiver consulted. A cross-lineage model is legitimate only when
+        # the leg's own persisted policy_decision records it as the
+        # selection; an unevidenced swap leaves no landed leg and fails
+        # closed.
+        binding = monitor_orchestrator_binding(
+            self._runtime(
+                base_model="claude-opus-5", reviewer_model="claude-fable-5"
+            )
+        )
+        self.assertEqual(binding["state"], "invalid")
+
+    def test_unverified_base_write_path_keeps_monitor_on_base(self) -> None:
+        # R2 round-2 finding 3737466426, empirically verified: the doc
+        # makes a confirmed write-capable base worker a prerequisite of
+        # reviewer ownership, but the binder returned
+        # orchestrator_on_reviewer for the ROUTINE unverified-host shape
+        # (host_agent_selection_verified false — the field's initialized
+        # default). The prose veto is now the binder's own answer.
+        binding = monitor_orchestrator_binding(
+            self._runtime(base_write_verified=False)
+        )
+        self.assertEqual(binding["state"], "bound")
+        self.assertEqual(binding["lineage"], "base")
+        self.assertEqual(binding["reason_code"], "orchestrator_on_base")
+        self.assertIn("write", binding["reason"])
+
+    def test_unverified_base_write_path_without_base_leg_fails_closed(
+        self,
+    ) -> None:
+        # No compliant write path and no landed base owner: reviewer
+        # ownership is forbidden by the doc's prerequisite and there is
+        # nothing to fall back to — fail closed, never bind.
+        binding = monitor_orchestrator_binding(
+            self._runtime(base_status="blocked", base_write_verified=False)
+        )
+        self.assertEqual(binding["state"], "invalid")
+
+    def test_missing_reviewer_leg_falls_back_to_base_with_reason(self) -> None:
+        runtime = self._runtime()
+        del runtime["claude_reviewer"]
+        binding = monitor_orchestrator_binding(runtime)
+        self.assertEqual(binding["state"], "bound")
+        self.assertEqual(binding["lineage"], "base")
+        self.assertIn("missing", binding["reason"])
+
+    def test_no_landed_leg_fails_closed_as_invalid(self) -> None:
+        binding = monitor_orchestrator_binding(
+            self._runtime(reviewer_status="blocked", base_status="blocked")
+        )
+        self.assertEqual(binding["state"], "invalid")
+        self.assertTrue(binding["errors"])
+
+    def test_malformed_runtime_fails_closed(self) -> None:
+        for garbage in (None, [], "ready", 7):
+            with self.subTest(garbage=garbage):
+                binding = monitor_orchestrator_binding(garbage)
+                self.assertEqual(binding["state"], "invalid")
+
+    def test_empty_model_string_never_binds(self) -> None:
+        binding = monitor_orchestrator_binding(
+            self._runtime(reviewer_model="", base_model="")
+        )
+        self.assertEqual(binding["state"], "invalid")
+
+    def test_base_session_gets_truthful_continuity_binding(self) -> None:
+        # The F5 case: a base working session reaches Phase 6 while the
+        # reviewer leg is ready. The record must stay truthful (base owns
+        # THIS session) and carry the nominal owner for the next boundary.
+        binding = monitor_orchestrator_binding(
+            self._runtime(), session_model="claude-fable-5"
+        )
+        self.assertEqual(binding["state"], "bound")
+        self.assertEqual(binding["lineage"], "base")
+        self.assertEqual(binding["model"], "claude-fable-5")
+        self.assertEqual(binding["reason_code"], "orchestrator_continuity")
+        self.assertEqual(binding["pending_owner"], "claude-opus-5")
+
+    def test_owner_session_binds_nominally_with_session_model(self) -> None:
+        binding = monitor_orchestrator_binding(
+            self._runtime(), session_model="claude-opus-5"
+        )
+        self.assertEqual(binding["reason_code"], "orchestrator_on_reviewer")
+        self.assertIsNone(binding["pending_owner"])
+
+    def test_unrecorded_session_model_fails_closed(self) -> None:
+        binding = monitor_orchestrator_binding(
+            self._runtime(), session_model="claude-sonnet-5"
+        )
+        self.assertEqual(binding["state"], "invalid")
+        self.assertTrue(binding["errors"])
 
 
 if __name__ == "__main__":

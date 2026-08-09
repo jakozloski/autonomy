@@ -13,6 +13,8 @@ from state_schema import (
     evaluate_state_text,
     validate_operation_collection,
     validate_operation_result_record,
+    monitor_digest,
+    monitor_extract,
 )
 
 SHA_A = "a" * 40
@@ -1894,6 +1896,245 @@ class WaitKeyLifecycleTests(unittest.TestCase):
         )
 
 
+class ModelRuntimeShapeTests(unittest.TestCase):
+    """R2 round-2 finding 3737466436: validate_conventions ignored
+    model_runtime entirely — unknown legs, unknown fields, and wrong
+    types all validated clean, leaving the binder's floor re-check as the
+    only defense against hand-edited gate records."""
+
+    def test_unknown_leg_and_unknown_field_are_errors(self) -> None:
+        from state_schema import validate_model_runtime_shape
+
+        errors = validate_model_runtime_shape(
+            {
+                "mystery_leg": {"model": "x"},
+                "claude": {
+                    "model": "claude-fable-5",
+                    "gate_status": "ready",
+                    "totally_unknown_field": 1,
+                },
+            }
+        )
+        joined = "\n".join(errors)
+        self.assertIn("mystery_leg", joined)
+        self.assertIn("totally_unknown_field", joined)
+
+    def test_wrong_types_are_errors(self) -> None:
+        from state_schema import validate_model_runtime_shape
+
+        errors = validate_model_runtime_shape(
+            {
+                "claude": {
+                    "model": "",
+                    "gate_status": 5,
+                    "host_agent_selection_verified": "yes",
+                    "policy_decision": "not-a-mapping",
+                }
+            }
+        )
+        joined = "\n".join(errors)
+        self.assertIn("model", joined)
+        self.assertIn("gate_status", joined)
+        self.assertIn("host_agent_selection_verified", joined)
+        self.assertIn("policy_decision", joined)
+
+    def test_documented_contract_shape_is_clean(self) -> None:
+        from state_schema import validate_model_runtime_shape
+
+        self.assertEqual(
+            validate_model_runtime_shape(
+                {
+                    "codex": {
+                        "model": "gpt-5.6-sol",
+                        "effort": "max",
+                        "live_catalog_verified_at": None,
+                        "gate_status": "ready",
+                        "policy_decision": {},
+                    },
+                    "claude": {
+                        "model": "claude-fable-5",
+                        "effort": "max",
+                        "subagent_override": None,
+                        "effort_override": None,
+                        "host_agent_selection_verified": True,
+                        "gate_status": "ready",
+                        "policy_decision": {},
+                    },
+                    "claude_reviewer": {
+                        "model": "claude-opus-5",
+                        "effort": "max",
+                        "subagent_override": None,
+                        "effort_override": None,
+                        "host_agent_selection_verified": False,
+                        "gate_status": "ready",
+                        "policy_decision": {},
+                    },
+                    "escalation_invocations": [
+                        {
+                            "trigger": "adversarial_escalation",
+                            "voice": "fresh_base_cli",
+                            "reason": "rule 3",
+                            "phase": "phase_4",
+                            "session_id": "s1",
+                            "pass_number": 4,
+                            "extra_audit_note": "append-only rows may grow",
+                        }
+                    ],
+                }
+            ),
+            [],
+        )
+
+
+class ValidatedTicketShapeTests(unittest.TestCase):
+    """R2 round-2 finding 3737466471 (the enforceable kernel):
+    validated_ticket was checked only as "must be a mapping" while
+    source_fingerprint was write-only — no executable check tied a
+    mutation-ready record to a complete validation. All-null stays valid
+    (entry states); a provider_id present without the rest of the
+    validation evidence is the tamper shape the planner then trusts."""
+
+    def test_all_null_validated_ticket_stays_valid(self) -> None:
+        result = evaluate_state_text(FULL_STATE)
+        self.assertEqual(result["errors"], [])
+
+    def test_provider_id_without_validation_evidence_is_suspect(self) -> None:
+        text = _mutate(
+            FULL_STATE,
+            "  provider_id: null",
+            '  provider_id: "cc8876e3-1483-4074-8d49-061f369f1f61"',
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("validated_ticket" in error for error in result["errors"]),
+            result["errors"],
+        )
+
+    def test_documented_persistence_shape_validates_clean(self) -> None:
+        # Series self-review finding: the coherence rule initially
+        # required tracker_type and source_fingerprint — but the two
+        # documented persistence procedures write only identifier +
+        # provider_id + validated_at, tracker_type has no writer anywhere,
+        # and the fingerprint (a hash of PR title/body linkage) cannot
+        # exist before Phase 5 creates the PR. The rule requires only the
+        # fields the workflow actually writes; the rest are type-checked
+        # when present.
+        text = _mutate(
+            FULL_STATE,
+            "  identifier: null",
+            '  identifier: "WEB-9247"',
+        )
+        text = _mutate(
+            text,
+            "  provider_id: null",
+            '  provider_id: "cc8876e3-1483-4074-8d49-061f369f1f61"',
+        )
+        text = _mutate(
+            text,
+            "  validated_at: null",
+            '  validated_at: "2026-08-06T20:35:00Z"',
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["state"], VALID)
+
+
+class SkippedDependencyRecordTests(unittest.TestCase):
+    """R2 round-2 finding 3737466456: a dependency descendant the planner
+    never attempted needs a persistable terminal record that is NOT
+    fabricated attempt evidence — and with it, the planner's terminal
+    failed answer must validate under a terminal monitor (before this
+    contract existed, no monitor state could persist that answer)."""
+
+    OPS_TWO = '    operations: ["github_assignees", "tracker_assign"]'
+
+    FAILED_OK = "\n".join(
+        (
+            '        status: "failed"',
+            "        attempts: 1",
+            '        started_at: "2026-07-14T16:59:00Z"',
+            '        verified_at: "2026-07-14T17:00:00Z"',
+            '        error: "Linear returned 500"',
+        )
+    )
+    SKIPPED_OK = "\n".join(
+        (
+            '        status: "skipped_dependency"',
+            "        attempts: 0",
+            '        error: "dependency failed: github_assignees"',
+        )
+    )
+
+    def _results(self, first: str, second: str) -> str:
+        return "\n".join(
+            (
+                "    operation_results:",
+                '      "github_assignees":',
+                first,
+                '      "tracker_assign":',
+                second,
+            )
+        )
+
+    def test_skipped_record_round_trips_a_terminal_failed_handoff(
+        self,
+    ) -> None:
+        text = _qa_handoff(
+            self.OPS_TWO, self._results(self.FAILED_OK, self.SKIPPED_OK), "failed"
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["state"], VALID)
+
+    def test_skipped_record_with_attempts_is_suspect(self) -> None:
+        bad = self.SKIPPED_OK.replace("attempts: 0", "attempts: 1")
+        text = _qa_handoff(
+            self.OPS_TWO, self._results(self.FAILED_OK, bad), "failed"
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("attempts must be 0" in error for error in result["errors"]),
+            result["errors"],
+        )
+
+    def test_skipped_record_without_error_is_suspect(self) -> None:
+        bad = "\n".join(
+            (
+                '        status: "skipped_dependency"',
+                "        attempts: 0",
+            )
+        )
+        text = _qa_handoff(
+            self.OPS_TWO, self._results(self.FAILED_OK, bad), "failed"
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any(
+                "requires a non-empty error" in error
+                for error in result["errors"]
+            ),
+            result["errors"],
+        )
+
+    def test_skipped_record_with_attempt_evidence_is_suspect(self) -> None:
+        bad = self.SKIPPED_OK + '\n        started_at: "2026-07-14T16:59:00Z"'
+        text = _qa_handoff(
+            self.OPS_TWO, self._results(self.FAILED_OK, bad), "failed"
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any(
+                "forbids attempt evidence" in error
+                for error in result["errors"]
+            ),
+            result["errors"],
+        )
+
+
 class OperationResultContractRedTests(unittest.TestCase):
     """R3-F11: the canonical operation-result contract (strict union of the
     schema and resume-helper rules), pinned on the schema side.
@@ -2381,10 +2622,11 @@ class PostPushUntilCeilingTests(unittest.TestCase):
             any("post_push_until" in error for error in result["errors"]), result["errors"]
         )
 
-    def test_absurd_window_override_falls_back_and_never_tracebacks(self) -> None:
-        """A state-supplied window beyond the one-day sanity bound is garbage:
-        it must not neuter the ceiling and must not overflow the timedelta
-        arithmetic into a traceback — the validator always returns a verdict."""
+    def test_absurd_window_override_is_rejected_loudly_and_never_tracebacks(self) -> None:
+        """R5-F1: a state-supplied window beyond the one-day sanity bound is
+        garbage: it must not neuter the ceiling, must not overflow the
+        timedelta arithmetic into a traceback — and it must be rejected as its
+        OWN loud error, never silently replaced by the default."""
         text = self._with_push_until(
             "2999-01-01T00:00:00Z", window_override=90000000000000
         )
@@ -2393,6 +2635,91 @@ class PostPushUntilCeilingTests(unittest.TestCase):
         self.assertTrue(
             any("post_push_until" in error for error in result["errors"]), result["errors"]
         )
+        self.assertTrue(
+            any("bot_grace_window_seconds" in error for error in result["errors"]),
+            result["errors"],
+        )
+
+    def test_r5_repro_two_day_window_gets_a_workable_recovery(self) -> None:
+        """R5-F1 reproduction: bot_grace_window_seconds: 172800 armed exactly
+        as the prose mandates (post_push_until = now + declared window) must
+        name the override as the defect with a recovery that works — not only
+        a ceiling error whose re-arm advice reproduces itself forever."""
+        text = self._with_push_until(
+            "2026-08-06T12:00:00+00:00", window_override=172800
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any(
+                "bot_grace_window_seconds" in error and "fix or remove" in error
+                for error in result["errors"]
+            ),
+            result["errors"],
+        )
+
+    def test_declared_garbage_override_is_rejected_without_post_push_until(self) -> None:
+        """R5-F1: the override is validated where it is DECLARED, not only
+        where it is consumed — a project must learn at entry, not at the
+        first push that arms the window."""
+        text = _mutate(
+            FULL_STATE,
+            "resolved_conventions:\n  quality_check_steps: []",
+            "resolved_conventions:\n  quality_check_steps: []\n  monitor_constants:\n"
+            "    bot_grace_window_seconds: 172800",
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("bot_grace_window_seconds" in error for error in result["errors"]),
+            result["errors"],
+        )
+
+    def test_override_bound_is_inclusive_at_86400_and_rejects_86401(self) -> None:
+        # Literal boundary pins on the business bound (one day): 86400 is the
+        # last legal override; 86401 is rejected loudly.
+        ok = self._with_push_until("2026-08-05T12:05:00+00:00", window_override=86400)
+        result = evaluate_state_text(ok)
+        self.assertEqual(result["state"], VALID, result["errors"])
+        over = self._with_push_until("2026-08-05T12:05:00+00:00", window_override=86401)
+        result = evaluate_state_text(over)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("bot_grace_window_seconds" in error for error in result["errors"]),
+            result["errors"],
+        )
+
+    def test_explicit_null_override_is_the_unset_idiom_not_an_error(self) -> None:
+        # Every template key initializes to null; an explicit null selects
+        # the default exactly like an absent key (documented in the
+        # monitor_constants comment), never a loud rejection.
+        text = _mutate(
+            FULL_STATE,
+            "resolved_conventions:\n  quality_check_steps: []",
+            "resolved_conventions:\n  quality_check_steps: []\n  monitor_constants:\n"
+            "    bot_grace_window_seconds: null",
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], VALID, result["errors"])
+
+    def test_non_integer_and_non_positive_overrides_are_rejected(self) -> None:
+        for declared in ('"1800"', "0", "-5"):
+            with self.subTest(declared=declared):
+                text = _mutate(
+                    FULL_STATE,
+                    "resolved_conventions:\n  quality_check_steps: []",
+                    "resolved_conventions:\n  quality_check_steps: []\n  monitor_constants:\n"
+                    f"    bot_grace_window_seconds: {declared}",
+                )
+                result = evaluate_state_text(text)
+                self.assertEqual(result["state"], SUSPECT)
+                self.assertTrue(
+                    any(
+                        "bot_grace_window_seconds" in error
+                        for error in result["errors"]
+                    ),
+                    result["errors"],
+                )
 
     def test_declared_window_override_extends_the_ceiling(self) -> None:
         # Documented per-project override: bot_grace_window_seconds: 1800.
@@ -2405,6 +2732,381 @@ class PostPushUntilCeilingTests(unittest.TestCase):
         self.assertTrue(
             any("post_push_until" in error for error in result["errors"]), result["errors"]
         )
+
+
+class MonitorOwnershipTests(unittest.TestCase):
+    """Phase 6 session ownership block: optional for migration (absent =
+    valid), but when present it is a versioned handoff that fails closed —
+    every field required, enum-bound lineage, no unknown keys, no future
+    binding instant."""
+
+    FIXED_NOW = "2026-08-04T12:00:00+00:00"
+
+    def setUp(self) -> None:
+        import state_schema
+        from datetime import datetime
+
+        self._saved_utcnow = state_schema._utcnow
+        fixed = datetime.fromisoformat(self.FIXED_NOW)
+        state_schema._utcnow = lambda: fixed
+
+    def tearDown(self) -> None:
+        import state_schema
+
+        state_schema._utcnow = self._saved_utcnow
+
+    def _with_block(self, block_lines: str) -> str:
+        return _mutate(
+            FULL_STATE,
+            "post_push_until: null",
+            f"post_push_until: null\nmonitor_ownership:\n{block_lines}",
+        )
+
+    WELL_FORMED = (
+        '  lineage: "reviewer"\n'
+        '  model: "claude-opus-5"\n'
+        '  bound_at: "2026-08-04T11:55:00+00:00"\n'
+        '  reason_code: "orchestrator_on_reviewer"'
+    )
+
+    def test_absent_block_stays_valid_for_pre_feature_states(self) -> None:
+        result = evaluate_state_text(FULL_STATE)
+        self.assertEqual(result["state"], VALID, result["errors"])
+
+    def test_well_formed_block_is_valid(self) -> None:
+        result = evaluate_state_text(self._with_block(self.WELL_FORMED))
+        self.assertEqual(result["state"], VALID, result["errors"])
+
+    def test_missing_field_fails_closed(self) -> None:
+        block = (
+            '  lineage: "reviewer"\n'
+            '  model: "claude-opus-5"\n'
+            '  bound_at: "2026-08-04T11:55:00+00:00"'
+        )
+        result = evaluate_state_text(self._with_block(block))
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any(
+                "monitor_ownership" in error and "reason_code" in error
+                for error in result["errors"]
+            ),
+            result["errors"],
+        )
+
+    def test_unknown_key_is_rejected(self) -> None:
+        block = self.WELL_FORMED + '\n  session_id: "abc"'
+        result = evaluate_state_text(self._with_block(block))
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any(
+                "monitor_ownership" in error and "unknown key" in error
+                for error in result["errors"]
+            ),
+            result["errors"],
+        )
+
+    def test_illegal_lineage_is_rejected(self) -> None:
+        block = self.WELL_FORMED.replace('"reviewer"', '"codex"')
+        result = evaluate_state_text(self._with_block(block))
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("monitor_ownership.lineage" in error for error in result["errors"]),
+            result["errors"],
+        )
+
+    def test_empty_model_is_rejected(self) -> None:
+        block = self.WELL_FORMED.replace('"claude-opus-5"', '""')
+        result = evaluate_state_text(self._with_block(block))
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("monitor_ownership.model" in error for error in result["errors"]),
+            result["errors"],
+        )
+
+    def test_future_bound_at_beyond_skew_is_rejected(self) -> None:
+        block = self.WELL_FORMED.replace(
+            "2026-08-04T11:55:00+00:00", "2026-08-04T12:05:01+00:00"
+        )
+        result = evaluate_state_text(self._with_block(block))
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("monitor_ownership.bound_at" in error for error in result["errors"]),
+            result["errors"],
+        )
+
+    def test_base_lineage_block_is_valid(self) -> None:
+        block = (
+            '  lineage: "base"\n'
+            '  model: "claude-fable-5"\n'
+            '  bound_at: "2026-08-04T11:55:00+00:00"\n'
+            '  reason_code: "orchestrator_on_base"'
+        )
+        result = evaluate_state_text(self._with_block(block))
+        self.assertEqual(result["state"], VALID, result["errors"])
+
+    def test_continuity_binding_requires_pending_owner(self) -> None:
+        block = (
+            '  lineage: "base"\n'
+            '  model: "claude-fable-5"\n'
+            '  bound_at: "2026-08-04T11:55:00+00:00"\n'
+            '  reason_code: "orchestrator_continuity"'
+        )
+        result = evaluate_state_text(self._with_block(block))
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("pending_owner" in error for error in result["errors"]),
+            result["errors"],
+        )
+
+    def test_continuity_binding_with_pending_owner_is_valid(self) -> None:
+        block = (
+            '  lineage: "base"\n'
+            '  model: "claude-fable-5"\n'
+            '  bound_at: "2026-08-04T11:55:00+00:00"\n'
+            '  reason_code: "orchestrator_continuity"\n'
+            '  pending_owner: "claude-opus-5"'
+        )
+        result = evaluate_state_text(self._with_block(block))
+        self.assertEqual(result["state"], VALID, result["errors"])
+
+    def test_empty_pending_owner_is_rejected(self) -> None:
+        block = self.WELL_FORMED + '\n  pending_owner: ""'
+        result = evaluate_state_text(self._with_block(block))
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("pending_owner" in error for error in result["errors"]),
+            result["errors"],
+        )
+
+
+class NextRetryOwnerLivenessTests(unittest.TestCase):
+    """R5-F2: the model gate also runs before the monitor exists (entry
+    preflight, plan review), and the documented lifecycle clears
+    next_retry_at when the gate lands ready/blocked — so a wait carried by a
+    blocked/complete owner or an aborted workflow is a stale resume point
+    the validator must reject, while a live pre-monitor wait stays valid."""
+
+    FIXED_NOW = "2026-08-04T12:00:00+00:00"
+    WITHIN_CEILING = "2026-08-04T12:10:00+00:00"
+
+    def setUp(self) -> None:
+        import state_schema
+        from datetime import datetime
+
+        self._saved_utcnow = state_schema._utcnow
+        fixed = datetime.fromisoformat(self.FIXED_NOW)
+        state_schema._utcnow = lambda: fixed
+
+    def tearDown(self) -> None:
+        import state_schema
+
+        state_schema._utcnow = self._saved_utcnow
+
+    def _with_wait(self, text: str) -> str:
+        return _mutate(
+            text,
+            "post_push_until: null",
+            f'post_push_until: null\nnext_retry_at: "{self.WITHIN_CEILING}"',
+        )
+
+    def test_live_pre_monitor_wait_stays_valid(self) -> None:
+        # The legitimate case the tie must NOT reject (the D1 lesson): the
+        # gate hit quota during plan (current_phase plan, in_progress,
+        # monitor pending) and persisted its bounded wait.
+        result = evaluate_state_text(self._with_wait(FULL_STATE))
+        self.assertEqual(result["state"], VALID, result["errors"])
+
+    def test_blocked_pre_monitor_owner_rejects_the_wait(self) -> None:
+        # Dawid's R5 hole: workflow blocked pre-monitor (monitor still
+        # pending) carrying a live resume-wait must be suspect — resume
+        # `continue` would sleep toward a wait nothing will consume.
+        text = _mutate(self._with_wait(FULL_STATE), '  plan: "in_progress"', '  plan: "blocked"')
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("next_retry_at" in error for error in result["errors"]), result["errors"]
+        )
+
+    def test_completed_owner_rejects_the_stale_wait(self) -> None:
+        # The gate landed and the phase completed; a surviving wait violates
+        # the documented clear-on-landing lifecycle.
+        text = _mutate(self._with_wait(FULL_STATE), '  plan: "in_progress"', '  plan: "complete"')
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("next_retry_at" in error for error in result["errors"]), result["errors"]
+        )
+
+    def test_aborted_workflow_rejects_the_wait(self) -> None:
+        text = _mutate(self._with_wait(FULL_STATE), 'current_phase: "plan"', 'current_phase: "aborted_at_plan"')
+        text = _mutate(text, '  plan: "in_progress"', '  plan: "blocked"')
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("next_retry_at" in error and "aborted" in error for error in result["errors"]),
+            result["errors"],
+        )
+
+    def test_monitor_in_progress_wait_still_valid(self) -> None:
+        # Regression guard: the monitor's own live wait (liveness ladder
+        # retries during monitoring) remains legal — owned by the existing
+        # terminal-monitor rule, not double-reported by the liveness tie.
+        text = _mutate(
+            _in_progress_monitor_state(),
+            "post_push_until: null",
+            f'post_push_until: null\nnext_retry_at: "{self.WITHIN_CEILING}"',
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], VALID, result["errors"])
+
+    def _with_gate_status(self, text: str, leg: str, status: str) -> str:
+        return _mutate(
+            text,
+            "resolved_conventions:\n  quality_check_steps: []",
+            "resolved_conventions:\n  quality_check_steps: []\n  model_runtime:\n"
+            f"    {leg}:\n"
+            '      model: "x"\n'
+            f'      gate_status: "{status}"',
+        )
+
+    def test_landed_blocked_gate_rejects_the_wait_even_at_entry(self) -> None:
+        # R5-review F4: the wait clears when the gate lands ready/blocked —
+        # a persisted blocked gate_status beside a live wait is stale in
+        # EVERY phase, entry/takeover included.
+        for leg in ("codex", "claude", "claude_reviewer"):
+            with self.subTest(leg=leg):
+                text = _mutate(
+                    self._with_wait(FULL_STATE),
+                    'current_phase: "plan"',
+                    'current_phase: "entry"',
+                )
+                text = _mutate(text, '  plan: "in_progress"', '  plan: "pending"')
+                text = self._with_gate_status(text, leg, "blocked")
+                result = evaluate_state_text(text)
+                self.assertEqual(result["state"], SUSPECT)
+                self.assertTrue(
+                    any(
+                        "next_retry_at" in error and "landed" in error
+                        for error in result["errors"]
+                    ),
+                    result["errors"],
+                )
+
+    def test_pending_gate_keeps_the_entry_wait_valid(self) -> None:
+        # Pass-through: a gate mid-wait (pending) beside its live wait is
+        # the legitimate entry-preflight shape.
+        text = _mutate(
+            self._with_wait(FULL_STATE),
+            'current_phase: "plan"',
+            'current_phase: "entry"',
+        )
+        text = _mutate(text, '  plan: "in_progress"', '  plan: "pending"')
+        text = self._with_gate_status(text, "codex", "pending")
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], VALID, result["errors"])
+
+
+class MonitorCliBlockTests(unittest.TestCase):
+    """Runner-owned monitor_cli control block: fail-closed shape, nullable
+    bootstrap fields, and the digest-excludes-the-block property that makes
+    single-write finalization sound."""
+
+    WELL_FORMED = (
+        "  schema_version: 1\n"
+        "  child_session_id: null\n"
+        '  owner_model: "claude-opus-5"\n'
+        "  last_completed_attempt_id: null\n"
+        "  child_failures: []\n"
+        "  in_flight: null"
+    )
+
+    def _with_block(self, block_body: str) -> str:
+        return _mutate(
+            FULL_STATE,
+            "post_push_until: null",
+            "post_push_until: null\nmonitor_cli:\n" + block_body,
+        )
+
+    def test_well_formed_block_is_valid(self) -> None:
+        result = evaluate_state_text(self._with_block(self.WELL_FORMED))
+        self.assertEqual(result["state"], VALID, result["errors"])
+
+    def test_missing_required_key_fails_closed(self) -> None:
+        body = self.WELL_FORMED.replace("  in_flight: null", "")
+        result = evaluate_state_text(self._with_block(body.rstrip("\n")))
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("in_flight" in error and "missing" in error for error in result["errors"]),
+            result["errors"],
+        )
+
+    def test_unknown_key_and_bad_version_fail_closed(self) -> None:
+        body = self.WELL_FORMED + "\n  surprise: 1"
+        result = evaluate_state_text(self._with_block(body))
+        self.assertEqual(result["state"], SUSPECT)
+        body2 = self.WELL_FORMED.replace("schema_version: 1", "schema_version: 2")
+        result2 = evaluate_state_text(self._with_block(body2))
+        self.assertEqual(result2["state"], SUSPECT)
+
+    def test_populated_in_flight_is_valid_and_pinned(self) -> None:
+        body = self.WELL_FORMED.replace(
+            "  in_flight: null",
+            "  in_flight:\n"
+            '    attempt_id: "abc123"\n'
+            "    tick_ordinal: 3\n"
+            '    started_at: "2026-08-04T11:00:00+00:00"\n'
+            '    deadline_at: "2026-08-04T11:45:00+00:00"\n'
+            "    child_pid: 4242\n"
+            "    child_pgid: 4242\n"
+            '    child_started_fingerprint: "Wed Aug  6 12:00:00 2026"\n'
+            '    base_workflow_digest: "abababababababababababababababababababababababababababababababab"',
+        )
+        result = evaluate_state_text(self._with_block(body))
+        self.assertEqual(result["state"], VALID, result["errors"])
+        for mutation, expect in (
+            (("tick_ordinal: 3", "tick_ordinal: 0"), "tick_ordinal"),
+            (("child_pid: 4242", "child_pid: 0"), "child_pid"),
+            (('started_at: "2026-08-04T11:00:00+00:00"', 'started_at: "nope"'), "started_at"),
+            (('attempt_id: "abc123"', 'attempt_id: ""'), "attempt_id"),
+            (("child_pgid: 4242", "child_pgid: 4243"), "child_pgid"),
+        ):
+            with self.subTest(field=expect):
+                mutated = body.replace(*mutation)
+                result = evaluate_state_text(self._with_block(mutated))
+                self.assertEqual(result["state"], SUSPECT)
+                self.assertTrue(
+                    any(expect in error for error in result["errors"]), result["errors"]
+                )
+
+    def test_child_failures_records_are_shape_checked(self) -> None:
+        body = self.WELL_FORMED.replace(
+            "  child_failures: []",
+            "  child_failures:\n"
+            '    - signature: "monitor-child:timeout"\n'
+            '      at: "2026-08-04T11:00:00+00:00"',
+        )
+        result = evaluate_state_text(self._with_block(body))
+        self.assertEqual(result["state"], VALID, result["errors"])
+        bad = body.replace('      at: "2026-08-04T11:00:00+00:00"', '      at: "later"')
+        result = evaluate_state_text(self._with_block(bad))
+        self.assertEqual(result["state"], SUSPECT)
+
+    def test_digest_excludes_the_runner_owned_block(self) -> None:
+        # THE single-write-finalization property: mutating monitor_cli must
+        # not move the workflow digest, and mutating workflow state must.
+        base = FULL_STATE
+        with_block = self._with_block(self.WELL_FORMED)
+        self.assertEqual(monitor_digest(base), monitor_digest(with_block))
+        other = _mutate(base, "monitor_poll_ticks: 0", "monitor_poll_ticks: 1")
+        self.assertNotEqual(monitor_digest(base), monitor_digest(other))
+
+    def test_monitor_extract_reports_the_runner_fields(self) -> None:
+        extract = monitor_extract(self._with_block(self.WELL_FORMED))
+        self.assertEqual(extract["state"], VALID, extract["errors"])
+        self.assertEqual(extract["counters"]["monitor_poll_ticks"], 0)
+        self.assertEqual(extract["monitor_cli"]["owner_model"], "claude-opus-5")
+        self.assertIsNotNone(extract["digest"])
+        self.assertEqual(extract["current_phase"], "plan")
 
 
 if __name__ == "__main__":

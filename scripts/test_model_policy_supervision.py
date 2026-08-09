@@ -30,6 +30,139 @@ class SuperviseStreamLiveProcessTests(unittest.TestCase):
     kernel pipe capacity while the auth event arrives on the other.
     """
 
+    def test_nonzero_child_exit_after_clean_streams_is_not_clean(self) -> None:
+        # R2 round-2 finding 3737466493, empirically verified: EOF only
+        # unregisters the pipes, so a child that printed benign output and
+        # exited 7 reported outcome "clean"/exit 0 — a failed smoke or
+        # review invocation could pass a mandatory gate. With the child's
+        # wait supplied, a nonzero status after clean streams must land as
+        # internal_failure (blocking failure matrix).
+        process = subprocess.Popen(
+            [sys.executable, "-c", "print('{}'); raise SystemExit(7)"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+
+        def kill_group() -> None:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+
+        try:
+            result = supervise_stream(
+                process.stdout,
+                process.stderr,
+                kill_group,
+                lambda: process.wait(timeout=10),
+            )
+            self.assertEqual(result["outcome"], "internal_failure")
+            self.assertNotEqual(result["exit_code"], 0)
+        finally:
+            if process.poll() is None:  # pragma: no cover - cleanup safety
+                kill_group()
+                process.wait(timeout=10)
+            for pipe in (process.stdout, process.stderr):
+                if pipe is not None:
+                    pipe.close()
+
+    def test_zero_child_exit_after_clean_streams_stays_clean(self) -> None:
+        # The pass-through side of the new guard: a well-behaved child that
+        # exits 0 after clean streams must remain outcome "clean" — the
+        # exit-code observation must not manufacture failures.
+        process = subprocess.Popen(
+            [sys.executable, "-c", "print('{}')"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+
+        def kill_group() -> None:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+
+        try:
+            result = supervise_stream(
+                process.stdout,
+                process.stderr,
+                kill_group,
+                lambda: process.wait(timeout=10),
+            )
+            self.assertEqual(result["outcome"], "clean")
+            self.assertEqual(result["exit_code"], 0)
+        finally:
+            if process.poll() is None:  # pragma: no cover - cleanup safety
+                kill_group()
+                process.wait(timeout=10)
+            for pipe in (process.stdout, process.stderr):
+                if pipe is not None:
+                    pipe.close()
+
+    def test_dead_child_kill_race_returns_structured_result(self) -> None:
+        # R2 round-2 finding 3737466443, second leg: a CLI that prints its
+        # failure and exits races the kill decision — killpg on the dead
+        # (even zombie, on Darwin) child raises ProcessLookupError, which
+        # previously escaped supervise_stream as a raw traceback. The dead
+        # child IS the kill's goal state: the classified outcome must come
+        # back structured.
+        script = textwrap.dedent(
+            """
+            import json, sys
+            sys.stdout.write(json.dumps({"type": "error", "status": 401}) + "\\n")
+            sys.stdout.flush()
+            """
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        process.wait(timeout=10)  # child is fully dead before supervision
+
+        def kill_group() -> None:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+
+        try:
+            result = supervise_stream(process.stdout, process.stderr, kill_group)
+            self.assertEqual(result["outcome"], "auth_error")
+        finally:
+            for pipe in (process.stdout, process.stderr):
+                if pipe is not None:
+                    pipe.close()
+
+    def test_raising_kill_callback_returns_structured_internal_failure(
+        self,
+    ) -> None:
+        # A cleanup failure that is NOT the child-already-dead race must
+        # not escape either — it becomes the structured internal_failure
+        # the docstring promises for every failure outcome.
+        script = textwrap.dedent(
+            """
+            import json, sys, time
+            sys.stdout.write(json.dumps({"type": "error", "status": 401}) + "\\n")
+            sys.stdout.flush()
+            time.sleep(120)
+            """
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+
+        def raising_kill() -> None:
+            raise PermissionError("kill denied")
+
+        try:
+            result = supervise_stream(process.stdout, process.stderr, raising_kill)
+            self.assertEqual(result["outcome"], "internal_failure")
+        finally:
+            if process.poll() is None:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                process.wait(timeout=10)
+            for pipe in (process.stdout, process.stderr):
+                if pipe is not None:
+                    pipe.close()
+
     def test_flooding_one_channel_does_not_prevent_prompt_termination(self) -> None:
         script = textwrap.dedent(
             """
