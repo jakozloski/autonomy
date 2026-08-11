@@ -8,14 +8,15 @@ description: "Full autonomous issue or PR workflow: resolve repo conventions, pl
 Run the whole scoped workflow: understand → plan → review plan → implement → review code → fix findings → merge readiness (world-state checks) → update PR → monitor until clean, paused for a human, or genuinely blocked.
 
 <!--
-SOURCE OF TRUTH: this entire directory:
-  <repo>/.agents/skills/autonomy/
-
-The project-level `.claude/skills/autonomy/` path may symlink here.
+SOURCE OF TRUTH: the repository-tracked copy of this entire directory — the
+real directory this file lives in. Its path varies by repository:
+`.agents/skills/autonomy/` (with `.claude/skills/autonomy` symlinked to it)
+in some repositories, or directly `.claude/skills/autonomy/` in others.
 Never edit a user-level fallback as the canonical copy. After this package is
-merged, refresh a user-level copy with the complete directory, not SKILL.md alone:
-  rsync -a <repo>/.agents/skills/autonomy/ ~/.claude/skills/autonomy/
-  rsync -a <repo>/.agents/skills/autonomy/ ~/.codex/skills/autonomy/
+merged, refresh a user-level copy with the complete directory, not SKILL.md
+alone (source = the resolved repository package directory):
+  rsync -a <repo-package-dir>/ ~/.claude/skills/autonomy/
+  rsync -a <repo-package-dir>/ ~/.codex/skills/autonomy/
 -->
 
 ## Loading Contract

@@ -327,7 +327,10 @@ If not found, set `gstack_integration.available: false` in state and skip gstack
 ```bash
 # NUL-delimited enumeration: parse with a NUL-safe reader (while IFS= read -r -d '')
 # so a newline-containing path cannot split classification and flip scope flags.
-CHANGED_FILES=$(git diff --name-only -z origin/<base_branch>...HEAD 2>/dev/null || printf "")
+# Never capture -z output with bare $(...): command substitution DROPS NUL
+# bytes, concatenating adjacent paths. Parse with a NUL-safe reader instead:
+#   git diff --name-only -z origin/<base_branch>...HEAD 2>/dev/null | while IFS= read -r -d '' f; do ...; done
+CHANGED_FILES: the NUL-delimited path list read by that loop (empty when the diff is empty)
 ```
 
 - `scope_frontend`: any file matching `*.tsx`, `*.jsx`, `*.css`, `*.scss`, `*.html`, or paths containing `components/`, `pages/`, `views/`, `app/`

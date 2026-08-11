@@ -2172,6 +2172,15 @@ class _Validator:
             evidence = entry.get("evidence")
             if evidence is not None and (not isinstance(evidence, str) or not evidence):
                 self.error(f"{path}.evidence: must be a non-empty string or null")
+            # "explicitly deferred with a tracked ticket" (SKILL.md item 11,
+            # merge-readiness.md) — a deferred AC with no evidence names no
+            # follow-up, so the deferral is untracked (algo#1216 R2 finding
+            # 3722493004: deferred + null evidence validated clean).
+            if entry.get("verdict") == "deferred" and evidence is None:
+                self.error(
+                    f"{path}.evidence: verdict 'deferred' requires the tracking "
+                    "ticket/follow-up reference in evidence"
+                )
 
     def validate_merge_readiness(self, value: Any) -> None:
         if not isinstance(value, dict):

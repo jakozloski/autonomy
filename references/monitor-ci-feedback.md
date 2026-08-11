@@ -350,8 +350,8 @@ From the paginated Pull Reviews REST results where `author_type == "Bot"` AND `a
 7. After fixing all issues (each fix committed individually in step 4), verify the working tree is clean with `git status --porcelain=v1` (including untracked paths). If not, evaluate and explicitly commit only intended remaining changes before proceeding.
 8. Capture the canonical pre-check boundary, using files touched by this iteration's fix commits for `TOUCHED_FILES`:
    ```bash
-   # Get all files changed in this iteration's commits (since last push)
-   TOUCHED_FILES=$(git diff --name-only origin/<branch>..HEAD)
+   # All files from this iteration's commits — NUL-safe per the canonical boundary
+   TOUCHED_FILES: parse `git diff --name-only -z origin/<branch>..HEAD` with a NUL-safe reader; never bare `$(...)`, which drops NULs and can split/merge unusual filenames
    ```
 9. Run ALL steps in `QUALITY_CHECK_STEPS` sequentially
 10. Apply the canonical quality-check boundary above, including its tracked + untracked `POSTCHECK_FILES` union.
@@ -482,7 +482,7 @@ If **merge conflicts** exist, follow the dedicated subsection below instead of t
    - Log in `attempt_log` as `conflict:<file_set_hash>`
    - If 3+ attempts on the same conflict set: notify user with `WORKFLOW BLOCKED`
 
-6. Capture the canonical pre-check boundary with files touched by the rebase resolution: `TOUCHED_FILES=$(git diff --name-only origin/<base_branch>..HEAD)`
+6. Capture the canonical pre-check boundary with files touched by the rebase resolution: `TOUCHED_FILES` from `git diff --name-only -z origin/<base_branch>..HEAD` via a NUL-safe reader (canonical boundary rule — never bare `$(...)`)
 
 7. Run ALL steps in `QUALITY_CHECK_STEPS` sequentially.
 

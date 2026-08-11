@@ -196,6 +196,53 @@ def _github_operation(
     }
 
 
+def qa_generation(request: dict[str, Any]) -> str:
+    """Digest of the remote targets a QA-handoff plan mutates.
+
+    Embedded in every ``qa.*`` operation ID so a completed ledger persisted
+    for DIFFERENT targets — another PR, a re-keyed ticket, a changed owner
+    map, a different QA user or workflow state — can never satisfy the
+    current plan (algo#1216 R2 finding 3722492998: with fixed IDs, changing
+    every PR/ticket/assignee/state payload still returned ``complete`` with
+    zero calls).  Mirrors ``roundtrip_generation``: plan-level on purpose,
+    so the plan re-mints as one atomic unit when any target changes.
+    Malformed segments hash as ``None`` — the planner's own validation
+    rejects them separately; this digest only has to CHANGE when a target
+    changes.
+    """
+
+    repository = request.get("repository")
+    name_with_owner = (
+        repository.get("nameWithOwner") if isinstance(repository, dict) else None
+    )
+    pull_request_number = request.get("pull_request_number")
+    owner = (
+        QA_OWNER_BY_REPOSITORY.get(name_with_owner)
+        if isinstance(name_with_owner, str)
+        else None
+    )
+    tracker = request.get("issue_tracker")
+    tracker = tracker if isinstance(tracker, dict) else {}
+    qa_assignee = tracker.get("qa_assignee")
+    qa_assignee = qa_assignee if isinstance(qa_assignee, dict) else {}
+    qa_state = tracker.get("qa_state")
+    qa_state = qa_state if isinstance(qa_state, dict) else {}
+    payload = {
+        "nameWithOwner": name_with_owner,
+        "pull_request_number": pull_request_number,
+        "github_login": owner["github_login"] if owner else None,
+        "ticket_identifier": tracker.get("ticket_identifier"),
+        "ticket_provider_id": tracker.get("ticket_provider_id"),
+        "write_path": tracker.get("write_path"),
+        "qa_assignee_provider_id": qa_assignee.get("provider_id"),
+        "qa_state_provider_id": qa_state.get("provider_id"),
+    }
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), default=str
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+
+
 def _approved_qa_operations(
     request: dict[str, Any],
     name_with_owner: str,
@@ -204,6 +251,7 @@ def _approved_qa_operations(
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[str]]:
     github_login = owner["github_login"]
     linear_name = owner["linear_name"]
+    generation = qa_generation(request)
     targets = {
         "assignees": [github_login],
         "reviewers": [],
@@ -211,7 +259,7 @@ def _approved_qa_operations(
     }
     operations = [
         _github_operation(
-            "qa.github.replace_assignees",
+            f"qa.github.replace_assignees:g{generation}",
             "replace_pull_request_assignees",
             name_with_owner,
             pull_request_number,
@@ -223,11 +271,11 @@ def _approved_qa_operations(
     ]
     operations.append(
         _github_operation(
-            "qa.github.verify_assignees",
+            f"qa.github.verify_assignees:g{generation}",
             "verify_pull_request_assignees",
             name_with_owner,
             pull_request_number,
-            depends_on=["qa.github.replace_assignees"],
+            depends_on=[f"qa.github.replace_assignees:g{generation}"],
             expected_assignees=[github_login],
         )
     )
@@ -296,10 +344,10 @@ def _approved_qa_operations(
         if write_path == "none":
             operations.append(
                 {
-                    "id": "qa.linear.record_unavailable",
+                    "id": f"qa.linear.record_unavailable:g{generation}",
                     "service": "local",
                     "action": "record_unavailable",
-                    "depends_on": ["qa.github.verify_assignees"],
+                    "depends_on": [f"qa.github.verify_assignees:g{generation}"],
                     "payload": {
                         "ticket_identifier": ticket_identifier,
                         "ticket_provider_id": ticket_provider_id,
@@ -341,10 +389,10 @@ def _approved_qa_operations(
 
         operations.append(
             {
-                "id": "qa.linear.assign_ticket",
+                "id": f"qa.linear.assign_ticket:g{generation}",
                 "service": "linear",
                 "action": "assign_ticket",
-                "depends_on": ["qa.github.verify_assignees"],
+                "depends_on": [f"qa.github.verify_assignees:g{generation}"],
                 "payload": {
                     "ticket_identifier": ticket_identifier,
                     "ticket_provider_id": ticket_provider_id,
@@ -356,10 +404,10 @@ def _approved_qa_operations(
         )
         operations.append(
             {
-                "id": "qa.linear.verify_ticket_assignee",
+                "id": f"qa.linear.verify_ticket_assignee:g{generation}",
                 "service": "linear",
                 "action": "verify_ticket_assignee",
-                "depends_on": ["qa.linear.assign_ticket"],
+                "depends_on": [f"qa.linear.assign_ticket:g{generation}"],
                 "payload": {
                     "ticket_identifier": ticket_identifier,
                     "ticket_provider_id": ticket_provider_id,
@@ -391,10 +439,10 @@ def _approved_qa_operations(
                 return targets, operations, errors
             operations.append(
                 {
-                    "id": "qa.linear.record_state_unavailable",
+                    "id": f"qa.linear.record_state_unavailable:g{generation}",
                     "service": "local",
                     "action": "record_unavailable",
-                    "depends_on": ["qa.linear.verify_ticket_assignee"],
+                    "depends_on": [f"qa.linear.verify_ticket_assignee:g{generation}"],
                     "payload": {
                         "ticket_identifier": ticket_identifier,
                         "ticket_provider_id": ticket_provider_id,
@@ -428,10 +476,10 @@ def _approved_qa_operations(
 
         operations.append(
             {
-                "id": "qa.linear.set_ticket_state",
+                "id": f"qa.linear.set_ticket_state:g{generation}",
                 "service": "linear",
                 "action": "set_ticket_state",
-                "depends_on": ["qa.linear.verify_ticket_assignee"],
+                "depends_on": [f"qa.linear.verify_ticket_assignee:g{generation}"],
                 "payload": {
                     "ticket_identifier": ticket_identifier,
                     "ticket_provider_id": ticket_provider_id,
@@ -443,10 +491,10 @@ def _approved_qa_operations(
         )
         operations.append(
             {
-                "id": "qa.linear.verify_ticket_state",
+                "id": f"qa.linear.verify_ticket_state:g{generation}",
                 "service": "linear",
                 "action": "verify_ticket_state",
-                "depends_on": ["qa.linear.set_ticket_state"],
+                "depends_on": [f"qa.linear.set_ticket_state:g{generation}"],
                 "payload": {
                     "ticket_identifier": ticket_identifier,
                     "ticket_provider_id": ticket_provider_id,
@@ -1162,6 +1210,69 @@ def plan_handoff(request: Any) -> dict[str, Any]:
         targets, operations, errors = _approved_qa_operations(
             request, name_with_owner, pull_request_number, owner
         )
+        if not errors and operations:
+            # Target-digest-bound IDs make a ledger persisted for different
+            # targets (another PR, a re-keyed ticket, a changed owner map or
+            # QA user/state) an orphan of the current plan.  Same contract as
+            # the roundtrip sweep below: terminal orphans — including
+            # skipped_dependency, whose record proves the operation never
+            # fired — are that target set's completed history, pruned with a
+            # warning; an IN-FLIGHT orphan marks a mutation that may already
+            # have fired remotely and fails closed with the recovery named.
+            # Non-qa IDs stay unknown-ID errors downstream.  Shape-validate
+            # EVERY record before classifying any as history: pruning an
+            # invalid record would launder the exact malformed evidence the
+            # record validation exists to reject.
+            raw_results = request.get("operation_results")
+            if isinstance(raw_results, dict):
+                _, shape_errors = _operation_results(request)
+                if shape_errors:
+                    return _blocked(scenario, *shape_errors)
+                known_ids = {operation["id"] for operation in operations}
+                stale_terminal: list[str] = []
+                stale_in_flight: list[str] = []
+                for operation_id, record in raw_results.items():
+                    if not isinstance(operation_id, str):
+                        continue
+                    if operation_id in known_ids:
+                        continue
+                    if not operation_id.startswith("qa."):
+                        continue
+                    status = (
+                        record.get("status")
+                        if isinstance(record, dict)
+                        else None
+                    )
+                    if status in ("complete", "failed", "skipped_dependency"):
+                        stale_terminal.append(operation_id)
+                    else:
+                        stale_in_flight.append(operation_id)
+                if stale_in_flight:
+                    return _blocked(
+                        scenario,
+                        "prior-target QA operation(s) still in flight: "
+                        + ", ".join(sorted(stale_in_flight))
+                        + " - verify each mutation's postcondition and record"
+                        " a terminal result before planning the current"
+                        " targets",
+                    )
+                if stale_terminal:
+                    pruned = dict(request)
+                    pruned["operation_results"] = {
+                        operation_id: record
+                        for operation_id, record in raw_results.items()
+                        if operation_id not in set(stale_terminal)
+                    }
+                    plan = _apply_operation_state(
+                        scenario, targets, operations, pruned
+                    )
+                    plan["warnings"].append(
+                        "ignored "
+                        + str(len(stale_terminal))
+                        + " prior-target terminal QA record(s): "
+                        + ", ".join(sorted(stale_terminal))
+                    )
+                    return plan
     else:
         targets, operations, errors = _roundtrip_operations(
             request, name_with_owner, pull_request_number

@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 from handoff_decision import (
+    qa_generation,
     QA_OWNER_BY_REPOSITORY,
     QA_STATE_NAME_BY_TEAM,
     main,
@@ -33,6 +34,22 @@ LINEAR_QA_STATE_ADM = {
     "provider_id": "linear-state-dev-ready-for-qa",
     "name": "Dev - Ready for QA",
 }
+
+# Target digest for the canonical fixture request most tests share; variant
+# tests (other repos/tickets/write paths) compute their own via qa_generation.
+QA_G = qa_generation(
+    {
+        "repository": REPOSITORY,
+        "pull_request_number": PR_NUMBER,
+        "issue_tracker": {
+            "qa_assignee": LINEAR_QA_ASSIGNEE,
+            "qa_state": LINEAR_QA_STATE_WEB,
+            "ticket_identifier": "WEB-8877",
+            "ticket_provider_id": "linear-ticket-web-8877",
+            "write_path": "environment_tool",
+        },
+    }
+)
 
 
 def reviewer(
@@ -174,23 +191,23 @@ class HandoffDecisionTest(unittest.TestCase):
         }
 
         github = github_operation(
-            "qa.github.replace_assignees",
+            f"qa.github.replace_assignees:g{QA_G}",
             "replace_pull_request_assignees",
             {"assignees": ["tjkeeper"]},
             "pending",
         )
         verify_github = github_operation(
-            "qa.github.verify_assignees",
+            f"qa.github.verify_assignees:g{QA_G}",
             "verify_pull_request_assignees",
             {"expected_assignees": ["tjkeeper"]},
             "waiting",
-            ["qa.github.replace_assignees"],
+            [f"qa.github.replace_assignees:g{QA_G}"],
         )
         linear = {
-            "id": "qa.linear.assign_ticket",
+            "id": f"qa.linear.assign_ticket:g{QA_G}",
             "service": "linear",
             "action": "assign_ticket",
-            "depends_on": ["qa.github.verify_assignees"],
+            "depends_on": [f"qa.github.verify_assignees:g{QA_G}"],
             "payload": {
                 "ticket_identifier": "WEB-8877",
                 "ticket_provider_id": "linear-ticket-web-8877",
@@ -201,10 +218,10 @@ class HandoffDecisionTest(unittest.TestCase):
             "status": "waiting",
         }
         verify_linear = {
-            "id": "qa.linear.verify_ticket_assignee",
+            "id": f"qa.linear.verify_ticket_assignee:g{QA_G}",
             "service": "linear",
             "action": "verify_ticket_assignee",
-            "depends_on": ["qa.linear.assign_ticket"],
+            "depends_on": [f"qa.linear.assign_ticket:g{QA_G}"],
             "payload": {
                 "ticket_identifier": "WEB-8877",
                 "ticket_provider_id": "linear-ticket-web-8877",
@@ -215,10 +232,10 @@ class HandoffDecisionTest(unittest.TestCase):
             "status": "waiting",
         }
         set_state = {
-            "id": "qa.linear.set_ticket_state",
+            "id": f"qa.linear.set_ticket_state:g{QA_G}",
             "service": "linear",
             "action": "set_ticket_state",
-            "depends_on": ["qa.linear.verify_ticket_assignee"],
+            "depends_on": [f"qa.linear.verify_ticket_assignee:g{QA_G}"],
             "payload": {
                 "ticket_identifier": "WEB-8877",
                 "ticket_provider_id": "linear-ticket-web-8877",
@@ -229,10 +246,10 @@ class HandoffDecisionTest(unittest.TestCase):
             "status": "waiting",
         }
         verify_state = {
-            "id": "qa.linear.verify_ticket_state",
+            "id": f"qa.linear.verify_ticket_state:g{QA_G}",
             "service": "linear",
             "action": "verify_ticket_state",
-            "depends_on": ["qa.linear.set_ticket_state"],
+            "depends_on": [f"qa.linear.set_ticket_state:g{QA_G}"],
             "payload": {
                 "ticket_identifier": "WEB-8877",
                 "ticket_provider_id": "linear-ticket-web-8877",
@@ -278,28 +295,28 @@ class HandoffDecisionTest(unittest.TestCase):
         )
 
     def test_adm_ticket_moves_to_dev_ready_for_qa(self) -> None:
-        plan = plan_handoff(
-            {
-                "scenario": "approved_qa",
-                "repository": REPOSITORY,
-                "pull_request_number": PR_NUMBER,
-                "issue_tracker": {
-                    "type": "linear",
-                    "qa_assignee": LINEAR_QA_ASSIGNEE,
-                    "qa_state": LINEAR_QA_STATE_ADM,
-                    "ticket_identifier": "ADM-769",
-                    "ticket_provider_id": "linear-ticket-adm-769",
-                    "ticket_validated": True,
-                    "write_path": "environment_tool",
-                },
-            }
-        )
+        request = {
+            "scenario": "approved_qa",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+            "issue_tracker": {
+                "type": "linear",
+                "qa_assignee": LINEAR_QA_ASSIGNEE,
+                "qa_state": LINEAR_QA_STATE_ADM,
+                "ticket_identifier": "ADM-769",
+                "ticket_provider_id": "linear-ticket-adm-769",
+                "ticket_validated": True,
+                "write_path": "environment_tool",
+            },
+        }
+        g = qa_generation(request)
+        plan = plan_handoff(request)
 
         self.assertEqual(plan["state"], "pending")
         set_state = next(
             operation
             for operation in plan["operations"]
-            if operation["id"] == "qa.linear.set_ticket_state"
+            if operation["id"] == f"qa.linear.set_ticket_state:g{g}"
         )
         self.assertEqual(set_state["payload"]["state_name"], "Dev - Ready for QA")
         self.assertEqual(
@@ -362,35 +379,35 @@ class HandoffDecisionTest(unittest.TestCase):
         )
 
     def test_unresolved_qa_state_records_nonblocking_local_failure(self) -> None:
-        plan = plan_handoff(
-            {
-                "scenario": "approved_qa",
-                "repository": REPOSITORY,
-                "pull_request_number": PR_NUMBER,
-                "issue_tracker": {
-                    "type": "linear",
-                    "qa_assignee": LINEAR_QA_ASSIGNEE,
-                    "qa_state": None,
-                    "qa_state_unresolved_reason": "state renamed in Linear",
-                    "ticket_identifier": "WEB-8877",
-                    "ticket_provider_id": "linear-ticket-web-8877",
-                    "ticket_validated": True,
-                    "write_path": "environment_tool",
-                },
-                "operation_results": {
-                    "qa.github.replace_assignees": operation_result("complete"),
-                    "qa.github.verify_assignees": operation_result("complete"),
-                    "qa.linear.assign_ticket": operation_result("complete"),
-                    "qa.linear.verify_ticket_assignee": operation_result("complete"),
-                },
-            }
-        )
+        request = {
+            "scenario": "approved_qa",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+            "issue_tracker": {
+                "type": "linear",
+                "qa_assignee": LINEAR_QA_ASSIGNEE,
+                "qa_state": None,
+                "qa_state_unresolved_reason": "state renamed in Linear",
+                "ticket_identifier": "WEB-8877",
+                "ticket_provider_id": "linear-ticket-web-8877",
+                "ticket_validated": True,
+                "write_path": "environment_tool",
+            },
+        }
+        g = qa_generation(request)
+        request["operation_results"] = {
+            f"qa.github.replace_assignees:g{g}": operation_result("complete"),
+            f"qa.github.verify_assignees:g{g}": operation_result("complete"),
+            f"qa.linear.assign_ticket:g{g}": operation_result("complete"),
+            f"qa.linear.verify_ticket_assignee:g{g}": operation_result("complete"),
+        }
+        plan = plan_handoff(request)
 
         self.assertEqual(plan["state"], "failed")
         record = next(
             operation
             for operation in plan["operations"]
-            if operation["id"] == "qa.linear.record_state_unavailable"
+            if operation["id"] == f"qa.linear.record_state_unavailable:g{g}"
         )
         self.assertEqual(record["service"], "local")
         self.assertEqual(record["status"], "failed")
@@ -401,8 +418,8 @@ class HandoffDecisionTest(unittest.TestCase):
         self.assertEqual(
             plan["warnings"],
             [
-                "Local operation qa.linear.record_state_unavailable recorded "
-                "unavailable; complete it manually."
+                f"Local operation qa.linear.record_state_unavailable:g{g} "
+                "recorded unavailable; complete it manually."
             ],
         )
 
@@ -415,14 +432,14 @@ class HandoffDecisionTest(unittest.TestCase):
             "ticket_validated": True,
             "write_path": "environment_tool",
         }
-        plan = plan_handoff(
-            {
-                "scenario": "approved_qa",
-                "repository": REPOSITORY,
-                "pull_request_number": PR_NUMBER,
-                "issue_tracker": dict(base_issue_tracker),
-            }
-        )
+        request = {
+            "scenario": "approved_qa",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+            "issue_tracker": dict(base_issue_tracker),
+        }
+        g = qa_generation(request)
+        plan = plan_handoff(request)
 
         self.assertEqual(plan["state"], "pending")
         self.assertEqual(
@@ -431,7 +448,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 for operation in plan["operations"]
                 if operation["service"] == "linear"
             ],
-            ["qa.linear.assign_ticket", "qa.linear.verify_ticket_assignee"],
+            [f"qa.linear.assign_ticket:g{g}", f"qa.linear.verify_ticket_assignee:g{g}"],
         )
 
         supplied_state = plan_handoff(
@@ -535,9 +552,9 @@ class HandoffDecisionTest(unittest.TestCase):
         plan = plan_handoff(
             self._qa_request_with_results(
                 {
-                    "qa.github.replace_assignees": operation_result("complete"),
-                    "qa.github.verify_assignees": operation_result("complete"),
-                    "qa.linear.assign_ticket": operation_result(
+                    f"qa.github.replace_assignees:g{QA_G}": operation_result("complete"),
+                    f"qa.github.verify_assignees:g{QA_G}": operation_result("complete"),
+                    f"qa.linear.assign_ticket:g{QA_G}": operation_result(
                         "failed", error="Linear returned 500"
                     ),
                 }
@@ -550,12 +567,12 @@ class HandoffDecisionTest(unittest.TestCase):
         self.assertEqual(
             statuses,
             {
-                "qa.github.replace_assignees": "complete",
-                "qa.github.verify_assignees": "complete",
-                "qa.linear.assign_ticket": "failed",
-                "qa.linear.verify_ticket_assignee": "skipped_dependency",
-                "qa.linear.set_ticket_state": "skipped_dependency",
-                "qa.linear.verify_ticket_state": "skipped_dependency",
+                f"qa.github.replace_assignees:g{QA_G}": "complete",
+                f"qa.github.verify_assignees:g{QA_G}": "complete",
+                f"qa.linear.assign_ticket:g{QA_G}": "failed",
+                f"qa.linear.verify_ticket_assignee:g{QA_G}": "skipped_dependency",
+                f"qa.linear.set_ticket_state:g{QA_G}": "skipped_dependency",
+                f"qa.linear.verify_ticket_state:g{QA_G}": "skipped_dependency",
             },
         )
         errors_by_id = {
@@ -566,22 +583,22 @@ class HandoffDecisionTest(unittest.TestCase):
         self.assertEqual(
             errors_by_id,
             {
-                "qa.linear.assign_ticket": None,
-                "qa.linear.verify_ticket_assignee": "dependency failed: qa.linear.assign_ticket",
-                "qa.linear.set_ticket_state": "dependency failed: qa.linear.verify_ticket_assignee",
-                "qa.linear.verify_ticket_state": "dependency failed: qa.linear.set_ticket_state",
+                f"qa.linear.assign_ticket:g{QA_G}": None,
+                f"qa.linear.verify_ticket_assignee:g{QA_G}": f"dependency failed: qa.linear.assign_ticket:g{QA_G}",
+                f"qa.linear.set_ticket_state:g{QA_G}": f"dependency failed: qa.linear.verify_ticket_assignee:g{QA_G}",
+                f"qa.linear.verify_ticket_state:g{QA_G}": f"dependency failed: qa.linear.set_ticket_state:g{QA_G}",
             },
         )
         self.assertEqual(
             plan["warnings"],
             [
-                "Remote operation qa.linear.assign_ticket failed; complete it manually.",
-                "Operation qa.linear.verify_ticket_assignee not executed "
-                "(dependency failed: qa.linear.assign_ticket); complete it manually.",
-                "Operation qa.linear.set_ticket_state not executed "
-                "(dependency failed: qa.linear.verify_ticket_assignee); complete it manually.",
-                "Operation qa.linear.verify_ticket_state not executed "
-                "(dependency failed: qa.linear.set_ticket_state); complete it manually.",
+                f"Remote operation qa.linear.assign_ticket:g{QA_G} failed; complete it manually.",
+                f"Operation qa.linear.verify_ticket_assignee:g{QA_G} not executed "
+                f"(dependency failed: qa.linear.assign_ticket:g{QA_G}); complete it manually.",
+                f"Operation qa.linear.set_ticket_state:g{QA_G} not executed "
+                f"(dependency failed: qa.linear.verify_ticket_assignee:g{QA_G}); complete it manually.",
+                f"Operation qa.linear.verify_ticket_state:g{QA_G} not executed "
+                f"(dependency failed: qa.linear.set_ticket_state:g{QA_G}); complete it manually.",
             ],
         )
 
@@ -595,9 +612,9 @@ class HandoffDecisionTest(unittest.TestCase):
         plan = plan_handoff(
             self._qa_request_with_results(
                 {
-                    "qa.github.replace_assignees": operation_result("complete"),
-                    "qa.github.verify_assignees": operation_result("complete"),
-                    "qa.linear.assign_ticket": operation_result(
+                    f"qa.github.replace_assignees:g{QA_G}": operation_result("complete"),
+                    f"qa.github.verify_assignees:g{QA_G}": operation_result("complete"),
+                    f"qa.linear.assign_ticket:g{QA_G}": operation_result(
                         "failed", error="Linear returned 500"
                     ),
                 }
@@ -605,11 +622,11 @@ class HandoffDecisionTest(unittest.TestCase):
         )
         self.assertEqual(plan["state"], "failed")
         statuses = {op["id"]: op["status"] for op in plan["operations"]}
-        self.assertEqual(statuses["qa.linear.assign_ticket"], "failed")
+        self.assertEqual(statuses[f"qa.linear.assign_ticket:g{QA_G}"], "failed")
         for descendant in (
-            "qa.linear.verify_ticket_assignee",
-            "qa.linear.set_ticket_state",
-            "qa.linear.verify_ticket_state",
+            f"qa.linear.verify_ticket_assignee:g{QA_G}",
+            f"qa.linear.set_ticket_state:g{QA_G}",
+            f"qa.linear.verify_ticket_state:g{QA_G}",
         ):
             self.assertEqual(statuses[descendant], "skipped_dependency")
 
@@ -623,28 +640,28 @@ class HandoffDecisionTest(unittest.TestCase):
         plan = plan_handoff(
             self._qa_request_with_results(
                 {
-                    "qa.github.replace_assignees": operation_result("complete"),
-                    "qa.github.verify_assignees": operation_result("complete"),
-                    "qa.linear.assign_ticket": operation_result(
+                    f"qa.github.replace_assignees:g{QA_G}": operation_result("complete"),
+                    f"qa.github.verify_assignees:g{QA_G}": operation_result("complete"),
+                    f"qa.linear.assign_ticket:g{QA_G}": operation_result(
                         "failed", error="Linear returned 500"
                     ),
-                    "qa.linear.verify_ticket_assignee": {
+                    f"qa.linear.verify_ticket_assignee:g{QA_G}": {
                         "status": "skipped_dependency",
                         "attempts": 0,
-                        "error": "dependency failed: qa.linear.assign_ticket",
+                        "error": f"dependency failed: qa.linear.assign_ticket:g{QA_G}",
                     },
-                    "qa.linear.set_ticket_state": {
+                    f"qa.linear.set_ticket_state:g{QA_G}": {
                         "status": "skipped_dependency",
                         "attempts": 0,
                         "error": (
                             "dependency failed:"
-                            " qa.linear.verify_ticket_assignee"
+                            f" qa.linear.verify_ticket_assignee:g{QA_G}"
                         ),
                     },
-                    "qa.linear.verify_ticket_state": {
+                    f"qa.linear.verify_ticket_state:g{QA_G}": {
                         "status": "skipped_dependency",
                         "attempts": 0,
-                        "error": "dependency failed: qa.linear.set_ticket_state",
+                        "error": f"dependency failed: qa.linear.set_ticket_state:g{QA_G}",
                     },
                 }
             )
@@ -654,7 +671,7 @@ class HandoffDecisionTest(unittest.TestCase):
         self.assertEqual(plan["errors"], [])
         statuses = {op["id"]: op["status"] for op in plan["operations"]}
         self.assertEqual(
-            statuses["qa.linear.verify_ticket_state"], "skipped_dependency"
+            statuses[f"qa.linear.verify_ticket_state:g{QA_G}"], "skipped_dependency"
         )
 
     def test_descendant_result_after_failed_dependency_is_blocked(self) -> None:
@@ -664,12 +681,12 @@ class HandoffDecisionTest(unittest.TestCase):
         plan = plan_handoff(
             self._qa_request_with_results(
                 {
-                    "qa.github.replace_assignees": operation_result("complete"),
-                    "qa.github.verify_assignees": operation_result("complete"),
-                    "qa.linear.assign_ticket": operation_result(
+                    f"qa.github.replace_assignees:g{QA_G}": operation_result("complete"),
+                    f"qa.github.verify_assignees:g{QA_G}": operation_result("complete"),
+                    f"qa.linear.assign_ticket:g{QA_G}": operation_result(
                         "failed", error="Linear returned 500"
                     ),
-                    "qa.linear.verify_ticket_assignee": operation_result("complete"),
+                    f"qa.linear.verify_ticket_assignee:g{QA_G}": operation_result("complete"),
                 }
             )
         )
@@ -678,8 +695,8 @@ class HandoffDecisionTest(unittest.TestCase):
         self.assertEqual(
             plan["errors"],
             [
-                "operation qa.linear.verify_ticket_assignee cannot have results: "
-                "dependency failed: qa.linear.assign_ticket"
+                f"operation qa.linear.verify_ticket_assignee:g{QA_G} cannot have results: "
+                f"dependency failed: qa.linear.assign_ticket:g{QA_G}"
             ],
         )
 
@@ -797,10 +814,11 @@ class HandoffDecisionTest(unittest.TestCase):
                 "ticket_validated": True,
                 "write_path": "none",
             },
-            "operation_results": {
-                "qa.github.replace_assignees": operation_result("complete"),
-                "qa.github.verify_assignees": operation_result("complete"),
-            },
+        }
+        g = qa_generation(request)
+        request["operation_results"] = {
+            f"qa.github.replace_assignees:g{g}": operation_result("complete"),
+            f"qa.github.verify_assignees:g{g}": operation_result("complete"),
         }
 
         self.assertEqual(
@@ -817,23 +835,23 @@ class HandoffDecisionTest(unittest.TestCase):
                 },
                 "operations": [
                     github_operation(
-                        "qa.github.replace_assignees",
+                        f"qa.github.replace_assignees:g{g}",
                         "replace_pull_request_assignees",
                         {"assignees": ["tjkeeper"]},
                         "complete",
                     ),
                     github_operation(
-                        "qa.github.verify_assignees",
+                        f"qa.github.verify_assignees:g{g}",
                         "verify_pull_request_assignees",
                         {"expected_assignees": ["tjkeeper"]},
                         "complete",
-                        ["qa.github.replace_assignees"],
+                        [f"qa.github.replace_assignees:g{g}"],
                     ),
                     {
-                        "id": "qa.linear.record_unavailable",
+                        "id": f"qa.linear.record_unavailable:g{g}",
                         "service": "local",
                         "action": "record_unavailable",
-                        "depends_on": ["qa.github.verify_assignees"],
+                        "depends_on": [f"qa.github.verify_assignees:g{g}"],
                         "payload": {
                             "ticket_identifier": "WEB-8877",
                             "ticket_provider_id": "linear-ticket-web-8877",
@@ -847,39 +865,39 @@ class HandoffDecisionTest(unittest.TestCase):
                 ],
                 "call_plan": [],
                 "warnings": [
-                    "Local operation qa.linear.record_unavailable recorded unavailable; complete it manually."
+                    f"Local operation qa.linear.record_unavailable:g{g} recorded unavailable; complete it manually."
                 ],
                 "errors": [],
             },
         )
 
     def test_unavailable_tracker_operation_cannot_be_marked_complete(self) -> None:
-        plan = plan_handoff(
-            {
-                "scenario": "approved_qa",
-                "repository": REPOSITORY,
-                "pull_request_number": PR_NUMBER,
-                "issue_tracker": {
-                    "type": "linear",
-                    "ticket_identifier": "WEB-8877",
-                    "ticket_provider_id": "linear-ticket-web-8877",
-                    "ticket_validated": True,
-                    "write_path": "none",
-                },
-                "operation_results": {
-                    "qa.github.replace_assignees": operation_result("complete"),
-                    "qa.github.verify_assignees": operation_result("complete"),
-                    "qa.linear.record_unavailable": operation_result("complete"),
-                },
-            }
-        )
+        request = {
+            "scenario": "approved_qa",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+            "issue_tracker": {
+                "type": "linear",
+                "ticket_identifier": "WEB-8877",
+                "ticket_provider_id": "linear-ticket-web-8877",
+                "ticket_validated": True,
+                "write_path": "none",
+            },
+        }
+        g = qa_generation(request)
+        request["operation_results"] = {
+            f"qa.github.replace_assignees:g{g}": operation_result("complete"),
+            f"qa.github.verify_assignees:g{g}": operation_result("complete"),
+            f"qa.linear.record_unavailable:g{g}": operation_result("complete"),
+        }
+        plan = plan_handoff(request)
 
         self.assertEqual(plan["state"], "blocked")
         self.assertEqual(plan["call_plan"], [])
         self.assertEqual(
             plan["errors"],
             [
-                "unavailable operations cannot be marked complete: qa.linear.record_unavailable"
+                f"unavailable operations cannot be marked complete: qa.linear.record_unavailable:g{g}"
             ],
         )
 
@@ -1310,50 +1328,124 @@ class HandoffDecisionTest(unittest.TestCase):
         )
 
     def test_in_flight_mutation_requires_verification_before_retry(self) -> None:
-        plan = plan_handoff(
-            {
-                "scenario": "approved_qa",
-                "repository": REPOSITORY,
-                "pull_request_number": PR_NUMBER,
-                "operation_results": {
-                    "qa.github.replace_assignees": {
-                        "status": "pending",
-                        "attempts": 1,
-                        "started_at": TIMESTAMP,
-                        "response_id": None,
-                    }
-                },
+        request = {
+            "scenario": "approved_qa",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+        }
+        g = qa_generation(request)
+        request["operation_results"] = {
+            f"qa.github.replace_assignees:g{g}": {
+                "status": "pending",
+                "attempts": 1,
+                "started_at": TIMESTAMP,
+                "response_id": None,
             }
-        )
+        }
+        plan = plan_handoff(request)
 
         self.assertEqual(plan["state"], "resume_verification_required")
         self.assertEqual(plan["operations"][0]["status"], "in_flight")
         self.assertEqual(plan["call_plan"][0]["action"], "verify_before_retry")
         self.assertEqual(
             plan["call_plan"][0]["payload"]["verification_operation"]["id"],
-            "qa.github.verify_assignees",
+            f"qa.github.verify_assignees:g{g}",
         )
 
-    def test_failed_resume_verification_can_retry_with_write_ahead(self) -> None:
-        plan = plan_handoff(
-            {
+    def test_completed_ledger_for_different_pr_never_satisfies_plan(self) -> None:
+        # algo#1216 R2 finding 3722492998, reproduced on the pre-digest
+        # planner: a fully completed ledger persisted for one PR returned
+        # "complete" with zero calls when re-planned for another PR.
+        # Target-digest-bound IDs orphan that ledger: terminal history is
+        # pruned with a warning and every operation replans fresh.
+        def request_for(pr_number: int) -> dict[str, object]:
+            return {
                 "scenario": "approved_qa",
                 "repository": REPOSITORY,
-                "pull_request_number": PR_NUMBER,
-                "operation_results": {
-                    "qa.github.replace_assignees": {
-                        "status": "retryable",
-                        "attempts": 1,
-                        "started_at": TIMESTAMP,
-                        "verified_at": TIMESTAMP,
-                        "error": "postcondition absent",
-                    }
+                "pull_request_number": pr_number,
+                "issue_tracker": {
+                    "type": "linear",
+                    "qa_assignee": LINEAR_QA_ASSIGNEE,
+                    "qa_state": LINEAR_QA_STATE_WEB,
+                    "ticket_identifier": "WEB-8877",
+                    "ticket_provider_id": "linear-ticket-web-8877",
+                    "ticket_validated": True,
+                    "write_path": "environment_tool",
                 },
             }
-        )
+
+        prior_g = qa_generation(request_for(1495))
+        request = request_for(9999)
+        request["operation_results"] = {
+            f"{base}:g{prior_g}": operation_result("complete")
+            for base in (
+                "qa.github.replace_assignees",
+                "qa.github.verify_assignees",
+                "qa.linear.assign_ticket",
+                "qa.linear.verify_ticket_assignee",
+                "qa.linear.set_ticket_state",
+                "qa.linear.verify_ticket_state",
+            )
+        }
+        self.assertNotEqual(prior_g, qa_generation(request))
+
+        plan = plan_handoff(request)
 
         self.assertEqual(plan["state"], "pending")
-        self.assertEqual(plan["call_plan"][0]["id"], "qa.github.replace_assignees")
+        self.assertTrue(plan["call_plan"])
+        current_g = qa_generation(request)
+        self.assertEqual(
+            plan["call_plan"][0]["id"],
+            f"qa.github.replace_assignees:g{current_g}",
+        )
+        self.assertEqual(len(plan["warnings"]), 1)
+        self.assertIn("6 prior-target terminal QA record(s)", plan["warnings"][0])
+
+    def test_in_flight_prior_target_qa_record_fails_closed(self) -> None:
+        # An in-flight record persisted for different targets marks a
+        # mutation that may already have fired remotely: never prune it —
+        # block with the recovery named, mirroring the roundtrip contract.
+        request = {
+            "scenario": "approved_qa",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+        }
+        stale_id = "qa.github.replace_assignees:gdeadbeef0123"
+        request["operation_results"] = {
+            stale_id: {
+                "status": "pending",
+                "attempts": 1,
+                "started_at": TIMESTAMP,
+            }
+        }
+        plan = plan_handoff(request)
+
+        self.assertEqual(plan["state"], "blocked")
+        self.assertEqual(plan["call_plan"], [])
+        self.assertIn("prior-target QA operation(s) still in flight", plan["errors"][0])
+        self.assertIn(stale_id, plan["errors"][0])
+        self.assertIn("verify each mutation's postcondition", plan["errors"][0])
+
+    def test_failed_resume_verification_can_retry_with_write_ahead(self) -> None:
+        request = {
+            "scenario": "approved_qa",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+        }
+        g = qa_generation(request)
+        request["operation_results"] = {
+            f"qa.github.replace_assignees:g{g}": {
+                "status": "retryable",
+                "attempts": 1,
+                "started_at": TIMESTAMP,
+                "verified_at": TIMESTAMP,
+                "error": "postcondition absent",
+            }
+        }
+        plan = plan_handoff(request)
+
+        self.assertEqual(plan["state"], "pending")
+        self.assertEqual(plan["call_plan"][0]["id"], f"qa.github.replace_assignees:g{g}")
         self.assertEqual(plan["call_plan"][0]["attempt"], 2)
         self.assertTrue(plan["call_plan"][0]["requires_pending_write"])
 
@@ -1364,7 +1456,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "operation_results": {
-                    "qa.github.replace_assignees": {
+                    f"qa.github.replace_assignees:g{QA_G}": {
                         "status": [],
                         "attempts": 1,
                     }
@@ -1382,7 +1474,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "operation_results": {
-                    "qa.github.replace_assignees": {
+                    f"qa.github.replace_assignees:g{QA_G}": {
                         "status": "complete",
                         "attempts": 1,
                         "started_at": TIMESTAMP,
@@ -1414,7 +1506,7 @@ class HandoffDecisionTest(unittest.TestCase):
                         "repository": REPOSITORY,
                         "pull_request_number": PR_NUMBER,
                         "operation_results": {
-                            "qa.github.replace_assignees": result,
+                            f"qa.github.replace_assignees:g{QA_G}": result,
                         },
                     }
                 )
@@ -1423,7 +1515,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 self.assertEqual(
                     plan["errors"],
                     [
-                        "operation_results['qa.github.replace_assignees'].verified_at "
+                        f"operation_results['qa.github.replace_assignees:g{QA_G}'].verified_at "
                         "cannot precede started_at"
                     ],
                 )
@@ -1435,7 +1527,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "operation_results": {
-                    "qa.github.replace_assignees": {
+                    f"qa.github.replace_assignees:g{QA_G}": {
                         "status": "complete",
                         "attempts": 1,
                         "started_at": TIMESTAMP,
@@ -1455,7 +1547,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "operation_results": {
-                    "qa.github.replace_assignees": {
+                    f"qa.github.replace_assignees:g{QA_G}": {
                         "status": "pending",
                         "attempts": 1,
                         "started_at": TIMESTAMP,
@@ -1489,18 +1581,18 @@ class HandoffDecisionTest(unittest.TestCase):
         # GitHub mutation and verification succeeded. Every Linear mutation and
         # verification reached terminal failure without undoing GitHub.
         request["operation_results"] = {
-            "qa.github.replace_assignees": operation_result("complete"),
-            "qa.github.verify_assignees": operation_result("complete"),
-            "qa.linear.assign_ticket": operation_result(
+            f"qa.github.replace_assignees:g{QA_G}": operation_result("complete"),
+            f"qa.github.verify_assignees:g{QA_G}": operation_result("complete"),
+            f"qa.linear.assign_ticket:g{QA_G}": operation_result(
                 "failed", error="assignment failed"
             ),
-            "qa.linear.verify_ticket_assignee": operation_result(
+            f"qa.linear.verify_ticket_assignee:g{QA_G}": operation_result(
                 "failed", error="verification failed"
             ),
-            "qa.linear.set_ticket_state": operation_result(
+            f"qa.linear.set_ticket_state:g{QA_G}": operation_result(
                 "failed", error="state move failed"
             ),
-            "qa.linear.verify_ticket_state": operation_result(
+            f"qa.linear.verify_ticket_state:g{QA_G}": operation_result(
                 "failed", error="state verification failed"
             ),
         }
@@ -1519,23 +1611,23 @@ class HandoffDecisionTest(unittest.TestCase):
                 },
                 "operations": [
                     github_operation(
-                        "qa.github.replace_assignees",
+                        f"qa.github.replace_assignees:g{QA_G}",
                         "replace_pull_request_assignees",
                         {"assignees": ["tjkeeper"]},
                         "complete",
                     ),
                     github_operation(
-                        "qa.github.verify_assignees",
+                        f"qa.github.verify_assignees:g{QA_G}",
                         "verify_pull_request_assignees",
                         {"expected_assignees": ["tjkeeper"]},
                         "complete",
-                        ["qa.github.replace_assignees"],
+                        [f"qa.github.replace_assignees:g{QA_G}"],
                     ),
                     {
-                        "id": "qa.linear.assign_ticket",
+                        "id": f"qa.linear.assign_ticket:g{QA_G}",
                         "service": "linear",
                         "action": "assign_ticket",
-                        "depends_on": ["qa.github.verify_assignees"],
+                        "depends_on": [f"qa.github.verify_assignees:g{QA_G}"],
                         "payload": {
                             "ticket_identifier": "WEB-8877",
                             "ticket_provider_id": "linear-ticket-web-8877",
@@ -1546,10 +1638,10 @@ class HandoffDecisionTest(unittest.TestCase):
                         "status": "failed",
                     },
                     {
-                        "id": "qa.linear.verify_ticket_assignee",
+                        "id": f"qa.linear.verify_ticket_assignee:g{QA_G}",
                         "service": "linear",
                         "action": "verify_ticket_assignee",
-                        "depends_on": ["qa.linear.assign_ticket"],
+                        "depends_on": [f"qa.linear.assign_ticket:g{QA_G}"],
                         "payload": {
                             "ticket_identifier": "WEB-8877",
                             "ticket_provider_id": "linear-ticket-web-8877",
@@ -1560,10 +1652,10 @@ class HandoffDecisionTest(unittest.TestCase):
                         "status": "failed",
                     },
                     {
-                        "id": "qa.linear.set_ticket_state",
+                        "id": f"qa.linear.set_ticket_state:g{QA_G}",
                         "service": "linear",
                         "action": "set_ticket_state",
-                        "depends_on": ["qa.linear.verify_ticket_assignee"],
+                        "depends_on": [f"qa.linear.verify_ticket_assignee:g{QA_G}"],
                         "payload": {
                             "ticket_identifier": "WEB-8877",
                             "ticket_provider_id": "linear-ticket-web-8877",
@@ -1574,10 +1666,10 @@ class HandoffDecisionTest(unittest.TestCase):
                         "status": "failed",
                     },
                     {
-                        "id": "qa.linear.verify_ticket_state",
+                        "id": f"qa.linear.verify_ticket_state:g{QA_G}",
                         "service": "linear",
                         "action": "verify_ticket_state",
-                        "depends_on": ["qa.linear.set_ticket_state"],
+                        "depends_on": [f"qa.linear.set_ticket_state:g{QA_G}"],
                         "payload": {
                             "ticket_identifier": "WEB-8877",
                             "ticket_provider_id": "linear-ticket-web-8877",
@@ -1590,10 +1682,10 @@ class HandoffDecisionTest(unittest.TestCase):
                 ],
                 "call_plan": [],
                 "warnings": [
-                    "Remote operation qa.linear.assign_ticket failed; complete it manually.",
-                    "Remote operation qa.linear.verify_ticket_assignee failed; complete it manually.",
-                    "Remote operation qa.linear.set_ticket_state failed; complete it manually.",
-                    "Remote operation qa.linear.verify_ticket_state failed; complete it manually.",
+                    f"Remote operation qa.linear.assign_ticket:g{QA_G} failed; complete it manually.",
+                    f"Remote operation qa.linear.verify_ticket_assignee:g{QA_G} failed; complete it manually.",
+                    f"Remote operation qa.linear.set_ticket_state:g{QA_G} failed; complete it manually.",
+                    f"Remote operation qa.linear.verify_ticket_state:g{QA_G} failed; complete it manually.",
                 ],
                 "errors": [],
             },
@@ -2147,7 +2239,7 @@ class RetryGuardCoverageTests(unittest.TestCase):
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "operation_results": {
-                    "qa.github.replace_assignees": {
+                    f"qa.github.replace_assignees:g{QA_G}": {
                         "status": "retryable",
                         "attempts": 3,
                         "started_at": TIMESTAMP,
@@ -2166,12 +2258,12 @@ class RetryGuardCoverageTests(unittest.TestCase):
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "operation_results": {
-                    "qa.github.replace_assignees": {
+                    f"qa.github.replace_assignees:g{QA_G}": {
                         "status": "pending",
                         "attempts": 1,
                         "started_at": TIMESTAMP,
                     },
-                    "qa.github.verify_assignees": {
+                    f"qa.github.verify_assignees:g{QA_G}": {
                         "status": "pending",
                         "attempts": 1,
                         "started_at": TIMESTAMP,

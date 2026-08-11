@@ -1254,6 +1254,33 @@ class MergeReadinessTests(unittest.TestCase):
             any("acceptance_criteria[0].verdict" in error for error in result["errors"])
         )
 
+    def test_deferred_verdict_without_evidence_is_rejected(self) -> None:
+        # algo#1216 R2 finding 3722493004: "explicitly deferred with a
+        # tracked ticket" (SKILL.md item 11) — deferred + null evidence
+        # names no follow-up, so the deferral is untracked.
+        text = _mutate(
+            self._with_blocks(), '    verdict: "pending"', '    verdict: "deferred"'
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any(
+                "verdict 'deferred' requires the tracking" in error
+                for error in result["errors"]
+            )
+        )
+
+    def test_deferred_verdict_with_tracking_evidence_is_valid(self) -> None:
+        text = _mutate(
+            self._with_blocks(), '    verdict: "pending"', '    verdict: "deferred"'
+        )
+        text = _mutate(
+            text, "    evidence: null", '    evidence: "deferred to WEB-9452"'
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["state"], VALID)
+
     def test_acceptance_criteria_rejects_non_list_scalar(self) -> None:
         text = _mutate(
             FULL_STATE,
