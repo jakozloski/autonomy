@@ -1652,7 +1652,9 @@ def monitor_child_prompt(
         f" ONLY this JSON object and nothing else:"
         f' {{"schema_version": 1, "attempt_id": "{attempt_id}",'
         f' "tick_ordinal": {tick_ordinal},'
-        f' "outcome": "continue"|"terminal"|"blocked",'
+        f' "outcome": <exactly one of the strings continue, terminal, or'
+        f" blocked — the single word your iteration's result selects, never"
+        f" this description>,"
         f' "post_workflow_digest": "<the digest>"}}'
     )
 
@@ -2448,8 +2450,19 @@ def monitor_orchestrator_binding(
         )
     if session_model == base_model:
         live_lineage, live_model = "base", base_model
-    elif session_model == reviewer_model:
+    elif session_model == reviewer_model and base_write_verified:
         live_lineage, live_model = "reviewer", reviewer_model
+    elif session_model == reviewer_model:
+        # CR 3760683975 (keeper-agents#1328): a live reviewer-model session
+        # WITHOUT a host-verified write-capable base worker path must not
+        # take reviewer ownership — that lineage's capability boundary
+        # dispatches all fix work to base workers, which is exactly the path
+        # that is unverified, leaving write work with no compliant actor.
+        # The truthful record keeps the live model (never re-model a live
+        # session) but binds under the base lineage's unrestricted inline
+        # capability set, mirroring the nominal no-write-path demotion; the
+        # nominal owner still takes over at the next session boundary.
+        live_lineage, live_model = "base", reviewer_model
     else:
         return {
             "state": "invalid",

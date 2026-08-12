@@ -171,7 +171,9 @@ class ValidatePackageTests(unittest.TestCase):
         matches = [
             index for index, line in enumerate(lines) if payload in line
         ]
-        assert len(matches) == 1
+        # CR 3760684079: a unittest assertion, not a bare assert — the bare
+        # form strips under -O and a zero-match would pass vacuously.
+        self.assertEqual(len(matches), 1, (payload, matches))
         return matches[0]
 
     def test_anchored_marker_rejects_relocation_attack(self) -> None:
@@ -193,7 +195,11 @@ class ValidatePackageTests(unittest.TestCase):
                         # Revert the anchored line (drop the substring) and
                         # relocate the intact text as a NON-anchored paragraph.
                         lines[index] = lines[index].replace(substring, "")
-                        lines.append(f"Parked copy: {relocated.lstrip('- ')}")
+                        lines.append(
+                            # CR 3760684085: strip ONE bullet prefix, not a
+                            # character set (lstrip eats every leading dash).
+                            "Parked copy: " + relocated.removeprefix("- ")
+                        )
                         target.write_text(
                             "\n".join(lines) + "\n", encoding="utf-8"
                         )

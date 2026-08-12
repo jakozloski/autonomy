@@ -725,7 +725,11 @@ class Runner:
                 datetime.now(timezone.utc) + timedelta(seconds=max(0, ceiling))
             ).isoformat(),
             "child_pid": proc.pid,
-            "child_pgid": os.getpgid(proc.pid),
+            # CR 3760683988: start_new_session=True makes the child a session
+            # leader, so pgid == pid BY CONSTRUCTION — and unlike
+            # os.getpgid(), recording the pid cannot raise if the child
+            # exits in the window between spawn and this line.
+            "child_pgid": proc.pid,
             "child_started_fingerprint": fingerprint,
             "base_workflow_digest": base_digest,
         }

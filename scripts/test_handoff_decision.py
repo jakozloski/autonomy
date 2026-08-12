@@ -548,7 +548,10 @@ class HandoffDecisionTest(unittest.TestCase):
         # verification's expected postcondition is already known to be false,
         # and the chained state move is declared to depend on it. All
         # descendants fail closed with dependency errors instead of becoming
-        # the next call.
+        # the next call. (Also pins R2 round-2 finding 3737466456: the
+        # never-attempted descendants render skipped_dependency, whose
+        # record proves a non-attempt — formerly a separate subset test,
+        # deduplicated per CR 3760684006.)
         plan = plan_handoff(
             self._qa_request_with_results(
                 {
@@ -601,34 +604,6 @@ class HandoffDecisionTest(unittest.TestCase):
                 f"(dependency failed: qa.linear.set_ticket_state:g{QA_G}); complete it manually.",
             ],
         )
-
-    def test_cascade_descendants_render_skipped_dependency(self) -> None:
-        # R2 round-2 finding 3737466456, empirically verified: descendants
-        # rendered "failed" with no persistable record — the schema derives
-        # missing records as pending and rejects the terminal monitor, so
-        # the planner's own terminal answer could not be persisted
-        # truthfully in ANY monitor state. Never-attempted descendants now
-        # render "skipped_dependency", whose record proves a non-attempt.
-        plan = plan_handoff(
-            self._qa_request_with_results(
-                {
-                    f"qa.github.replace_assignees:g{QA_G}": operation_result("complete"),
-                    f"qa.github.verify_assignees:g{QA_G}": operation_result("complete"),
-                    f"qa.linear.assign_ticket:g{QA_G}": operation_result(
-                        "failed", error="Linear returned 500"
-                    ),
-                }
-            )
-        )
-        self.assertEqual(plan["state"], "failed")
-        statuses = {op["id"]: op["status"] for op in plan["operations"]}
-        self.assertEqual(statuses[f"qa.linear.assign_ticket:g{QA_G}"], "failed")
-        for descendant in (
-            f"qa.linear.verify_ticket_assignee:g{QA_G}",
-            f"qa.linear.set_ticket_state:g{QA_G}",
-            f"qa.linear.verify_ticket_state:g{QA_G}",
-        ):
-            self.assertEqual(statuses[descendant], "skipped_dependency")
 
     def test_skipped_dependency_records_replan_to_same_terminal_state(
         self,
@@ -1394,6 +1369,10 @@ class HandoffDecisionTest(unittest.TestCase):
         self.assertEqual(plan["state"], "pending")
         self.assertTrue(plan["call_plan"])
         current_g = qa_generation(request)
+        # CR 3760684014: pin the suffix FORMAT too, not only disjointness —
+        # a digest helper regressing to a constant would keep the sets
+        # disjoint from prior_g while silently unbinding targets.
+        self.assertRegex(current_g, r"^[0-9a-f]{12}$")
         self.assertEqual(
             plan["call_plan"][0]["id"],
             f"qa.github.replace_assignees:g{current_g}",

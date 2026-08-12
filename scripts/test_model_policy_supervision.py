@@ -115,10 +115,14 @@ class SuperviseStreamLiveProcessTests(unittest.TestCase):
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
+        # CR 3760684024: capture the group BEFORE reaping — os.getpgid on a
+        # reaped pid raises, which made the old kill a silent no-op that
+        # never exercised killpg at all.
+        pgid = os.getpgid(process.pid)
         process.wait(timeout=10)  # child is fully dead before supervision
 
         def kill_group() -> None:
-            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            os.killpg(pgid, signal.SIGKILL)
 
         try:
             result = supervise_stream(process.stdout, process.stderr, kill_group)

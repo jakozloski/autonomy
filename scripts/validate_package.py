@@ -823,7 +823,14 @@ def _validate_references(
             if relative_path not in REQUIRED_REFERENCE_FILES:
                 errors.append(f"missing heading target file: {relative_path}")
             continue
-        actual_headings = _markdown_headings(candidate.read_text(encoding="utf-8"))
+        heading_text = candidate.read_text(encoding="utf-8")
+        # CR 3760684106: an unclosed fence corrupts heading classification
+        # for everything after it — report it for EVERY heading-scanned
+        # file, not only anchored-marker files.
+        _heading_rows, heading_ends_open = _scan_fence_states(heading_text)
+        if heading_ends_open:
+            errors.append(f"{relative_path}: unclosed code fence at end of file")
+        actual_headings = _markdown_headings(heading_text)
         expected_heading_set = set(headings)
         for heading in headings:
             if heading not in actual_headings:
@@ -966,7 +973,13 @@ def _anchored_candidate(line: str, *, fenced: bool, in_fence: bool) -> str | Non
     return stripped
 
 
-def _anchored_matches(text: str, anchor: str, *, fenced: bool) -> list[str]:
+def _anchored_matches(
+    text: str,
+    anchor: str,
+    *,
+    fenced: bool,
+    rows: list[tuple[str, bool | None]] | None = None,
+) -> list[str]:
     """Collect operative lines matching an anchor in its declared context.
 
     Fence state comes from ``_iter_fence_state`` (the heading scanner's
@@ -979,7 +992,10 @@ def _anchored_matches(text: str, anchor: str, *, fenced: bool) -> list[str]:
 
     matches: list[str] = []
     in_comment = False
-    rows, _ends_open = _scan_fence_states(text)
+    if rows is None:
+        # CR 3760684113: callers that already scanned pass their rows;
+        # standalone callers keep the self-contained scan.
+        rows, _ends_open = _scan_fence_states(text)
     for line, state in rows:
         if state is None:
             continue  # fence delimiter
@@ -1025,13 +1041,15 @@ def _validate_anchored_markers(package_dir: Path) -> list[str]:
             # Missing reference files are reported by their own checks.
             continue
         text = candidate.read_text(encoding="utf-8")
-        _rows, ends_open = _scan_fence_states(text)
+        scanned_rows, ends_open = _scan_fence_states(text)
         if ends_open:
             errors.append(
                 f"{relative_path}: unclosed code fence at end of file"
             )
         for anchor, fenced, required in anchor_specs:
-            matches = _anchored_matches(text, anchor, fenced=fenced)
+            matches = _anchored_matches(
+                text, anchor, fenced=fenced, rows=scanned_rows
+            )
             if len(matches) != 1:
                 errors.append(
                     f"{relative_path}: expected exactly one operative line"

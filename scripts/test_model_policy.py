@@ -2274,9 +2274,13 @@ class MonitorChildInvocationTests(unittest.TestCase):
         self.assertEqual(MONITOR_SLICE_CLEANUP_MARGIN_SECONDS, 120)
         self.assertEqual(MONITOR_CHILD_MIN_VIABLE_SECONDS, 240)
         self.assertEqual(MONITOR_CHILD_IDLE_TIMEOUT_SECONDS, 180)
+        # CR 3760684029: the old bound (ceiling + 300) contradicted the
+        # comment above by permitting a 300s overrun of the parent's own
+        # attempt ceiling — the slice plus its cleanup margin must fit
+        # STRICTLY inside the ceiling.
         self.assertLess(
             MONITOR_SLICE_BUDGET_SECONDS + MONITOR_SLICE_CLEANUP_MARGIN_SECONDS,
-            PER_ATTEMPT_CEILING_SECONDS + 300,
+            PER_ATTEMPT_CEILING_SECONDS,
         )
 
 
@@ -2469,6 +2473,27 @@ class MonitorOrchestratorBindingTests(unittest.TestCase):
         )
         self.assertEqual(binding["state"], "invalid")
         self.assertTrue(binding["errors"])
+
+    def test_live_reviewer_session_without_write_path_binds_base_lineage(
+        self,
+    ) -> None:
+        # CR 3760683975 (keeper-agents#1328), verified against the binder:
+        # with host_agent_selection_verified false, a LIVE session on the
+        # reviewer model still received a reviewer-lineage continuity
+        # binding — but that lineage's capability boundary dispatches all
+        # fix work to base workers, which is exactly the unverified path.
+        # The truthful record keeps the live model and binds under the base
+        # lineage's unrestricted inline capability set, mirroring the
+        # nominal no-write-path demotion.
+        binding = monitor_orchestrator_binding(
+            self._runtime(base_write_verified=False),
+            session_model="claude-opus-5",
+        )
+        self.assertEqual(binding["state"], "bound")
+        self.assertEqual(binding["lineage"], "base")
+        self.assertEqual(binding["model"], "claude-opus-5")
+        self.assertEqual(binding["reason_code"], "orchestrator_continuity")
+        self.assertEqual(binding["pending_owner"], "claude-fable-5")
 
 
 if __name__ == "__main__":

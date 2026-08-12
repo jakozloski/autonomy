@@ -283,6 +283,8 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         import tempfile
 
         self.dir = Path(tempfile.mkdtemp(prefix="monitor-runner-"))
+        # CR 3760684042: reclaim the fixture directory even on failure.
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
         self.state = self.dir / "workflow-state.local.md"
         self.state.write_text(STATE_FIXTURE, encoding="utf-8")
         self.fake = self.dir / "fake-claude.py"
@@ -531,7 +533,18 @@ class MonitorRunnerE2ETests(unittest.TestCase):
             text=True,
         )
         try:
-            time.sleep(3.0)
+            # CR 3760684053: poll the observable (the first runner's child
+            # launch hits the argv log) instead of a fixed sleep — bounded,
+            # and immune to slow-host flake.
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                if self.argv_log.exists() and self.argv_log.read_text(
+                    encoding="utf-8"
+                ).strip():
+                    break
+                time.sleep(0.1)
+            else:
+                self.fail("first runner never launched its child")
             second = self._run(budget="365", timeout=30)
             self.assertEqual(second.returncode, 3, second.stdout + second.stderr)
             summary = self._summary(second)

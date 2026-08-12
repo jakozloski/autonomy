@@ -1123,9 +1123,16 @@ class _Validator:
                             " of sleeping toward it"
                         )
                     elif (
-                        wait_phases.get(phase)
-                        if isinstance(wait_phases, dict)
-                        else None
+                        # CR 3760683996 (keeper-agents#1328):
+                        # phases.runtime_verification is a MAPPING with a
+                        # status field, not a bare string — read the status
+                        # through it so a live runtime-verification owner is
+                        # not misread as absent.
+                        (lambda owner: owner.get("status") if isinstance(owner, dict) else owner)(
+                            wait_phases.get(phase)
+                            if isinstance(wait_phases, dict)
+                            else None
+                        )
                     ) != "in_progress":
                         self.error(
                             "next_retry_at: a pending model-gate wait needs a live"

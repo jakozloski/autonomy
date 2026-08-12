@@ -1238,6 +1238,16 @@ def plan_handoff(request: Any) -> dict[str, Any]:
                         continue
                     if not operation_id.startswith("qa."):
                         continue
+                    # CR 3760683938 (keeper-agents#1328), applied to both
+                    # sweeps: prunable history is ONLY an id whose base
+                    # (before the :g digest) names an operation family the
+                    # current plan mints — a fabricated "qa.bogus:g..." id
+                    # must stay an unknown-ID error, never laundered as a
+                    # prior-target record.
+                    if operation_id.split(":g", 1)[0] not in {
+                        known.split(":g", 1)[0] for known in known_ids
+                    }:
+                        continue
                     status = (
                         record.get("status")
                         if isinstance(record, dict)
@@ -1319,6 +1329,15 @@ def plan_handoff(request: Any) -> dict[str, Any]:
                     if operation_id in known_ids:
                         continue
                     if not operation_id.startswith("roundtrip."):
+                        continue
+                    # CR 3760683938: same family restriction as the QA sweep
+                    # — the base before the generation/identity segments must
+                    # match a family the current plan mints. Roundtrip ids
+                    # carry per-reviewer identity (base:identity:gDIGEST), so
+                    # compare on the leading dotted family name alone.
+                    if operation_id.split(":", 1)[0] not in {
+                        known.split(":", 1)[0] for known in known_ids
+                    }:
                         continue
                     status = (
                         record.get("status")

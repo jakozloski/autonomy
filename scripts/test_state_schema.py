@@ -791,6 +791,43 @@ class ValueContractTests(unittest.TestCase):
                         evaluate_state_text(text)["errors"],
                     )
 
+    def test_runtime_verification_owner_reads_status_through_the_mapping(
+        self,
+    ) -> None:
+        # CR 3760683996 (keeper-agents#1328): phases.runtime_verification is
+        # a MAPPING with a status field, so the live-owner check comparing
+        # the raw phase value to "in_progress" misread every legitimate
+        # runtime-verification wait as ownerless and rejected valid states.
+        def rv_state(status: str) -> str:
+            text = FULL_STATE
+            for old, new in (
+                ('current_phase: "plan"', 'current_phase: "runtime_verification"'),
+                ('  plan: "in_progress"', '  plan: "complete"'),
+                ('  plan_review: "pending"', '  plan_review: "complete"'),
+                ('  implementation: "pending"', '  implementation: "complete"'),
+                ('  self_review: "pending"', '  self_review: "complete"'),
+                (
+                    '  runtime_verification:\n    status: "pending"',
+                    f'  runtime_verification:\n    status: "{status}"',
+                ),
+                (
+                    "post_push_until: null",
+                    'post_push_until: null\nnext_retry_at: "2026-08-03T21:00:00Z"',
+                ),
+            ):
+                assert old in text, old
+                text = text.replace(old, new, 1)
+            return text
+
+        live = evaluate_state_text(rv_state("in_progress"))
+        self.assertEqual(live["state"], VALID, live["errors"])
+        stale = evaluate_state_text(rv_state("pending"))
+        self.assertEqual(stale["state"], SUSPECT)
+        self.assertTrue(
+            any("live" in error and "next_retry_at" in error for error in stale["errors"]),
+            stale["errors"],
+        )
+
     def test_next_retry_at_rejects_non_iso_values_with_exact_field_error(self) -> None:
         for key in ("next_retry_at", "hold_started_at"):
             for value in ('"soon"', "12345", '"2026-99-99T25:61:61Z"'):
@@ -3068,12 +3105,22 @@ class MonitorCliBlockTests(unittest.TestCase):
         )
 
     def test_unknown_key_and_bad_version_fail_closed(self) -> None:
+        # CR 3760684066: pin the SPECIFIC rejection, not just any-SUSPECT —
+        # an unrelated error would otherwise green these cases vacuously.
         body = self.WELL_FORMED + "\n  surprise: 1"
         result = evaluate_state_text(self._with_block(body))
         self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("surprise" in error for error in result["errors"]),
+            result["errors"],
+        )
         body2 = self.WELL_FORMED.replace("schema_version: 1", "schema_version: 2")
         result2 = evaluate_state_text(self._with_block(body2))
         self.assertEqual(result2["state"], SUSPECT)
+        self.assertTrue(
+            any("schema_version" in error for error in result2["errors"]),
+            result2["errors"],
+        )
 
     def test_populated_in_flight_is_valid_and_pinned(self) -> None:
         body = self.WELL_FORMED.replace(
