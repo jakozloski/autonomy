@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -209,6 +210,43 @@ if outcome_env == "terminal" and os.environ.get("FAKE_SKIP_STATUS_FLIP") != "1":
     text = text.replace('monitor: "in_progress"', 'monitor: "paused"', 1)
 if os.environ.get("FAKE_SET_PENDING_HANDOFF") == "1":
     text = text.replace('    status: "idle"', '    status: "pending"', 1)
+if os.environ.get("FAKE_SET_FAILED_HANDOFF") == "1":
+    old_qa = "\n".join([
+        "  qa:",
+        "    scenario: null",
+        '    status: "idle"',
+        "    repository_name_with_owner: null",
+        "    targets:",
+        "      github_assignees: []",
+        "      tracker_assignee_id: null",
+        "      tracker_assignee_name: null",
+        "    operations: []",
+        "    operation_results: {}",
+    ])
+    new_qa = "\n".join([
+        "  qa:",
+        '    scenario: "clean_unapproved"',
+        '    status: "failed"',
+        '    repository_name_with_owner: "Keeper-Dating/matchmaking"',
+        "    targets:",
+        '      github_assignees: ["tjkeeper"]',
+        "      tracker_assignee_id: null",
+        "      tracker_assignee_name: null",
+        '    operations: ["qa.github.replace_assignees:gtest"]',
+        "    operation_results:",
+        '      "qa.github.replace_assignees:gtest":',
+        '        status: "failed"',
+        "        attempts: 1",
+        '        started_at: "2026-08-08T00:00:00Z"',
+        '        verified_at: "2026-08-08T00:00:01Z"',
+        '        error: "GitHub rejected the assignee"',
+    ])
+    assert old_qa in text
+    text = text.replace(old_qa, new_qa, 1)
+corrupt_target = os.environ.get("FAKE_CORRUPT_FILE")
+if corrupt_target:
+    with open(corrupt_target, "w", encoding="utf-8") as h:
+        h.write("raise SystemExit(1)\n")
 if mode in ("mutate_canonical", "mutate_then_die"):
     with open(state_path, "w", encoding="utf-8") as h:
         h.write(text)
@@ -267,6 +305,7 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         timeout: int = 90,
         wait_scale: str = "1.0",
         max_ticks: str | None = None,
+        schema_cli: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = dict(os.environ)
         env["FAKE_MODE"] = mode
@@ -284,7 +323,7 @@ class MonitorRunnerE2ETests(unittest.TestCase):
                 "--claude-bin",
                 str(self.fake),
                 "--schema-cli",
-                str(SCHEMA),
+                schema_cli if schema_cli is not None else str(SCHEMA),
                 "--wait-scale",
                 wait_scale,
             ]
@@ -356,6 +395,47 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(summary["runner_outcome"], "terminal")
         self.assertEqual(summary["ticks_completed"], 1)
+
+    def test_terminal_with_failed_handoff_aggregate_commits(self) -> None:
+        # R2 #1328 finding 3767068772, reproduced red-first: the QA contract
+        # records a failed handoff operation as a non-blocking warning and
+        # the exit still pauses, but the transition check rejected any
+        # terminal candidate whose ledger aggregate was "failed" — the valid
+        # candidate was discarded and monitoring strand-blocked instead of
+        # pausing.
+        completed = self._run(
+            budget="2000",
+            env_extra={"FAKE_OUTCOME": "terminal", "FAKE_SET_FAILED_HANDOFF": "1"},
+        )
+        summary = self._summary(completed)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(summary["runner_outcome"], "terminal")
+        extract = self._extract()
+        self.assertEqual(extract["state"], "valid", extract["errors"])
+        self.assertEqual(extract["monitor_status"], "paused")
+        self.assertIn("failed", extract["handoff_statuses"])
+
+    def test_corrupted_schema_source_cannot_forge_validation(self) -> None:
+        # R2 #1328 finding 3767068783: the schema CLI executed from the
+        # writable package after the write-capable child had run — replacing
+        # the helper mid-run could forge validation. The runner now
+        # snapshots the helper before any launch; a child that rewrites the
+        # source it was pointed at changes nothing.
+        schema_copy = self.dir / "schema-copy.py"
+        shutil.copyfile(SCHEMA, schema_copy)
+        completed = self._run(
+            schema_cli=str(schema_copy),
+            env_extra={"FAKE_CORRUPT_FILE": str(schema_copy)},
+        )
+        summary = self._summary(completed)
+        self.assertEqual(summary["runner_outcome"], "slice_exhausted", completed.stderr)
+        self.assertEqual(summary["ticks_completed"], 1)
+        self.assertEqual(
+            schema_copy.read_text(encoding="utf-8"), "raise SystemExit(1)\n"
+        )
+        extract = self._extract()
+        self.assertEqual(extract["state"], "valid", extract["errors"])
+        self.assertEqual(extract["counters"]["monitor_poll_ticks"], 1)
 
     def test_wrong_served_model_blocks_immediately(self) -> None:
         completed = self._run(mode="wrong_model")

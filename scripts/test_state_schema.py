@@ -3135,6 +3135,69 @@ class MonitorCliBlockTests(unittest.TestCase):
         self.assertIsNotNone(extract["digest"])
         self.assertEqual(extract["current_phase"], "plan")
 
+    def test_monitor_extract_blocker_evidence_families(self) -> None:
+        # R2 #1328 finding 3767068764: every documented condition-(c) source
+        # must extract blocker evidence, or the runner discards legitimate
+        # blocked exits — the mandatory R2-authorization exit
+        # (human:user-confirm:r2-review-authorization) was the observed
+        # casualty. The three feedback maps were already covered.
+        base = self._with_block(self.WELL_FORMED)
+        self.assertFalse(monitor_extract(base)["blocked_evidence_present"])
+        families = (
+            (
+                "human-key-fires-on-presence",
+                'attempt_log:\n  "human:user-confirm:r2-review-authorization": 1',
+                True,
+            ),
+            ("prompt-trail-stale", 'attempt_log:\n  "prompt-trail:stale": 1', True),
+            ("three-strike-family", 'attempt_log:\n  "ci:lint": 3', True),
+            ("two-strikes-not-evidence", 'attempt_log:\n  "ci:lint": 2', False),
+            ("non-family-key", 'attempt_log:\n  "push:retry": 5', False),
+        )
+        for name, replacement, expect in families:
+            with self.subTest(family=name):
+                mutated = base.replace("attempt_log: {}", replacement)
+                self.assertNotEqual(mutated, base)
+                self.assertEqual(
+                    monitor_extract(mutated)["blocked_evidence_present"], expect
+                )
+
+    def test_monitor_extract_engaged_roundtrip_is_blocker_evidence(self) -> None:
+        # Only condition (c) plans roundtrip operations, so an engaged
+        # (non-idle) roundtrip ledger is durable human-review-block
+        # evidence; the tier fixtures' idle shell must NOT read as evidence
+        # (the base assertion in the families test pins that side).
+        base = self._with_block(self.WELL_FORMED)
+        idle_block = (
+            "  review_roundtrip:\n"
+            "    scenario: null\n"
+            '    status: "idle"\n'
+            "    targets:\n"
+            "      reviewers: []\n"
+            "      github_assignees: []\n"
+            "    operations: []\n"
+            "    operation_results: {}"
+        )
+        engaged_block = (
+            "  review_roundtrip:\n"
+            '    scenario: "human_review_roundtrip"\n'
+            '    status: "failed"\n'
+            "    targets:\n"
+            '      reviewers: ["alice"]\n'
+            '      github_assignees: ["alice"]\n'
+            '    operations: ["roundtrip.github.request_review:alice:gdeadbeef0123"]\n'
+            "    operation_results:\n"
+            '      "roundtrip.github.request_review:alice:gdeadbeef0123":\n'
+            '        status: "failed"\n'
+            "        attempts: 1\n"
+            '        started_at: "2026-08-08T00:00:00Z"\n'
+            '        verified_at: "2026-08-08T00:00:01Z"\n'
+            '        error: "review request rejected"'
+        )
+        engaged = base.replace(idle_block, engaged_block)
+        self.assertNotEqual(engaged, base)
+        self.assertTrue(monitor_extract(engaged)["blocked_evidence_present"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1563,6 +1563,26 @@ class SuperviseStreamTests(unittest.TestCase):
         self.assertEqual(result["exit_code"], CLASSIFY_EXIT_INTERNAL_FAILURE)
         self.assertEqual(killed, [True])
 
+    def test_wait_exception_after_clean_streams_kills_the_child(self) -> None:
+        # R2 #1328 finding 3767068801, empirically verified: with clean
+        # streams the cleanup branch was already skipped, so a child_wait
+        # that RAISES left the (possibly credentialed) child running with
+        # zero kill calls while supervision reported internal_failure — the
+        # child could survive supervision and overlap the retry.
+        stdout = _FakePipe([])
+        killed = []
+
+        def raising_wait() -> int | None:
+            raise OSError("wait failed")
+
+        result = supervise_stream(
+            stdout, None, lambda: killed.append(True), raising_wait
+        )
+
+        self.assertEqual(result["outcome"], "internal_failure")
+        self.assertEqual(result["exit_code"], CLASSIFY_EXIT_INTERNAL_FAILURE)
+        self.assertEqual(killed, [True])
+
     def test_final_record_without_trailing_newline_is_processed(self) -> None:
         stdout = _FakePipe([json.dumps({"type": "error", "status": 401}).encode()])
         killed = []

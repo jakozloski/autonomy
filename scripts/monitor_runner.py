@@ -41,11 +41,14 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
@@ -492,7 +495,22 @@ class Runner:
         self.state_path = Path(args.state_file).resolve()
         self.skill_dir = Path(args.skill_dir).resolve()
         self.claude_bin = args.claude_bin
-        self.schema = SchemaCli(Path(args.schema_cli).resolve())
+        # R2 #1328 finding 3767068783: the schema CLI must not execute from
+        # the writable skill package after a write-capable child has run — a
+        # compromised child could rewrite the validator and forge a valid
+        # verdict. Snapshot the helper to a private directory OUTSIDE the
+        # worktree BEFORE any child launch, pin its digest, and re-verify
+        # identity immediately before every canonical commit.
+        source_cli = Path(args.schema_cli).resolve()
+        snapshot_dir = Path(
+            tempfile.mkdtemp(prefix="autonomy-schema-snapshot-")
+        )
+        self.schema_snapshot_path = snapshot_dir / source_cli.name
+        shutil.copyfile(source_cli, self.schema_snapshot_path)
+        self.schema_snapshot_sha256 = hashlib.sha256(
+            self.schema_snapshot_path.read_bytes()
+        ).hexdigest()
+        self.schema = SchemaCli(self.schema_snapshot_path)
         self.slice_deadline = time.monotonic() + args.slice_budget
         # Testability seam (same class as --claude-bin): scales ladder and
         # poll waits so hermetic failure-path tests finish in seconds. The
@@ -927,12 +945,17 @@ class Runner:
             or (
                 outcome == "terminal"
                 and monitor_status in ("complete", "paused")
-                # R2-2: a terminal claim must carry a terminal-consistent
-                # ledger — no handoff may be mid-flight or failed. The
-                # SESSION still owns the exit flow (terminal audit, exit
-                # actions) on receipt; this is the schema-visible floor.
+                # R2-2 as amended by R2 #1328 finding 3767068772: a terminal
+                # claim must carry a terminal-consistent ledger — no handoff
+                # may be MID-FLIGHT (pending). Terminal `failed` aggregates
+                # are legitimate: the QA contract records a failed operation
+                # as a non-blocking warning and the exit still pauses or
+                # completes. The SESSION still owns the exit flow (terminal
+                # audit, exit actions) on receipt; this is the schema-visible
+                # floor.
                 and all(
-                    status in ("idle", "complete") for status in handoff_statuses
+                    status in ("idle", "complete", "failed")
+                    for status in handoff_statuses
                 )
             )
             or (
@@ -979,6 +1002,32 @@ class Runner:
             self.failures.pop()  # the un-committed success marker
             self.charge_failure(fresh, "monitor-child:finalize_invalid")
             return "retry"
+        # R2 #1328 finding 3767068783 (commit-time identity recheck): the
+        # snapshot lives outside the worktree, but verifying it is cheap and
+        # closes the remaining tamper window before the verdict it produced
+        # is acted on.
+        current_cli_sha = hashlib.sha256(
+            self.schema_snapshot_path.read_bytes()
+        ).hexdigest()
+        if current_cli_sha != self.schema_snapshot_sha256:
+            self._discard(candidate)
+            self.failures.pop()
+            raise RunnerExit(
+                4,
+                "suspect_state",
+                "schema-CLI snapshot digest changed since runner init —"
+                " validation authority is no longer trustworthy; stop and"
+                " reconcile per the Resume trust model",
+            )
+        # R2 #1328 finding 3767068789: the canonical check at candidate
+        # verification time leaves the extraction/digest/finalize-validation
+        # window unguarded — a writer that ignores the kernel lock could land
+        # between it and this replace and be silently erased. Re-read
+        # canonical NOW, immediately before the atomic replacement; any drift
+        # is an unknown writer and stops the runner as suspect state, never a
+        # clobber (identical semantics to the post-child check above).
+        last_look = self.schema.extract(self.state_path)
+        self._require_unmutated_canonical(last_look, candidate)
         atomic_write(candidate, finalized)
         os.replace(candidate, self.state_path)
         self.ticks_completed += 1

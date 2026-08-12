@@ -276,8 +276,17 @@ MERGE_READINESS_KEYS = frozenset(
         "dependencies",
         "ac_conformance",
         "claims_audit",
+        "backfill",
     )
 )
+# R2 #1328 finding 3767068795: merge-readiness Check 1 makes verified
+# backfill completion a merge precondition when readers depend on populated
+# rows, but the schema had no field to persist it — the deploy hold could
+# release on schema-applied evidence while required rows stayed null.
+# ``merge_readiness.backfill`` maps a backfill name to its requirement and
+# verification state; a required backfill is hold-active until "complete",
+# and completion requires evidence naming the verification.
+BACKFILL_STATE_ENUM = frozenset(("pending", "complete", "n_a"))
 
 # Full top-level key inventory of the documented v1 schema.  Presence beyond
 # the tier's required set is fine as long as the key is known.
@@ -2237,6 +2246,43 @@ class _Validator:
                             APPLIED_STATE_ENUM,
                             f"{env_path}.{_safe_key(str(migration))}",
                         )
+        if "backfill" in value:
+            backfill = value.get("backfill")
+            if not isinstance(backfill, dict):
+                self.error("merge_readiness.backfill: must be a mapping")
+            else:
+                for name, record in backfill.items():
+                    bf_path = f"merge_readiness.backfill.{_safe_key(str(name))}"
+                    if not isinstance(record, dict):
+                        self.error(f"{bf_path}: must be a mapping")
+                        continue
+                    for key in record:
+                        if key not in ("required", "state", "evidence"):
+                            self.error(
+                                f"{bf_path}: unknown key {_safe_key(str(key))!r}"
+                            )
+                    required = record.get("required")
+                    if not isinstance(required, bool):
+                        self.error(f"{bf_path}.required: must be a boolean")
+                    self.check_enum(
+                        record.get("state"), BACKFILL_STATE_ENUM, f"{bf_path}.state"
+                    )
+                    evidence = record.get("evidence")
+                    if evidence is not None and (
+                        not isinstance(evidence, str) or not evidence
+                    ):
+                        self.error(
+                            f"{bf_path}.evidence: must be a non-empty string or null"
+                        )
+                    if (
+                        required is True
+                        and record.get("state") == "complete"
+                        and evidence is None
+                    ):
+                        self.error(
+                            f"{bf_path}.evidence: a required backfill marked"
+                            " complete must name its verification evidence"
+                        )
         if "claims_audit" in value:
             audit = value.get("claims_audit")
             if not isinstance(audit, dict):
@@ -2409,7 +2455,15 @@ def monitor_extract(text: str) -> dict[str, Any]:
             status = record.get("status") if isinstance(record, dict) else None
             statuses.append(status if isinstance(status, str) else "malformed")
     extract["handoff_statuses"] = statuses
-    extract["blocked_evidence_present"] = any(
+    # R2 #1328 finding 3767068764: condition (c) blocks on more than the
+    # three feedback maps — `human:*` attempt_log keys fire on PRESENCE
+    # (the R2-authorization exit is exactly this shape), `prompt-trail:stale`
+    # fires on presence, three-strike ci:/conflict:/branch:/ready: families
+    # fire at 3+, and a human-review block persists its evidence as the
+    # review_roundtrip ledger. A blocked candidate carrying any documented
+    # source must extract blocker evidence, or the runner discards the
+    # mandatory human exit and strands monitoring in_progress.
+    blocked = any(
         isinstance(state.get(key), dict) and state.get(key)
         for key in (
             "exhausted_feedback",
@@ -2417,6 +2471,35 @@ def monitor_extract(text: str) -> dict[str, Any]:
             "manual_branch_protection_blockers",
         )
     )
+    if not blocked:
+        attempt_log = state.get("attempt_log")
+        if isinstance(attempt_log, dict):
+            for key, count in attempt_log.items():
+                if not isinstance(key, str):
+                    continue
+                if key.startswith("human:") or key == "prompt-trail:stale":
+                    blocked = True
+                    break
+                if (
+                    key.split(":", 1)[0] in ("ci", "conflict", "branch", "ready")
+                    and isinstance(count, int)
+                    and not isinstance(count, bool)
+                    and count >= 3
+                ):
+                    blocked = True
+                    break
+    if not blocked and isinstance(handoffs, dict):
+        roundtrip = handoffs.get("review_roundtrip")
+        # An ENGAGED roundtrip ledger (never the tier fixtures' idle shell):
+        # only condition (c) plans roundtrip operations, so a non-idle status
+        # is durable evidence of a human-review block.
+        if isinstance(roundtrip, dict) and roundtrip.get("status") in (
+            "pending",
+            "complete",
+            "failed",
+        ):
+            blocked = True
+    extract["blocked_evidence_present"] = blocked
     return extract
 
 

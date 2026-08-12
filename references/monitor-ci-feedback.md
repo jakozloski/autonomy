@@ -31,8 +31,8 @@ while True:
     wait <= POLL_CHUNK with progress, THEN fetch fresh checks, feedback metadata (Phase A only — see Step 2), branch/protection state, head, grace clock, and — when a merge-readiness deploy/dependency hold set this tick — that hold's applied/live state (the direction-aware rechecks) — ONE sequential wait→refresh operation per tick, in a single tool round where the host permits composing them, never concurrent and never one round per query (see the Polling schedule cost note)
     if the exact clean wait condition still holds:
       continue
-    # Any failure, feedback, branch action, draft flip, terminal handoff, pause,
-    # or completion needs mutation/state transition and must consume work.
+    # Any failure/feedback/branch action, draft flip, terminal handoff, pause, or completion needs mutation and must consume work.
+    # KEEPER (R2 #1328 finding 3767068776): derive pending-@r2-ask state HERE, at loop entry — while an ask is pending on the current head, do NOT promote to work: Steps 1-3 are push-capable and would supersede the running review. Stay read-only (replies/acks only) and recheck the exact-head ask/review state immediately before ANY push.
     loop_reason = "work"
     continue
   else:

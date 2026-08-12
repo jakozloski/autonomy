@@ -707,6 +707,19 @@ def supervise_stream(
         except Exception:
             child_returncode = None
             outcome = "internal_failure"
+            # R2 #1328 finding 3767068801: a wait that RAISES proves nothing
+            # about the child's lifecycle — it may still be running with
+            # credentials, and the clean-streams path skipped cleanup before
+            # this branch. Route through the same process-group kill as every
+            # non-clean outcome; ProcessLookupError is the kill's goal state,
+            # and any other cleanup failure adds nothing beyond the
+            # internal_failure already recorded.
+            try:
+                kill_callback()
+            except ProcessLookupError:
+                pass
+            except Exception:
+                pass
         if outcome == "clean" and child_returncode not in (0, None):
             outcome = "internal_failure"
 
