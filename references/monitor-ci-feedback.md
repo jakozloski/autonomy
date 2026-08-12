@@ -52,7 +52,7 @@ while True:
      # Evaluation order: c → draft-PR gate → a → b → d → e (first match wins).
      # Condition (c) MUST be checked first so terminal-exhaustion / CHANGES_REQUESTED /
      # unresolved human threads can't be bypassed by an APPROVED match in (a)/(b).
-     c. If stuck (CI, conflict, branch-state, ready-flip 3+ attempts) OR exhausted_feedback/manual_unknown_feedback/manual_branch_protection_blockers non-empty OR CHANGES_REQUESTED OR unresolved_human_threads > 0 OR any `human:` key present (fires on presence) → run only eligible roundtrip work, then persist blocked + stranded-work report. If draft, leave it draft.
+     c. If stuck (CI, conflict, branch-state, ready-flip 3+ attempts) OR exhausted_feedback/manual_unknown_feedback/manual_branch_protection_blockers non-empty OR CHANGES_REQUESTED OR unresolved_human_threads > 0 OR any `human:` key present (fires on presence) → run only eligible roundtrip work (Keeper: handback requires the R2 gate satisfied on the current head, else route to the R2 gate — monitor-exit-handoffs.md), then persist blocked + stranded-work report. If draft, leave it draft.
      ▸ Draft-PR gate (not an exit; see Step 4): if isDraft AND post_push_until is not null AND merge-readiness holds are clear (direction-aware deploy/dependency rechecks — see the gate definition in monitor-exit-handoffs.md) AND the clean-pass
         preconditions hold (gating checks passing + all_feedback_addressed + branch_pause_ready + grace_elapsed + CI-config self-verification when applicable, draft-unrunnable ready-only workflows excluded at flip)
         # NOTE: no stable_poll_confirmed here — the flip is not an exit, so it fires on the first grace-elapsed clean pass instead of waiting for the two-poll convergence.
