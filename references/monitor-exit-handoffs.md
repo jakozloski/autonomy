@@ -223,13 +223,13 @@ Keeper's review flow routes implementer → R2 (`r2-keeper`, Keeper's review bot
 
 Run this handoff at the FIRST clean exit — condition (a) (approved → `complete`) or condition (d) (clean but unapproved → `paused`). Preview QA runs in parallel with code review, so the paused exit transfers QA ownership too; it still never merges and never writes `complete`. Whichever exit fires second re-verifies the recorded operation postconditions instead of re-executing (a human reassignment in between is human action, not drift to correct). The helper scenario is `approved_qa` for condition (a) and `clean_unapproved` for condition (d); both plan identical operations. Resolve the exact repository identity with `gh repo view --json nameWithOwner --jq .nameWithOwner`; same-name forks fail closed. In Keeper repositories the R2 review gate precedes these exits, so the first clean exit — and this handoff — occurs only after R2 has approved the PR (or the user explicitly waived the gate).
 
-| Exact `nameWithOwner`                 | GitHub PR assignee | Linear email     | Linear user id                         | Display name         |
-| ------------------------------------- | ------------------ | ---------------- | -------------------------------------- | -------------------- |
-| `Keeper-Dating/matchmaking`           | `tjkeeper`         | `tj@keeper.ai`   | `4d5aed4e-076c-47e5-94a1-0a39287364e1` | Timothy Jhon Pascual |
-| `Keeper-Dating/keeper-lead-generator` | `tjkeeper`         | `tj@keeper.ai`   | `4d5aed4e-076c-47e5-94a1-0a39287364e1` | Timothy Jhon Pascual |
-| `Keeper-Dating/calculator-api`        | `tjkeeper`         | `tj@keeper.ai`   | `4d5aed4e-076c-47e5-94a1-0a39287364e1` | Timothy Jhon Pascual |
-| `Keeper-Dating/admin-portal`          | `shafqatukhan`     | `shafqat@keeper.ai` | `18fadb17-d9e6-495b-af66-c234f457ff20` | Shafqat           |
-| anything else                         | none — skip        | —                | —                                      | —                    |
+| Exact `nameWithOwner`                 | GitHub PR assignee | Linear email        | Linear user id                         | Display name         |
+| ------------------------------------- | ------------------ | ------------------- | -------------------------------------- | -------------------- |
+| `Keeper-Dating/matchmaking`           | `tjkeeper`         | `tj@keeper.ai`      | `4d5aed4e-076c-47e5-94a1-0a39287364e1` | Timothy Jhon Pascual |
+| `Keeper-Dating/keeper-lead-generator` | `tjkeeper`         | `tj@keeper.ai`      | `4d5aed4e-076c-47e5-94a1-0a39287364e1` | Timothy Jhon Pascual |
+| `Keeper-Dating/calculator-api`        | `tjkeeper`         | `tj@keeper.ai`      | `4d5aed4e-076c-47e5-94a1-0a39287364e1` | Timothy Jhon Pascual |
+| `Keeper-Dating/admin-portal`          | `shafqatukhan`     | `shafqat@keeper.ai` | `18fadb17-d9e6-495b-af66-c234f457ff20` | Shafqat              |
+| anything else                         | none — skip        | —                   | —                                      | —                    |
 
 This table restates `QA_OWNER_BY_REPOSITORY` in `scripts/handoff_decision.py`, which is canonical at runtime; a sync test in `scripts/test_handoff_decision.py` fails if the two drift. The **Linear user id** is the stable binding (sourced from the org identity map, `keeper-agents/scripts/users.json`): the planner hard-fails when a resolved QA user's provider id differs from it, while the display name is an advisory cross-check that only warns. The **Linear email** exists because Keeper's authorized managed broker (`linear_update_issue`) accepts `assignee_email`/`state_name` and resolves ids internally (R2 #1495 finding 3776596721) — managed-path mutations send the email and state NAME, and postconditions still verify by provider id.
 
