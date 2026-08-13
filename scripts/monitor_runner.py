@@ -682,6 +682,22 @@ class Runner:
         base_digest = extract.get("digest")
         if not isinstance(base_digest, str):
             raise RunnerExit(4, "suspect_state", "canonical digest unavailable")
+        tainted = extract.get("tainted") or []
+        if tainted:
+            # R2 #1495 finding 3776596739: structural validity alone must not
+            # launch a write-capable child — instruction-like content in the
+            # prompt ledger or feedback maps reaches the model with no tool
+            # clamp. Fail closed BEFORE the launch; clearing the taint is a
+            # human judgment, never the runner's.
+            raise RunnerExit(
+                4,
+                "suspect_state",
+                f"canonical state carries {len(tainted)} instruction-like"
+                " taint record(s) — a write-capable monitor child must not"
+                " launch on untrusted content; review the tainted paths in"
+                " the validator output, clean or explicitly rewrite them,"
+                " then resume",
+            )
         prompt = monitor_child_prompt(
             str(self.skill_dir),
             str(self.state_path),
@@ -789,6 +805,35 @@ class Runner:
                 "killed monitor child could not be reaped within the bounded"
                 " window — a possibly-live writer needs a human",
             )
+        if drained["outcome"] == "clean" and drained["exit_code"] == 0:
+            # R2 #1495 finding 3776596760: the leader's poll() says nothing
+            # about descendants — a redirected-stdio worker can survive a
+            # "clean" tick and keep mutating outside the runner's
+            # single-writer guarantee. Prove the whole process group extinct
+            # before accepting; survivors are killed, boundedly rechecked,
+            # and the tick is charged and retried.
+            survivors = _live_group_members(proc.pid)
+            if survivors:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline and _live_group_members(
+                    proc.pid
+                ):
+                    time.sleep(0.2)
+                self._discard(candidate)
+                if _live_group_members(proc.pid):
+                    raise RunnerExit(
+                        5,
+                        "blocked",
+                        "monitor child exited clean but left live process-"
+                        "group members that survived SIGKILL — a possibly-"
+                        "live writer needs a human",
+                    )
+                self.charge_failure(fresh, "monitor-child:group_survivors")
+                return "retry"
         if drained["outcome"] != "clean" or drained["exit_code"] != 0:
             self._discard(candidate)
             if drained["outcome"] != "clean":
@@ -972,6 +1017,7 @@ class Runner:
         )
         valid = (
             candidate_extract.get("state") == "valid"
+            and not (candidate_extract.get("tainted") or [])
             and candidate_digest is not None
             and candidate_digest == verdict.get("post_workflow_digest")
             and deltas in ((1, 0), (0, 1))

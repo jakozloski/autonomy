@@ -2420,6 +2420,12 @@ def monitor_extract(text: str) -> dict[str, Any]:
         "version": SCHEMA_VERSION,
         "state": result["state"],
         "errors": result["errors"],
+        # admin-portal#1495 R2 finding 3776596739: taint detection is
+        # advisory for the VALIDATION verdict but load-bearing for the
+        # runner — a structurally valid state carrying instruction-like
+        # content must not reach a write-capable child. Surface the records
+        # so the runner can fail closed before every launch.
+        "tainted": result.get("tainted", []),
         "digest": monitor_digest(text),
         "monitor_cli": None,
         "monitor_ownership": None,

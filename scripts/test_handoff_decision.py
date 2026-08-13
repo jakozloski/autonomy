@@ -23,7 +23,7 @@ TIMESTAMP = "2026-07-09T20:09:07Z"
 FIX_SHA = "a" * 40
 REMOTE_HEAD_SHA = "b" * 40
 LINEAR_QA_ASSIGNEE = {
-    "provider_id": "linear-user-tjkeeper",
+    "provider_id": "4d5aed4e-076c-47e5-94a1-0a39287364e1",
     "name": "Timothy Jhon Pascual",
 }
 LINEAR_QA_STATE_WEB = {
@@ -156,18 +156,26 @@ class HandoffDecisionTest(unittest.TestCase):
             {
                 "Keeper-Dating/admin-portal": {
                     "github_login": "shafqatukhan",
+                    "linear_email": "shafqat@keeper.ai",
+                    "linear_user_id": "18fadb17-d9e6-495b-af66-c234f457ff20",
                     "linear_name": "Shafqat",
                 },
                 "Keeper-Dating/calculator-api": {
                     "github_login": "tjkeeper",
+                    "linear_email": "tj@keeper.ai",
+                    "linear_user_id": "4d5aed4e-076c-47e5-94a1-0a39287364e1",
                     "linear_name": "Timothy Jhon Pascual",
                 },
                 "Keeper-Dating/keeper-lead-generator": {
                     "github_login": "tjkeeper",
+                    "linear_email": "tj@keeper.ai",
+                    "linear_user_id": "4d5aed4e-076c-47e5-94a1-0a39287364e1",
                     "linear_name": "Timothy Jhon Pascual",
                 },
                 "Keeper-Dating/matchmaking": {
                     "github_login": "tjkeeper",
+                    "linear_email": "tj@keeper.ai",
+                    "linear_user_id": "4d5aed4e-076c-47e5-94a1-0a39287364e1",
                     "linear_name": "Timothy Jhon Pascual",
                 },
             },
@@ -211,7 +219,8 @@ class HandoffDecisionTest(unittest.TestCase):
             "payload": {
                 "ticket_identifier": "WEB-8877",
                 "ticket_provider_id": "linear-ticket-web-8877",
-                "assignee_id": "linear-user-tjkeeper",
+                "assignee_id": "4d5aed4e-076c-47e5-94a1-0a39287364e1",
+                "assignee_email": "tj@keeper.ai",
                 "assignee_name": "Timothy Jhon Pascual",
                 "write_path": "environment_tool",
             },
@@ -225,7 +234,7 @@ class HandoffDecisionTest(unittest.TestCase):
             "payload": {
                 "ticket_identifier": "WEB-8877",
                 "ticket_provider_id": "linear-ticket-web-8877",
-                "expected_assignee_id": "linear-user-tjkeeper",
+                "expected_assignee_id": "4d5aed4e-076c-47e5-94a1-0a39287364e1",
                 "expected_assignee_name": "Timothy Jhon Pascual",
                 "write_path": "environment_tool",
             },
@@ -322,6 +331,63 @@ class HandoffDecisionTest(unittest.TestCase):
         self.assertEqual(
             set_state["payload"]["state_id"], "linear-state-dev-ready-for-qa"
         )
+
+    def test_wrong_linear_user_id_blocks_the_handoff(self) -> None:
+        # admin-portal#1495 R2 finding 3722356257, resolved structurally:
+        # binding is by the STABLE mapped Linear user id — resolving a
+        # different user is a wrong-target handoff and hard-fails.
+        request = {
+            "scenario": "approved_qa",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+            "issue_tracker": {
+                "type": "linear",
+                "qa_assignee": {
+                    "provider_id": "00000000-0000-0000-0000-000000000000",
+                    "name": "Timothy Jhon Pascual",
+                },
+                "qa_state": LINEAR_QA_STATE_WEB,
+                "ticket_identifier": "WEB-8877",
+                "ticket_provider_id": "linear-ticket-web-8877",
+                "ticket_validated": True,
+                "write_path": "environment_tool",
+            },
+        }
+        plan = plan_handoff(request)
+        self.assertEqual(plan["state"], "blocked")
+        self.assertTrue(
+            any("must be the mapped Linear user id" in e for e in plan["errors"])
+        )
+
+    def test_display_name_drift_warns_but_proceeds(self) -> None:
+        # The display name is an ADVISORY cross-check: labels drift, the id
+        # binding is the guard. A mismatch warns and the plan proceeds.
+        request = {
+            "scenario": "approved_qa",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+            "issue_tracker": {
+                "type": "linear",
+                "qa_assignee": {
+                    "provider_id": "4d5aed4e-076c-47e5-94a1-0a39287364e1",
+                    "name": "TJ Pascual (renamed)",
+                },
+                "qa_state": LINEAR_QA_STATE_WEB,
+                "ticket_identifier": "WEB-8877",
+                "ticket_provider_id": "linear-ticket-web-8877",
+                "ticket_validated": True,
+                "write_path": "environment_tool",
+            },
+        }
+        plan = plan_handoff(request)
+        self.assertEqual(plan["state"], "pending")
+        self.assertTrue(
+            any("display label" in w and "proceeds" in w for w in plan["warnings"])
+        )
+        assign = next(
+            op for op in plan["operations"] if op["action"] == "assign_ticket"
+        )
+        self.assertEqual(assign["payload"]["assignee_email"], "tj@keeper.ai")
 
     def test_qa_state_name_must_match_ticket_team(self) -> None:
         plan = plan_handoff(
@@ -1610,7 +1676,8 @@ class HandoffDecisionTest(unittest.TestCase):
                         "payload": {
                             "ticket_identifier": "WEB-8877",
                             "ticket_provider_id": "linear-ticket-web-8877",
-                            "assignee_id": "linear-user-tjkeeper",
+                            "assignee_id": "4d5aed4e-076c-47e5-94a1-0a39287364e1",
+                            "assignee_email": "tj@keeper.ai",
                             "assignee_name": "Timothy Jhon Pascual",
                             "write_path": "environment_tool",
                         },
@@ -1624,7 +1691,7 @@ class HandoffDecisionTest(unittest.TestCase):
                         "payload": {
                             "ticket_identifier": "WEB-8877",
                             "ticket_provider_id": "linear-ticket-web-8877",
-                            "expected_assignee_id": "linear-user-tjkeeper",
+                            "expected_assignee_id": "4d5aed4e-076c-47e5-94a1-0a39287364e1",
                             "expected_assignee_name": "Timothy Jhon Pascual",
                             "write_path": "environment_tool",
                         },
@@ -1972,7 +2039,7 @@ class HandoffDecisionTest(unittest.TestCase):
             tracker = dict(base_tracker)
             tracker["qa_assignee"] = dict(LINEAR_QA_ASSIGNEE)
             if field == "qa_assignee":
-                tracker["qa_assignee"]["provider_id"] = " linear-user-tjkeeper "
+                tracker["qa_assignee"]["provider_id"] = " 4d5aed4e-076c-47e5-94a1-0a39287364e1 "
                 expected_field = "qa_assignee.provider_id"
             else:
                 tracker[field] = " "
@@ -2194,11 +2261,13 @@ class QaOwnerDocumentationSyncTest(unittest.TestCase):
             if not stripped.startswith("|"):
                 continue
             cells = [cell.strip() for cell in stripped.strip("|").split("|")]
-            if len(cells) != 3 or not cells[0].startswith("`Keeper-Dating/"):
+            if len(cells) != 5 or not cells[0].startswith("`Keeper-Dating/"):
                 continue
             documented[cells[0].strip("`")] = {
                 "github_login": cells[1].strip("`"),
-                "linear_name": cells[2],
+                "linear_email": cells[2].strip("`"),
+                "linear_user_id": cells[3].strip("`"),
+                "linear_name": cells[4],
             }
 
         self.assertEqual(documented, QA_OWNER_BY_REPOSITORY)

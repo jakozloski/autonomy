@@ -50,21 +50,37 @@ MAX_OPERATION_ATTEMPTS = state_schema.MAX_OPERATION_ATTEMPTS
 
 # Match nameWithOwner exactly.  Repository basename matching would incorrectly
 # hand off forks such as another-owner/matchmaking.
+# Identity binding (admin-portal#1495 R2 findings 3722356257 + 3776596721):
+# ``linear_user_id`` is the STABLE binding — sourced from
+# keeper-agents/scripts/users.json, the org's identity map — and the planner
+# hard-fails when a resolved QA user does not match it. ``linear_email`` is
+# the field Keeper's authorized managed broker (`linear_update_issue`)
+# accepts for assignment (it resolves IDs internally); provider IDs remain
+# the postcondition-verification key. ``linear_name`` is an ADVISORY display
+# cross-check only: a mismatch warns (display names drift), never blocks.
 QA_OWNER_BY_REPOSITORY = {
     "Keeper-Dating/admin-portal": {
         "github_login": "shafqatukhan",
+        "linear_email": "shafqat@keeper.ai",
+        "linear_user_id": "18fadb17-d9e6-495b-af66-c234f457ff20",
         "linear_name": "Shafqat",
     },
     "Keeper-Dating/calculator-api": {
         "github_login": "tjkeeper",
+        "linear_email": "tj@keeper.ai",
+        "linear_user_id": "4d5aed4e-076c-47e5-94a1-0a39287364e1",
         "linear_name": "Timothy Jhon Pascual",
     },
     "Keeper-Dating/keeper-lead-generator": {
         "github_login": "tjkeeper",
+        "linear_email": "tj@keeper.ai",
+        "linear_user_id": "4d5aed4e-076c-47e5-94a1-0a39287364e1",
         "linear_name": "Timothy Jhon Pascual",
     },
     "Keeper-Dating/matchmaking": {
         "github_login": "tjkeeper",
+        "linear_email": "tj@keeper.ai",
+        "linear_user_id": "4d5aed4e-076c-47e5-94a1-0a39287364e1",
         "linear_name": "Timothy Jhon Pascual",
     },
 }
@@ -248,7 +264,7 @@ def _approved_qa_operations(
     name_with_owner: str,
     pull_request_number: int,
     owner: dict[str, str],
-) -> tuple[dict[str, Any], list[dict[str, Any]], list[str]]:
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[str], list[str]]:
     github_login = owner["github_login"]
     linear_name = owner["linear_name"]
     generation = qa_generation(request)
@@ -280,6 +296,7 @@ def _approved_qa_operations(
         )
     )
     errors: list[str] = []
+    advisory_warnings: list[str] = []
 
     issue_tracker = request.get("issue_tracker", {})
     if not isinstance(issue_tracker, dict):
@@ -288,16 +305,16 @@ def _approved_qa_operations(
     tracker_type = issue_tracker.get("type", "none")
     if not isinstance(tracker_type, str):
         errors.append("issue_tracker.type must be a string")
-        return targets, operations, errors
+        return targets, operations, errors, advisory_warnings
     if tracker_type not in ISSUE_TRACKER_TYPES:
         errors.append("issue_tracker.type must be one of: github, jira, linear, none")
-        return targets, operations, errors
+        return targets, operations, errors, advisory_warnings
 
     if tracker_type == "linear":
         ticket_required = issue_tracker.get("ticket_required", True)
         if not isinstance(ticket_required, bool):
             errors.append("issue_tracker.ticket_required must be a boolean")
-            return targets, operations, errors
+            return targets, operations, errors, advisory_warnings
         ticket_validated = issue_tracker.get("ticket_validated") is True
         if not ticket_required:
             ticket_exemption_reason = issue_tracker.get("ticket_exemption_reason")
@@ -306,40 +323,40 @@ def _approved_qa_operations(
                     "issue_tracker.ticket_exemption_reason must be non-empty "
                     "when a Linear ticket is not required"
                 )
-                return targets, operations, errors
+                return targets, operations, errors, advisory_warnings
             if not ticket_validated:
-                return targets, operations, errors
+                return targets, operations, errors, advisory_warnings
         if not ticket_validated:
             errors.append("a Linear QA handoff requires a currently validated ticket")
-            return targets, operations, errors
+            return targets, operations, errors, advisory_warnings
         ticket_identifier = issue_tracker.get("ticket_identifier")
         if not _is_stripped_nonempty_string(ticket_identifier):
             errors.append(
                 "issue_tracker.ticket_identifier must be stripped and non-empty "
                 "when a Linear ticket is validated"
             )
-            return targets, operations, errors
+            return targets, operations, errors, advisory_warnings
         ticket_provider_id = issue_tracker.get("ticket_provider_id")
         if not _is_stripped_nonempty_string(ticket_provider_id):
             errors.append(
                 "issue_tracker.ticket_provider_id must be stripped and non-empty "
                 "when a Linear ticket is validated"
             )
-            return targets, operations, errors
+            return targets, operations, errors, advisory_warnings
 
         write_path = issue_tracker.get("write_path")
         if write_path not in LINEAR_WRITE_PATHS:
             errors.append(
                 "issue_tracker.write_path must be one of: environment_tool, local_api, none"
             )
-            return targets, operations, errors
+            return targets, operations, errors, advisory_warnings
 
         session_environment = request.get("session_environment")
         if write_path == "local_api" and session_environment != "local":
             errors.append(
                 "issue_tracker.write_path local_api requires session_environment='local'"
             )
-            return targets, operations, errors
+            return targets, operations, errors, advisory_warnings
 
         if write_path == "none":
             operations.append(
@@ -362,26 +379,35 @@ def _approved_qa_operations(
                     "automatic_failure": "No authorized Linear write path is available.",
                 }
             )
-            return targets, operations, errors
+            return targets, operations, errors, advisory_warnings
 
         qa_assignee = issue_tracker.get("qa_assignee")
         if not isinstance(qa_assignee, dict):
             errors.append(
                 "issue_tracker.qa_assignee must contain the resolved Linear provider ID"
             )
-            return targets, operations, errors
+            return targets, operations, errors, advisory_warnings
         linear_provider_id = qa_assignee.get("provider_id")
         resolved_name = qa_assignee.get("name")
         if not _is_stripped_nonempty_string(linear_provider_id):
             errors.append(
                 "issue_tracker.qa_assignee.provider_id must be stripped and non-empty"
             )
-            return targets, operations, errors
-        if resolved_name != linear_name:
+            return targets, operations, errors, advisory_warnings
+        if linear_provider_id != owner["linear_user_id"]:
             errors.append(
-                f"issue_tracker.qa_assignee.name must resolve exactly to {linear_name!r}"
+                "issue_tracker.qa_assignee.provider_id must be the mapped"
+                f" Linear user id {owner['linear_user_id']!r} (stable binding"
+                " from the org identity map); resolving a different user is"
+                " a wrong-target handoff, not a drifted label"
             )
-            return targets, operations, errors
+            return targets, operations, errors, advisory_warnings
+        if resolved_name != linear_name:
+            advisory_warnings.append(
+                f"qa_assignee.name {resolved_name!r} differs from the mapped"
+                f" display label {linear_name!r} — display names drift;"
+                " binding is by linear_user_id and proceeds"
+            )
         targets["linear_assignee"] = {
             "provider_id": linear_provider_id,
             "name": linear_name,
@@ -397,6 +423,7 @@ def _approved_qa_operations(
                     "ticket_identifier": ticket_identifier,
                     "ticket_provider_id": ticket_provider_id,
                     "assignee_id": linear_provider_id,
+                    "assignee_email": owner["linear_email"],
                     "assignee_name": linear_name,
                     "write_path": write_path,
                 },
@@ -427,7 +454,7 @@ def _approved_qa_operations(
                     f"issue_tracker.qa_state must be omitted for team {team_key!r}, "
                     "which has no mapped QA workflow state"
                 )
-            return targets, operations, errors
+            return targets, operations, errors, advisory_warnings
         if qa_state is None:
             unresolved_reason = issue_tracker.get("qa_state_unresolved_reason")
             if not _is_stripped_nonempty_string(unresolved_reason):
@@ -436,7 +463,7 @@ def _approved_qa_operations(
                     f"{expected_state_name!r} workflow state for team {team_key!r}; "
                     "pass qa_state_unresolved_reason to record a manual state move"
                 )
-                return targets, operations, errors
+                return targets, operations, errors, advisory_warnings
             operations.append(
                 {
                     "id": f"qa.linear.record_state_unavailable:g{generation}",
@@ -454,25 +481,25 @@ def _approved_qa_operations(
                     "automatic_failure": unresolved_reason,
                 }
             )
-            return targets, operations, errors
+            return targets, operations, errors, advisory_warnings
         if not isinstance(qa_state, dict):
             errors.append(
                 "issue_tracker.qa_state must contain the resolved Linear "
                 "workflow-state provider ID"
             )
-            return targets, operations, errors
+            return targets, operations, errors, advisory_warnings
         state_provider_id = qa_state.get("provider_id")
         if not _is_stripped_nonempty_string(state_provider_id):
             errors.append(
                 "issue_tracker.qa_state.provider_id must be stripped and non-empty"
             )
-            return targets, operations, errors
+            return targets, operations, errors, advisory_warnings
         if qa_state.get("name") != expected_state_name:
             errors.append(
                 "issue_tracker.qa_state.name must resolve exactly to "
                 f"{expected_state_name!r} for team {team_key!r}"
             )
-            return targets, operations, errors
+            return targets, operations, errors, advisory_warnings
 
         operations.append(
             {
@@ -505,7 +532,7 @@ def _approved_qa_operations(
             }
         )
 
-    return targets, operations, errors
+    return targets, operations, errors, advisory_warnings
 
 
 def _roundtrip_targets(
@@ -1187,6 +1214,7 @@ def plan_handoff(request: Any) -> dict[str, Any]:
     assert name_with_owner is not None
     assert pull_request_number is not None
 
+    extra_warnings: list[str] = []
     # QA handoff fires at the FIRST clean exit: approved (monitor -> complete)
     # or clean-but-unapproved (monitor -> paused). Preview QA runs in parallel
     # with code review, so both scenarios plan the identical operation set; the
@@ -1207,9 +1235,12 @@ def plan_handoff(request: Any) -> dict[str, Any]:
                 "repository.nameWithOwner is not in the exact QA-owner map",
             )
 
-        targets, operations, errors = _approved_qa_operations(
-            request, name_with_owner, pull_request_number, owner
+        targets, operations, errors, qa_advisory_warnings = (
+            _approved_qa_operations(
+                request, name_with_owner, pull_request_number, owner
+            )
         )
+        extra_warnings.extend(qa_advisory_warnings)
         if not errors and operations:
             # Target-digest-bound IDs make a ledger persisted for different
             # targets (another PR, a re-keyed ticket, a changed owner map or
@@ -1282,6 +1313,7 @@ def plan_handoff(request: Any) -> dict[str, Any]:
                         + " prior-target terminal QA record(s): "
                         + ", ".join(sorted(stale_terminal))
                     )
+                    plan["warnings"].extend(extra_warnings)
                     return plan
     else:
         targets, operations, errors = _roundtrip_operations(
@@ -1382,7 +1414,9 @@ def plan_handoff(request: Any) -> dict[str, Any]:
 
     if errors:
         return _blocked(scenario, *errors)
-    return _apply_operation_state(scenario, targets, operations, request)
+    plan = _apply_operation_state(scenario, targets, operations, request)
+    plan["warnings"].extend(extra_warnings)
+    return plan
 
 
 def main() -> int:
