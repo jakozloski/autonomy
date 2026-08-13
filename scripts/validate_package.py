@@ -460,6 +460,16 @@ REQUIRED_REDACTION_PATTERNS = {
             "sk-" + "svcacct-abcDEF0123456789_-abcDEF",
         ),
     ),
+    # algo#1216 R2 round-3 delivery: password/Cookie redaction was
+    # incomplete — both are label/format-anchored to avoid false positives.
+    "password_assignment": (
+        r"""(?i)\bpassword["']?\s*[:=]\s*["']?[^\s"']{8,}""",
+        ("password=" + "SuperSecret99", "PASSWORD: " + "hunter2hunter2"),
+    ),
+    "cookie_header_value": (
+        r"""(?i)\b(Set-)?Cookie:\s*[^\s;=]+=[^\s;]{8,}""",
+        ("Cookie: " + "session=abcdef12345678", "Set-Cookie: " + "sid=0123456789abcdef"),
+    ),
     "anthropic_key": (
         r"sk-ant-[A-Za-z0-9_-]{40,}",
         ("sk-" + "ant-abcdefghijklmnopqrstuvwxyz_1234567890-ABCDE",),

@@ -425,11 +425,11 @@ Before posting ANY content to PRs, comments, or logs (including the Prompt Trail
 - GitHub user/OAuth token: `gh[pour]_[A-Za-z0-9]{20,255}`; fine-grained PAT: `github_pat_[A-Za-z0-9_]{20,255}`
 - GitHub server token: `ghs_([A-Za-z0-9]{20,255}|[A-Za-z0-9]+_[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})`
 - Authorization Bearer header: `(?i)Authorization:\s*Bearer\s+[A-Za-z0-9._~+/-]{8,}=*` — the header form model_policy.py's excerpt handling defers to this list; that deferral was previously a promise with no pattern behind it
-- Slack token: `xox[baprs]-[A-Za-z0-9-]{10,}`
-- Linear API key: `lin_api_[A-Za-z0-9_]{40,}`
+- Slack token: `xox[baprs]-[A-Za-z0-9-]{10,}`; Linear API key: `lin_api_[A-Za-z0-9_]{40,}`
 - OpenAI / Codex key: `sk-((proj|svcacct)-)?[A-Za-z0-9_-]{20,}`
 - Anthropic key: `sk-ant-[A-Za-z0-9_-]{40,}`
 - JWT: `eyJ[A-Za-z0-9_\-=]{10,}\.eyJ[A-Za-z0-9_\-=]{10,}\.[A-Za-z0-9_\-=]+`
+- Password assignment (label-anchored): `(?i)\bpassword["']?\s*[:=]\s*["']?[^\s"']{8,}`; Cookie/Set-Cookie header value: `(?i)\b(Set-)?Cookie:\s*[^\s;=]+=[^\s;]{8,}`
 
 **Action on match:** redact and proceed. Do NOT BLOCK the workflow on detection — that would make the skill unusable on PRs that happen to discuss credentials in comments. Log the redaction count in `attempt_log` as `redaction:<kind>:<count>` for audit.
 

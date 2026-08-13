@@ -186,6 +186,8 @@ if mode != "no_init":
         init["session_id"] = os.environ.get("FAKE_SID", "fake-sid-1")
     print(json.dumps(init), flush=True)
 
+if mode == "die_late":
+    pass  # falls through to normal candidate/verdict production; exits 7 at the end
 if mode == "sleep":
     time.sleep(float(os.environ.get("FAKE_SLEEP", "30")))
     sys.exit(1)
@@ -280,7 +282,7 @@ if mode == "no_verdict":
     print(json.dumps({"type": "result", "result": "not json"}), flush=True)
 else:
     print(json.dumps({"type": "result", "result": json.dumps(verdict)}), flush=True)
-sys.exit(0)
+sys.exit(7 if mode == "die_late" else 0)
 '''
 
 
@@ -495,6 +497,31 @@ class MonitorRunnerE2ETests(unittest.TestCase):
                 pass  # killed by the runner, as required
             else:
                 self.fail("survivor process outlived the runner's kill")
+
+    def test_failed_exit_with_surviving_group_member_is_reaped(self) -> None:
+        # R2 #1495 finding 3777668741: the failure path cleared in_flight
+        # (the only survivor record) while an exit-nonzero child's
+        # redirected-stdio descendant kept running. Group extinction now
+        # covers EVERY drained outcome, so the survivor is killed before
+        # any failure commit.
+        pid_file = self.dir / "survivor.pid"
+        completed = self._run(
+            mode="die_late", budget="900", timeout=90, wait_scale="0.02",
+            max_ticks="3",
+            env_extra={
+                "FAKE_LEAVE_SURVIVOR": "1",
+                "FAKE_SURVIVOR_PID_FILE": str(pid_file),
+            },
+        )
+        self.assertEqual(completed.returncode, 5, completed.stderr)
+        if pid_file.exists():
+            pid = int(pid_file.read_text())
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                pass  # reaped by the runner, as required
+            else:
+                self.fail("survivor outlived the failure-path reap")
 
     def test_wrong_served_model_blocks_immediately(self) -> None:
         completed = self._run(mode="wrong_model")

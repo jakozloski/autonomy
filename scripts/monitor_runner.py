@@ -569,6 +569,16 @@ class Runner:
 
     # -- failure ledger --------------------------------------------------
     def charge_failure(self, extract: dict[str, Any], signature: str) -> None:
+        # R2 #1495 finding 3777668741 (second half): this failure commit is a
+        # read-modify-write of canonical state — re-verify canonical against
+        # the launch snapshot IMMEDIATELY before it, so drift written after
+        # the post-drain verification stops as suspect instead of being
+        # silently absorbed. Only meaningful once a launch snapshot exists;
+        # pre-launch charges have no child window to guard.
+        if self.launch_block is not None and self.launch_base_digest is not None:
+            self._require_unmutated_canonical(
+                self.schema.extract(self.state_path), None
+            )
         self.failures.append({"signature": signature, "at": _utcnow_iso()})
         # Streak, not lifetime (F8): the 3-strike rule fires on CONSECUTIVE
         # same-signature failures; a successful tick or a different
@@ -805,33 +815,35 @@ class Runner:
                 "killed monitor child could not be reaped within the bounded"
                 " window — a possibly-live writer needs a human",
             )
-        if drained["outcome"] == "clean" and drained["exit_code"] == 0:
-            # R2 #1495 finding 3776596760: the leader's poll() says nothing
-            # about descendants — a redirected-stdio worker can survive a
-            # "clean" tick and keep mutating outside the runner's
-            # single-writer guarantee. Prove the whole process group extinct
-            # before accepting; survivors are killed, boundedly rechecked,
-            # and the tick is charged and retried.
-            survivors = _live_group_members(proc.pid)
-            if survivors:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
-                deadline = time.monotonic() + 5.0
-                while time.monotonic() < deadline and _live_group_members(
-                    proc.pid
-                ):
-                    time.sleep(0.2)
+        # R2 #1495 findings 3776596760 + 3777668741: the leader's exit —
+        # clean OR failed — says nothing about descendants, and the failure
+        # path clears the only survivor record (in_flight) when it commits.
+        # Prove the whole process group extinct for EVERY drained outcome
+        # before any state is cleared or committed; survivors are killed and
+        # boundedly rechecked, an unkillable survivor blocks for a human,
+        # and a clean tick that needed the kill is charged and retried.
+        survivors = _live_group_members(proc.pid)
+        if survivors:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and _live_group_members(
+                proc.pid
+            ):
+                time.sleep(0.2)
+            if _live_group_members(proc.pid):
                 self._discard(candidate)
-                if _live_group_members(proc.pid):
-                    raise RunnerExit(
-                        5,
-                        "blocked",
-                        "monitor child exited clean but left live process-"
-                        "group members that survived SIGKILL — a possibly-"
-                        "live writer needs a human",
-                    )
+                raise RunnerExit(
+                    5,
+                    "blocked",
+                    "monitor child left live process-group members that"
+                    " survived SIGKILL — a possibly-live writer needs a"
+                    " human",
+                )
+            if drained["outcome"] == "clean" and drained["exit_code"] == 0:
+                self._discard(candidate)
                 self.charge_failure(fresh, "monitor-child:group_survivors")
                 return "retry"
         if drained["outcome"] != "clean" or drained["exit_code"] != 0:
@@ -896,6 +908,12 @@ class Runner:
         )
 
     def _clear_in_flight(self, extract: dict[str, Any]) -> None:
+        # Same pre-commit canonical recheck as charge_failure (finding
+        # 3777668741): this path also clears in_flight via read-modify-write.
+        if self.launch_block is not None and self.launch_base_digest is not None:
+            self._require_unmutated_canonical(
+                self.schema.extract(self.state_path), None
+            )
         block = self.current_block(extract)
         block["in_flight"] = None
         # R2-5: memory is truth for session identity too — a cleared resume
