@@ -807,9 +807,13 @@ class MonitorRunnerE2ETests(unittest.TestCase):
             max_ticks="3",
         )
         self.assertEqual(completed.returncode, 5, completed.stderr)
-        preserved = self.state.with_suffix(".failed-candidate.md")
-        self.assertTrue(preserved.exists(), "failed candidate must be preserved")
-        self.assertIn("monitor_poll_ticks: 1", preserved.read_text(encoding="utf-8"))
+        sidecars = sorted(
+            self.state.parent.glob(self.state.stem + ".failed-candidate-*")
+        )
+        self.assertTrue(sidecars, "failed candidate must be preserved")
+        self.assertIn(
+            "monitor_poll_ticks: 1", sidecars[0].read_text(encoding="utf-8")
+        )
     def test_unusable_schema_cli_is_a_structured_internal_failure(self) -> None:
         # Pass-4 opus F2 + codex C-F1: Runner.__init__ reads the schema CLI
         # bytes into memory (the validator is now stdin-pinned, no on-disk
@@ -907,7 +911,9 @@ class MonitorRunnerE2ETests(unittest.TestCase):
             runner.recover_in_flight(extract)
         except mr.RunnerExit:
             pass
-        preserved = self.state.with_suffix(".failed-candidate.md")
+        preserved = self.state.with_suffix(
+            ".failed-candidate-" + attempt + ".md"
+        )
         self.assertTrue(preserved.exists())
         self.assertEqual(preserved.read_text(encoding="utf-8"), "pending-intent-record")
         self.assertFalse(recorded.exists())
