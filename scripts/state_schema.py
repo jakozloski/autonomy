@@ -2759,6 +2759,10 @@ def monitor_extract(text: str) -> dict[str, Any]:
         "current_phase": None,
         "monitor_status": None,
         "handoff_statuses": [],
+        "handoff_operations": {},
+        "handoff_results": {},
+        "phases_merge_readiness": None,
+        "merge_readiness_hold": False,
         "blocked_evidence_present": False,
     }
     try:
@@ -2793,6 +2797,58 @@ def monitor_extract(text: str) -> dict[str, Any]:
             status = record.get("status") if isinstance(record, dict) else None
             statuses.append(status if isinstance(status, str) else "malformed")
     extract["handoff_statuses"] = statuses
+    # algo#1216 R2 findings 3787189747/3787189752/3787189757: the runner's
+    # terminal/launch decisions need schema-owned views of (a) per-operation
+    # handoff results for monotonicity, (b) the direction-aware deploy/
+    # backfill hold, and (c) the merge-readiness PHASE for the pre-4b gate.
+    operations_map: dict[str, list[str]] = {}
+    results_map: dict[str, dict[str, str]] = {}
+    if isinstance(handoffs, dict):
+        for kind, record in handoffs.items():
+            if not isinstance(record, dict):
+                continue
+            ops = record.get("operations")
+            operations_map[str(kind)] = [
+                op for op in ops if isinstance(op, str)
+            ] if isinstance(ops, list) else []
+            results: dict[str, str] = {}
+            raw = record.get("operation_results")
+            if isinstance(raw, dict):
+                for op_id, res in raw.items():
+                    status = res.get("status") if isinstance(res, dict) else None
+                    if isinstance(op_id, str) and isinstance(status, str):
+                        results[op_id] = status
+            results_map[str(kind)] = results
+    extract["handoff_operations"] = operations_map
+    extract["handoff_results"] = results_map
+    phases_map = state.get("phases")
+    if isinstance(phases_map, dict):
+        mr_phase = phases_map.get("merge_readiness")
+        if isinstance(mr_phase, str):
+            extract["phases_merge_readiness"] = mr_phase
+    gate = state.get("merge_readiness")
+    hold = False
+    if isinstance(gate, dict):
+        if gate.get("deploy_order") == "hazard_documented" and gate.get(
+            "hazard_direction"
+        ) in ("additive", "mixed"):
+            applied = gate.get("applied_state")
+            if isinstance(applied, dict):
+                for env_map in applied.values():
+                    if isinstance(env_map, dict) and any(
+                        status == "pending" for status in env_map.values()
+                    ):
+                        hold = True
+        backfill = gate.get("backfill")
+        if isinstance(backfill, dict):
+            for record in backfill.values():
+                if (
+                    isinstance(record, dict)
+                    and record.get("required") is True
+                    and record.get("state") == "pending"
+                ):
+                    hold = True
+    extract["merge_readiness_hold"] = hold
     # R2 #1328 finding 3767068764 is satisfied by the shared predicate below:
     # blocker evidence is more than the three feedback maps - `human:*` and
     # `prompt-trail:stale` attempt_log keys fire on presence, the three-strike

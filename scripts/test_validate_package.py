@@ -786,6 +786,12 @@ class ValidatePackageTests(unittest.TestCase):
         try:
             import frontmatter  # the scanner's real frontmatter parser
         except ImportError:
+            if os.environ.get("SKILL_CHECKS_REQUIRE_SCANNER") == "1":
+                self.fail(
+                    "python-frontmatter absent but SKILL_CHECKS_REQUIRE_SCANNER=1"
+                    " — CI must install the scanner deps rather than skip"
+                    " load-bearing parity tests (algo#1216 R2 finding 3787189766)"
+                )
             self.skipTest("python-frontmatter absent; scanner-parity uncheckable")
         cases = {
             '"\\ud800"': True,  # lone surrogate: reject (loader raises under libyaml)
@@ -839,6 +845,12 @@ class ValidatePackageTests(unittest.TestCase):
         try:
             import frontmatter  # the scanner's real frontmatter parser
         except ImportError:
+            if os.environ.get("SKILL_CHECKS_REQUIRE_SCANNER") == "1":
+                self.fail(
+                    "python-frontmatter absent but SKILL_CHECKS_REQUIRE_SCANNER=1"
+                    " — CI must install the scanner deps rather than skip"
+                    " load-bearing parity tests (algo#1216 R2 finding 3787189766)"
+                )
             self.skipTest("python-frontmatter absent; scanner-parity uncheckable")
         for code in (0x0B, 0x0C, 0x1C, 0x1D, 0x1E):
             with self.subTest(codepoint=f"U+{code:04X}"):
@@ -879,6 +891,12 @@ class ValidatePackageTests(unittest.TestCase):
         try:
             import frontmatter  # the scanner's real frontmatter parser
         except ImportError:
+            if os.environ.get("SKILL_CHECKS_REQUIRE_SCANNER") == "1":
+                self.fail(
+                    "python-frontmatter absent but SKILL_CHECKS_REQUIRE_SCANNER=1"
+                    " — CI must install the scanner deps rather than skip"
+                    " load-bearing parity tests (algo#1216 R2 finding 3787189766)"
+                )
             self.skipTest("python-frontmatter absent; scanner-parity uncheckable")
         # Printable (YAML c-printable), non-C0-control whitespace: the class
         # the whitespace guard uniquely owns (C0 controls are the opus-F1

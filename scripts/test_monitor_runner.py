@@ -84,6 +84,20 @@ manual_unknown_feedback: {}
 manual_branch_protection_blockers: {}
 human_roundtrip:
   reviewers: {}
+acceptance_criteria:
+  - id: "AC-1"
+    text: "package validates and tests pass"
+    source: "description"
+    verdict: "met"
+    evidence: "validator green; suite green"
+merge_readiness:
+  deploy_order: "n_a"
+  applied_state: {}
+  dependencies: "n_a"
+  ac_conformance: "pass"
+  claims_audit:
+    audited: 0
+    rewritten: 0
 handoffs:
   qa:
     scenario: null
@@ -138,6 +152,7 @@ phases:
   runtime_verification:
     status: "waived"
     reason: "skill_only: no runtime code changed"
+  merge_readiness: "complete"
   pr: "complete"
   monitor: "in_progress"
 ---
@@ -363,6 +378,17 @@ if os.environ.get("FAKE_SET_FAILED_HANDOFF") == "1":
     ])
     assert old_qa in text
     text = text.replace(old_qa, new_qa, 1)
+if os.environ.get("FAKE_RESET_HANDOFFS") == "1":
+    import re as _re
+    text = _re.sub(
+        r"handoffs:\n  qa:.*?\n  review_roundtrip:",
+        "handoffs:\n  qa:\n    scenario: null\n    status: \"idle\"\n"
+        "    repository_name_with_owner: null\n    targets:\n"
+        "      github_assignees: []\n      tracker_assignee_id: null\n"
+        "      tracker_assignee_name: null\n    operations: []\n"
+        "    operation_results: {}\n  review_roundtrip:",
+        text, count=1, flags=_re.S,
+    )
 corrupt_target = os.environ.get("FAKE_CORRUPT_FILE")
 if corrupt_target:
     with open(corrupt_target, "w", encoding="utf-8") as h:
@@ -826,6 +852,123 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         # artifact, see __init__) is runner-lifetime only: main's finally
         # reclaims it.
         self.assertEqual(list(tmp_home.glob("monitor-wrapper-*")), [])
+
+    def _fresh_runner_module(self, tag):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(tag, RUNNER)
+        mr = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mr)
+        return mr
+
+    def _direct_runner(self, mr):
+        import argparse
+        return mr.Runner(argparse.Namespace(
+            state_file=str(self.state), skill_dir=str(SCRIPTS.parent),
+            claude_bin=str(self.fake), schema_cli=str(SCHEMA),
+            slice_budget=1.0, wait_scale=1.0, max_ticks=None,
+            acknowledge_taint=None,
+        ))
+
+    def test_replaced_lock_file_is_detected_by_the_holder(self) -> None:
+        # algo#1216 R2 finding 3787189736: a child can unlink+recreate the
+        # lock path; the HOLDER must detect the swap before any canonical
+        # commit and stop as suspect rather than racing a second runner.
+        mr = self._fresh_runner_module("mr_lock_test")
+        runner = self._direct_runner(mr)
+        runner.acquire_lock()
+        try:
+            os.unlink(runner.lock_path)
+            Path(runner.lock_path).write_text("", encoding="utf-8")
+            with self.assertRaises(mr.RunnerExit) as caught:
+                runner._verify_lock_inode()
+            self.assertEqual(caught.exception.outcome, "suspect_state")
+        finally:
+            runner._lock_handle.close()
+
+    def test_recovery_preserves_the_recorded_in_flight_candidate(self) -> None:
+        # algo#1216 R2 finding 3787189741: recovery deleted every candidate,
+        # destroying the only write-ahead record of external mutations the
+        # dead child may have fired.
+        mr = self._fresh_runner_module("mr_rec_test")
+        runner = self._direct_runner(mr)
+        attempt = "ab" * 16
+        recorded = self.state.parent / (self.state.name + ".attempt-" + attempt + ".md")
+        recorded.write_text("pending-intent-record", encoding="utf-8")
+        stray = self.state.parent / (self.state.name + ".attempt-" + "cd" * 16 + ".md")
+        stray.write_text("stray", encoding="utf-8")
+        extract = runner.schema.extract(runner.state_path)
+        runner.owner_model = "claude-opus-5"
+        block = runner.current_block(extract)
+        block["in_flight"] = {"attempt_id": attempt}
+        extract["monitor_cli"] = block
+        try:
+            runner.recover_in_flight(extract)
+        except mr.RunnerExit:
+            pass
+        preserved = self.state.with_suffix(".failed-candidate.md")
+        self.assertTrue(preserved.exists())
+        self.assertEqual(preserved.read_text(encoding="utf-8"), "pending-intent-record")
+        self.assertFalse(recorded.exists())
+        self.assertFalse(stray.exists())
+
+    def test_pre_4b_legacy_state_refuses_to_launch(self) -> None:
+        # algo#1216 R2 finding 3787189757: a legacy state without the
+        # merge-readiness phase must not reach a write-capable child.
+        state = self.state.read_text(encoding="utf-8")
+        state = state.replace('  merge_readiness: "complete"\n', "")
+        self.state.write_text(state, encoding="utf-8")
+        completed = self._run()
+        summary = self._summary(completed)
+        self.assertEqual(completed.returncode, 5, completed.stderr)
+        self.assertIn("Phase 4b", summary.get("reason", ""))
+        self.assertFalse(self.argv_log.exists(), "child must never launch")
+
+    def test_terminal_with_live_backfill_hold_is_rejected(self) -> None:
+        # algo#1216 R2 finding 3787189747: a terminal claim with a required
+        # backfill still pending is premature merge readiness.
+        state = self.state.read_text(encoding="utf-8")
+        state = state.replace(
+            'merge_readiness:\n  deploy_order: "n_a"',
+            'merge_readiness:\n  deploy_order: "hazard_documented"\n'
+            '  hazard_direction: "additive"\n'
+            "  backfill:\n"
+            '    "seed-scores":\n'
+            "      required: true\n"
+            '      state: "pending"\n'
+            "      evidence: null",
+        )
+        self.state.write_text(state, encoding="utf-8")
+        completed = self._run(
+            budget="900", timeout=90, wait_scale="0.02", max_ticks="3",
+            env_extra={"FAKE_OUTCOME": "terminal"},
+        )
+        self.assertEqual(completed.returncode, 5, completed.stderr)
+        extract = self._extract()
+        signatures = [f["signature"] for f in extract["monitor_cli"]["child_failures"]]
+        self.assertIn("monitor-child:transition_rejected", signatures)
+        self.assertEqual(extract["monitor_status"], "in_progress")
+
+    def test_candidate_dropping_a_pending_handoff_is_rejected(self) -> None:
+        # algo#1216 R2 finding 3787189752: a pending operation result must
+        # never silently vanish — absence is legal only via a generation
+        # rollover that still plans the same family.
+        state = self.state.read_text(encoding="utf-8")
+        state = state.replace('  qa:\n    scenario: null\n    status: "idle"\n    repository_name_with_owner: null\n    targets:\n      github_assignees: []\n      tracker_assignee_id: null\n      tracker_assignee_name: null\n    operations: []\n    operation_results: {}', '  qa:\n    scenario: "clean_unapproved"\n    status: "pending"\n    repository_name_with_owner: "Keeper-Dating/matchmaking"\n    targets:\n      github_assignees: ["tjkeeper"]\n      tracker_assignee_id: null\n      tracker_assignee_name: null\n    operations: ["qa.github.replace_assignees:gtest"]\n    operation_results:\n      "qa.github.replace_assignees:gtest":\n        status: "pending"\n        attempts: 1\n        started_at: "2026-08-08T00:00:00Z"')
+        self.state.write_text(state, encoding="utf-8")
+        verdict = subprocess.run(
+            [sys.executable, str(SCHEMA), str(self.state)],
+            capture_output=True, text=True,
+        )
+        payload = json.loads(verdict.stdout)
+        self.assertEqual(payload["state"], "valid", payload["errors"])
+        completed = self._run(
+            budget="900", timeout=90, wait_scale="0.02", max_ticks="3",
+            env_extra={"FAKE_RESET_HANDOFFS": "1"},
+        )
+        self.assertEqual(completed.returncode, 5, completed.stderr)
+        extract = self._extract()
+        signatures = [f["signature"] for f in extract["monitor_cli"]["child_failures"]]
+        self.assertIn("monitor-child:transition_rejected", signatures)
 
     def test_wrong_served_model_blocks_immediately(self) -> None:
         completed = self._run(mode="wrong_model")

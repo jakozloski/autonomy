@@ -44,6 +44,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -892,13 +893,66 @@ class Runner:
 
     # -- lock ------------------------------------------------------------
     def acquire_lock(self) -> None:
-        handle = open(self.lock_path, "ab")
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        # algo#1216 R2 finding 3787189736: the lock path sits inside the
+        # child-writable repository — a child that unlinks and recreates it
+        # lets a second runner flock the NEW inode while the first still
+        # holds the old one. Two defenses: (1) acquisition verifies the
+        # locked fd and the path resolve to the same inode (retrying a
+        # bounded number of times across unlink races); (2) every canonical
+        # commit re-verifies the held inode (_verify_lock_inode) and stops
+        # as suspect on a swap — the holder detects the sabotage instead of
+        # racing the usurper.
+        for _ in range(5):
+            handle = open(self.lock_path, "ab")
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                handle.close()
+                raise RunnerExit(3, "lock_held", "another monitor runner is active")
+            try:
+                path_stat = os.stat(self.lock_path)
+            except FileNotFoundError:
+                handle.close()
+                continue
+            fd_stat = os.fstat(handle.fileno())
+            if (path_stat.st_ino, path_stat.st_dev) == (
+                fd_stat.st_ino,
+                fd_stat.st_dev,
+            ):
+                self._lock_handle = handle
+                return
             handle.close()
-            raise RunnerExit(3, "lock_held", "another monitor runner is active")
-        self._lock_handle = handle
+        raise RunnerExit(
+            4,
+            "suspect_state",
+            "monitor lock path kept changing inode during acquisition —"
+            " an unknown writer is replacing the lock file; reconcile per"
+            " the Resume trust model",
+        )
+
+    def _verify_lock_inode(self) -> None:
+        handle = getattr(self, "_lock_handle", None)
+        if handle is None:
+            return
+        try:
+            path_stat = os.stat(self.lock_path)
+            fd_stat = os.fstat(handle.fileno())
+        except OSError:
+            path_stat = None
+            fd_stat = None
+        if (
+            path_stat is None
+            or fd_stat is None
+            or (path_stat.st_ino, path_stat.st_dev)
+            != (fd_stat.st_ino, fd_stat.st_dev)
+        ):
+            raise RunnerExit(
+                4,
+                "suspect_state",
+                "monitor lock file was replaced while held — the exclusion"
+                " protocol is compromised (a second runner may be active);"
+                " stop and reconcile per the Resume trust model",
+            )
 
     # -- state helpers ---------------------------------------------------
     def read_text(self) -> str:
@@ -919,6 +973,7 @@ class Runner:
         return base
 
     def commit_block(self, block: dict[str, Any]) -> None:
+        self._verify_lock_inode()
         spliced = splice_monitor_cli(self.read_text(), block)
         atomic_write(self.state_path, spliced)
 
@@ -1000,12 +1055,34 @@ class Runner:
         in_flight = block.get("in_flight")
         if not isinstance(in_flight, dict):
             return
+        # algo#1216 R2 finding 3787189741: the dead child's candidate is the
+        # only durable write-ahead record of external mutations it may have
+        # fired — recovery must PRESERVE the exact in_flight attempt's
+        # candidate (validated as untrusted input by shape) and delete only
+        # true strays; resume then reconciles its pending intents per the
+        # preserved-candidate contract before any fresh mutation.
+        recorded_attempt = in_flight.get("attempt_id")
+        preserved_any = False
         for stray in self.state_path.parent.glob(self.state_path.name + ".attempt-*"):
+            is_recorded = (
+                isinstance(recorded_attempt, str)
+                and re.fullmatch(r"[0-9a-f]{32}", recorded_attempt) is not None
+                and stray.name
+                == self.state_path.name + f".attempt-{recorded_attempt}.md"
+            )
+            if is_recorded:
+                self._preserve_failed(stray)
+                preserved_any = True
+                continue
             try:
                 stray.unlink()
             except OSError:
                 pass
-        _heartbeat("recovery: unknown prior attempt reconciled (candidate discarded)")
+        _heartbeat(
+            "recovery: unknown prior attempt reconciled ("
+            + ("candidate preserved for reconciliation" if preserved_any else "no recorded candidate found")
+            + ")"
+        )
         self.charge_failure(extract, "monitor-child:unknown_outcome")
 
     # -- tick ------------------------------------------------------------
@@ -1605,6 +1682,35 @@ class Runner:
         # monitor is exactly the false-completion the audit exists to stop.
         monitor_status = candidate_extract.get("monitor_status")
         handoff_statuses = candidate_extract.get("handoff_statuses") or []
+        # algo#1216 R2 finding 3787189752: a candidate must never lose or
+        # regress an operation result canonical state already carried — a
+        # vanished pending QA op is an external action that may already have
+        # fired. Absence is legal ONLY through a generation rollover, i.e.
+        # the candidate still plans at least one operation of the same
+        # dotted family for that handoff kind.
+        terminal_statuses = ("complete", "failed", "skipped_dependency")
+        launch_results = fresh.get("handoff_results") or {}
+        cand_results = candidate_extract.get("handoff_results") or {}
+        cand_ops = candidate_extract.get("handoff_operations") or {}
+        handoffs_monotonic = True
+        for kind, ops in launch_results.items():
+            for op_id, status in ops.items():
+                new_status = (cand_results.get(kind) or {}).get(op_id)
+                if new_status is None:
+                    family = op_id.split(":", 1)[0]
+                    planned = cand_ops.get(kind) or []
+                    if not any(
+                        planned_id.split(":", 1)[0] == family
+                        for planned_id in planned
+                    ):
+                        handoffs_monotonic = False
+                elif status in terminal_statuses and new_status != status:
+                    handoffs_monotonic = False
+                elif status in ("pending", "retryable") and new_status not in (
+                    "pending",
+                    "retryable",
+                ) + terminal_statuses:
+                    handoffs_monotonic = False
         outcome_consistent = (
             (outcome == "continue" and monitor_status == "in_progress")
             or (
@@ -1643,6 +1749,14 @@ class Runner:
             and deltas in ((1, 0), (0, 1))
             and candidate_extract.get("monitor_cli") == snapshot
             and outcome_consistent
+            and handoffs_monotonic
+            # algo#1216 R2 finding 3787189747: a terminal claim with a live
+            # direction-aware deploy/backfill hold is exactly the premature
+            # merge-readiness the hold exists to prevent.
+            and not (
+                outcome == "terminal"
+                and candidate_extract.get("merge_readiness_hold") is True
+            )
         )
         if not valid:
             self._preserve_failed(candidate)
@@ -1681,6 +1795,7 @@ class Runner:
         # clobber (identical semantics to the post-child check above).
         last_look = self.schema.extract(self.state_path)
         self._require_unmutated_canonical(last_look, candidate)
+        self._verify_lock_inode()
         atomic_write(candidate, finalized)
         os.replace(candidate, self.state_path)
         self.ticks_completed += 1
@@ -1822,6 +1937,19 @@ class Runner:
                 "blocked",
                 "workflow is not at an in-progress monitor phase — the"
                 " owner-pinned runner only executes Phase 6",
+            )
+        # algo#1216 R2 finding 3787189757: pre-4b states are deliberately
+        # schema-valid (migration tolerance), but a LEGACY resume must not
+        # reach clean monitoring completion without the mandatory
+        # acceptance-criteria/dependency/migration/claims gate. Refuse the
+        # launch with the actionable recovery instead of silently running.
+        if extract.get("phases_merge_readiness") != "complete":
+            raise RunnerExit(
+                5,
+                "blocked",
+                "phases.merge_readiness is not complete — run Phase 4b"
+                " (merge readiness) to completion before monitoring; a"
+                " pre-4b legacy state must not bypass the gate",
             )
         retries = 0
         # Bounded like every loop in this package (scanner rule + doctrine):
