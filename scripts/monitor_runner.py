@@ -816,12 +816,12 @@ class Runner:
         self.schema = SchemaCli(self.schema_source)
         # algo#1216 R2 finding 3779532260, composed with the same in-memory
         # trust base: the exec-barrier wrapper is trust-bearing code too — a
-        # prior tick's child could rewrite the worktree wrapper and run code
-        # as the runner's UID at the next launch, before in_flight is durably
-        # recorded. The wrapper cannot travel over stdin the way the
+        # prior tick's child could rewrite the worktree wrapper and thereby
+        # own the next launch as the runner's UID, before in_flight is
+        # durably recorded. The wrapper cannot travel over stdin the way the
         # validator does (stdin already carries the GO launch token), so pin
-        # its SOURCE bytes here, before any child has run, and exec it from
-        # ONE 0600 unpredictable-name file created now and REWRITTEN from
+        # its SOURCE bytes here, before any child has run, and launch from
+        # ONE 0600 unpredictable-name stage file created now and REWRITTEN from
         # these bytes immediately before every launch — children are strictly
         # sequential and the drained-outcome group-extinction check reaps
         # survivors, so no writer exists between that rewrite and the
@@ -829,11 +829,11 @@ class Runner:
         # runner can leak one small file in TMPDIR.
         source_wrapper = SCRIPTS_DIR / "monitor_child_wrapper.py"
         self.wrapper_source = source_wrapper.read_bytes()
-        wrapper_fd, wrapper_exec_name = tempfile.mkstemp(
+        wrapper_fd, wrapper_stage_name = tempfile.mkstemp(
             prefix="monitor-wrapper-", suffix=".py"
         )
         os.close(wrapper_fd)
-        self.wrapper_exec_path = Path(wrapper_exec_name)
+        self.wrapper_stage_path = Path(wrapper_stage_name)
         # algo#1216 R2 finding 3779532263: canonical state lives under
         # <repo>/.claude, and a child launched THERE gets default file access
         # only below it — Phase 6 could not touch application files. Launch
@@ -1110,7 +1110,7 @@ class Runner:
             # owner-pinned model launches identically.
             "-I",
             "-S",
-            str(self.wrapper_exec_path),
+            str(self.wrapper_stage_path),
             "--",
         ] + argv
         # R7 codex #10: strip the ambient CLAUDE_CODE_* override knobs before
@@ -1127,11 +1127,11 @@ class Runner:
             if key not in CLAUDE_READ_ONLY_ENV_UNSET
         }
         try:
-            # algo#1216 R2 finding 3779532260: restore the exec file from
-            # the __init__-pinned wrapper bytes immediately before the
+            # algo#1216 R2 finding 3779532260: restore the stage file
+            # from the __init__-pinned wrapper bytes immediately before the
             # launch — the interpreter reads only bytes this runner just
             # wrote from its own heap.
-            self.wrapper_exec_path.write_bytes(self.wrapper_source)
+            self.wrapper_stage_path.write_bytes(self.wrapper_source)
             proc = subprocess.Popen(
                 wrapper,
                 stdin=subprocess.PIPE,
@@ -1530,13 +1530,13 @@ class Runner:
         except OSError:
             self._discard(candidate)
 
-    def cleanup_wrapper_exec(self) -> None:
-        """Remove the runner-lifetime wrapper exec file (main()'s finally).
+    def cleanup_wrapper_stage(self) -> None:
+        """Remove the runner-lifetime wrapper stage file (main()'s finally).
 
         Best-effort by design: the file is 0600 with an unpredictable name,
         so a leak on a hard kill is bounded and harmless."""
         try:
-            self.wrapper_exec_path.unlink()
+            self.wrapper_stage_path.unlink()
         except OSError:
             pass
 
@@ -1939,7 +1939,7 @@ def main() -> int:
     )
     args = parser.parse_args()
     # Pass-4 opus F2: Runner.__init__ performs failable filesystem I/O (the
-    # schema-CLI and wrapper source pins plus the wrapper exec-file mkstemp -
+    # schema-CLI and wrapper source pins plus the wrapper stage-file mkstemp -
     # pass-5 codex F1 dropped the old snapshot mkdtemp/copyfile), so
     # construction must sit inside the structured boundary - an init crash
     # escaping as a raw traceback with
@@ -1986,10 +1986,10 @@ def main() -> int:
         )
         return 4
     finally:
-        # The wrapper exec file is runner-lifetime state (see __init__);
+        # The wrapper stage file is runner-lifetime state (see __init__);
         # every exit path — structured or not — reclaims it here.
         if runner is not None:
-            runner.cleanup_wrapper_exec()
+            runner.cleanup_wrapper_stage()
     _emit(summary)
     return 0
 

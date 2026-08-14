@@ -71,7 +71,29 @@ _HELPER_RUNNERS: list[Runner] = []
 
 def tearDownModule() -> None:  # noqa: N802 — unittest hook name
     for helper_runner in _HELPER_RUNNERS:
-        helper_runner.cleanup_wrapper_exec()
+        helper_runner.cleanup_wrapper_stage()
+
+
+class WrapperStagingTests(unittest.TestCase):
+    """algo#1216 R2 finding 3779532260 composed with the in-memory trust base
+    (pass-4 codex C-F1): the barrier wrapper's SOURCE bytes are pinned in the
+    runner's heap at init — before any child has run — and the staged launch
+    file lives outside the child-writable package with an unpredictable name.
+    cleanup_wrapper_stage (main's finally) reclaims it. Lives HERE, not in the
+    e2e file: this file holds the no-child-process direct-construction tests
+    (scanner structural rule keeps the e2e file's subprocess calls away from
+    module-loading machinery)."""
+
+    def test_runner_pins_wrapper_bytes_and_stages_outside_the_worktree(self) -> None:
+        runner = _runner("claude-opus-5", "max")
+        source = SCRIPTS / "monitor_child_wrapper.py"
+        self.assertEqual(runner.wrapper_source, source.read_bytes())
+        self.assertTrue(runner.wrapper_stage_path.exists())
+        self.assertNotEqual(
+            runner.wrapper_stage_path.resolve().parent, SCRIPTS.resolve()
+        )
+        runner.cleanup_wrapper_stage()
+        self.assertFalse(runner.wrapper_stage_path.exists())
 
 
 class ChildCommandThreadingTests(unittest.TestCase):
@@ -273,7 +295,7 @@ class LaunchChildIsolationTests(unittest.TestCase):
         # 0600 unpredictable-name file OUTSIDE the package (algo#1216 R2
         # finding 3779532260) — never from the child-writable package path.
         self.assertEqual(argv[:3], [sys.executable, "-I", "-S"])
-        self.assertEqual(argv[3], str(runner.wrapper_exec_path))
+        self.assertEqual(argv[3], str(runner.wrapper_stage_path))
         self.assertNotEqual(
             pathlib.Path(argv[3]).resolve().parent, SCRIPTS.resolve()
         )

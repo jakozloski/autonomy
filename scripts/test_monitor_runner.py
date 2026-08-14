@@ -740,36 +740,6 @@ class MonitorRunnerE2ETests(unittest.TestCase):
             else:
                 self.fail("survivor outlived the failure-path reap")
 
-    def test_runner_pins_wrapper_bytes_and_execs_outside_the_worktree(self) -> None:
-        # algo#1216 R2 finding 3779532260, composed with the in-memory trust
-        # base (pass-4 codex C-F1): the exec barrier's SOURCE bytes are
-        # pinned in the runner's heap at init — before any child has run —
-        # and the exec file lives outside the child-writable package with an
-        # unpredictable name. cleanup_wrapper_exec (main's finally) must
-        # reclaim it.
-        import argparse
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("mr_under_test", RUNNER)
-        mr = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mr)
-        args = argparse.Namespace(
-            state_file=str(self.state), skill_dir=str(SCRIPTS.parent),
-            claude_bin=str(self.fake), schema_cli=str(SCHEMA),
-            slice_budget=1.0, wait_scale=1.0, max_ticks=None,
-            acknowledge_taint=None,
-        )
-        runner = mr.Runner(args)
-        try:
-            source = SCRIPTS / "monitor_child_wrapper.py"
-            self.assertEqual(runner.wrapper_source, source.read_bytes())
-            self.assertTrue(runner.wrapper_exec_path.exists())
-            self.assertNotEqual(
-                runner.wrapper_exec_path.resolve().parent, SCRIPTS.resolve()
-            )
-        finally:
-            runner.cleanup_wrapper_exec()
-        self.assertFalse(runner.wrapper_exec_path.exists())
-
     def test_child_launches_at_the_repository_root(self) -> None:
         # algo#1216 R2 finding 3779532263: state lives under <repo>/.claude;
         # a child launched there cannot touch application files. The runner
@@ -852,8 +822,9 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         summary = self._summary(completed)  # structured exit actually happened
         self.assertEqual(summary["ticks_completed"], 1, completed.stderr)
         self.assertEqual(list(tmp_home.glob("autonomy-schema-snapshot-*")), [])
-        # The wrapper exec file (the one on-disk staging artifact, see
-        # __init__) is runner-lifetime only: main's finally reclaims it.
+        # The staged wrapper launch file (the one on-disk staging
+        # artifact, see __init__) is runner-lifetime only: main's finally
+        # reclaims it.
         self.assertEqual(list(tmp_home.glob("monitor-wrapper-*")), [])
 
     def test_wrong_served_model_blocks_immediately(self) -> None:
