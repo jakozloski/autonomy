@@ -463,8 +463,16 @@ REQUIRED_REDACTION_PATTERNS = {
     # algo#1216 R2 round-3 delivery: password/Cookie redaction was
     # incomplete — both are label/format-anchored to avoid false positives.
     "password_assignment": (
-        r"""(?i)\bpassword["']?\s*[:=]\s*["']?[^\s"']{8,}""",
-        ("password=" + "SuperSecret99", "PASSWORD: " + "hunter2hunter2"),
+        # algo#1216 R2 finding 3779532276: the \b-anchored form missed
+        # DB_PASSWORD/MYSQL_PASSWORD-style labels (underscore is a word
+        # character, so no boundary exists before "password").
+        r"""(?i)[\w-]*password["']?\s*[:=]\s*["']?[^\s"']{8,}""",
+        (
+            "password=" + "SuperSecret99",
+            "PASSWORD: " + "hunter2hunter2",
+            "DB_PASSWORD=" + "prodsecret99",
+            "MYSQL_PASSWORD: " + "hunter2hunter2",
+        ),
     ),
     "cookie_header_value": (
         r"""(?i)\b(Set-)?Cookie:\s*[^\s;=]+=[^\s;]{8,}""",

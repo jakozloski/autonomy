@@ -511,6 +511,28 @@ class Runner:
             self.schema_snapshot_path.read_bytes()
         ).hexdigest()
         self.schema = SchemaCli(self.schema_snapshot_path)
+        # algo#1216 R2 finding 3779532260: the exec barrier is trust-bearing
+        # code too — a prior tick's child could rewrite the worktree wrapper
+        # and run code before in_flight is durably recorded. Snapshot it
+        # beside the schema helper and execute ONLY the immutable copy.
+        source_wrapper = SCRIPTS_DIR / "monitor_child_wrapper.py"
+        self.wrapper_snapshot_path = snapshot_dir / source_wrapper.name
+        shutil.copyfile(source_wrapper, self.wrapper_snapshot_path)
+        # algo#1216 R2 finding 3779532263: canonical state lives under
+        # <repo>/.claude, and a child launched THERE gets default file access
+        # only below it — Phase 6 could not touch application files. Launch
+        # at the repository root when one exists (state/skill/candidate
+        # paths in the prompt are absolute, so nothing else moves).
+        root_probe = subprocess.run(
+            ["git", "-C", str(self.state_path.parent), "rev-parse",
+             "--show-toplevel"],
+            capture_output=True, text=True,
+        )
+        root = root_probe.stdout.strip()
+        self.child_cwd = (
+            root if root_probe.returncode == 0 and root else
+            str(self.state_path.parent)
+        )
         self.slice_deadline = time.monotonic() + args.slice_budget
         # Testability seam (same class as --claude-bin): scales ladder and
         # poll waits so hermetic failure-path tests finish in seconds. The
@@ -668,7 +690,7 @@ class Runner:
         # structural rule: exec and subprocess never share a file).
         wrapper = [
             sys.executable,
-            str(SCRIPTS_DIR / "monitor_child_wrapper.py"),
+            str(self.wrapper_snapshot_path),
             "--",
         ] + argv
         proc = subprocess.Popen(
@@ -677,7 +699,7 @@ class Runner:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
-            cwd=str(self.state_path.parent),
+            cwd=self.child_cwd,
         )
         return {"proc": proc}
 
@@ -843,11 +865,11 @@ class Runner:
                     " human",
                 )
             if drained["outcome"] == "clean" and drained["exit_code"] == 0:
-                self._discard(candidate)
+                self._preserve_failed(candidate)
                 self.charge_failure(fresh, "monitor-child:group_survivors")
                 return "retry"
         if drained["outcome"] != "clean" or drained["exit_code"] != 0:
-            self._discard(candidate)
+            self._preserve_failed(candidate)
             if drained["outcome"] != "clean":
                 self.charge_failure(fresh, f"monitor-child:{drained['outcome']}")
                 return "retry"
@@ -887,7 +909,7 @@ class Runner:
             )
         if resumed:
             if not isinstance(session_id, str) or session_id != self.child_session_id:
-                self._discard(candidate)
+                self._preserve_failed(candidate)
                 self.charge_failure(
                     fresh,
                     "monitor-child:session_mismatch"
@@ -896,11 +918,11 @@ class Runner:
                 )
                 return "retry"
         elif not isinstance(session_id, str) or not session_id:
-            self._discard(candidate)
+            self._preserve_failed(candidate)
             self.charge_failure(fresh, "monitor-child:no_session_id")
             return "retry"
         if verdict is None:
-            self._discard(candidate)
+            self._preserve_failed(candidate)
             self.charge_failure(fresh, "monitor-child:no_verdict")
             return "retry"
         return self._verify_and_commit(
@@ -965,6 +987,19 @@ class Runner:
         except OSError:
             pass
 
+    def _preserve_failed(self, candidate: Path) -> None:
+        """algo#1216 R2 finding 3779532272: a failed child's candidate is the
+        only durable record of external mutations it may already have fired
+        (write-ahead handoff intents live there). Preserve exactly one — the
+        newest — beside canonical state for resume reconciliation instead of
+        destroying the evidence; suspect-stop paths keep their documented
+        discard semantics."""
+        preserved = self.state_path.with_suffix(".failed-candidate.md")
+        try:
+            os.replace(candidate, preserved)
+        except OSError:
+            self._discard(candidate)
+
     def _verify_and_commit(
         self,
         fresh: dict[str, Any],
@@ -982,7 +1017,7 @@ class Runner:
             or outcome not in ("continue", "terminal", "blocked")
         )
         if checks_failed or not candidate.exists():
-            self._discard(candidate)
+            self._preserve_failed(candidate)
             self.charge_failure(fresh, "monitor-child:verdict_mismatch")
             return "retry"
         snapshot = self.launch_block
@@ -1043,7 +1078,7 @@ class Runner:
             and outcome_consistent
         )
         if not valid:
-            self._discard(candidate)
+            self._preserve_failed(candidate)
             self.charge_failure(fresh, "monitor-child:transition_rejected")
             return "retry"
         # R2-6: the success marker must be part of the SAME single finalize

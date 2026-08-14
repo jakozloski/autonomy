@@ -164,6 +164,10 @@ argv_log = os.environ.get("FAKE_ARGV_LOG")
 if argv_log:
     with open(argv_log, "a", encoding="utf-8") as h:
         h.write(json.dumps(sys.argv[1:]) + "\n")
+cwd_file = os.environ.get("FAKE_CWD_FILE")
+if cwd_file:
+    with open(cwd_file, "w", encoding="utf-8") as h:
+        h.write(os.getcwd())
 
 prompt = sys.argv[-1]
 state_match = re.search(r"state file at (\S+) —", prompt)
@@ -522,6 +526,74 @@ class MonitorRunnerE2ETests(unittest.TestCase):
                 pass  # reaped by the runner, as required
             else:
                 self.fail("survivor outlived the failure-path reap")
+
+    def test_runner_snapshots_the_wrapper_outside_the_worktree(self) -> None:
+        # algo#1216 R2 finding 3779532260: the exec barrier must run from the
+        # runner's immutable snapshot dir, never the child-writable worktree.
+        # Pin the init contract directly: the snapshot exists outside the
+        # package, byte-equals the source at init, and is what launch uses.
+        import argparse
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("mr_under_test", RUNNER)
+        mr = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mr)
+        args = argparse.Namespace(
+            state_file=str(self.state), skill_dir=str(SCRIPTS.parent),
+            claude_bin=str(self.fake), schema_cli=str(SCHEMA),
+            slice_budget=1.0, wait_scale=1.0, max_ticks=None,
+        )
+        runner = mr.Runner(args)
+        source = SCRIPTS / "monitor_child_wrapper.py"
+        self.assertTrue(runner.wrapper_snapshot_path.exists())
+        self.assertNotEqual(
+            runner.wrapper_snapshot_path.resolve().parent, SCRIPTS.resolve()
+        )
+        self.assertEqual(
+            runner.wrapper_snapshot_path.read_bytes(), source.read_bytes()
+        )
+
+    def test_child_launches_at_the_repository_root(self) -> None:
+        # algo#1216 R2 finding 3779532263: state lives under <repo>/.claude;
+        # a child launched there cannot touch application files. The runner
+        # resolves the repo root and launches the child at it.
+        import shutil as _shutil
+        repo = self.dir / "repo"
+        (repo / ".claude").mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        state = repo / ".claude" / "workflow-state.local.md"
+        _shutil.copyfile(self.state, state)
+        cwd_file = self.dir / "child-cwd.txt"
+        env = dict(os.environ)
+        env["FAKE_MODE"] = "ok"
+        env["FAKE_ARGV_LOG"] = str(self.dir / "argv2.jsonl")
+        env["FAKE_CWD_FILE"] = str(cwd_file)
+        completed = subprocess.run(
+            [sys.executable, str(RUNNER), str(state),
+             "--slice-budget", "365", "--skill-dir", str(SCRIPTS.parent),
+             "--claude-bin", str(self.fake), "--schema-cli", str(SCHEMA),
+             "--wait-scale", "1.0"],
+            capture_output=True, text=True, env=env, timeout=90,
+        )
+        lines = [l for l in completed.stdout.strip().splitlines() if l.startswith("{")]
+        self.assertTrue(lines, completed.stdout + completed.stderr)
+        summary = json.loads(lines[-1])
+        self.assertEqual(summary["ticks_completed"], 1, completed.stderr)
+        self.assertEqual(
+            Path(cwd_file.read_text()).resolve(), repo.resolve()
+        )
+
+    def test_failed_child_candidate_is_preserved_for_resume(self) -> None:
+        # algo#1216 R2 finding 3779532272: a failed child's candidate is the
+        # only durable record of external effects it may have fired — the
+        # failure path must preserve it, not destroy it.
+        completed = self._run(
+            mode="die_late", budget="900", timeout=90, wait_scale="0.02",
+            max_ticks="3",
+        )
+        self.assertEqual(completed.returncode, 5, completed.stderr)
+        preserved = self.state.with_suffix(".failed-candidate.md")
+        self.assertTrue(preserved.exists(), "failed candidate must be preserved")
+        self.assertIn("monitor_poll_ticks: 1", preserved.read_text(encoding="utf-8"))
 
     def test_wrong_served_model_blocks_immediately(self) -> None:
         completed = self._run(mode="wrong_model")
