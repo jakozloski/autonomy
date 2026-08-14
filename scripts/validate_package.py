@@ -64,6 +64,7 @@ REQUIRED_SCRIPT_FILES = (
     "scripts/monitor_runner.py",
     "scripts/monitor_child_wrapper.py",
     "scripts/test_monitor_runner.py",
+    "scripts/test_monitor_runner_unit.py",
 )
 
 # Evidence-gate and state-hardening content contracts.  Each marker is an
@@ -302,17 +303,11 @@ REQUIRED_GATE_MARKERS = {
         "base_workflow_digest",
         "NO inline fallback under a continuity binding",
     ),
-    "scripts/handoff_decision.py": (
-        # R3 F5 — the attempt cap is REBOUND from state_schema, never a second
-        # literal (interning makes equality tests vacuous; the source line is
-        # the pin).
-        "MAX_OPERATION_ATTEMPTS = state_schema.MAX_OPERATION_ATTEMPTS",
-    ),
-    "scripts/model_policy.py": (
-        # R3 F2/r6 — the quota-wait ceiling is REBOUND from state_schema so
-        # the helper clamp and the validator's resume bound cannot drift.
-        "MAX_QUOTA_WAIT_SECONDS = state_schema.MAX_QUOTA_WAIT_SECONDS",
-    ),
+    # The state_schema re-export bindings (attempt cap, quota-wait ceiling,
+    # 3-strike child-failure limit) are NOT here: a file-wide substring is
+    # satisfied by the same text parked in a comment, which is exactly how a
+    # rebind silently reverts to an independent literal (R7.2 codex #9). They
+    # live in REQUIRED_PY_BINDINGS below, checked as operative source lines.
     "references/project-and-entry.md": (
         "red/green + variant evidence gate",
         "defect_evidence_mode",
@@ -327,6 +322,25 @@ REQUIRED_GATE_MARKERS = {
         # never run. The resume router's monitor bullet must carry the
         # same precondition Phase 5 enforces.
         "then re-enter the monitor",
+    ),
+}
+
+# Operative-line pins for the state_schema re-export bindings. Each value must
+# appear as a real Python statement — a whole source line carrying only the
+# binding (leading indentation and an optional trailing comment aside), NOT the
+# same text hidden in a comment or embedded in other code. This is the single
+# source of truth these constants forbid drift against: the actual runtime
+# value cannot be pinned by identity because CPython interns the small ints, so
+# reverting `X = state_schema.X` to an independent literal `X = 3` yields the
+# same object — only the source form distinguishes them (R7.2 codex #9, the
+# complete set of three: attempt cap, quota-wait ceiling, child-failure limit).
+REQUIRED_PY_BINDINGS = {
+    "scripts/handoff_decision.py": (
+        "MAX_OPERATION_ATTEMPTS = state_schema.MAX_OPERATION_ATTEMPTS",
+    ),
+    "scripts/model_policy.py": (
+        "MAX_QUOTA_WAIT_SECONDS = state_schema.MAX_QUOTA_WAIT_SECONDS",
+        "MONITOR_CHILD_FAILURE_LIMIT = state_schema.MONITOR_CHILD_FAILURE_LIMIT",
     ),
 }
 
@@ -592,6 +606,234 @@ BUILTIN_EXPECTED_HEADINGS: Mapping[str, tuple[str, ...]] = {
     ),
 }
 
+# R7 codex #14 / R7.2 codex #4: a real YAML loader (the skill scanner, the
+# runtime) rejects inputs that outer-quote matching alone accepts. If this
+# validator passes a skill the loader cannot parse, the pinned scanner silently
+# omits that package and still exits zero, so an unloadable, UNSCANNED skill
+# ships green — verified empirically: a SKILL.md whose frontmatter PyYAML
+# rejects drops the scanner's "Total Skills Scanned" count and leaves
+# `scan-all --fail-on-findings` at exit 0. The scanner loads frontmatter via
+# `python-frontmatter` → PyYAML 6.0.2, so a value it refuses is a silent skip.
+# We cannot `import yaml` here (this must run from a bare clone with nothing
+# installed), so mirror three PyYAML reject classes, each pinned against
+# `frontmatter.loads` in test_validate_package.py:
+#   * quoted-scalar escapes — an unknown escape (`"bad\q"`), a stray interior
+#     quote (`"a"b"`), or a `\x`/`\u`/`\U` escape resolving to a surrogate or a
+#     value past U+10FFFF (`_quoted_scalar_error`);
+#   * plain-scalar indicators — an unquoted value opening a non-plain-scalar
+#     node: a flow collection, alias, anchor, tag, directive, or block scalar
+#     (`_plain_scalar_error`);
+#   * raw control characters — any non-printable byte the reader rejects
+#     (`_forbidden_control_char` / `_is_yaml_printable`).
+# Escape set sourced from PyYAML 6.0.2 `Scanner.ESCAPE_REPLACEMENTS` /
+# `Scanner.ESCAPE_CODES`; the printable set from `reader.Reader.NON_PRINTABLE`.
+_YAML_DQ_ESCAPES = frozenset("0abtnvfre \"/\\N_LP\t")
+_YAML_DQ_HEX = {"x": 2, "u": 4, "U": 8}
+_HEXDIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def _trailing_after_quote_error(rest: str, quote_word: str) -> str | None:
+    """None if what follows a closing quote is valid YAML, else a phrase.
+
+    PyYAML strips trailing whitespace and a `#` comment after a closing quote
+    (`"x" # note`, `'x'# note`, `"x"\t# c` all load to `x`; verified against
+    `frontmatter.loads` -- R7.2 opus #10). A `#` needs NO preceding space
+    after a quote: the quote is the token boundary. Anything else after the
+    quote (`"x"junk`, `"x" junk`) is a real parse error the loader rejects."""
+    stripped = rest.lstrip(" \t")
+    if stripped == "" or stripped.startswith("#"):
+        return None
+    return f"content after the closing {quote_word} quote"
+
+
+def _quoted_scalar(scalar: str) -> tuple[str | None, str | None]:
+    """Return `(inner, None)` for a valid single-line YAML quoted scalar, else
+    `(None, phrase)`. `scalar` is already known to open with `'` or `"`. A
+    closing quote may be followed by whitespace and/or a `#` comment, which
+    PyYAML strips; `inner` is the RAW between-quotes text (escapes undecoded --
+    the validator needs it only for presence/name checks, not decoding).
+    Matches what PyYAML rejects so the validator gate agrees with the real
+    loader; no PyYAML dependency."""
+    quote = scalar[0]
+    length = len(scalar)
+    index = 1
+    if quote == "'":
+        # Single-quoted: the sole escape is `''` -> `'`; a lone `'` closes.
+        while index < length:
+            if scalar[index] == "'":
+                if index + 1 < length and scalar[index + 1] == "'":
+                    index += 2
+                    continue
+                trailing = _trailing_after_quote_error(scalar[index + 1 :], "single")
+                if trailing is not None:
+                    return None, trailing
+                return scalar[1:index], None
+            index += 1
+        return None, "an unterminated single-quoted scalar"
+    # Double-quoted: validate every backslash escape; the closing quote may be
+    # followed only by whitespace and/or a comment.
+    while index < length:
+        char = scalar[index]
+        if char == "\\":
+            if index + 1 >= length:
+                return None, "a trailing backslash escape"
+            marker = scalar[index + 1]
+            width = _YAML_DQ_HEX.get(marker)
+            if width is not None:
+                digits = scalar[index + 2 : index + 2 + width]
+                if len(digits) != width or any(d not in _HEXDIGITS for d in digits):
+                    return None, f"an invalid \\{marker} hex escape"
+                code = int(digits, 16)
+                if 0xD800 <= code <= 0xDFFF or code > 0x10FFFF:
+                    # Both refused for the same load-bearing reason: the scanner's
+                    # parser (python-frontmatter aliases SafeLoader to libyaml's
+                    # CSafeLoader when the C ext is present) raises on a lone
+                    # surrogate (U+D800 to U+DFFF) AND on a value past U+10FFFF, so
+                    # either skips the package UNSCANNED and the gate must reject
+                    # to stay aligned. Trap for an auditor: bare yaml.safe_load
+                    # (pure-Python SafeLoader) LOADS a lone surrogate, so probing
+                    # with it instead of frontmatter.loads misreads this as
+                    # over-rejection. Even without libyaml a lone surrogate has no
+                    # UTF-8 encoding, so refusing it stays safe in either env.
+                    return None, f"a \\{marker} escape outside the Unicode scalar range"
+                index += 2 + width
+                continue
+            if marker not in _YAML_DQ_ESCAPES:
+                return None, f"an unknown escape character \\{marker}"
+            index += 2
+            continue
+        if char == '"':
+            trailing = _trailing_after_quote_error(scalar[index + 1 :], "double")
+            if trailing is not None:
+                return None, trailing
+            return scalar[1:index], None
+        index += 1
+    return None, "an unterminated double-quoted scalar"
+
+
+def _quoted_scalar_error(scalar: str) -> str | None:
+    """The error side of `_quoted_scalar` for callers that only gate (the
+    openai.yaml interface check); returns None when the scalar is valid."""
+    return _quoted_scalar(scalar)[1]
+
+
+def _strip_plain_trailing_comment(scalar: str) -> str:
+    """Drop a trailing YAML `#` comment from a plain (unquoted) scalar.
+
+    A `#` opens a comment only when preceded by whitespace (`foo # note` ->
+    `foo`); `foo#bar` has no comment and is returned unchanged. Verified
+    against `frontmatter.loads` (R7.2 opus #10)."""
+    match = re.search(r"[ \t]#", scalar)
+    if match is None:
+        return scalar
+    return scalar[: match.start()].rstrip(" \t")
+
+
+def _is_yaml_printable(code: int) -> bool:
+    """True if a decoded character with this code point is in the YAML printable
+    set (PyYAML `reader.Reader.NON_PRINTABLE`, negated). A character outside it
+    raises `ReaderError` in the real loader, so the whole skill is skipped and
+    left UNSCANNED. The two line-break forms (LF/CR) are printable in YAML but
+    never survive `splitlines`, so they are intentionally omitted here."""
+    return (
+        code == 0x09
+        or 0x20 <= code <= 0x7E
+        or code == 0x85
+        or 0xA0 <= code <= 0xD7FF
+        or 0xE000 <= code <= 0xFFFD
+        or 0x10000 <= code <= 0x10FFFF
+    )
+
+
+def _forbidden_control_char(text: str) -> int | None:
+    """Return the code point of the first non-printable character in `text`,
+    else None. A raw control character anywhere in the frontmatter block
+    (a key, value, or comment — all read by the YAML reader) is a `ReaderError`
+    that skips the package; TAB is the sole allowed control character."""
+    for char in text:
+        if not _is_yaml_printable(ord(char)):
+            return ord(char)
+    return None
+
+
+def _forbidden_yaml_whitespace(text: str) -> int | None:
+    """Return the code point of the first Unicode-whitespace character in `text`
+    that YAML does NOT accept as separation, else None.
+
+    Pass-4 codex F5: YAML separation whitespace (s-white) is exactly SPACE
+    (0x20) and TAB (0x09). Every other code point Python treats as whitespace
+    (`str.strip()`/`str.split()` and the `re` module's `\\s` all match the
+    Unicode set: NBSP, the Zs space separators, NEL, LS/PS, ...) is CONTENT
+    to the YAML reader, never separation. When one lands in a structural
+    position (after a `:`, after a closing quote, trailing a plain scalar) the
+    real loader raises a Scanner/Parser error and the whole skill is skipped
+    UNSCANNED, while this validator's Python-native strip/`\\s` silently
+    absorbs it and ACCEPTS - the one-way invariant's under-rejection failure.
+    Flag on presence (fail-closed, over-rejection-safe: the rare inside-a-
+    quoted-scalar use the reader WOULD accept is also rejected, but no real
+    skill frontmatter carries these code points). LF/CR are line breaks split
+    away before this scan, so they are excluded here."""
+    for char in text:
+        if char.isspace() and char not in "\t \r\n":
+            return ord(char)
+    return None
+
+
+# YAML indicator characters that cannot open a plain scalar: each introduces a
+# non-plain-scalar node (flow collection, alias, anchor, tag, directive, or
+# block scalar). Verbatim from the YAML 1.1 c-indicator set minus the three
+# context-sensitive ones ('-', '?', ':'), which `_plain_scalar_error` handles
+# by their following character.
+_PLAIN_SCALAR_INDICATORS = {
+    "@": "reserved indicator '@'",
+    "`": "reserved indicator '`'",
+    "%": "directive indicator '%'",
+    ",": "flow indicator ','",
+    "[": "flow-sequence indicator '['",
+    "]": "flow indicator ']'",
+    "{": "flow-mapping indicator '{'",
+    "}": "flow indicator '}'",
+    "*": "alias indicator '*'",
+    "!": "tag indicator '!'",
+    "&": "anchor indicator '&'",
+    "|": "block-scalar indicator '|'",
+    ">": "block-scalar indicator '>'",
+}
+
+
+def _plain_scalar_error(scalar: str) -> str | None:
+    """Return a phrase if an unquoted (plain) frontmatter value is not a plain
+    YAML string scalar, else None. `scalar` is non-empty and does not open with
+    a quote.
+
+    A skill's frontmatter values (`name`, `description`) are plain or quoted
+    string scalars. This refuses every unquoted value that opens a
+    non-plain-scalar node, and it does so for two reasons that resolve the same
+    way — reject:
+      * The forms a real loader ALSO rejects (`@bad`, `[bad`, `*a`, `!tag`,
+        `| x`, `- x`, a bare `:`) make the scanner skip the package UNSCANNED,
+        so they must be caught here (the whole point of R7.2 codex #4).
+      * The forms a real loader would ACCEPT as a non-string (`[a, b]` list,
+        `{a: b}` map, `!!str x` tagged, `&a v` anchored, a bare `|`/`>` empty
+        block) are out of contract for a skill name/description and never
+        appear in a real one — refusing them is correct, not over-rejection.
+    Confirmed against `frontmatter.loads` (the scanner's own parser) in
+    test_validate_package.py."""
+    leader = _PLAIN_SCALAR_INDICATORS.get(scalar[0])
+    if leader is not None:
+        return f"an unquoted value opening with YAML {leader}"
+    if scalar[0] in "-?:" and (len(scalar) == 1 or scalar[1] in " \t"):
+        # '-', '?', ':' open a plain scalar only when a non-space "safe"
+        # character follows; '- ', '? ', ': ', or a bare one is a block/mapping
+        # indicator the loader rejects.
+        return f"an unquoted value opening with the '{scalar[0]}' indicator"
+    if re.search(r":(?:[ \t]|$)", scalar):
+        # An interior ': ' (or a trailing ':') turns the remainder into a
+        # nested mapping the loader rejects as a plain scalar.
+        return "an unquoted ': ' that must be quoted"
+    return None
+
+
 def _parse_frontmatter(skill_text: str) -> tuple[dict[str, str], list[str]]:
     errors: list[str] = []
     lines = skill_text.splitlines()
@@ -606,6 +848,48 @@ def _parse_frontmatter(skill_text: str) -> tuple[dict[str, str], list[str]]:
         )
     except StopIteration:
         return {}, ["SKILL.md frontmatter is missing its closing --- delimiter"]
+
+    # Pass-4 opus F1: str.splitlines() consumes U+000B/000C/001C/001D/001E as
+    # line boundaries, so a per-splitlines-line scan can never see exactly the
+    # non-printables the YAML reader raises ReaderError on (package skipped
+    # UNSCANNED - the invariant failure this battery exists to prevent). Scan
+    # \n-physical lines, which keep those bytes in-line, across the whole
+    # block. When the closing delimiter is not \n-physical (itself possible
+    # only via a boundary control char), scan to EOF - the offending char is
+    # in range either way. This scan strictly subsumes a per-splitlines-line
+    # check: splitlines boundaries are a superset of \n, so every splitlines
+    # line is a substring of some physical line.
+    physical_lines = skill_text.split("\n")
+    physical_closing = next(
+        (
+            index
+            for index, line in enumerate(physical_lines[1:], start=1)
+            if line.strip() == "---"
+        ),
+        len(physical_lines),
+    )
+    for line_number, raw_line in enumerate(
+        physical_lines[1:physical_closing], start=2
+    ):
+        control = _forbidden_control_char(raw_line)
+        if control is not None:
+            # A raw control character anywhere in the block (key, value, or
+            # comment) is a ReaderError that skips the package.
+            return {}, [
+                f"SKILL.md:{line_number}: frontmatter has a non-printable "
+                f"character (U+{control:04X}) the YAML reader rejects"
+            ]
+        whitespace = _forbidden_yaml_whitespace(raw_line)
+        if whitespace is not None:
+            # A Unicode whitespace char YAML does not treat as separation
+            # (only SPACE/TAB are). In a structural position the real loader
+            # raises and skips the package; this validator's strip/\s would
+            # absorb it and accept. See _forbidden_yaml_whitespace.
+            return {}, [
+                f"SKILL.md:{line_number}: frontmatter uses a non-separation "
+                f"Unicode whitespace character (U+{whitespace:04X}); YAML "
+                "separation whitespace is SPACE or TAB only"
+            ]
 
     values: dict[str, str] = {}
     for line_number, raw_line in enumerate(lines[1:end_index], start=2):
@@ -623,24 +907,31 @@ def _parse_frontmatter(skill_text: str) -> tuple[dict[str, str], list[str]]:
             errors.append(f"SKILL.md:{line_number}: duplicate frontmatter key {key!r}")
             continue
         scalar = value.strip()
-        if scalar and scalar[0] in "'\"":
-            if len(scalar) < 2 or scalar[-1] != scalar[0]:
+        if scalar[:1] in ("'", '"'):
+            inner, quote_error = _quoted_scalar(scalar)
+            if quote_error is not None:
                 errors.append(
-                    f"SKILL.md:{line_number}: frontmatter key {key!r} has an "
-                    "unterminated quoted scalar"
+                    f"SKILL.md:{line_number}: frontmatter key {key!r} has "
+                    f"{quote_error}"
                 )
                 continue
-            scalar = scalar[1:-1]
-        elif re.search(r":(?:[ \t]|$)", scalar):
-            # An unquoted plain scalar containing ':' before whitespace or at
-            # end-of-line is invalid YAML; a lenient regex accepting it here
-            # would pass validation while the real skill loader fails to parse
-            # the frontmatter.
-            errors.append(
-                f"SKILL.md:{line_number}: frontmatter key {key!r} must quote "
-                "scalars containing ': '"
-            )
-            continue
+            # inner is the comment-stripped between-quotes text (never None
+            # once quote_error is None).
+            scalar = inner or ""
+        elif scalar:
+            # An unquoted plain scalar the real skill loader cannot parse would
+            # pass a lenient validator while making the scanner skip the
+            # package UNSCANNED; refuse exactly what PyYAML refuses. Strip a
+            # trailing `#` comment first (PyYAML does), so the check runs on the
+            # real value and the stored value matches what the loader sees.
+            scalar = _strip_plain_trailing_comment(scalar)
+            plain_error = _plain_scalar_error(scalar)
+            if plain_error is not None:
+                errors.append(
+                    f"SKILL.md:{line_number}: frontmatter key {key!r} has "
+                    f"{plain_error}"
+                )
+                continue
         values[key] = scalar
 
     unknown = sorted(set(values) - ALLOWED_FRONTMATTER_KEYS)
@@ -787,7 +1078,10 @@ def _extract_direct_interface_scalar(text: str, key: str) -> list[str]:
 
 
 def _direct_interface_quote_errors(text: str, keys: Iterable[str]) -> list[str]:
-    """Reject direct interface scalars that start a quote but never close it."""
+    """Reject direct interface scalars the real YAML loader would refuse:
+    unterminated, an unknown escape, or a stray interior quote. Shares the
+    SKILL.md frontmatter rule via `_quoted_scalar_error` so both quoted-scalar
+    gates in this file agree with PyYAML rather than drifting (R7 codex #14)."""
 
     errors: list[str] = []
     for key in keys:
@@ -797,14 +1091,12 @@ def _direct_interface_quote_errors(text: str, keys: Iterable[str]) -> list[str]:
             if match is None:
                 continue
             value = match.group(1).strip()
-            if (
-                value
-                and value[0] in "'\""
-                and (len(value) < 2 or value[-1] != value[0])
-            ):
+            if not value or value[0] not in "'\"":
+                continue
+            quote_error = _quoted_scalar_error(value)
+            if quote_error is not None:
                 errors.append(
-                    f"agents/openai.yaml interface.{key} has an unterminated "
-                    "quoted scalar"
+                    f"agents/openai.yaml interface.{key} has {quote_error}"
                 )
     return errors
 
@@ -875,6 +1167,32 @@ def _validate_gate_markers(package_dir: Path) -> list[str]:
             if marker not in text:
                 errors.append(
                     f"{relative_path}: missing required gate marker {marker!r}"
+                )
+    return errors
+
+
+def _validate_py_bindings(package_dir: Path) -> list[str]:
+    """Require every REQUIRED_PY_BINDINGS statement as an OPERATIVE source line.
+
+    A whole line must carry exactly the binding — leading indentation and a
+    trailing ``# comment`` aside — so the same text parked in a comment or
+    embedded in other code does NOT satisfy it. That closes the substring
+    bypass a plain ``marker in text`` check leaves open (R7.2 codex #9)."""
+    errors: list[str] = []
+    for relative_path, statements in sorted(REQUIRED_PY_BINDINGS.items()):
+        candidate = package_dir / relative_path
+        if not candidate.is_file():
+            # Missing script files are reported by their own checks.
+            continue
+        text = candidate.read_text(encoding="utf-8")
+        for statement in statements:
+            pattern = (
+                r"^[ \t]*" + re.escape(statement) + r"[ \t]*(?:#.*)?$"
+            )
+            if re.search(pattern, text, re.MULTILINE) is None:
+                errors.append(
+                    f"{relative_path}: binding {statement!r} must appear as an "
+                    "operative source line (not a comment or substring)"
                 )
     return errors
 
@@ -991,6 +1309,26 @@ def _anchored_candidate(line: str, *, fenced: bool, in_fence: bool) -> str | Non
     return stripped
 
 
+_INLINE_HTML_COMMENT = re.compile(r"<!--.*?-->")
+
+
+def _strip_inline_html_comments(line: str) -> str:
+    """Display text of a prose line: inline ``<!-- ... -->`` spans render as
+    nothing, and a trailing unclosed opener hides the rest of the line.
+
+    R6-F16: the required-substring check must run against this display text
+    for prose anchors - a required clause hidden inside an inline comment on
+    the anchor line passes a raw-line substring search while rendering as
+    absent, the same decoy family the block-comment scan already rejects.
+    """
+
+    stripped = _INLINE_HTML_COMMENT.sub("", line)
+    open_index = stripped.rfind("<!--")
+    if open_index != -1:
+        stripped = stripped[:open_index]
+    return stripped
+
+
 def _anchored_matches(
     text: str,
     anchor: str,
@@ -1074,8 +1412,15 @@ def _validate_anchored_markers(package_dir: Path) -> list[str]:
                     f" anchored by {anchor!r}, found {len(matches)}"
                 )
                 continue
+            # R6-F16: prose anchors are checked against their DISPLAY text —
+            # a clause hidden in an inline HTML comment renders as nothing
+            # and must not satisfy the check. Fenced anchors keep the raw
+            # line: inside a code fence, comment syntax is literal content.
+            haystack = (
+                matches[0] if fenced else _strip_inline_html_comments(matches[0])
+            )
             for substring in required:
-                if substring not in matches[0]:
+                if substring not in haystack:
                     errors.append(
                         f"{relative_path}: anchored line {anchor!r} is"
                         f" missing required text {substring!r}"
@@ -1111,6 +1456,7 @@ def validate_package(package_dir: Path) -> list[str]:
             errors.append(f"missing required script file: {required_file}")
     errors.extend(_validate_policy_text(package_dir))
     errors.extend(_validate_gate_markers(package_dir))
+    errors.extend(_validate_py_bindings(package_dir))
     errors.extend(_validate_anchored_markers(package_dir))
     errors.extend(_validate_openai_yaml(package_dir))
     return errors

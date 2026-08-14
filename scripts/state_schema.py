@@ -249,7 +249,8 @@ MONITOR_CLI_IN_FLIGHT_KEYS = frozenset(
 )
 MONITOR_CHILD_FAILURE_KEYS = frozenset(("signature", "at"))
 # Same-signature child failures before the runner blocks (mirrors the
-# workflow's 3-strike rule; rebound nowhere — the runner reads it from here).
+# workflow's 3-strike rule). The runner consumes it through model_policy's
+# re-export — it never imports this module (structural rule).
 MONITOR_CHILD_FAILURE_LIMIT = 3
 # Phase 4b (merge readiness) value contracts — see references/merge-readiness.md.
 AC_VERDICT_ENUM = frozenset(("pending", "met", "unmet", "deferred", "n_a"))
@@ -1230,6 +1231,18 @@ class _Validator:
                     self.error(
                         "monitor_ownership: a continuity binding must carry the"
                         " nominal owner in pending_owner"
+                    )
+                # R6-F12: the reverse direction — pending_owner is meaningful
+                # ONLY on a continuity binding; a stray value elsewhere is
+                # write-only metadata that can contradict the real owner.
+                if (
+                    isinstance(pending_owner, str)
+                    and pending_owner
+                    and ownership.get("reason_code") != "orchestrator_continuity"
+                ):
+                    self.error(
+                        "monitor_ownership: pending_owner is only valid on an"
+                        " orchestrator_continuity binding"
                     )
                 lineage = ownership.get("lineage")
                 if "lineage" in ownership and lineage not in MONITOR_OWNERSHIP_LINEAGE_ENUM:
@@ -2355,6 +2368,76 @@ def taint_scan(state: dict, body_lines: list[str]) -> list[dict[str, str]]:
     return findings
 
 
+def _frontmatter_comments(text: str) -> list[str]:
+    """Ordered raw comment remnants inside the frontmatter fence.
+
+    R7 codex #7: ``_strip_comment`` removes trailing ``#`` comments while
+    parsing frontmatter, and ``_collect_lines`` skips a comment-only line
+    outright (never an error), so both ``taint_scan`` (which sees only the
+    parsed mapping) and ``monitor_digest`` (which serializes only that mapping
+    plus the body) were blind to them -- yet the monitored child is instructed
+    to read the RAW state file, comments included. This collector is the
+    single source both closures share: ``_frontmatter_comment_findings``
+    taint-scans each remnant (injection channel) and ``monitor_digest`` folds
+    the remnant sequence into the canonical digest (mutation channel).
+    Body ``#`` is a Markdown heading and is deliberately never collected.
+    """
+
+    comments: list[str] = []
+    lines = text.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return comments
+    for offset, raw in enumerate(lines[1:], start=2):
+        if raw.strip() == "---":
+            break
+        try:
+            stripped = _strip_comment(raw, offset)
+        except StructuralError:
+            # An unterminated quote is rejected by parse_state_text upstream;
+            # a line that never parses is not a comment channel to collect.
+            continue
+        if stripped != raw.rstrip():
+            comments.append(raw.rstrip()[len(stripped) :].lstrip())
+    return comments
+
+
+def _frontmatter_comment_findings(text: str) -> list[dict[str, str]]:
+    """Taint records for INSTRUCTION-LIKE comments inside the frontmatter fence.
+
+    Pass-3 (opus #2, narrowing R7 codex #7): flagging comment PRESENCE bricked
+    the package's own documented usage -- the state template in
+    references/state-and-safety.md carries dozens of benign ``#`` annotations
+    and merge-readiness.md tells agents to initialize from it, so a compliant
+    template-derived state would block the runner on tick 1, recoverable only
+    by a human ``--acknowledge-taint``. Comments therefore get exactly the
+    trust bar every other frontmatter string gets: ``_is_tainted`` over the
+    comment text. The mutation channel presence-flagging used to close is
+    closed by ``monitor_digest`` instead, which folds the raw remnants into
+    the canonical digest -- adding, removing, or rewriting ANY comment
+    mid-loop moves the digest ``_require_unmutated_canonical`` pins, even
+    though the parsed mapping is unchanged.
+
+    Identity is content-keyed on purpose (stable path, digest of the raw
+    remnant -- pass-3 opus #5/codex #10): a line-numbered path would let any
+    unrelated state edit renumber the finding and silently revoke an operator
+    acknowledgment, while a content digest keeps the acknowledgment bound to
+    the exact instruction it was granted for.
+    """
+
+    findings: list[dict[str, str]] = []
+    for remnant in _frontmatter_comments(text):
+        content = remnant.lstrip("#").strip()
+        if content and _is_tainted(content):
+            findings.append(
+                {
+                    "path": "frontmatter-comment",
+                    "digest": _digest(remnant),
+                    "kind": "comment",
+                }
+            )
+    return findings
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -2374,6 +2457,13 @@ def evaluate_state_text(text: str) -> dict[str, Any]:
     validator = _Validator(state)
     tier_name = validator.validate()
     tainted = taint_scan(state, body_lines)
+    # R7 codex #7 (narrowed by pass-3 opus #2): comments are stripped before
+    # taint_scan runs, so an instruction-bearing frontmatter comment would
+    # reach the raw-reading child unflagged. Scan the remnants with the same
+    # instruction heuristic as every other frontmatter string; benign
+    # template annotations pass, and comment MUTATION is caught separately
+    # by monitor_digest folding the remnants into the canonical digest.
+    tainted.extend(_frontmatter_comment_findings(text))
     return {
         "version": SCHEMA_VERSION,
         "state": SUSPECT if validator.errors else VALID,
@@ -2402,8 +2492,241 @@ def monitor_digest(text: str) -> str | None:
         return None
     trimmed = {key: value for key, value in state.items() if key != "monitor_cli"}
     payload = json.dumps(trimmed, sort_keys=True, ensure_ascii=False)
+    # Pass-3 (opus #2 follow-through on R7 codex #7): comments are stripped
+    # from the parsed mapping, so fold the raw frontmatter comment remnants
+    # into the digest -- a comment added, removed, or rewritten mid-loop must
+    # move the canonical digest even though the parsed state is unchanged.
+    # JSON-encoded so a body line can never collide with the comment block.
+    payload += "\n" + json.dumps(_frontmatter_comments(text), ensure_ascii=False)
     payload += "\n" + "\n".join(line.rstrip("\n") for line in body_lines)
     return hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()
+
+
+# Durable condition-(c) blocker representations (references/
+# monitor-exit-handoffs.md "If stuck"): presence-fired attempt_log families,
+# three-strike counter families, the three feedback blocker maps, and the
+# per-reviewer human-feedback evidence. The ephemeral triggers
+# (CHANGES_REQUESTED, unresolved human threads) surface durably through
+# ``human_roundtrip`` ``blocker_remaining: true`` records, which Step 2
+# populates whenever human feedback is processed.
+_BLOCKED_EVIDENCE_MAPS = (
+    "exhausted_feedback",
+    "manual_unknown_feedback",
+    "manual_branch_protection_blockers",
+)
+_BLOCKED_THREE_STRIKE_PREFIXES = ("ci:", "conflict:", "branch:", "ready:")
+# monitor-ci-feedback.md Step 3 conflict-complexity key: conflict:complex_<F>f_<H>h
+# (F = file count, H = hunk count). fullmatch()ed at the call site so a malformed
+# or below-threshold key is never mistaken for immediate block evidence. Pass-6
+# codex F3/F4: [0-9] not \d (\d admits Unicode digits int() would still parse, so
+# "complex_٤f_٦h" must NOT be read as 4f/6h) and a {1,9} bound not + (an
+# overlong digit run must never reach int(), which raises above Python 3.11+'s
+# decimal-digit ceiling -> the validator would emit no JSON and strand the
+# runner). A non-ASCII-digit, >9-digit, or trailing-newline key simply fails the
+# grammar and falls through to the generic conflict: three-strike path. Pass-7
+# opus N4: the pattern self-anchors (\A...\Z) so it stays an EXACT-match grammar
+# even if a future caller uses re.search instead of the fullmatch below - a bare
+# pattern would let re.search accept a "ci:conflict:complex_9f_9h" substring.
+_CONFLICT_COMPLEX_KEY = re.compile(
+    r"\Aconflict:complex_([0-9]{1,9})f_([0-9]{1,9})h\Z"
+)
+
+
+def roundtrip_generation(raw_reviewers: Any, targets: Any) -> str:
+    """Digest of the feedback evidence a roundtrip plan answers.
+
+    Canonical single source (pass-3 codex #2): ``handoff_decision`` embeds
+    this digest in every roundtrip operation ID (``...:g<12hex>``) so a
+    completed earlier round's ledger can never satisfy a later round, and
+    ``monitor_blocked_evidence_present`` recomputes it from the persisted
+    reviewer evidence so only the CURRENT generation's ledger counts as
+    durable blocked evidence -- a prior-generation terminal record is that
+    round's history (the planner ignores it with a warning), never fresh
+    evidence for a new blocked transition. ``raw_reviewers`` is a list of
+    reviewer-evidence entries each carrying its ``login`` (the planner's
+    request shape); the predicate flattens state's login-keyed
+    ``human_roundtrip.reviewers`` map into that same shape before calling.
+    """
+
+    wanted = {
+        login.casefold() for login in (targets or []) if isinstance(login, str)
+    }
+    payload: list[dict[str, Any]] = []
+    for entry in raw_reviewers if isinstance(raw_reviewers, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        login = entry.get("login")
+        if not isinstance(login, str) or login.casefold() not in wanted:
+            continue
+        bodies = entry.get("review_bodies")
+        roots = entry.get("inline_roots")
+        pushed = entry.get("pushed_fix_shas")
+        payload.append(
+            {
+                "login": login.casefold(),
+                "review_bodies": {
+                    str(key): (
+                        value.get("updated_at") if isinstance(value, dict) else None
+                    )
+                    for key, value in bodies.items()
+                }
+                if isinstance(bodies, dict)
+                else None,
+                "inline_roots": {
+                    str(key): (
+                        value.get("updated_at") if isinstance(value, dict) else None
+                    )
+                    for key, value in roots.items()
+                }
+                if isinstance(roots, dict)
+                else None,
+                "pushed_through_sha": entry.get("pushed_through_sha"),
+                "pushed_fix_shas": sorted(
+                    sha for sha in pushed if isinstance(sha, str)
+                )
+                if isinstance(pushed, list)
+                else None,
+            }
+        )
+    payload.sort(key=lambda item: item["login"])
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+
+
+def monitor_blocked_evidence_present(state: Any) -> bool:
+    """Schema-owned blocker predicate: does this state carry ANY documented
+    durable condition-(c) representation?
+
+    One definition consumed by ``monitor_extract`` and, through the CLI, by
+    the runner's blocked-outcome validation — the runner must accept every
+    blocked exit the references document (``human:*`` keys fire on presence,
+    ``prompt-trail:stale`` fires on presence, ``ci:``/``conflict:``/
+    ``branch:``/``ready:`` fire at the three-strike limit), not only the
+    three feedback maps. The conflict-resolution IMMEDIATE-block keys
+    (``conflict:enumeration_failed`` and ``conflict:complex_<F>f_<H>h``) are
+    the exception to the three-strike rule for the ``conflict:`` family:
+    monitor-ci-feedback.md Step 3 PERSISTS them then BLOCKs on the FIRST
+    REAL occurrence - a non-bool integer count >= 1 (the "count 1" the doc's
+    "first occurrence" implies), NOT bare key presence; the complex key
+    additionally requires its exact <F>f_<H>h grammar and the >3-file/>5-hunk
+    threshold (pass-4 codex F3; both count guards hoisted round-7.7). Within
+    ``attempt_log`` only ``human:*`` and ``prompt-trail:stale`` stay
+    presence-fired; the feedback maps, a ``human_roundtrip`` blocker, and the
+    review-roundtrip ledger below are separate non-count blocker sources.
+    """
+
+    if not isinstance(state, dict):
+        return False
+    for map_key in _BLOCKED_EVIDENCE_MAPS:
+        value = state.get(map_key)
+        if isinstance(value, dict) and value:
+            return True
+    attempt_log = state.get("attempt_log")
+    if isinstance(attempt_log, dict):
+        for key, count in attempt_log.items():
+            if not isinstance(key, str):
+                continue
+            if key.startswith("human:") or key == "prompt-trail:stale":
+                return True
+            # pass-4 codex F3: the conflict-resolution complexity guard and
+            # the enumeration-failure paths (monitor-ci-feedback.md Step 3)
+            # PERSIST then BLOCK on the FIRST occurrence - an immediate,
+            # count-1 block, not a three-strike retry (a deterministically
+            # too-complex merge does not become resolvable by re-attempting
+            # it twice more). Recognize them on presence so the runner accepts
+            # the documented block instead of discarding the candidate and
+            # misattributing the strand to a generic transition_rejected
+            # 3-strike. Pass-6 codex F2 / pass-7 codex+opus: BOTH immediate keys
+            # additionally require the same non-bool int occurrence count >= 1
+            # that the doc's "first occurrence at count 1" implies (matching the
+            # generic branch's guard below) - so an injected count 0 or a bool
+            # True can never mint an immediate block from a key that has NOT
+            # actually occurred. The guard is hoisted here to cover BOTH
+            # enumeration_failed and the complex key; the earlier revision
+            # guarded only the complex key, leaving enumeration_failed forgeable
+            # at count 0 (validate_attempt_log permits count 0). human:* and
+            # prompt-trail:stale above stay presence-fired BY DESIGN - cleared
+            # by deletion, not by a count.
+            occurred = (
+                isinstance(count, int)
+                and not isinstance(count, bool)
+                and count >= 1
+            )
+            if occurred and key == "conflict:enumeration_failed":
+                return True
+            # pass-5 codex F2: the complexity key is trusted on presence ONLY
+            # when it matches the exact conflict:complex_<F>f_<H>h grammar AND
+            # clears the documented threshold (> 3 files OR > 5 hunks). The old
+            # startswith() accepted a below-threshold or malformed key
+            # (conflict:complex_1f_1h, conflict:complex_x) as an immediate
+            # block, letting a worker mint a spurious human handoff from a
+            # trivial or spoofed conflict; a non-qualifying key falls through
+            # to the generic conflict: three-strike path below (never a clean
+            # merge - the fail-safe direction is preserved).
+            complex_match = _CONFLICT_COMPLEX_KEY.fullmatch(key)
+            if (
+                occurred
+                and complex_match
+                and (
+                    int(complex_match.group(1)) > 3
+                    or int(complex_match.group(2)) > 5
+                )
+            ):
+                return True
+            if (
+                key.startswith(_BLOCKED_THREE_STRIKE_PREFIXES)
+                and isinstance(count, int)
+                and not isinstance(count, bool)
+                # The workflow's shared 3-strike doctrine (same limit the
+                # operation ledger enforces).
+                and count >= MAX_OPERATION_ATTEMPTS
+            ):
+                return True
+    roundtrip = state.get("human_roundtrip")
+    reviewers = roundtrip.get("reviewers") if isinstance(roundtrip, dict) else None
+    if isinstance(reviewers, dict):
+        for record in reviewers.values():
+            if isinstance(record, dict) and record.get("blocker_remaining") is True:
+                return True
+    # R7 codex #3: the SUCCESSFUL review-roundtrip blocked exit ("roundtrip
+    # complete, awaiting re-review") clears blocker_remaining to False by
+    # eligibility, so its durable evidence is the roundtrip handoff ledger
+    # itself — planned operations exist and the aggregate left idle.
+    handoffs = state.get("handoffs")
+    rt = handoffs.get("review_roundtrip") if isinstance(handoffs, dict) else None
+    if isinstance(rt, dict):
+        operations = rt.get("operations")
+        status = rt.get("status")
+        if (
+            isinstance(operations, list)
+            and operations
+            and isinstance(status, str)
+            and status != "idle"
+        ):
+            # Pass-3 codex #2, narrowing the branch above: operation IDs embed
+            # the feedback generation (":g<12hex>", a digest of the eligible
+            # reviewers' evidence), and the generation contract makes an
+            # earlier round's completed ledger HISTORY, never evidence for a
+            # fresh blocked transition. Recompute the digest from the
+            # persisted reviewer evidence and accept only a matching ledger;
+            # missing targets or drifted evidence mismatch and fail closed.
+            targets = rt.get("targets")
+            target_logins = (
+                targets.get("reviewers") if isinstance(targets, dict) else None
+            )
+            entries: list[dict[str, Any]] = []
+            if isinstance(reviewers, dict):
+                for login, record in reviewers.items():
+                    if isinstance(login, str) and isinstance(record, dict):
+                        entries.append({**record, "login": login})
+            suffix = ":g" + roundtrip_generation(
+                entries, target_logins if isinstance(target_logins, list) else []
+            )
+            if any(
+                isinstance(op, str) and op.endswith(suffix) for op in operations
+            ):
+                return True
+    return False
 
 
 def monitor_extract(text: str) -> dict[str, Any]:
@@ -2420,12 +2743,14 @@ def monitor_extract(text: str) -> dict[str, Any]:
         "version": SCHEMA_VERSION,
         "state": result["state"],
         "errors": result["errors"],
-        # admin-portal#1495 R2 finding 3776596739: taint detection is
-        # advisory for the VALIDATION verdict but load-bearing for the
-        # runner — a structurally valid state carrying instruction-like
-        # content must not reach a write-capable child. Surface the records
-        # so the runner can fail closed before every launch.
-        "tainted": result.get("tainted", []),
+        # R6-F5 + admin-portal#1495 R2 finding 3776596739: taint is part of
+        # the runner-facing contract — path+digest records only, never the
+        # flagged text. A structurally valid state carrying instruction-like
+        # content must not reach a write-capable child, so the records are
+        # surfaced here and the runner fails closed on them before every
+        # launch. Hard index, not .get(): a missing key must crash the
+        # extract rather than degrade to an empty (fail-open) taint list.
+        "tainted": result["tainted"],
         "digest": monitor_digest(text),
         "monitor_cli": None,
         "monitor_ownership": None,
@@ -2468,51 +2793,15 @@ def monitor_extract(text: str) -> dict[str, Any]:
             status = record.get("status") if isinstance(record, dict) else None
             statuses.append(status if isinstance(status, str) else "malformed")
     extract["handoff_statuses"] = statuses
-    # R2 #1328 finding 3767068764: condition (c) blocks on more than the
-    # three feedback maps — `human:*` attempt_log keys fire on PRESENCE
-    # (the R2-authorization exit is exactly this shape), `prompt-trail:stale`
-    # fires on presence, three-strike ci:/conflict:/branch:/ready: families
-    # fire at 3+, and a human-review block persists its evidence as the
-    # review_roundtrip ledger. A blocked candidate carrying any documented
-    # source must extract blocker evidence, or the runner discards the
-    # mandatory human exit and strands monitoring in_progress.
-    blocked = any(
-        isinstance(state.get(key), dict) and state.get(key)
-        for key in (
-            "exhausted_feedback",
-            "manual_unknown_feedback",
-            "manual_branch_protection_blockers",
-        )
-    )
-    if not blocked:
-        attempt_log = state.get("attempt_log")
-        if isinstance(attempt_log, dict):
-            for key, count in attempt_log.items():
-                if not isinstance(key, str):
-                    continue
-                if key.startswith("human:") or key == "prompt-trail:stale":
-                    blocked = True
-                    break
-                if (
-                    key.split(":", 1)[0] in ("ci", "conflict", "branch", "ready")
-                    and isinstance(count, int)
-                    and not isinstance(count, bool)
-                    and count >= 3
-                ):
-                    blocked = True
-                    break
-    if not blocked and isinstance(handoffs, dict):
-        roundtrip = handoffs.get("review_roundtrip")
-        # An ENGAGED roundtrip ledger (never the tier fixtures' idle shell):
-        # only condition (c) plans roundtrip operations, so a non-idle status
-        # is durable evidence of a human-review block.
-        if isinstance(roundtrip, dict) and roundtrip.get("status") in (
-            "pending",
-            "complete",
-            "failed",
-        ):
-            blocked = True
-    extract["blocked_evidence_present"] = blocked
+    # R2 #1328 finding 3767068764 is satisfied by the shared predicate below:
+    # blocker evidence is more than the three feedback maps - `human:*` and
+    # `prompt-trail:stale` attempt_log keys fire on presence, the three-strike
+    # ci:/conflict:/branch:/ready: families fire at the limit, and a human-
+    # review block persists as the review_roundtrip ledger. Recomputing it from
+    # the helper keeps monitor_extract and the runner's blocked-outcome CLI
+    # validation on one definition (and adds the pass-3 codex #2 generation
+    # recheck that rejects an earlier round's stale ledger).
+    extract["blocked_evidence_present"] = monitor_blocked_evidence_present(state)
     return extract
 
 

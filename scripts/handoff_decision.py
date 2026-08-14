@@ -300,7 +300,12 @@ def _approved_qa_operations(
 
     issue_tracker = request.get("issue_tracker", {})
     if not isinstance(issue_tracker, dict):
-        return targets, operations, ["issue_tracker must be an object"]
+        return (
+            targets,
+            operations,
+            ["issue_tracker must be an object"],
+            advisory_warnings,
+        )
 
     tracker_type = issue_tracker.get("type", "none")
     if not isinstance(tracker_type, str):
@@ -766,52 +771,13 @@ def roundtrip_generation(
     whole reviewer set, so the plan re-mints as one atomic unit.
     """
 
-    wanted = {login.casefold() for login in reviewers}
-    payload: list[dict[str, Any]] = []
-    raw_reviewers = request.get("reviewers")
-    for entry in raw_reviewers if isinstance(raw_reviewers, list) else []:
-        if not isinstance(entry, dict):
-            continue
-        login = entry.get("login")
-        if not isinstance(login, str) or login.casefold() not in wanted:
-            continue
-        bodies = entry.get("review_bodies")
-        roots = entry.get("inline_roots")
-        pushed = entry.get("pushed_fix_shas")
-        payload.append(
-            {
-                "login": login.casefold(),
-                "review_bodies": {
-                    str(key): (
-                        value.get("updated_at")
-                        if isinstance(value, dict)
-                        else None
-                    )
-                    for key, value in bodies.items()
-                }
-                if isinstance(bodies, dict)
-                else None,
-                "inline_roots": {
-                    str(key): (
-                        value.get("updated_at")
-                        if isinstance(value, dict)
-                        else None
-                    )
-                    for key, value in roots.items()
-                }
-                if isinstance(roots, dict)
-                else None,
-                "pushed_through_sha": entry.get("pushed_through_sha"),
-                "pushed_fix_shas": sorted(
-                    sha for sha in pushed if isinstance(sha, str)
-                )
-                if isinstance(pushed, list)
-                else None,
-            }
-        )
-    payload.sort(key=lambda item: item["login"])
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+    # Pass-3 codex #2: the canonicalization+digest moved to
+    # state_schema.roundtrip_generation (single source) so the runner-side
+    # blocked-evidence predicate can recompute the CURRENT generation and
+    # refuse a prior round's ledger. This wrapper keeps the planner's
+    # request-shaped call site; the entry filtering, payload shape, and
+    # digest are byte-identical to the pre-move implementation.
+    return state_schema.roundtrip_generation(request.get("reviewers"), reviewers)
 
 
 def _roundtrip_operations(

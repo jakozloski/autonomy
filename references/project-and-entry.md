@@ -22,10 +22,12 @@ The base branch this PR targets (or will target). Needed for every `origin/<base
 
 1. **Entry B (PR takeover):** Use `baseRefName` from `gh pr view --json baseRefName`. Persist to `base_branch` in state immediately.
 2. **Entry A (solve an issue):** Resolve in this order, first match wins:
-   - CLAUDE.md: explicit "Base branch", "PR target", or "Development workflow" mention (e.g., `dev`, `staging`)
+   - CLAUDE.md: explicit "Base branch", "PR target", or "Development workflow" mention (e.g., `dev`, `staging`). On an agent VM this includes `/home/keeper/CLAUDE.md`, which is `REPO_MAP.md`'s Repository Directory table — its Default Branch column is authoritative for every Keeper repo.
    - `gh repo view --json defaultBranchRef --jq .defaultBranchRef.name`
    - `git remote show origin | awk '/HEAD branch/ {print $NF}'`
 3. Persist to `base_branch` in state before any command that depends on `origin/<base_branch>` runs.
+
+A repo's GitHub default branch is not always where work lands. `keeper-lead-generator` reports `main` as its default but promotes `development` -> `staging` -> `main`, so steps 2b/2c resolve the wrong base there — which is exactly why the table in step 2a outranks them. Never skip ahead to `defaultBranchRef` for a repo listed in `REPO_MAP.md`.
 
 If `base_branch` cannot be resolved, BLOCK with a clear error — every downstream step depends on it.
 

@@ -23,6 +23,7 @@ from model_policy import (
     REVIEWER_MODEL,
     REVIEWER_MODEL_ALIAS,
     apply_auth_recovery,
+    auth_signature_offset,
     bounded_excerpt,
     build_descriptor,
     classify_stream_event,
@@ -2283,6 +2284,29 @@ class MonitorChildInvocationTests(unittest.TestCase):
             PER_ATTEMPT_CEILING_SECONDS,
         )
 
+    def test_child_failure_limit_is_the_schema_constant(self) -> None:
+        # The runner consumes the 3-strike limit through model_policy's
+        # re-export (it may not import state_schema); drift here would let
+        # the runner and schema disagree on the blocking threshold.
+        #
+        # R7 codex #16: neither assertion below can catch a re-export replaced
+        # by an independent literal `3` — CPython interns small ints, so
+        # `assertIs(3, 3)` is True and the value still equals 3. The real
+        # anti-substitution guard is the validator source-pin
+        # (`MONITOR_CHILD_FAILURE_LIMIT = state_schema.MONITOR_CHILD_FAILURE_LIMIT`
+        # in REQUIRED_GATE_MARKERS), exercised by
+        # test_missing_gate_marker_is_rejected_per_file_and_marker. These two
+        # lines remain as a value-equality + same-object sanity check only.
+        import state_schema
+
+        import model_policy
+
+        self.assertIs(
+            model_policy.MONITOR_CHILD_FAILURE_LIMIT,
+            state_schema.MONITOR_CHILD_FAILURE_LIMIT,
+        )
+        self.assertEqual(model_policy.MONITOR_CHILD_FAILURE_LIMIT, 3)
+
 
 class MonitorOrchestratorBindingTests(unittest.TestCase):
     """Phase 6 session ownership: the binding consumes the documented
@@ -2494,6 +2518,39 @@ class MonitorOrchestratorBindingTests(unittest.TestCase):
         self.assertEqual(binding["model"], "claude-opus-5")
         self.assertEqual(binding["reason_code"], "orchestrator_continuity")
         self.assertEqual(binding["pending_owner"], "claude-fable-5")
+
+
+class AuthSignatureOffsetUnicodeTests(unittest.TestCase):
+    """Pin that auth_signature_offset indexes the ORIGINAL string (pass-3 opus
+    #9 / codex #7). The monitor_runner sticky excerpt anchors on this offset to
+    retain what detection fired on; a ``text.lower()``-derived offset drifts
+    when Unicode lowercasing changes length, which would push the excerpt past
+    the marker it means to preserve."""
+
+    def test_offset_indexes_original_text_under_length_changing_lowercasing(
+        self,
+    ) -> None:
+        marker = "authentication_error"
+        # U+0130 (dotted capital I) lowercases to TWO code points ("i" + a
+        # combining dot), so a 50-char prefix becomes 100 chars under
+        # str.lower(); an offset derived from the lowercased text would land 50
+        # chars past the marker in the ORIGINAL string. The trailing space gives
+        # the \b before the signature a non-word char to anchor on.
+        prefix = "İ" * 50 + " "
+        text = prefix + marker + ": credentials revoked"
+        offset = auth_signature_offset(text)
+        self.assertIsNotNone(offset)
+        # text.index is the true original-string offset; a lowercased-text
+        # implementation returns a larger, drifted value.
+        self.assertEqual(offset, text.index(marker))
+        self.assertTrue(
+            text[offset:].startswith(marker), (offset, text[offset : offset + 24])
+        )
+
+    def test_bare_401_without_context_is_not_a_signature(self) -> None:
+        # Companion guardrail: an incidental millisecond count must NOT read as
+        # an auth marker — that would turn a retryable transient into a kill.
+        self.assertIsNone(auth_signature_offset("read timeout after 401ms"))
 
 
 if __name__ == "__main__":

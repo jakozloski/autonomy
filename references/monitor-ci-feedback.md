@@ -41,7 +41,7 @@ while True:
     state.monitor_self_review_call_count = 0
     monitor_self_review_call_count = 0
     if work_iteration > MAX_ITERATIONS:
-      raise BLOCKED("logical work hard cap reached")
+      raise BLOCKED("logical work hard cap reached (human:user-confirm:work-cap)")  # persist-first like every blocked exit: set attempt_log["human:user-confirm:work-cap"] (enumerated human:user-confirm[:slug]; a loop past its work ceiling needs a human) + phases.monitor "blocked" + stranded-work report in .claude/workflow-state.local.md BEFORE raising, else monitor_blocked_evidence_present rejects the unkeyed "blocked" and the runner mis-scores the strand as a generic transition_rejected 3-strike
 
   # ────── iteration body ──────
   1. Check CI status (if pending, block with --watch; if failing, fix+push+continue)

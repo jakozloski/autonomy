@@ -13,6 +13,7 @@ from validate_package import (
     EXEC_MODEL_FLAGS,
     REQUIRED_ANCHORED_MARKERS,
     REQUIRED_GATE_MARKERS,
+    REQUIRED_PY_BINDINGS,
     REQUIRED_REDACTION_PATTERNS,
     REQUIRED_SCRIPT_FILES,
     REVIEW_MODEL_FLAGS,
@@ -106,6 +107,12 @@ class PackageFixture:
             script_lines = ["# package fixture"]
             for marker in REQUIRED_GATE_MARKERS.get(relative_path, ()):
                 script_lines.append(marker)
+            # _validate_py_bindings (R7.2 codex #9) requires each cross-module
+            # constant binding as an OPERATIVE source line, not a comment, so
+            # bake the statements in verbatim or test_valid_package_passes
+            # fails on the very invariant this fixture is supposed to satisfy.
+            for statement in REQUIRED_PY_BINDINGS.get(relative_path, ()):
+                script_lines.append(statement)
             (self.root / relative_path).write_text(
                 "\n".join(script_lines) + "\n", encoding="utf-8"
             )
@@ -306,6 +313,39 @@ class ValidatePackageTests(unittest.TestCase):
                         )
                     finally:
                         target.write_text(original, encoding="utf-8")
+
+    def test_anchored_marker_rejects_inline_comment_hidden_clause(self) -> None:
+        # R6-F16: the required clause is still ON the anchor line as raw
+        # bytes but wrapped in an inline HTML comment, so it renders as
+        # nothing — a raw-line substring search passes while the displayed
+        # condition is gone. The display-text check must reject it.
+        for relative_path, anchor_specs in REQUIRED_ANCHORED_MARKERS.items():
+            for anchor, fenced, required in anchor_specs:
+                if fenced:
+                    continue  # inside a code fence, comment syntax is literal
+                for substring in required:
+                    with self.subTest(
+                        file=relative_path, anchor=anchor, substring=substring
+                    ):
+                        target = self.package.root / relative_path
+                        original = target.read_text(encoding="utf-8")
+                        lines = original.splitlines()
+                        index = self._operative_index(lines, anchor, required)
+                        head, sep, tail = lines[index].rpartition(substring)
+                        assert sep, "operative line lost its required text"
+                        lines[index] = f"{head}<!-- {substring} -->{tail}"
+                        target.write_text(
+                            "\n".join(lines) + "\n", encoding="utf-8"
+                        )
+                        try:
+                            errors = validate_package(self.package.root)
+                            self.assertIn(
+                                f"{relative_path}: anchored line {anchor!r} is"
+                                f" missing required text {substring!r}",
+                                errors,
+                            )
+                        finally:
+                            target.write_text(original, encoding="utf-8")
 
     def test_anchored_marker_ignores_html_comment_decoy(self) -> None:
         # Pass-4 latent gap: a multi-line HTML comment renders as nothing,
@@ -623,7 +663,339 @@ class ValidatePackageTests(unittest.TestCase):
 
         self.assertIn(
             "SKILL.md:3: frontmatter key 'description' has an unterminated "
-            "quoted scalar",
+            "double-quoted scalar",
+            errors,
+        )
+
+    def test_frontmatter_rejects_quoted_scalars_the_yaml_loader_refuses(self) -> None:
+        # R7 codex #14: outer-quote matching alone accepts scalars a real YAML
+        # loader rejects; the pinned skill scanner then omits the unparseable
+        # package and still exits zero, shipping an unscanned skill green. Each
+        # case is invalid YAML per PyYAML 6.0.2 flow-scalar rules and must be
+        # caught here so the validator gate agrees with the loader.
+        rejected = {
+            '"bad\\q"': "an unknown escape character",  # unknown double-quote escape
+            '"a"b"': "content after the closing double quote",  # stray interior quote
+            '"a\\xZZ"': "an invalid \\x hex escape",  # non-hex \x digits
+            "'a'b'": "content after the closing single quote",  # single-quote reopen
+            # R7.2 codex #4: the scanner's parser (frontmatter.loads, which uses
+            # libyaml's CSafeLoader when present) raises on BOTH a \U past
+            # U+10FFFF and a lone surrogate, skipping the package UNSCANNED, so
+            # the gate must reject them too. Bare yaml.safe_load (pure-Python)
+            # instead LOADS the surrogate, so audit with frontmatter.loads. The
+            # runtime differential is pinned in the scanner-parity test below.
+            '"\\U00110000"': "outside the Unicode scalar range",  # astral past U+10FFFF
+            '"\\ud800"': "outside the Unicode scalar range",  # lone surrogate
+        }
+        for scalar, fragment in rejected.items():
+            with self.subTest(scalar=scalar):
+                skill_path = self.package.root / "SKILL.md"
+                skill_path.write_text(
+                    _valid_skill_text().replace(
+                        "description: Run the complete autonomous engineering "
+                        "workflow.",
+                        f"description: {scalar}",
+                    ),
+                    encoding="utf-8",
+                )
+                errors = validate_package(self.package.root)
+                self.assertTrue(
+                    any(
+                        "frontmatter key 'description' has" in error
+                        and fragment in error
+                        for error in errors
+                    ),
+                    f"{scalar!r} -> {errors}",
+                )
+
+    def test_frontmatter_accepts_valid_quoted_scalars(self) -> None:
+        # The pass-through side of the #14 gate: legal quoted scalars — a valid
+        # escape, single-quote literal backslash, doubled single quote, and a
+        # colon-bearing double-quoted string (the real SKILL.md shape) — must
+        # NOT be rejected, or the stricter check would false-fail real skills.
+        for scalar in (
+            '"line\\tbreak"',  # valid \t escape
+            "'literal\\q backslash'",  # single-quoted: backslash is literal
+            "'it''s fine'",  # single-quoted doubled quote
+            '"Full workflow: take over this PR, solve this issue."',
+        ):
+            with self.subTest(scalar=scalar):
+                skill_path = self.package.root / "SKILL.md"
+                skill_path.write_text(
+                    _valid_skill_text().replace(
+                        "description: Run the complete autonomous engineering "
+                        "workflow.",
+                        f"description: {scalar}",
+                    ),
+                    encoding="utf-8",
+                )
+                errors = validate_package(self.package.root)
+                self.assertFalse(
+                    any("quoted scalar" in error for error in errors),
+                    f"{scalar!r} -> {errors}",
+                )
+
+    def test_frontmatter_accepts_slash_escape_max_codepoint_and_trailing_comment(
+        self,
+    ) -> None:
+        # R7.2 O4/O10 pass-through, confirmed against frontmatter.loads in the
+        # differential oracle: PyYAML 6.0.2's double-quote escape set INCLUDES
+        # '/', so "a\/b" is valid (loads to "a/b"); \U0010FFFF is the top of the
+        # Unicode scalar range (in-range, unlike \U00110000); and a trailing '#'
+        # comment after a closing quote is stripped by the loader. Each must
+        # pass, or the stricter gate would false-reject a real skill the scanner
+        # accepts. Keyed on the reject wrapper ("frontmatter key 'description'
+        # has ...") so a regression that starts rejecting any of them fails
+        # here. (Both reviewers flagged \/ as invalid; the oracle proved
+        # otherwise, so this pins the accept.)
+        for scalar in (
+            '"a\\/b"',  # O4: '/' is a valid double-quote escape
+            '"\\U0010FFFF"',  # top of the Unicode scalar range (in-range)
+            '"ok" # trailing note',  # O10: trailing comment after a quoted scalar
+        ):
+            with self.subTest(scalar=scalar):
+                skill_path = self.package.root / "SKILL.md"
+                skill_path.write_text(
+                    _valid_skill_text().replace(
+                        "description: Run the complete autonomous engineering "
+                        "workflow.",
+                        f"description: {scalar}",
+                    ),
+                    encoding="utf-8",
+                )
+                errors = validate_package(self.package.root)
+                self.assertFalse(
+                    any(
+                        "frontmatter key 'description' has" in error
+                        for error in errors
+                    ),
+                    f"{scalar!r} -> {errors}",
+                )
+
+    def test_surrogate_and_astral_gate_matches_scanner_parser(self) -> None:
+        # R7.2 codex #4, executable differential: makes the load-bearing one-way
+        # invariant real instead of a prose claim. The scanner's OWN parser is
+        # python-frontmatter, which aliases SafeLoader to libyaml's CSafeLoader
+        # when the C ext is present; that loader RAISES on a lone surrogate,
+        # whereas bare yaml.safe_load (pure-Python) LOADS it. So we compute the
+        # scanner-parser verdict at runtime and assert: any escape the loader
+        # raises on (unloadable -> skipped UNSCANNED) MUST be rejected by the
+        # gate; the top in-range codepoint the loader accepts must pass.
+        # \U00110000 raises in BOTH loaders, so it exercises the invariant even
+        # where libyaml is absent and the surrogate case goes quiet.
+        try:
+            import frontmatter  # the scanner's real frontmatter parser
+        except ImportError:
+            self.skipTest("python-frontmatter absent; scanner-parity uncheckable")
+        cases = {
+            '"\\ud800"': True,  # lone surrogate: reject (loader raises under libyaml)
+            '"\\U00110000"': True,  # astral past U+10FFFF: reject (both loaders raise)
+            '"\\U0010FFFF"': False,  # top in-range: accept (both loaders load)
+        }
+        for scalar, must_reject in cases.items():
+            with self.subTest(scalar=scalar):
+                doc = f"---\ndescription: {scalar}\nname: autonomy\n---\nbody\n"
+                try:
+                    frontmatter.loads(doc)
+                    scanner_raises = False
+                except Exception:
+                    scanner_raises = True
+                skill_path = self.package.root / "SKILL.md"
+                skill_path.write_text(
+                    _valid_skill_text().replace(
+                        "description: Run the complete autonomous engineering "
+                        "workflow.",
+                        f"description: {scalar}",
+                    ),
+                    encoding="utf-8",
+                )
+                errors = validate_package(self.package.root)
+                rejected = any(
+                    "outside the Unicode scalar range" in error for error in errors
+                )
+                if scanner_raises:
+                    # THE load-bearing direction: parser-raise => gate must reject,
+                    # else an unloadable skill ships UNSCANNED-green.
+                    self.assertTrue(
+                        rejected,
+                        f"scanner parser raises on {scalar!r} but the gate accepted "
+                        f"it -> unscanned skill would ship green: {errors}",
+                    )
+                if not must_reject:
+                    # In-range codepoint the scanner loads: the gate must not
+                    # false-reject a skill the scanner would scan clean.
+                    self.assertFalse(
+                        rejected,
+                        f"{scalar!r} is in-range (scanner loads it) yet the gate "
+                        f"rejected it: {errors}",
+                    )
+
+    def test_splitlines_boundary_control_chars_match_scanner_parser(self) -> None:
+        # Pass-4 opus F1, executable differential: str.splitlines() consumes
+        # U+000B/000C/001C/001D/001E as line boundaries, so a per-splitlines-
+        # line control scan can never see them - while the scanner's parser
+        # raises ReaderError on every one and the package would ship
+        # UNSCANNED-green. The \n-physical-line scan must reject each one.
+        try:
+            import frontmatter  # the scanner's real frontmatter parser
+        except ImportError:
+            self.skipTest("python-frontmatter absent; scanner-parity uncheckable")
+        for code in (0x0B, 0x0C, 0x1C, 0x1D, 0x1E):
+            with self.subTest(codepoint=f"U+{code:04X}"):
+                char = chr(code)
+                doc = _valid_skill_text().replace(
+                    "name: autonomy", f"name: autonomy{char}injected: x"
+                )
+                try:
+                    frontmatter.loads(doc)
+                    scanner_raises = False
+                except Exception:
+                    scanner_raises = True
+                self.assertTrue(
+                    scanner_raises,
+                    f"premise drift: frontmatter.loads now accepts U+{code:04X};"
+                    " re-derive the boundary battery against the new parser",
+                )
+                (self.package.root / "SKILL.md").write_text(doc, encoding="utf-8")
+                errors = validate_package(self.package.root)
+                self.assertTrue(
+                    any(
+                        f"non-printable character (U+{code:04X})" in error
+                        for error in errors
+                    ),
+                    f"scanner parser raises on U+{code:04X} but the gate accepted"
+                    f" -> unscanned skill would ship green: {errors}",
+                )
+
+    def test_non_separation_whitespace_matches_scanner_parser(self) -> None:
+        # Pass-4 codex F5, executable differential: YAML separation whitespace
+        # (s-white) is exactly SPACE and TAB. Every other char Python's
+        # str.isspace()/re \s accepts (NBSP, the Zs space separators, NEL,
+        # LS/PS) is CONTENT to the YAML reader, not separation. Dropped into
+        # the "name: " separator position each one makes the scanner's parser
+        # raise (skill skipped UNSCANNED), while a Python-native strip/split
+        # would silently absorb it and ACCEPT. The physical-line whitespace
+        # guard must reject each so no unscanned skill ships green.
+        try:
+            import frontmatter  # the scanner's real frontmatter parser
+        except ImportError:
+            self.skipTest("python-frontmatter absent; scanner-parity uncheckable")
+        # Printable (YAML c-printable), non-C0-control whitespace: the class
+        # the whitespace guard uniquely owns (C0 controls are the opus-F1
+        # non-printable check, exercised by the battery above).
+        battery = (
+            0x00A0, 0x1680, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005,
+            0x2006, 0x2007, 0x2008, 0x2009, 0x200A, 0x202F, 0x205F, 0x3000,
+            0x0085, 0x2028, 0x2029,
+        )
+        for code in battery:
+            with self.subTest(codepoint=f"U+{code:04X}"):
+                char = chr(code)
+                # Replace the "name: " separator space with the non-separation
+                # char: a structural position where the reader must raise.
+                doc = _valid_skill_text().replace(
+                    "name: autonomy", f"name:{char}autonomy"
+                )
+                try:
+                    frontmatter.loads(doc)
+                    scanner_raises = False
+                except Exception:
+                    scanner_raises = True
+                self.assertTrue(
+                    scanner_raises,
+                    f"premise drift: frontmatter.loads now accepts U+{code:04X}"
+                    " in the separator position; re-derive the battery",
+                )
+                (self.package.root / "SKILL.md").write_text(doc, encoding="utf-8")
+                errors = validate_package(self.package.root)
+                self.assertTrue(
+                    any(
+                        "non-separation Unicode whitespace character "
+                        f"(U+{code:04X})" in error
+                        for error in errors
+                    ),
+                    f"scanner parser raises on U+{code:04X} but the gate accepted"
+                    f" -> unscanned skill would ship green: {errors}",
+                )
+
+    def test_non_separation_whitespace_is_rejected_fail_closed(self) -> None:
+        # The guard flags on PRESENCE (fail-closed, over-rejection-safe), not
+        # only in reader-raising structural positions: a trailing NBSP on a
+        # plain scalar is CONTENT the reader ACCEPTS, yet the guard still
+        # rejects it. Pins the fail-closed design so a future narrowing to
+        # "only structural positions" (which would reopen the under-rejection
+        # gap for positions not enumerated) fails here.
+        char = "\u00a0"  # NBSP trailing a plain scalar
+        doc = _valid_skill_text().replace(
+            "name: autonomy", f"name: autonomy{char}"
+        )
+        try:
+            import frontmatter
+
+            frontmatter.loads(doc)  # must NOT raise: the reader accepts it
+        except ImportError:
+            pass  # validator-only property; scanner premise is optional here
+        except Exception:  # pragma: no cover - premise drift
+            self.skipTest("premise drift: reader now raises on trailing NBSP")
+        (self.package.root / "SKILL.md").write_text(doc, encoding="utf-8")
+        errors = validate_package(self.package.root)
+        self.assertTrue(
+            any(
+                "non-separation Unicode whitespace character (U+00A0)" in error
+                for error in errors
+            ),
+            "fail-closed guard must reject NBSP even where the reader accepts"
+            f" it: {errors}",
+        )
+
+    def test_py_binding_parked_in_a_comment_is_rejected(self) -> None:
+        # R7.2 codex #9: the cross-module constant binding must be an OPERATIVE
+        # source line. _validate_py_bindings anchors on ^[ \t]*<stmt>...$
+        # (MULTILINE), so a naive `stmt in text` substring check would accept
+        # the binding parked in a `#` comment while the module reverts the
+        # constant to an independent literal — exactly the drift the pin exists
+        # to catch. Comment out the fixture's operative binding and the gate
+        # must still fail it.
+        target = "scripts/handoff_decision.py"
+        statement = REQUIRED_PY_BINDINGS[target][0]
+        path = self.package.root / target
+        original = path.read_text(encoding="utf-8")
+        self.assertIn(
+            statement + "\n", original, "fixture must write the binding operative"
+        )
+        path.write_text(
+            original.replace(statement + "\n", f"# {statement}\n"),
+            encoding="utf-8",
+        )
+        errors = validate_package(self.package.root)
+        self.assertTrue(
+            any(
+                statement in error and "operative source line" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_openai_yaml_rejects_quoted_scalars_the_yaml_loader_refuses(self) -> None:
+        # The openai.yaml interface scalars share the SKILL.md quoted-scalar
+        # rule via `_quoted_scalar_error`; pin that the sibling gate also
+        # rejects an unknown escape, not only an unterminated quote.
+        (self.package.root / "agents" / "openai.yaml").write_text(
+            "interface:\n"
+            '  display_name: "bad\\q"\n'
+            "  short_description: Autonomous workflow\n"
+            "  default_prompt: Use $autonomy.\n",
+            encoding="utf-8",
+        )
+
+        errors = validate_package(self.package.root)
+
+        self.assertTrue(
+            any(
+                "agents/openai.yaml interface.display_name has an unknown "
+                "escape character" in error
+                for error in errors
+            ),
             errors,
         )
 
@@ -805,7 +1177,8 @@ class ValidatePackageTests(unittest.TestCase):
         errors = validate_package(self.package.root)
 
         self.assertIn(
-            "agents/openai.yaml interface.display_name has an unterminated quoted scalar",
+            "agents/openai.yaml interface.display_name has an unterminated "
+            "double-quoted scalar",
             errors,
         )
 
@@ -823,7 +1196,12 @@ class ValidatePackageTests(unittest.TestCase):
         errors = validate_package(self.package.root)
 
         self.assertTrue(
-            any("must quote scalars containing" in error for error in errors)
+            any(
+                "frontmatter key 'description' has an unquoted ': ' that must be quoted"
+                in error
+                for error in errors
+            ),
+            errors,
         )
 
     def test_frontmatter_rejects_colon_tab_and_trailing_colon_scalars(self) -> None:
@@ -839,8 +1217,101 @@ class ValidatePackageTests(unittest.TestCase):
                 )
                 errors = validate_package(self.package.root)
                 self.assertTrue(
-                    any("must quote scalars containing" in error for error in errors)
+                    any(
+                        "an unquoted ': ' that must be quoted" in error
+                        for error in errors
+                    ),
+                    errors,
                 )
+
+    def test_frontmatter_rejects_every_plain_scalar_indicator(self) -> None:
+        # R7.2 codex #4 (completeness pin): a skill description must be a plain
+        # or quoted STRING scalar. An unquoted value opening with a YAML
+        # indicator is not one, and _plain_scalar_error refuses the WHOLE
+        # _PLAIN_SCALAR_INDICATORS table for two reasons that resolve the same
+        # way (mirroring its docstring): the loader REJECTS some (@ [ * ! | > …),
+        # so the pinned scanner skips the package UNSCANNED while scan-all still
+        # exits 0; it ACCEPTS others as a non-string node (& anchor, bare block),
+        # out of contract for a description. Both must reject. Iterate the table
+        # itself so a NEW indicator added without a gate case fails here (partial
+        # coverage of a set is its own defect); deleting the lookup in
+        # _plain_scalar_error turns every subcase red. The assertion pins the
+        # literal reject phrase and the indicator character, not the map's own
+        # descriptive text, so it cannot go tautological with the map.
+        from validate_package import _PLAIN_SCALAR_INDICATORS
+
+        for indicator in _PLAIN_SCALAR_INDICATORS:
+            with self.subTest(indicator=indicator):
+                skill_path = self.package.root / "SKILL.md"
+                skill_path.write_text(
+                    _valid_skill_text().replace(
+                        "description: Run the complete autonomous engineering "
+                        "workflow.",
+                        f"description: {indicator}safe",
+                    ),
+                    encoding="utf-8",
+                )
+                errors = validate_package(self.package.root)
+                self.assertTrue(
+                    any(
+                        "frontmatter key 'description' has an unquoted value "
+                        "opening with YAML " in error
+                        and f"'{indicator}'" in error
+                        for error in errors
+                    ),
+                    f"{indicator!r} -> {errors}",
+                )
+
+    def test_frontmatter_rejects_block_openers_and_control_char(self) -> None:
+        # R7.2 codex #4, the non-table plain-scalar rejections: '-' and '?' open
+        # a block/mapping node when a space follows (the loader reads '- x' as a
+        # sequence, not a string), and a raw C0 control char anywhere in the
+        # fence is a ReaderError. Both make the scanner skip the package
+        # UNSCANNED, so the gate must catch them alongside the indicator table
+        # above. Deleting the '-?:' branch reddens the openers; deleting the
+        # _forbidden_control_char guard reddens the NUL case.
+        openers = {
+            "- x": "an unquoted value opening with the '-' indicator",
+            "? x": "an unquoted value opening with the '?' indicator",
+        }
+        for value, fragment in openers.items():
+            with self.subTest(value=value):
+                skill_path = self.package.root / "SKILL.md"
+                skill_path.write_text(
+                    _valid_skill_text().replace(
+                        "description: Run the complete autonomous engineering "
+                        "workflow.",
+                        f"description: {value}",
+                    ),
+                    encoding="utf-8",
+                )
+                errors = validate_package(self.package.root)
+                self.assertTrue(
+                    any(
+                        "frontmatter key 'description' has " + fragment in error
+                        for error in errors
+                    ),
+                    f"{value!r} -> {errors}",
+                )
+        # A raw NUL in the value is a line-level ReaderError with its own message,
+        # not a plain-scalar phrase — pin it so the control-char guard (which
+        # runs on the whole fence, before the scalar checks) cannot regress.
+        skill_path = self.package.root / "SKILL.md"
+        skill_path.write_text(
+            _valid_skill_text().replace(
+                "description: Run the complete autonomous engineering workflow.",
+                "description: a\x00b",
+            ),
+            encoding="utf-8",
+        )
+        errors = validate_package(self.package.root)
+        self.assertTrue(
+            any(
+                "non-printable character (U+0000) the YAML reader rejects" in error
+                for error in errors
+            ),
+            errors,
+        )
 
     def test_openai_yaml_accepts_document_start_marker(self) -> None:
         (self.package.root / "agents" / "openai.yaml").write_text(

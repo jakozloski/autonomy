@@ -359,6 +359,22 @@ class HandoffDecisionTest(unittest.TestCase):
             any("must be the mapped Linear user id" in e for e in plan["errors"])
         )
 
+    def test_non_object_issue_tracker_blocks_instead_of_raising(self) -> None:
+        # CodeRabbit keeper-agents#1328: every other path of
+        # _approved_qa_operations returns four values, so the three-value
+        # early return crashed the planner with ValueError on a QA-mapped
+        # repository instead of returning a blocked plan.
+        plan = plan_handoff(
+            {
+                "scenario": "approved_qa",
+                "repository": REPOSITORY,
+                "pull_request_number": PR_NUMBER,
+                "issue_tracker": "linear",
+            }
+        )
+        self.assertEqual(plan["state"], "blocked")
+        self.assertIn("issue_tracker must be an object", plan["errors"])
+
     def test_display_name_drift_warns_but_proceeds(self) -> None:
         # The display name is an ADVISORY cross-check: labels drift, the id
         # binding is the guard. A mismatch warns and the plan proceeds.

@@ -30,7 +30,21 @@ def main() -> int:
     token = sys.stdin.readline()
     if token.strip() != "GO":
         return 0
-    os.execvp(argv[0], argv)
+    try:
+        os.execvp(argv[0], argv)
+    except OSError as error:
+        # R6-F7: a deterministic launch failure must surface as the marker
+        # the runner classifies into an immediate actionable block — a raw
+        # traceback here was charged as generic retryable exit_1 and burned
+        # the three-attempt child budget before blocking. The literal
+        # mirrors monitor_runner.WRAPPER_EXEC_FAILED_MARKER (this file may
+        # import nothing that pulls subprocess next to exec).
+        print(
+            f"MONITOR-WRAPPER-EXEC-FAILED: {argv[0]!r}: {error}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 127
     return 127  # pragma: no cover — execvp does not return
 
 

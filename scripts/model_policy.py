@@ -146,6 +146,7 @@ deliberately not part of this gate.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import re
 import selectors
@@ -311,8 +312,13 @@ _AUTH_SIGNATURES = (
 
 # Word-bounded so identifier-embedded fragments ("unauthorized_count=0") never
 # match: "_" is a word character, so \b refuses the boundary inside it.
+# IGNORECASE (pass-3 opus #9 / codex #7): matching the ORIGINAL text keeps
+# every reported offset exact — offsets derived from ``text.lower()`` drift
+# when Unicode lowercasing changes string length (e.g. "İ" -> "i̇"), which
+# could push a marker-anchored excerpt past the marker it preserved.
 _AUTH_SIGNATURE_RE = re.compile(
-    "|".join(rf"\b{re.escape(signature)}\b" for signature in _AUTH_SIGNATURES)
+    "|".join(rf"\b{re.escape(signature)}\b" for signature in _AUTH_SIGNATURES),
+    re.IGNORECASE,
 )
 
 # Context-anchored HTTP 401 forms for _has_auth_signature.  "401 unauthorized"
@@ -324,7 +330,8 @@ _HTTP_401_CONTEXT = re.compile(
     r"|\bhttp\s+401(?!\d)"
     r"|\bstatus(?:[ _]code)?\s*[=:]?\s*401(?!\d)"
     r"|\berror\s*[=:]?\s*401(?!\d)"
-    r"|\b401\s+unauthorized\b"
+    r"|\b401\s+unauthorized\b",
+    re.IGNORECASE,
 )
 
 # A raw record larger than this means framing is broken (or hostile): bound the
@@ -446,6 +453,31 @@ def _auth_scope_text(event: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
+def auth_signature_offset(text: str) -> int | None:
+    """Earliest offset of a deterministic auth-failure marker, or ``None``.
+
+    Single source for both the boolean predicate below and the
+    marker-preserving stderr excerpt in ``monitor_runner`` (R7 codex #12):
+    that excerpt must retain whatever detection actually fired on, so it
+    anchors on this offset rather than re-deriving a span from the private
+    regexes and drifting.  Offsets index the ORIGINAL string: the patterns
+    carry ``re.IGNORECASE`` instead of searching ``text.lower()``, whose
+    length can differ under Unicode lowercasing and shift the anchor
+    (pass-3 opus #9 / codex #7).
+    """
+
+    match = _AUTH_SIGNATURE_RE.search(text)
+    if match is not None:
+        return match.start()
+    # A bare 401 is NOT enough: transport messages legitimately contain
+    # incidental numbers ("read timeout after 401ms", "backoff 401ms"), and
+    # misclassifying one as auth converts a retryable transient failure into a
+    # non-retryable kill.  Require an HTTP/status/error context or the literal
+    # "401 unauthorized" phrase.
+    context = _HTTP_401_CONTEXT.search(text)
+    return context.start() if context is not None else None
+
+
 def _has_auth_signature(text: str) -> bool:
     """True when *text* carries a deterministic authentication failure marker.
 
@@ -453,15 +485,7 @@ def _has_auth_signature(text: str) -> bool:
     stderr — never assistant/tool content, which may discuss "401" innocently.
     """
 
-    lowered = text.lower()
-    if _AUTH_SIGNATURE_RE.search(lowered):
-        return True
-    # A bare 401 is NOT enough: transport messages legitimately contain
-    # incidental numbers ("read timeout after 401ms", "backoff 401ms"), and
-    # misclassifying one as auth converts a retryable transient failure into a
-    # non-retryable kill.  Require an HTTP/status/error context or the literal
-    # "401 unauthorized" phrase.
-    return bool(_HTTP_401_CONTEXT.search(lowered))
+    return auth_signature_offset(text) is not None
 
 
 def bounded_excerpt(existing: str, addition: str) -> str:
@@ -534,6 +558,66 @@ def _read_available(pipe: Any, size: int) -> bytes:
     return pipe.read(size)
 
 
+def _accepts_timeout_kw(callable_obj: Callable[..., Any]) -> bool:
+    """True when the callable's SIGNATURE accepts a ``timeout`` keyword.
+
+    Probed via ``inspect.signature`` (never a trial call — R7 codex #9: a
+    try/except ``TypeError`` probe both swallowed internal ``TypeError``s
+    and silently fell back to an unbounded bare call). An unresolvable
+    signature reads as not-capable, which fails closed under a ceiling.
+    """
+
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return False
+    for parameter in signature.parameters.values():
+        if parameter.kind == parameter.VAR_KEYWORD:
+            return True
+        if parameter.name == "timeout" and parameter.kind in (
+            parameter.POSITIONAL_OR_KEYWORD,
+            parameter.KEYWORD_ONLY,
+        ):
+            return True
+    return False
+
+
+def _call_child_wait(
+    child_wait: Callable[..., int | None],
+    timeout_seconds: float,
+    *,
+    allow_unbounded: bool = False,
+) -> tuple[str, int | None]:
+    """Invoke the caller's wait with a bounded timeout when it supports one.
+
+    Returns ``(status, returncode)``: ``"done"`` (returncode meaningful),
+    ``"timeout"`` (the bounded window expired with the child still alive),
+    ``"incapable"`` (no timeout support and unbounded calls are not allowed
+    here — the caller must fail structurally rather than hang), or
+    ``"error"`` (the wait itself failed).  ``subprocess.TimeoutExpired`` is
+    matched BY NAME because this module never imports subprocess (the
+    scanner's structural rule for files whose call names carry an eval
+    substring).  A bare zero-argument callable is invoked directly ONLY when
+    ``allow_unbounded`` is set (no ceiling was requested, so the caller owns
+    boundedness); under a ceiling it lands ``"incapable"`` instead of
+    reintroducing the unbounded post-EOF hang.
+    """
+
+    if _accepts_timeout_kw(child_wait):
+        try:
+            return ("done", child_wait(timeout=timeout_seconds))
+        except Exception as error:
+            if type(error).__name__ == "TimeoutExpired":
+                return ("timeout", None)
+            return ("error", None)
+    if not allow_unbounded:
+        return ("incapable", None)
+    try:
+        return ("done", child_wait())
+    except Exception:
+        return ("error", None)
+
+
 def supervise_stream(
     stdout_pipe: IO[bytes] | None,
     stderr_pipe: IO[bytes] | None,
@@ -561,10 +645,23 @@ def supervise_stream(
     ``child_wait`` is the supervised process's own wait: when supplied and the
     streams close clean, a nonzero child status lands as ``internal_failure``
     instead of a false clean — EOF alone proves only that the pipes closed,
-    not that the invocation succeeded.  The kill itself is guarded:
+    not that the invocation succeeded.  That post-EOF wait honors the
+    REMAINING total deadline in bounded chunks (R6-F4, mirroring the runner's
+    ``_drain_child``): ``child_wait`` is called with a bounded ``timeout``
+    keyword when it accepts one (``subprocess.Popen.wait``'s signature — the
+    canonical value; a bare zero-argument callable is NEVER invoked while a
+    deadline is active — it lands ``"incapable"`` and fails closed to the
+    kill/reap path, pass-3 codex #13), and a
+    child that closed its pipes but lives past the ceiling is killed as
+    ``runaway`` — never waited on unboundedly.  The kill itself is guarded:
     ``ProcessLookupError`` means the child already died (the kill's goal
     state), and any other cleanup failure returns as the structured
-    ``internal_failure`` this contract promises rather than raising.
+    ``internal_failure`` this contract promises rather than raising.  Every
+    kill — failure-path and post-EOF ceiling alike — is followed by a
+    bounded reap through ``child_wait`` when one was supplied, so a killed
+    gate child is collected instead of leaking a zombie into the long-lived
+    session; a child that cannot be reaped within the bound lands as
+    ``internal_failure`` (three same-signature strikes reach a human).
     ``idle_timeout_seconds`` bounds SILENCE, not total runtime: the clock
     resets on every byte received, so a slow-but-alive stream is never killed
     for being slow — a max-effort review legitimately runs for many minutes.
@@ -586,6 +683,38 @@ def supervise_stream(
     }
     outcome = "clean"
     auth_line_source: str | None = None
+
+    def _guarded_kill() -> bool:
+        """Kill the child; True unless the kill itself failed structurally."""
+        try:
+            kill_callback()
+        except ProcessLookupError:
+            pass  # already dead — the kill's goal state (reap still collects)
+        except Exception:
+            return False
+        return True
+
+    def _reap_after_kill(deadline_seconds: float = 30.0) -> bool:
+        """R6-F4: bounded reap after every kill — without it each killed gate
+        child leaks a zombie into the long-lived session. True when the child
+        was observed to exit (or no wait handle was supplied — the caller
+        owns the process object then)."""
+        if child_wait is None:
+            return True
+        end = time.monotonic() + deadline_seconds
+        # Bounded like every loop in this package (scanner rule): the
+        # deadline is the real bound; the range is an unreachable backstop.
+        for _reap_round in range(100_000):
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                return False
+            status, _code = _call_child_wait(child_wait, min(5.0, remaining))
+            if status == "done":
+                return True
+            if status in ("error", "incapable"):
+                return False
+            # "timeout": chunk expired with the child still alive — loop.
+        return False
 
     selector = selectors.DefaultSelector()
     registered = 0
@@ -687,11 +816,11 @@ def supervise_stream(
         # races the kill decision; on Darwin even an un-reaped zombie
         # raises it) — that is the kill's goal state, not a failure. Any
         # other cleanup failure becomes the structured internal_failure.
-        try:
-            kill_callback()
-        except ProcessLookupError:
-            pass
-        except Exception:
+        # R6-F4: the kill is then followed by a bounded reap — a SIGKILLed
+        # child left unwaited is a zombie in the long-lived session.
+        if not _guarded_kill():
+            outcome = "internal_failure"
+        if not _reap_after_kill():
             outcome = "internal_failure"
     elif child_wait is not None:
         # R2 round-2 finding 3737466493: EOF only proves the streams
@@ -702,10 +831,47 @@ def supervise_stream(
         # clean streams is an internal_failure (blocking failure matrix) —
         # the streams gave no classifiable reason, so the tooling itself
         # is broken from the gate's point of view.
-        try:
-            child_returncode = child_wait()
-        except Exception:
-            child_returncode = None
+        # R6-F4: this wait honors the REMAINING total deadline in bounded
+        # chunks (mirroring the runner's _drain_child). A child that closed
+        # its pipes and lives past the ceiling is killed as runaway and
+        # boundedly reaped — the ceiling advertised to the caller bounds
+        # the WHOLE invocation, not just the streaming phase. A failing
+        # wait also kills and reaps: the child may still be alive, and
+        # skipping the kill here was the second half of the finding.
+        child_returncode = None
+        # Bounded like every loop in this package (scanner rule): the
+        # ceiling is the real bound; the range is an unreachable backstop.
+        for _wait_round in range(1_000_000):
+            remaining = (
+                None
+                if total_deadline is None
+                else total_deadline - time.monotonic()
+            )
+            if remaining is not None and remaining <= 0:
+                outcome = "runaway"
+                if not _guarded_kill():
+                    outcome = "internal_failure"
+                if not _reap_after_kill():
+                    outcome = "internal_failure"
+                break
+            chunk = 5.0 if remaining is None else min(5.0, remaining)
+            status, code = _call_child_wait(
+                child_wait, chunk, allow_unbounded=remaining is None
+            )
+            if status == "done":
+                child_returncode = code
+                break
+            if status in ("error", "incapable"):
+                # "incapable" = a ceiling is active but the wait cannot be
+                # bounded (R7 codex #9): fail structurally — kill and reap —
+                # rather than hang past the advertised ceiling.
+                outcome = "internal_failure"
+                _guarded_kill()
+                _reap_after_kill()
+                break
+            # "timeout": the bounded chunk expired with the child alive —
+            # re-check the ceiling and wait again.
+        else:
             outcome = "internal_failure"
             # R2 #1328 finding 3767068801: a wait that RAISES proves nothing
             # about the child's lifecycle — it may still be running with
@@ -1588,6 +1754,10 @@ MONITOR_CHILD_MIN_VIABLE_SECONDS = 240
 # Heuristics: liveness_idle_kill_seconds) — a monitor child that goes fully
 # silent this long is dead, not slow.
 MONITOR_CHILD_IDLE_TIMEOUT_SECONDS = 180
+# Re-export of the schema-owned 3-strike limit: the runner may not import
+# state_schema directly (structural rule — subprocess files stay free of the
+# evaluator entry-point names), so this module is its constant bridge.
+MONITOR_CHILD_FAILURE_LIMIT = state_schema.MONITOR_CHILD_FAILURE_LIMIT
 
 
 def monitor_child_arguments(
