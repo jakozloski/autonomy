@@ -903,7 +903,38 @@ class Runner:
         # as suspect on a swap — the holder detects the sabotage instead of
         # racing the usurper.
         for _ in range(5):
-            handle = open(self.lock_path, "ab")
+            # 3787662322: a FIFO (or other special file) planted at the lock
+            # path makes a plain open() block forever, outside every runner
+            # deadline. Open non-blocking and no-follow, then require a
+            # regular file before trusting the descriptor.
+            try:
+                fd = os.open(
+                    self.lock_path,
+                    os.O_WRONLY
+                    | os.O_APPEND
+                    | os.O_CREAT
+                    | os.O_NONBLOCK
+                    | getattr(os, "O_NOFOLLOW", 0),
+                )
+            except OSError:
+                raise RunnerExit(
+                    4,
+                    "suspect_state",
+                    "monitor lock path cannot be opened as a regular file"
+                    " (symlink or special file planted?) — reconcile per the"
+                    " Resume trust model",
+                )
+            import stat as _stat
+            if not _stat.S_ISREG(os.fstat(fd).st_mode):
+                os.close(fd)
+                raise RunnerExit(
+                    4,
+                    "suspect_state",
+                    "monitor lock path is not a regular file — an unknown"
+                    " writer planted a special file; reconcile per the"
+                    " Resume trust model",
+                )
+            handle = os.fdopen(fd, "ab")
             try:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
@@ -1595,17 +1626,27 @@ class Runner:
             pass
 
     def _preserve_failed(self, candidate: Path) -> None:
-        """algo#1216 R2 finding 3779532272: a failed child's candidate is the
-        only durable record of external mutations it may already have fired
-        (write-ahead handoff intents live there). Preserve exactly one — the
-        newest — beside canonical state for resume reconciliation instead of
-        destroying the evidence; suspect-stop paths keep their documented
-        discard semantics."""
-        preserved = self.state_path.with_suffix(".failed-candidate.md")
+        """algo#1216 R2 findings 3779532272 + 3787662312: a failed child's
+        candidate is the only durable record of external mutations it may
+        already have fired. Preservation is ATTEMPT-SCOPED (consecutive
+        failures never overwrite each other), and an archival failure leaves
+        the source candidate IN PLACE — deleting the evidence because the
+        rename failed would be strictly worse than an unarchived candidate.
+        Suspect-stop paths keep their documented discard semantics."""
+        marker = candidate.name
+        prefix = self.state_path.name + ".attempt-"
+        attempt = (
+            marker[len(prefix):-3]
+            if marker.startswith(prefix) and marker.endswith(".md")
+            else "unknown"
+        )
+        preserved = self.state_path.with_suffix(
+            f".failed-candidate-{attempt}.md"
+        )
         try:
             os.replace(candidate, preserved)
         except OSError:
-            self._discard(candidate)
+            pass  # never destroy the write-ahead record
 
     def cleanup_wrapper_stage(self) -> None:
         """Remove the runner-lifetime wrapper stage file (main()'s finally).
@@ -1697,6 +1738,13 @@ class Runner:
             for op_id, status in ops.items():
                 new_status = (cand_results.get(kind) or {}).get(op_id)
                 if new_status is None:
+                    if status in ("pending", "retryable"):
+                        # 3787662315: an in-flight result is a mutation that
+                        # may already have fired — it must reach a terminal
+                        # status before any removal or generation rollover
+                        # (mirrors the planner's fail-closed in-flight guard).
+                        handoffs_monotonic = False
+                        continue
                     family = op_id.split(":", 1)[0]
                     planned = cand_ops.get(kind) or []
                     if not any(
@@ -1943,6 +1991,35 @@ class Runner:
         # reach clean monitoring completion without the mandatory
         # acceptance-criteria/dependency/migration/claims gate. Refuse the
         # launch with the actionable recovery instead of silently running.
+        # algo#1216 R2 finding 3787662312 (third leg): preserved sidecars
+        # carrying PENDING external intents must be reconciled before another
+        # write-capable child runs — otherwise the loop can duplicate the
+        # very mutations the sidecar records.
+        pending_sidecars = []
+        for sidecar in sorted(
+            self.state_path.parent.glob(
+                self.state_path.stem + ".failed-candidate*"
+            )
+        ):
+            side_extract = self.schema.extract(sidecar)
+            results = side_extract.get("handoff_results") or {}
+            if any(
+                status in ("pending", "retryable")
+                for kind in results.values()
+                for status in kind.values()
+            ):
+                pending_sidecars.append(sidecar.name)
+        if pending_sidecars:
+            raise RunnerExit(
+                5,
+                "blocked",
+                "preserved failed-candidate sidecar(s) carry unreconciled"
+                " pending external intents: "
+                + ", ".join(pending_sidecars)
+                + " — verify each pending operation's remote postcondition"
+                " per state-and-safety.md, record terminal results in"
+                " canonical state, then delete the sidecar(s) and resume",
+            )
         if extract.get("phases_merge_readiness") != "complete":
             raise RunnerExit(
                 5,

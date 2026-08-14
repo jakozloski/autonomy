@@ -389,6 +389,8 @@ if os.environ.get("FAKE_RESET_HANDOFFS") == "1":
         "    operation_results: {}\n  review_roundtrip:",
         text, count=1, flags=_re.S,
     )
+if os.environ.get("FAKE_ROLL_HANDOFFS") == "1":
+    text = text.replace(":gtest", ":gnew0")
 corrupt_target = os.environ.get("FAKE_CORRUPT_FILE")
 if corrupt_target:
     with open(corrupt_target, "w", encoding="utf-8") as h:
@@ -969,6 +971,133 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         extract = self._extract()
         signatures = [f["signature"] for f in extract["monitor_cli"]["child_failures"]]
         self.assertIn("monitor-child:transition_rejected", signatures)
+
+    def test_consecutive_failures_preserve_attempt_scoped_candidates(self) -> None:
+        # algo#1216 R2 finding 3787662312: a fixed sidecar name retained only
+        # the newest failure; preservation is now attempt-scoped.
+        completed = self._run(
+            mode="die_late", budget="900", timeout=90, wait_scale="0.02",
+            max_ticks="3",
+        )
+        self.assertEqual(completed.returncode, 5, completed.stderr)
+        sidecars = sorted(
+            self.state.parent.glob(self.state.stem + ".failed-candidate-*")
+        )
+        self.assertGreaterEqual(len(sidecars), 2, [s.name for s in sidecars])
+        names = {s.name for s in sidecars}
+        self.assertEqual(len(names), len(sidecars), "attempt-scoped names must be unique")
+
+    def test_pending_sidecar_blocks_the_next_write_capable_tick(self) -> None:
+        # algo#1216 R2 finding 3787662312 (third leg): unreconciled pending
+        # intents in a preserved sidecar must block further write-capable
+        # children until reconciled.
+        state = self.state.read_text(encoding="utf-8")
+        idle_qa = "\n".join([
+            "  qa:",
+            "    scenario: null",
+            '    status: "idle"',
+            "    repository_name_with_owner: null",
+            "    targets:",
+            "      github_assignees: []",
+            "      tracker_assignee_id: null",
+            "      tracker_assignee_name: null",
+            "    operations: []",
+            "    operation_results: {}",
+        ])
+        pending_qa = "\n".join([
+            "  qa:",
+            '    scenario: "clean_unapproved"',
+            '    status: "pending"',
+            '    repository_name_with_owner: "Keeper-Dating/matchmaking"',
+            "    targets:",
+            '      github_assignees: ["tjkeeper"]',
+            "      tracker_assignee_id: null",
+            "      tracker_assignee_name: null",
+            '    operations: ["qa.github.replace_assignees:gtest"]',
+            "    operation_results:",
+            '      "qa.github.replace_assignees:gtest":',
+            '        status: "pending"',
+            "        attempts: 1",
+            '        started_at: "2026-08-08T00:00:00Z"',
+        ])
+        sidecar = self.state.with_suffix(".failed-candidate-deadbeef.md")
+        sidecar.write_text(state.replace(idle_qa, pending_qa), encoding="utf-8")
+        completed = self._run()
+        summary = self._summary(completed)
+        self.assertEqual(completed.returncode, 5, completed.stderr)
+        self.assertIn("unreconciled pending external intents", summary.get("reason", ""))
+        self.assertFalse(self.argv_log.exists(), "child must never launch")
+
+    def test_generation_roll_over_pending_result_is_rejected(self) -> None:
+        # algo#1216 R2 finding 3787662315: gOLD pending -> gNEW pending must
+        # be rejected — an in-flight result reaches terminal before rollover.
+        state = self.state.read_text(encoding="utf-8")
+        idle_qa = "\n".join([
+            "  qa:",
+            "    scenario: null",
+            '    status: "idle"',
+            "    repository_name_with_owner: null",
+            "    targets:",
+            "      github_assignees: []",
+            "      tracker_assignee_id: null",
+            "      tracker_assignee_name: null",
+            "    operations: []",
+            "    operation_results: {}",
+        ])
+        pending_qa = "\n".join([
+            "  qa:",
+            '    scenario: "clean_unapproved"',
+            '    status: "pending"',
+            '    repository_name_with_owner: "Keeper-Dating/matchmaking"',
+            "    targets:",
+            '      github_assignees: ["tjkeeper"]',
+            "      tracker_assignee_id: null",
+            "      tracker_assignee_name: null",
+            '    operations: ["qa.github.replace_assignees:gtest"]',
+            "    operation_results:",
+            '      "qa.github.replace_assignees:gtest":',
+            '        status: "pending"',
+            "        attempts: 1",
+            '        started_at: "2026-08-08T00:00:00Z"',
+        ])
+        self.state.write_text(state.replace(idle_qa, pending_qa), encoding="utf-8")
+        completed = self._run(
+            budget="900", timeout=90, wait_scale="0.02", max_ticks="3",
+            env_extra={"FAKE_ROLL_HANDOFFS": "1"},
+        )
+        self.assertEqual(completed.returncode, 5, completed.stderr)
+        extract = self._extract()
+        signatures = [f["signature"] for f in extract["monitor_cli"]["child_failures"]]
+        self.assertIn("monitor-child:transition_rejected", signatures)
+
+    def test_terminal_with_dependency_hazard_is_rejected(self) -> None:
+        # algo#1216 R2 finding 3787662319: a documented merged-but-not-live
+        # dependency holds the clean exits until it verifies live.
+        state = self.state.read_text(encoding="utf-8")
+        state = state.replace('  dependencies: "n_a"', '  dependencies: "hazard_documented"')
+        self.state.write_text(state, encoding="utf-8")
+        completed = self._run(
+            budget="900", timeout=90, wait_scale="0.02", max_ticks="3",
+            env_extra={"FAKE_OUTCOME": "terminal"},
+        )
+        self.assertEqual(completed.returncode, 5, completed.stderr)
+        extract = self._extract()
+        signatures = [f["signature"] for f in extract["monitor_cli"]["child_failures"]]
+        self.assertIn("monitor-child:transition_rejected", signatures)
+
+    def test_fifo_at_lock_path_fails_fast_as_suspect(self) -> None:
+        # algo#1216 R2 finding 3787662322: a FIFO planted at the lock path
+        # made the plain open() block forever; the non-blocking no-follow
+        # open now fails fast with a structured suspect exit.
+        mr = self._fresh_runner_module("mr_fifo_test")
+        runner = self._direct_runner(mr)
+        os.mkfifo(runner.lock_path)
+        import time as _time
+        started = _time.monotonic()
+        with self.assertRaises(mr.RunnerExit) as caught:
+            runner.acquire_lock()
+        self.assertLess(_time.monotonic() - started, 2.0)
+        self.assertEqual(caught.exception.outcome, "suspect_state")
 
     def test_wrong_served_model_blocks_immediately(self) -> None:
         completed = self._run(mode="wrong_model")

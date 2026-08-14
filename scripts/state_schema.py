@@ -2848,6 +2848,11 @@ def monitor_extract(text: str) -> dict[str, Any]:
                     and record.get("state") == "pending"
                 ):
                     hold = True
+        # algo#1216 R2 finding 3787662319: a documented merged-but-not-live
+        # dependency holds the clean exits unconditionally (not direction-
+        # gated) until it verifies live — monitor-exit-handoffs (a)/(d).
+        if gate.get("dependencies") == "hazard_documented":
+            hold = True
     extract["merge_readiness_hold"] = hold
     # R2 #1328 finding 3767068764 is satisfied by the shared predicate below:
     # blocker evidence is more than the three feedback maps - `human:*` and
