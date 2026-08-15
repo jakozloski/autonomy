@@ -859,12 +859,17 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         # reclaims it.
         self.assertEqual(list(tmp_home.glob("monitor-wrapper-*")), [])
 
-    def _fresh_runner_module(self, tag):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(tag, RUNNER)
-        mr = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mr)
-        return mr
+    def _runner_module(self):
+        # Direct in-process import, NOT a dynamic per-test module load: the
+        # scanner's BEHAVIOR_EVAL_SUBPROCESS rule forbids eval/exec-substring
+        # call names in this subprocess-heavy file (the same rule that keeps
+        # the wrapper in its own exec-only file), and monitor_runner holds no
+        # mutable module-level state, so one shared module object is
+        # isolation-equivalent to a fresh load for these direct-construction
+        # tests. Discovery runs with scripts/ on sys.path (same mechanism
+        # test_monitor_runner_unit.py relies on).
+        import monitor_runner
+        return monitor_runner
 
     def _direct_runner(self, mr):
         import argparse
@@ -879,7 +884,7 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         # algo#1216 R2 finding 3787189736: a child can unlink+recreate the
         # lock path; the HOLDER must detect the swap before any canonical
         # commit and stop as suspect rather than racing a second runner.
-        mr = self._fresh_runner_module("mr_lock_test")
+        mr = self._runner_module()
         runner = self._direct_runner(mr)
         runner.acquire_lock()
         try:
@@ -895,7 +900,7 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         # algo#1216 R2 finding 3787189741: recovery deleted every candidate,
         # destroying the only write-ahead record of external mutations the
         # dead child may have fired.
-        mr = self._fresh_runner_module("mr_rec_test")
+        mr = self._runner_module()
         runner = self._direct_runner(mr)
         attempt = "ab" * 16
         recorded = self.state.parent / (self.state.name + ".attempt-" + attempt + ".md")
@@ -1095,7 +1100,7 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         # algo#1216 R2 finding 3787662322: a FIFO planted at the lock path
         # made the plain open() block forever; the non-blocking no-follow
         # open now fails fast with a structured suspect exit.
-        mr = self._fresh_runner_module("mr_fifo_test")
+        mr = self._runner_module()
         runner = self._direct_runner(mr)
         os.mkfifo(runner.lock_path)
         import time as _time
