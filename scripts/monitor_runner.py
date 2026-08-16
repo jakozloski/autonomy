@@ -1736,7 +1736,7 @@ class Runner:
         pending_sidecars: list[str] = []
         unreadable_sidecars: list[str] = []
         unmerged_sidecars: list[str] = []
-        retained = 0
+        conflicting_sidecars: list[str] = []
         canonical_results = extract.get("handoff_results") or {}
         canonical_terminal = {
             (kind_name, operation_id): status
@@ -1745,15 +1745,38 @@ class Runner:
             for operation_id, status in kind.items()
             if status in ("complete", "failed", "skipped_dependency")
         }
-        for sidecar in sorted(
+        sidecars = sorted(
             self.state_path.parent.glob(
                 self.state_path.stem + ".failed-candidate*"
             )
-        ):
+        )
+        # R2 re-reply 3792845972: enforce count and byte ceilings BEFORE any
+        # parsing or compaction — schema-extracting every globbed sidecar
+        # first made startup work unbounded (one arbitrarily large failed
+        # candidate, or an unbounded accumulation, costs a full parse each).
+        if len(sidecars) > self.SIDECAR_RETENTION_LIMIT:
+            raise RunnerExit(
+                5,
+                "blocked",
+                f"{len(sidecars)} preserved sidecars exceed the retention"
+                f" limit ({self.SIDECAR_RETENTION_LIMIT}) — reconcile and"
+                " delete them per state-and-safety.md before resuming;"
+                " unbounded sidecar accumulation makes startup work"
+                " unbounded (bound enforced before any sidecar is parsed)",
+            )
+        for sidecar in sidecars:
+            try:
+                sidecar_bytes = sidecar.stat().st_size
+            except OSError:
+                sidecar_bytes = None
+            if sidecar_bytes is None or sidecar_bytes > self.max_candidate_bytes:
+                # Oversized or unstatable: never parse it — same fail-closed
+                # class as an unreadable sidecar, decided from metadata only.
+                unreadable_sidecars.append(sidecar.name)
+                continue
             side_extract = self.schema.extract(sidecar)
             if side_extract.get("state") != "valid":
                 unreadable_sidecars.append(sidecar.name)
-                retained += 1
                 continue
             results = side_extract.get("handoff_results") or {}
             statuses = [
@@ -1767,31 +1790,39 @@ class Runner:
                 for _, _, status in statuses
             ):
                 pending_sidecars.append(sidecar.name)
-                retained += 1
                 continue
             terminal = [
                 entry
                 for entry in statuses
                 if entry[2] in ("complete", "failed", "skipped_dependency")
             ]
+            # R2 re-reply 3792845972: compare terminal RECORDS, not keys —
+            # key-only matching deleted a sidecar recording "complete" while
+            # canonical said "failed", destroying exactly the conflicting
+            # evidence a human must reconcile.
             if terminal and all(
-                (kind_name, operation_id) in canonical_terminal
-                for kind_name, operation_id, _ in terminal
+                canonical_terminal.get((kind_name, operation_id)) == status
+                for kind_name, operation_id, status in terminal
             ):
-                # Redundant evidence: canonical already carries a terminal
-                # record for every operation this sidecar names. Compact.
+                # Redundant evidence: canonical already carries the SAME
+                # terminal record for every operation this sidecar names.
                 try:
                     sidecar.unlink()
                     _heartbeat(
                         f"sidecar compacted (redundant terminal evidence): {sidecar.name}"
                     )
-                    continue
                 except OSError:
-                    retained += 1
-                    continue
+                    pass
+                continue
+            if terminal and any(
+                (kind_name, operation_id) in canonical_terminal
+                and canonical_terminal[(kind_name, operation_id)] != status
+                for kind_name, operation_id, status in terminal
+            ):
+                conflicting_sidecars.append(sidecar.name)
+                continue
             if terminal:
                 unmerged_sidecars.append(sidecar.name)
-            retained += 1
         if unreadable_sidecars:
             raise RunnerExit(
                 5,
@@ -1816,6 +1847,20 @@ class Runner:
                 " per state-and-safety.md, record terminal results in"
                 " canonical state, then delete the sidecar(s) and resume",
             )
+        if conflicting_sidecars:
+            raise RunnerExit(
+                5,
+                "blocked",
+                "preserved failed-candidate sidecar(s) carry terminal"
+                " evidence that CONFLICTS with canonical state's record for"
+                " the same operation: "
+                + ", ".join(conflicting_sidecars)
+                + " — a human must reconcile which record is true (verify"
+                " the remote postcondition per state-and-safety.md, correct"
+                " canonical state if needed), then delete the sidecar(s)"
+                " and resume; the runner never chooses between conflicting"
+                " histories",
+            )
         if unmerged_sidecars:
             raise RunnerExit(
                 5,
@@ -1826,15 +1871,6 @@ class Runner:
                 + " — record each terminal result in canonical state (the"
                 " runner never merges history unsupervised), then delete the"
                 " sidecar(s) and resume",
-            )
-        if retained > self.SIDECAR_RETENTION_LIMIT:
-            raise RunnerExit(
-                5,
-                "blocked",
-                f"{retained} preserved sidecars exceed the retention limit"
-                f" ({self.SIDECAR_RETENTION_LIMIT}) — reconcile and delete"
-                " them per state-and-safety.md before resuming; unbounded"
-                " sidecar accumulation makes startup work unbounded",
             )
 
     def _verify_skill_snapshot(self) -> None:
@@ -2301,7 +2337,40 @@ def _read_ceiling(raw: str) -> int:
     return value
 
 
+def _require_isolated_boot() -> None:
+    """R2 admin#1495 re-reply 3792845974 (finding 3791925158, the in-package
+    enforceable half): plain ``python3 monitor_runner.py`` loads PYTHONPATH,
+    site hooks, and user customizations BEFORE this file's first line — a
+    same-UID writer of any of those surfaces owns the gate. The runner
+    cannot attest an immutable install (that remains the host contract),
+    but it CAN refuse an unisolated boot: require ``python3 -I -S``, the
+    same isolation its own children already run under. sys.path[0] is
+    re-added explicitly at module top, so imports are auditable."""
+
+    if sys.flags.isolated and sys.flags.no_site:
+        return
+    print(
+        json.dumps(
+            {
+                "runner_outcome": "blocked",
+                "reason": (
+                    "monitor_runner requires an isolated interpreter boot:"
+                    " launch it as `python3 -I -S .../monitor_runner.py ...`"
+                    " (isolated, no site hooks) — a plain `python3` boot"
+                    " consumes PYTHONPATH/sitecustomize before any integrity"
+                    " check runs (finding 3791925158); the immutable-install"
+                    " half of that finding remains a host deployment"
+                    " contract this check cannot attest"
+                ),
+            }
+        ),
+        flush=True,
+    )
+    raise SystemExit(5)
+
+
 def main() -> int:
+    _require_isolated_boot()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("state_file")
     parser.add_argument("--slice-budget", type=float, default=MONITOR_SLICE_BUDGET_SECONDS)

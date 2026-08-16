@@ -273,7 +273,9 @@ class SidecarGateTests(unittest.TestCase):
         self.assertIn("TERMINAL operation evidence", caught.exception.reason)
         self.assertTrue(sidecar.exists(), "never delete unmerged evidence")
 
-    def test_retention_limit_blocks_even_for_idle_sidecars(self) -> None:
+    def test_retention_limit_blocks_before_any_parse(self) -> None:
+        # R2 re-reply 3792845972: the count ceiling is enforced BEFORE any
+        # sidecar is schema-extracted — the untouched stub queue proves it.
         runner = self._runner_with_state()
         stub = self._StubSchema()
         runner.schema = stub
@@ -285,6 +287,47 @@ class SidecarGateTests(unittest.TestCase):
             runner._gate_sidecars({"handoff_results": {}})
         self.assertEqual(caught.exception.code, 5)
         self.assertIn("retention limit", caught.exception.reason)
+        self.assertEqual(
+            len(stub.queued), count, "no sidecar may be parsed past the cap"
+        )
+
+    def test_conflicting_terminal_evidence_blocks_never_compacts(self) -> None:
+        # R2 re-reply 3792845972: key-only matching deleted a sidecar
+        # recording "complete" while canonical said "failed" — conflicting
+        # histories are exactly what a human must reconcile.
+        runner = self._runner_with_state()
+        stub = self._StubSchema()
+        runner.schema = stub
+        sidecar = self._sidecar(runner, "cc")
+        stub.queued.append(
+            {
+                "state": "valid",
+                "handoff_results": {"qa": {"op-9": "complete"}},
+            }
+        )
+        canonical = {"handoff_results": {"qa": {"op-9": "failed"}}}
+        with self.assertRaises(RunnerExit) as caught:
+            runner._gate_sidecars(canonical)
+        self.assertEqual(caught.exception.code, 5)
+        self.assertIn("CONFLICTS", caught.exception.reason)
+        self.assertTrue(
+            sidecar.exists(), "conflicting evidence must never be deleted"
+        )
+
+    def test_oversized_sidecar_blocks_without_parsing(self) -> None:
+        # R2 re-reply 3792845972: byte ceiling enforced from stat metadata
+        # BEFORE parsing — the empty stub queue proves no extract ran.
+        runner = self._runner_with_state()
+        stub = self._StubSchema()
+        runner.schema = stub
+        runner.max_candidate_bytes = 64
+        sidecar = self._sidecar(runner, "dd")
+        sidecar.write_text("x" * 200, encoding="utf-8")
+        with self.assertRaises(RunnerExit) as caught:
+            runner._gate_sidecars({"handoff_results": {}})
+        self.assertEqual(caught.exception.code, 5)
+        self.assertIn("failed validation", caught.exception.reason)
+        self.assertTrue(sidecar.exists())
 
 
 class ChildSkillSnapshotTests(unittest.TestCase):

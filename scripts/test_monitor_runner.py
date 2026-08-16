@@ -561,6 +561,8 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         return subprocess.run(
             [
                 sys.executable,
+                "-I",
+                "-S",
                 str(RUNNER),
                 str(self.state),
                 "--slice-budget",
@@ -793,7 +795,7 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         env["FAKE_ARGV_LOG"] = str(self.dir / "argv2.jsonl")
         env["FAKE_CWD_FILE"] = str(cwd_file)
         completed = subprocess.run(
-            [sys.executable, str(RUNNER), str(state),
+            [sys.executable, "-I", "-S", str(RUNNER), str(state),
              "--slice-budget", "365", "--skill-dir", str(SCRIPTS.parent),
              "--claude-bin", str(self.fake), "--schema-cli", str(SCHEMA),
              "--wait-scale", "1.0"],
@@ -1028,6 +1030,22 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         self.assertIsNotNone(match, "child prompt must name the skill dir")
         self.assertIn("monitor-skill-snap-", match.group(1))
         self.assertNotIn(str(SCRIPTS.parent), match.group(1))
+
+    def test_plain_interpreter_boot_is_refused(self) -> None:
+        # R2 re-reply 3792845974 (finding 3791925158, in-package half): a
+        # plain `python3` boot consumes PYTHONPATH/sitecustomize before any
+        # integrity check runs — the runner refuses it with the sanctioned
+        # launcher named; the whole suite launching with -I -S is the
+        # pass-through side.
+        completed = subprocess.run(
+            [sys.executable, str(RUNNER), str(self.state),
+             "--slice-budget", "5", "--skill-dir", str(SCRIPTS.parent),
+             "--claude-bin", str(self.fake), "--schema-cli", str(SCHEMA)],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(completed.returncode, 5, completed.stderr)
+        self.assertIn("-I -S", completed.stdout + completed.stderr)
+        self.assertFalse(self.argv_log.exists(), "child must never launch")
 
     def test_unreadable_sidecar_fails_closed_before_launch(self) -> None:
         # matchmaking#3551 R2 finding 3790012750: a truncated, malformed, or
@@ -1355,6 +1373,8 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         first = subprocess.Popen(
             [
                 sys.executable,
+                "-I",
+                "-S",
                 str(RUNNER),
                 str(self.state),
                 "--slice-budget",
@@ -1407,6 +1427,8 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         first = subprocess.Popen(
             [
                 sys.executable,
+                "-I",
+                "-S",
                 str(RUNNER),
                 str(self.state),
                 "--slice-budget",
@@ -2324,7 +2346,7 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         env["FAKE_ARGV_LOG"] = str(self.argv_log)
         completed = subprocess.run(
             [
-                sys.executable, str(RUNNER), str(state),
+                sys.executable, "-I", "-S", str(RUNNER), str(state),
                 "--slice-budget", "365",
                 "--skill-dir", str(SCRIPTS.parent),
                 "--claude-bin", os.path.join(".", self.fake.name),
@@ -2359,7 +2381,7 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         env["FAKE_ARGV_LOG"] = str(self.argv_log)
         completed = subprocess.run(
             [
-                sys.executable, str(RUNNER), str(self.state),
+                sys.executable, "-I", "-S", str(RUNNER), str(self.state),
                 "--slice-budget", "900",
                 "--skill-dir", str(SCRIPTS.parent),
                 "--claude-bin", str(vanishing),
