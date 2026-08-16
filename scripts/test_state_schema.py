@@ -1944,6 +1944,17 @@ class ResumeValueContractCoverageTests(unittest.TestCase):
         )
 
 
+
+class RoundtripGenerationSerializerTests(unittest.TestCase):
+    def test_roundtrip_generation_hashes_non_json_values(self) -> None:
+        # CR 3761135391: same default=str serializer as qa_generation — a
+        # direct caller's non-JSON pushed_through_sha (validated only when
+        # fix_shas is non-empty) must hash, not raise TypeError.
+        entry = {"login": "alice", "pushed_through_sha": object()}
+        digest = roundtrip_generation([entry], ["alice"])
+        self.assertRegex(digest, r"^[0-9a-f]{12}$")
+
+
 class MainEntryTests(unittest.TestCase):
     def test_undecodable_state_file_fails_closed(self) -> None:
         import io

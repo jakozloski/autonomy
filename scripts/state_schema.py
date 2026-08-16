@@ -2597,7 +2597,12 @@ def roundtrip_generation(raw_reviewers: Any, targets: Any) -> str:
             }
         )
     payload.sort(key=lambda item: item["login"])
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    # CR 3761135391: same serializer settings as qa_generation — a direct
+    # caller's non-JSON pushed_through_sha (unchecked when fix_shas is
+    # empty) must hash per the malformed-segments contract, not raise.
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), default=str
+    )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
 
 
