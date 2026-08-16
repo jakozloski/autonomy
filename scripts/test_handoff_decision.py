@@ -1288,6 +1288,15 @@ class HandoffDecisionTest(unittest.TestCase):
         }
         second_plan = plan_handoff(second_round)
         self.assertEqual(second_plan["state"], "blocked")
+        # CR 3791614716: pin the SHAPE error itself — blocked-for-any-reason
+        # (an unknown-ID error, say) must not satisfy this regression.
+        self.assertTrue(
+            any(
+                first_ids[0] in error and "attempts" in error
+                for error in second_plan["errors"]
+            ),
+            second_plan["errors"],
+        )
         self.assertFalse(
             any(
                 "prior-generation" in warning

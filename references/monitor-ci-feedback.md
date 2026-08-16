@@ -32,8 +32,8 @@ while True:
     if the exact clean wait condition still holds:
       continue
     # Any failure/feedback/branch action, draft flip, terminal handoff, pause, or completion needs mutation and must consume work.
-    # KEEPER (R2 #1328 finding 3767068776; CodeRabbit 3779091111): derive pending-@r2-ask state HERE. While an ask is pending on the current head, a dirty wait must NOT hand the iteration body push authority — Steps 1-3 are push-capable and would supersede the running review. Process the new observation read-only (replies/acks only) and re-enter the wait; only a head with no pending unedited actor ask promotes to work. Recheck the exact-head ask/review state immediately before ANY push.
-    loop_reason = "work" if no unedited actor ask is pending on the current head else "wait_repoll"
+    # KEEPER (R2 #1328 finding 3767068776; CodeRabbit 3779091111/3791614706): derive pending-@r2-ask state HERE, by the R2 gate's own headless predicate (an unedited actor ask newer than R2's newest formal review — NOT head-bound; monitor-exit-handoffs.md owns the definition). While any such ask is pending, a dirty wait must NOT hand the iteration body push authority — Steps 1-3 are push-capable and would supersede the running review. Process the new observation read-only (replies/acks only) and re-enter the wait; only a state with no pending unedited actor ask promotes to work. Recheck the ask/review state immediately before ANY push.
+    loop_reason = "work" if no unedited actor ask is pending else "wait_repoll"
     continue
   else:
     work_iteration += 1
