@@ -212,6 +212,15 @@ def _github_operation(
     }
 
 
+
+def _normalized_reviewer_logins(raw: Any) -> list[str] | None:
+    if not isinstance(raw, list):
+        return None
+    return sorted(
+        {login.casefold() for login in raw if isinstance(login, str)}
+    )
+
+
 def qa_generation(request: dict[str, Any]) -> str:
     """Digest of the remote targets a QA-handoff plan mutates.
 
@@ -252,6 +261,14 @@ def qa_generation(request: dict[str, Any]) -> str:
         "write_path": tracker.get("write_path"),
         "qa_assignee_provider_id": qa_assignee.get("provider_id"),
         "qa_state_provider_id": qa_state.get("provider_id"),
+        # admin#1495 R2 finding 3791925153 (executed repro): the reviewer set
+        # shapes operation IDs and dependencies, so it is a TARGET fact —
+        # omitting it reused a generation across reviewer changes and
+        # stranded resumes on unknown-operation errors. Normalized (casefold,
+        # sorted, deduplicated) so ordering is never a spurious rollover.
+        "code_reviewers": _normalized_reviewer_logins(
+            request.get("code_reviewers", [])
+        ),
     }
     canonical = json.dumps(
         payload, sort_keys=True, separators=(",", ":"), default=str

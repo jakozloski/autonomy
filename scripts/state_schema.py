@@ -254,6 +254,12 @@ MONITOR_CHILD_FAILURE_KEYS = frozenset(("signature", "at"))
 MONITOR_CHILD_FAILURE_LIMIT = 3
 # Phase 4b (merge readiness) value contracts — see references/merge-readiness.md.
 AC_VERDICT_ENUM = frozenset(("pending", "met", "unmet", "deferred", "n_a"))
+# A deferral's follow-up must be an immutable tracker reference: a
+# TEAM-123-style ticket identifier or an issue/ticket URL (finding
+# 3791925156 — arbitrary strings like "later" are not tracked follow-ups).
+DEFERRAL_TICKET_PATTERN = re.compile(
+    r"(\b[A-Z][A-Z0-9]+-[0-9]+\b|https?://\S+/(issues?|ticket|browse)/\S+)"
+)
 AC_ENTRY_KEYS = frozenset(("id", "text", "source", "verdict", "evidence"))
 DEPLOY_ORDER_ENUM = frozenset(
     ("pending", "pass", "hazard_documented", "blocked", "n_a")
@@ -337,6 +343,7 @@ KNOWN_TOP_LEVEL_KEYS = frozenset(
         "phases",
         "decision_audit_trail",
         "acceptance_criteria",
+        "acceptance_criteria_capture",
         "merge_readiness",
     )
 )
@@ -350,6 +357,7 @@ KNOWN_TOP_LEVEL_KEYS = frozenset(
 OPTIONAL_TOP_LEVEL_KEYS = frozenset(
     (
         "acceptance_criteria",
+        "acceptance_criteria_capture",
         "merge_readiness",
         "monitor_ownership",
         "monitor_cli",
@@ -1437,6 +1445,10 @@ class _Validator:
             self.validate_clean_polls(state.get("clean_poll_timestamps"))
         if "acceptance_criteria" in state:
             self.validate_acceptance_criteria(state.get("acceptance_criteria"))
+        if "acceptance_criteria_capture" in state:
+            self.validate_acceptance_criteria_capture(
+                state.get("acceptance_criteria_capture")
+            )
         if "merge_readiness" in state:
             self.validate_merge_readiness(state.get("merge_readiness"))
         # (v) a complete merge-readiness phase cannot coexist with a blocked
@@ -2205,11 +2217,65 @@ class _Validator:
             # merge-readiness.md) — a deferred AC with no evidence names no
             # follow-up, so the deferral is untracked (algo#1216 R2 finding
             # 3722493004: deferred + null evidence validated clean).
-            if entry.get("verdict") == "deferred" and evidence is None:
+            if entry.get("verdict") == "deferred":
+                # admin#1495 R2 finding 3791925156: "with a tracked ticket"
+                # means a TICKET, not any prose — "later" validated clean.
+                # Require an immutable tracker reference in the evidence: a
+                # ticket identifier (TEAM-123 style) or a tracker/issue URL.
+                if evidence is None or DEFERRAL_TICKET_PATTERN.search(
+                    evidence
+                ) is None:
+                    self.error(
+                        f"{path}.evidence: verdict 'deferred' requires a"
+                        " tracked ticket reference (an identifier like"
+                        " WEB-1234 or a tracker/issue URL) in evidence —"
+                        " free-form prose does not track a follow-up"
+                    )
+
+
+    def validate_acceptance_criteria_capture(self, value: Any) -> None:
+        """admin#1495 R2 finding 3791925150: the kickoff authorization
+        snapshot. Captured ACs come from MUTABLE ticket prose; without a
+        recorded source revision and capture digest, a post-kickoff ticket
+        edit silently expands what the run believes it was asked to do.
+        Check 3's re-fetch compares against this snapshot and treats drift
+        as a re-authorization gate (merge-readiness.md), so the block must
+        be tamper-evident: fixed keys, ISO capture time, and a hex digest
+        of the normalized captured list."""
+
+        if not isinstance(value, dict):
+            self.error("acceptance_criteria_capture: must be a mapping")
+            return
+        for key in value:
+            if key not in ("captured_at", "requester", "source_revision", "digest"):
                 self.error(
-                    f"{path}.evidence: verdict 'deferred' requires the tracking "
-                    "ticket/follow-up reference in evidence"
+                    "acceptance_criteria_capture: unknown key"
+                    f" {_safe_key(str(key))!r}"
                 )
+        captured_at = value.get("captured_at")
+        if normalize_iso_timestamp(captured_at) is None:
+            self.error(
+                "acceptance_criteria_capture.captured_at: must be an ISO 8601"
+                " timestamp"
+            )
+        self.require_string(value, "requester", "acceptance_criteria_capture")
+        source_revision = value.get("source_revision")
+        if source_revision is not None and (
+            not isinstance(source_revision, str) or not source_revision
+        ):
+            self.error(
+                "acceptance_criteria_capture.source_revision: must be a"
+                " non-empty string or null (null = entry-context capture"
+                " with no ticket revision to bind)"
+            )
+        digest = value.get("digest")
+        if not isinstance(digest, str) or re.fullmatch(
+            r"[0-9a-f]{12,64}", digest
+        ) is None:
+            self.error(
+                "acceptance_criteria_capture.digest: must be 12-64 lowercase"
+                " hex (sha256 of the normalized captured AC list)"
+            )
 
     def validate_merge_readiness(self, value: Any) -> None:
         if not isinstance(value, dict):

@@ -553,6 +553,43 @@ class HandoffDecisionTest(unittest.TestCase):
             ],
         )
 
+    def test_qa_generation_rolls_over_when_reviewers_change(self) -> None:
+        # admin#1495 R2 finding 3791925153 (executed repro): the reviewer set
+        # shapes operation IDs, so it is a target fact — omitting it from the
+        # digest reused a generation across reviewer changes and stranded
+        # resumes on unknown-operation errors. Order and case are normalized
+        # so a reorder is never a spurious rollover.
+        base = {
+            "scenario": "approved_qa",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+            "existing_assignees": ["jakozloski"],
+            "issue_tracker": {
+                "type": "linear",
+                "qa_assignee": LINEAR_QA_ASSIGNEE,
+                "qa_state": LINEAR_QA_STATE_WEB,
+                "ticket_identifier": "WEB-8877",
+                "ticket_provider_id": "linear-ticket-web-8877",
+                "ticket_validated": True,
+                "write_path": "environment_tool",
+            },
+        }
+        gen_none = qa_generation(base)
+        gen_alice = qa_generation({**base, "code_reviewers": ["alice"]})
+        gen_bob = qa_generation({**base, "code_reviewers": ["bob"]})
+        gen_both = qa_generation({**base, "code_reviewers": ["alice", "bob"]})
+        gen_both_reordered = qa_generation(
+            {**base, "code_reviewers": ["Bob", "ALICE", "bob"]}
+        )
+        self.assertEqual(
+            len({gen_none, gen_alice, gen_bob, gen_both}), 4,
+            "reviewer set changes must roll the generation",
+        )
+        self.assertEqual(
+            gen_both, gen_both_reordered,
+            "ordering/case/duplicates must not roll the generation",
+        )
+
     def test_qa_code_reviewers_mint_write_ahead_request_operations(
         self,
     ) -> None:

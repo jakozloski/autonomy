@@ -1430,7 +1430,7 @@ class MergeReadinessTests(unittest.TestCase):
         self.assertEqual(result["state"], SUSPECT)
         self.assertTrue(
             any(
-                "verdict 'deferred' requires the tracking" in error
+                "requires a tracked ticket reference" in error
                 for error in result["errors"]
             )
         )
@@ -1538,6 +1538,76 @@ class MergeReadinessTests(unittest.TestCase):
                     )
                 self.assertIs(
                     monitor_extract(text)["merge_readiness_hold"], expected_hold
+                )
+
+    def test_deferred_verdict_with_freeform_evidence_is_rejected(self) -> None:
+        # admin#1495 R2 finding 3791925156: "with a tracked ticket" means a
+        # TICKET — evidence: "later" validated clean while tracking nothing.
+        text = _mutate(
+            self._with_blocks(), '    verdict: "pending"', '    verdict: "deferred"'
+        )
+        text = _mutate(text, "    evidence: null", '    evidence: "later"')
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any(
+                "requires a tracked ticket reference" in error
+                for error in result["errors"]
+            )
+        )
+
+    def test_deferred_verdict_with_tracker_url_is_valid(self) -> None:
+        text = _mutate(
+            self._with_blocks(), '    verdict: "pending"', '    verdict: "deferred"'
+        )
+        text = _mutate(
+            text,
+            "    evidence: null",
+            '    evidence: "deferred: https://linear.app/keeperdating/issue/WEB-9452"',
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["errors"], [])
+
+    _CAPTURE_BLOCK = "\n".join(
+        (
+            "acceptance_criteria_capture:",
+            '  captured_at: "2026-08-16T12:00:00Z"',
+            '  requester: "jakozloski"',
+            '  source_revision: "2026-08-15T09:00:00Z"',
+            '  digest: "abcdef0123456789"',
+        )
+    )
+
+    def test_acceptance_criteria_capture_block_validates(self) -> None:
+        # admin#1495 R2 finding 3791925150: the kickoff authorization
+        # snapshot is schema-legal and shape-checked.
+        text = _mutate(
+            self._with_blocks(),
+            "decision_audit_trail: []",
+            self._CAPTURE_BLOCK + "\ndecision_audit_trail: []",
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["errors"], [])
+
+    def test_acceptance_criteria_capture_rejects_bad_shapes(self) -> None:
+        base = _mutate(
+            self._with_blocks(),
+            "decision_audit_trail: []",
+            self._CAPTURE_BLOCK + "\ndecision_audit_trail: []",
+        )
+        for mutation, needle in (
+            (('  digest: "abcdef0123456789"', '  digest: "not-hex"'), "digest"),
+            (('  captured_at: "2026-08-16T12:00:00Z"', '  captured_at: "yesterday"'), "captured_at"),
+            (('  requester: "jakozloski"', '  requester: ""'), "requester"),
+            (('  source_revision: "2026-08-15T09:00:00Z"', '  source_revision: ""'), "source_revision"),
+        ):
+            with self.subTest(field=needle):
+                text = _mutate(base, *mutation)
+                result = evaluate_state_text(text)
+                self.assertEqual(result["state"], SUSPECT)
+                self.assertTrue(
+                    any(needle in error for error in result["errors"]),
+                    result["errors"],
                 )
 
     def test_dependencies_enum_accepts_check_2_completed_outcomes(self) -> None:

@@ -34,6 +34,7 @@ from unittest import mock
 from model_policy import REVIEWER_EFFORT
 from monitor_runner import (
     Runner,
+    durable_replace,
     RunnerExit,
     SchemaCli,
     _read_ceiling,
@@ -179,6 +180,111 @@ class LaunchSnapshotClearingTests(unittest.TestCase):
         self.assertIsNone(runner.launch_base_digest)
         self.assertEqual(stub.calls, 1)
 
+
+
+
+class DurableReplaceTests(unittest.TestCase):
+    def test_replaces_and_removes_source(self) -> None:
+        # admin#1495 R2 finding 3791925163: every commit-path namespace
+        # update routes through one helper that also fsyncs the parent.
+        tmp = Path(tempfile.mkdtemp(prefix="unit-durable-replace-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        source = tmp / "candidate.md"
+        target = tmp / "state.md"
+        source.write_text("new", encoding="utf-8")
+        target.write_text("old", encoding="utf-8")
+        durable_replace(source, target)
+        self.assertEqual(target.read_text(encoding="utf-8"), "new")
+        self.assertFalse(source.exists())
+
+
+class SidecarGateTests(unittest.TestCase):
+    """admin#1495 R2 finding 3791925160: per-launch reconciliation with
+    terminal compaction and bounded retention, driven in-process with the
+    schema CLI stubbed (each queued extract is consumed per sidecar in
+    sorted-glob order; every other seam is real)."""
+
+    class _StubSchema:
+        def __init__(self) -> None:
+            self.queued: list[dict] = []
+
+        def extract(self, path: object) -> dict:
+            return self.queued.pop(0)
+
+    def _runner_with_state(self) -> Runner:
+        tmp = Path(tempfile.mkdtemp(prefix="unit-sidecar-gate-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        state = tmp / "state.md"
+        state.write_text(
+            "---\nstate_schema_version: 1\n---\n\nbody\n", encoding="utf-8"
+        )
+        args = argparse.Namespace(
+            state_file=str(state),
+            skill_dir=str(SCRIPTS.parent),
+            claude_bin="claude",
+            schema_cli=str(SCRIPTS / "state_schema.py"),
+            slice_budget=100.0,
+            wait_scale=1.0,
+            acknowledge_taint=None,
+        )
+        runner = Runner(args)
+        _HELPER_RUNNERS.append(runner)
+        return runner
+
+    def _sidecar(self, runner: Runner, marker: str) -> Path:
+        sidecar = runner.state_path.with_suffix(
+            f".failed-candidate-{marker}.md"
+        )
+        sidecar.write_text("sidecar", encoding="utf-8")
+        return sidecar
+
+    def test_redundant_terminal_sidecar_is_compacted(self) -> None:
+        runner = self._runner_with_state()
+        stub = self._StubSchema()
+        runner.schema = stub
+        sidecar = self._sidecar(runner, "aa")
+        stub.queued.append(
+            {
+                "state": "valid",
+                "handoff_results": {"qa": {"op-1": "complete"}},
+            }
+        )
+        canonical = {"handoff_results": {"qa": {"op-1": "complete"}}}
+        runner._gate_sidecars(canonical)  # no raise
+        self.assertFalse(
+            sidecar.exists(), "redundant terminal evidence must compact"
+        )
+
+    def test_unmerged_terminal_sidecar_blocks(self) -> None:
+        runner = self._runner_with_state()
+        stub = self._StubSchema()
+        runner.schema = stub
+        sidecar = self._sidecar(runner, "bb")
+        stub.queued.append(
+            {
+                "state": "valid",
+                "handoff_results": {"qa": {"op-2": "failed"}},
+            }
+        )
+        canonical = {"handoff_results": {}}
+        with self.assertRaises(RunnerExit) as caught:
+            runner._gate_sidecars(canonical)
+        self.assertEqual(caught.exception.code, 5)
+        self.assertIn("TERMINAL operation evidence", caught.exception.reason)
+        self.assertTrue(sidecar.exists(), "never delete unmerged evidence")
+
+    def test_retention_limit_blocks_even_for_idle_sidecars(self) -> None:
+        runner = self._runner_with_state()
+        stub = self._StubSchema()
+        runner.schema = stub
+        count = runner.SIDECAR_RETENTION_LIMIT + 1
+        for index in range(count):
+            self._sidecar(runner, f"{index:02d}")
+            stub.queued.append({"state": "valid", "handoff_results": {}})
+        with self.assertRaises(RunnerExit) as caught:
+            runner._gate_sidecars({"handoff_results": {}})
+        self.assertEqual(caught.exception.code, 5)
+        self.assertIn("retention limit", caught.exception.reason)
 
 
 class ChildSkillSnapshotTests(unittest.TestCase):

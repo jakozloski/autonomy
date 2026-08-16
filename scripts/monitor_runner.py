@@ -441,10 +441,13 @@ def atomic_write(path: Path, text: str) -> None:
         except OSError:
             pass
         raise
-    os.replace(tmp, path)
-    # R6-F14: fsync the parent directory so the rename itself survives a
-    # power loss — the data fsync above does not make the directory entry
-    # durable. Best-effort where the platform disallows directory opens.
+    durable_replace(tmp, path)
+
+
+def _fsync_parent(path: Path) -> None:
+    # R6-F14: fsync the parent directory so a rename itself survives a
+    # power loss — a data fsync does not make the directory entry durable.
+    # Best-effort where the platform disallows directory opens.
     try:
         dir_fd = os.open(path.parent, os.O_RDONLY)
     except OSError:
@@ -455,6 +458,17 @@ def atomic_write(path: Path, text: str) -> None:
         pass
     finally:
         os.close(dir_fd)
+
+
+def durable_replace(source: Path, target: Path) -> None:
+    """admin#1495 R2 finding 3791925163: EVERY namespace update on the
+    canonical-state commit path routes through one helper that fsyncs the
+    target's parent after the rename — previously only atomic_write's
+    internal rename was durable, so a crash after the final
+    candidate-to-canonical replace could roll a reported-committed tick
+    back."""
+    os.replace(source, target)
+    _fsync_parent(target)
 
 
 def process_fingerprint(pid: int) -> str | None:
@@ -1306,6 +1320,11 @@ class Runner:
     def run_tick(self, extract: dict[str, Any]) -> str:
         from datetime import timedelta
 
+        # Finding 3791925160: the sidecar gate runs before EVERY launch —
+        # a candidate preserved by the previous tick in this same slice
+        # must be reconciled before another write-capable child runs.
+        self._gate_sidecars(extract)
+
         tick_ordinal = self.ticks_completed + 1
         attempt_id = uuid.uuid4().hex
         candidate = self.state_path.parent / (
@@ -1689,9 +1708,134 @@ class Runner:
             f".failed-candidate-{attempt}.md"
         )
         try:
-            os.replace(candidate, preserved)
+            durable_replace(candidate, preserved)
         except OSError:
             pass  # never destroy the write-ahead record
+
+
+    # Sidecars a run may retain at once even after compaction: past this,
+    # startup work is unbounded and the audit unreadable — a human cleans up.
+    SIDECAR_RETENTION_LIMIT = 20
+
+    def _gate_sidecars(self, extract: dict[str, Any]) -> None:
+        """admin#1495 R2 finding 3791925160: reconcile every preserved
+        sidecar before EVERY launch, not only at startup — a candidate
+        preserved by tick N must gate tick N+1's launch in the same slice.
+
+        Per sidecar, in order: an unreadable/invalid extract fails closed
+        (matchmaking#3551 finding 3790012750 — suspect extracts carry empty
+        handoff_results, which is "cannot rule pending out", never "no
+        pending work"); a pending/retryable result blocks for verify-before-
+        retry reconciliation; a terminal-only sidecar whose every result is
+        already recorded terminally in CANONICAL state is redundant evidence
+        and is COMPACTED (deleted, logged); a terminal-only sidecar carrying
+        evidence canonical lacks blocks with the merge instruction — the
+        runner never merges history unsupervised. A post-compaction count
+        above SIDECAR_RETENTION_LIMIT blocks (bounded startup work)."""
+
+        pending_sidecars: list[str] = []
+        unreadable_sidecars: list[str] = []
+        unmerged_sidecars: list[str] = []
+        retained = 0
+        canonical_results = extract.get("handoff_results") or {}
+        canonical_terminal = {
+            (kind_name, operation_id): status
+            for kind_name, kind in canonical_results.items()
+            if isinstance(kind, dict)
+            for operation_id, status in kind.items()
+            if status in ("complete", "failed", "skipped_dependency")
+        }
+        for sidecar in sorted(
+            self.state_path.parent.glob(
+                self.state_path.stem + ".failed-candidate*"
+            )
+        ):
+            side_extract = self.schema.extract(sidecar)
+            if side_extract.get("state") != "valid":
+                unreadable_sidecars.append(sidecar.name)
+                retained += 1
+                continue
+            results = side_extract.get("handoff_results") or {}
+            statuses = [
+                (kind_name, operation_id, status)
+                for kind_name, kind in results.items()
+                if isinstance(kind, dict)
+                for operation_id, status in kind.items()
+            ]
+            if any(
+                status in ("pending", "retryable")
+                for _, _, status in statuses
+            ):
+                pending_sidecars.append(sidecar.name)
+                retained += 1
+                continue
+            terminal = [
+                entry
+                for entry in statuses
+                if entry[2] in ("complete", "failed", "skipped_dependency")
+            ]
+            if terminal and all(
+                (kind_name, operation_id) in canonical_terminal
+                for kind_name, operation_id, _ in terminal
+            ):
+                # Redundant evidence: canonical already carries a terminal
+                # record for every operation this sidecar names. Compact.
+                try:
+                    sidecar.unlink()
+                    _heartbeat(
+                        f"sidecar compacted (redundant terminal evidence): {sidecar.name}"
+                    )
+                    continue
+                except OSError:
+                    retained += 1
+                    continue
+            if terminal:
+                unmerged_sidecars.append(sidecar.name)
+            retained += 1
+        if unreadable_sidecars:
+            raise RunnerExit(
+                5,
+                "blocked",
+                "preserved failed-candidate sidecar(s) failed validation"
+                " (truncated, malformed, or unreadable): "
+                + ", ".join(unreadable_sidecars)
+                + " — the runner cannot prove they carry no pending external"
+                " intents, so treat every operation they may record as"
+                " possibly fired: verify remote postconditions per"
+                " state-and-safety.md, record terminal results in canonical"
+                " state, then delete the sidecar(s) and resume",
+            )
+        if pending_sidecars:
+            raise RunnerExit(
+                5,
+                "blocked",
+                "preserved failed-candidate sidecar(s) carry unreconciled"
+                " pending external intents: "
+                + ", ".join(pending_sidecars)
+                + " — verify each pending operation's remote postcondition"
+                " per state-and-safety.md, record terminal results in"
+                " canonical state, then delete the sidecar(s) and resume",
+            )
+        if unmerged_sidecars:
+            raise RunnerExit(
+                5,
+                "blocked",
+                "preserved failed-candidate sidecar(s) carry TERMINAL"
+                " operation evidence canonical state does not record: "
+                + ", ".join(unmerged_sidecars)
+                + " — record each terminal result in canonical state (the"
+                " runner never merges history unsupervised), then delete the"
+                " sidecar(s) and resume",
+            )
+        if retained > self.SIDECAR_RETENTION_LIMIT:
+            raise RunnerExit(
+                5,
+                "blocked",
+                f"{retained} preserved sidecars exceed the retention limit"
+                f" ({self.SIDECAR_RETENTION_LIMIT}) — reconcile and delete"
+                " them per state-and-safety.md before resuming; unbounded"
+                " sidecar accumulation makes startup work unbounded",
+            )
 
     def _verify_skill_snapshot(self) -> None:
         """Re-verify the staged instruction surface against the __init__
@@ -1913,7 +2057,10 @@ class Runner:
         self._require_unmutated_canonical(last_look, candidate)
         self._verify_lock_inode()
         atomic_write(candidate, finalized)
-        os.replace(candidate, self.state_path)
+        # Finding 3791925163: the final namespace update is the commit the
+        # runner reports — it must be durable too, not only the candidate's
+        # own rename inside atomic_write.
+        durable_replace(candidate, self.state_path)
         self.ticks_completed += 1
         # F8: a successful commit resets the failure streak (the persisted
         # success marker above is the cross-slice reconstruction boundary).
@@ -2063,53 +2210,7 @@ class Runner:
         # carrying PENDING external intents must be reconciled before another
         # write-capable child runs — otherwise the loop can duplicate the
         # very mutations the sidecar records.
-        pending_sidecars = []
-        unreadable_sidecars = []
-        for sidecar in sorted(
-            self.state_path.parent.glob(
-                self.state_path.stem + ".failed-candidate*"
-            )
-        ):
-            side_extract = self.schema.extract(sidecar)
-            # matchmaking#3551 R2 finding 3790012750: a truncated, malformed,
-            # or unreadable sidecar extracts as suspect with EMPTY
-            # handoff_results. That means "cannot rule pending intents out",
-            # never "no pending work" — fail closed before any launch instead
-            # of inspecting results the extract does not have.
-            if side_extract.get("state") != "valid":
-                unreadable_sidecars.append(sidecar.name)
-                continue
-            results = side_extract.get("handoff_results") or {}
-            if any(
-                status in ("pending", "retryable")
-                for kind in results.values()
-                for status in kind.values()
-            ):
-                pending_sidecars.append(sidecar.name)
-        if unreadable_sidecars:
-            raise RunnerExit(
-                5,
-                "blocked",
-                "preserved failed-candidate sidecar(s) failed validation"
-                " (truncated, malformed, or unreadable): "
-                + ", ".join(unreadable_sidecars)
-                + " — the runner cannot prove they carry no pending external"
-                " intents, so treat every operation they may record as"
-                " possibly fired: verify remote postconditions per"
-                " state-and-safety.md, record terminal results in canonical"
-                " state, then delete the sidecar(s) and resume",
-            )
-        if pending_sidecars:
-            raise RunnerExit(
-                5,
-                "blocked",
-                "preserved failed-candidate sidecar(s) carry unreconciled"
-                " pending external intents: "
-                + ", ".join(pending_sidecars)
-                + " — verify each pending operation's remote postcondition"
-                " per state-and-safety.md, record terminal results in"
-                " canonical state, then delete the sidecar(s) and resume",
-            )
+        self._gate_sidecars(extract)
         if extract.get("phases_merge_readiness") != "complete":
             raise RunnerExit(
                 5,

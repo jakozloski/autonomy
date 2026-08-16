@@ -1246,15 +1246,25 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         # stderr, but those raise ValueError, so this stays precise to #11.
         combined = completed.stdout + completed.stderr
         self.assertNotIn("UnicodeDecodeError", combined, combined)
-        # Blocked through the structured 3-strike path (code 5), NOT the
-        # last-resort internal_failure backstop (code 4) — proves the specific
-        # catch converted the crash into a charged, recoverable retry.
+        # Blocked structurally (code 5), NOT the last-resort
+        # internal_failure backstop (code 4) — proves the specific catch
+        # converted the crash into a charged, structured outcome.
         self.assertEqual(completed.returncode, 5, completed.stdout + completed.stderr)
         extract = self._extract()
         failures = extract["monitor_cli"]["child_failures"]
         signatures = [f["signature"] for f in failures]
+        # One charged verdict_mismatch, then the per-launch sidecar gate
+        # (admin#1495 finding 3791925160) refuses the SECOND launch: the
+        # preserved bad-utf8 candidate is an unreadable durable record, so
+        # retrying a write-capable child over it is exactly the replay
+        # hazard the gate exists to stop — reconciliation, not 3-strike,
+        # is the recovery for an unreadable preserved candidate.
         self.assertEqual(
-            signatures.count("monitor-child:verdict_mismatch"), 3, signatures
+            signatures.count("monitor-child:verdict_mismatch"), 1, signatures
+        )
+        summary = self._summary(completed)
+        self.assertIn(
+            "failed validation", summary.get("reason", ""), summary
         )
         # Nothing was committed and canonical state is untouched.
         self.assertEqual(extract["counters"]["monitor_poll_ticks"], 0)
