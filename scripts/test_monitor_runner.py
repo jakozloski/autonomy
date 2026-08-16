@@ -998,6 +998,72 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         names = {s.name for s in sidecars}
         self.assertEqual(len(names), len(sidecars), "attempt-scoped names must be unique")
 
+    def test_unreadable_sidecar_fails_closed_before_launch(self) -> None:
+        # matchmaking#3551 R2 finding 3790012750: a truncated, malformed, or
+        # unreadable sidecar extracts as suspect with EMPTY handoff_results —
+        # pre-fix that read as "no pending work" and a write-capable child
+        # launched over the unreadable durable record of possibly-fired
+        # external mutations. Every non-valid extract must block the launch.
+        state = self.state.read_text(encoding="utf-8")
+        cases = {
+            "truncated": state[:120],  # cut mid-frontmatter, no closing fence
+            "malformed": "---\nstate_schema_version: [unclosed\n---\nbody\n",
+            "garbage": "\x00\x01 not a state document at all",
+        }
+        for name, content in cases.items():
+            with self.subTest(case=name):
+                sidecar = self.state.with_suffix(
+                    ".failed-candidate-deadbeef.md"
+                )
+                sidecar.write_text(content, encoding="utf-8")
+                try:
+                    completed = self._run()
+                    summary = self._summary(completed)
+                    self.assertEqual(completed.returncode, 5, completed.stderr)
+                    self.assertIn(
+                        "failed validation", summary.get("reason", "")
+                    )
+                    self.assertIn("deadbeef", summary.get("reason", ""))
+                    self.assertFalse(
+                        self.argv_log.exists(), "child must never launch"
+                    )
+                finally:
+                    sidecar.unlink()
+
+    def test_extraction_failure_sidecar_fails_closed_before_launch(self) -> None:
+        # Same finding, extraction-failure leg: a sidecar path the schema CLI
+        # cannot even read (a directory here) yields the structured suspect
+        # verdict from the invocation guard — same fail-closed branch.
+        sidecar = self.state.with_suffix(".failed-candidate-cafecafe.md")
+        sidecar.mkdir()
+        try:
+            completed = self._run()
+            summary = self._summary(completed)
+            self.assertEqual(completed.returncode, 5, completed.stderr)
+            self.assertIn("failed validation", summary.get("reason", ""))
+            self.assertIn("cafecafe", summary.get("reason", ""))
+            self.assertFalse(
+                self.argv_log.exists(), "child must never launch"
+            )
+        finally:
+            sidecar.rmdir()
+
+    def test_valid_idle_sidecar_does_not_block_the_launch(self) -> None:
+        # Pass-through side of the fail-closed guard: a fully valid preserved
+        # sidecar with no pending external intents must not block work.
+        sidecar = self.state.with_suffix(".failed-candidate-feedf00d.md")
+        sidecar.write_text(
+            self.state.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        try:
+            completed = self._run()
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertTrue(
+                self.argv_log.exists(), "the launch must proceed"
+            )
+        finally:
+            sidecar.unlink()
+
     def test_pending_sidecar_blocks_the_next_write_capable_tick(self) -> None:
         # algo#1216 R2 finding 3787662312 (third leg): unreconciled pending
         # intents in a preserved sidecar must block further write-capable

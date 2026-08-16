@@ -2007,12 +2007,21 @@ class Runner:
         # write-capable child runs — otherwise the loop can duplicate the
         # very mutations the sidecar records.
         pending_sidecars = []
+        unreadable_sidecars = []
         for sidecar in sorted(
             self.state_path.parent.glob(
                 self.state_path.stem + ".failed-candidate*"
             )
         ):
             side_extract = self.schema.extract(sidecar)
+            # matchmaking#3551 R2 finding 3790012750: a truncated, malformed,
+            # or unreadable sidecar extracts as suspect with EMPTY
+            # handoff_results. That means "cannot rule pending intents out",
+            # never "no pending work" — fail closed before any launch instead
+            # of inspecting results the extract does not have.
+            if side_extract.get("state") != "valid":
+                unreadable_sidecars.append(sidecar.name)
+                continue
             results = side_extract.get("handoff_results") or {}
             if any(
                 status in ("pending", "retryable")
@@ -2020,6 +2029,19 @@ class Runner:
                 for status in kind.values()
             ):
                 pending_sidecars.append(sidecar.name)
+        if unreadable_sidecars:
+            raise RunnerExit(
+                5,
+                "blocked",
+                "preserved failed-candidate sidecar(s) failed validation"
+                " (truncated, malformed, or unreadable): "
+                + ", ".join(unreadable_sidecars)
+                + " — the runner cannot prove they carry no pending external"
+                " intents, so treat every operation they may record as"
+                " possibly fired: verify remote postconditions per"
+                " state-and-safety.md, record terminal results in canonical"
+                " state, then delete the sidecar(s) and resume",
+            )
         if pending_sidecars:
             raise RunnerExit(
                 5,
