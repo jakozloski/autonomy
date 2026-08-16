@@ -1318,6 +1318,12 @@ def plan_handoff(request: Any) -> dict[str, Any]:
             # scenario's own generation turnover.
             raw_results = request.get("operation_results")
             if isinstance(raw_results, dict):
+                # CR 3777197527: shape-gate BEFORE any pruning, exactly like
+                # the QA sweep above — pruning a malformed record launders
+                # the evidence record validation exists to reject.
+                _, shape_errors = _operation_results(request)
+                if shape_errors:
+                    return _blocked(scenario, *shape_errors)
                 known_ids = {operation["id"] for operation in operations}
                 stale_terminal: list[str] = []
                 stale_in_flight: list[str] = []

@@ -480,17 +480,29 @@ REQUIRED_REDACTION_PATTERNS = {
         # algo#1216 R2 finding 3779532276: the \b-anchored form missed
         # DB_PASSWORD/MYSQL_PASSWORD-style labels (underscore is a word
         # character, so no boundary exists before "password").
-        r"""(?i)[\w-]*password["']?\s*[:=]\s*["']?[^\s"']{8,}""",
+        # CR 3787358691: quoted values redact the WHOLE quoted string —
+        # the unquoted branch stops at whitespace, so a multi-word secret
+        # ("correct horse battery staple") previously leaked its suffix.
+        r"""(?i)[\w-]*password["']?\s*[:=]\s*("[^"\r\n]{4,}"|'[^'\r\n]{4,}'|[^\s"']{8,})""",
         (
             "password=" + "SuperSecret99",
             "PASSWORD: " + "hunter2hunter2",
             "DB_PASSWORD=" + "prodsecret99",
             "MYSQL_PASSWORD: " + "hunter2hunter2",
+            'PASSWORD="' + 'correct horse battery staple"',
         ),
     ),
     "cookie_header_value": (
-        r"""(?i)\b(Set-)?Cookie:\s*[^\s;=]+=[^\s;]{8,}""",
-        ("Cookie: " + "session=abcdef12345678", "Set-Cookie: " + "sid=0123456789abcdef"),
+        # CR 3787358691/3779091168: redact the whole header remainder — the
+        # old per-pair form let a short first pair (theme=x) expose the
+        # session token in a later pair.
+        r"""(?i)\b(Set-)?Cookie:[^\r\n]{8,}""",
+        (
+            "Cookie: " + "session=abcdef12345678",
+            "Set-Cookie: " + "sid=0123456789abcdef",
+            "Cookie: " + "theme=x; session=abcdef12345678",
+            "Set-Cookie: " + "sid=0123456789abcdef; Path=/; HttpOnly",
+        ),
     ),
     # algo#1216 R2 round-7 finding 3788363460: Keeper's own credential
     # formats (Stripe live keys, GCP API keys / OAuth tokens, PEM private
@@ -1482,11 +1494,48 @@ def validate_package(package_dir: Path) -> list[str]:
     for required_file in REQUIRED_SCRIPT_FILES:
         if not (package_dir / required_file).is_file():
             errors.append(f"missing required script file: {required_file}")
+    errors.extend(_validate_test_collection(package_dir))
     errors.extend(_validate_policy_text(package_dir))
     errors.extend(_validate_gate_markers(package_dir))
     errors.extend(_validate_py_bindings(package_dir))
     errors.extend(_validate_anchored_markers(package_dir))
     errors.extend(_validate_openai_yaml(package_dir))
+    return errors
+
+def _validate_test_collection(package_dir: Path) -> list[str]:
+    """CR 3761135481: ``unittest discover`` exits 0 after collecting zero
+    tests, so file existence alone cannot prove the CI suite runs anything.
+    Statically require every required test module to define at least one
+    ``test*`` method inside a class — the discover pattern ``test_*.py``
+    already matches the filenames by construction."""
+
+    import ast
+
+    errors: list[str] = []
+    for required_file in REQUIRED_SCRIPT_FILES:
+        name = required_file.rsplit("/", 1)[-1]
+        if not (name.startswith("test_") and name.endswith(".py")):
+            continue
+        path = package_dir / required_file
+        if not path.is_file():
+            continue  # the existence check reports this separately
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (SyntaxError, ValueError):
+            errors.append(f"{required_file}: test module failed to parse")
+            continue
+        has_test = any(
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name.startswith("test")
+            for candidate_class in ast.walk(tree)
+            if isinstance(candidate_class, ast.ClassDef)
+            for node in candidate_class.body
+        )
+        if not has_test:
+            errors.append(
+                f"{required_file}: defines no test* method in any class —"
+                " discovery would collect zero tests and still exit 0"
+            )
     return errors
 
 
@@ -1508,7 +1557,10 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
         errors = validate_package(args.package_dir)
-    except ValueError as error:
+    except (ValueError, OSError) as error:
+        # CR 3761135467: read_text on an unreadable or non-UTF-8 file must
+        # report the same structured fail-closed way as the other CLIs
+        # (UnicodeDecodeError is a ValueError subclass; OSError is not).
         print(f"ERROR: {error}", file=sys.stderr)
         return 2
 

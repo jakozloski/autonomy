@@ -734,14 +734,19 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         ]
         self.assertIn("monitor-child:group_survivors", signatures)
         self.assertEqual(extract["counters"]["monitor_poll_ticks"], 0)
-        if pid_file.exists():
-            pid = int(pid_file.read_text())
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                pass  # killed by the runner, as required
-            else:
-                self.fail("survivor process outlived the runner's kill")
+        # CR 3779091158/3784681489: the pid file is the precondition, not an
+        # option — without it the kill assertion below never runs and the
+        # test passes vacuously.
+        self.assertTrue(
+            pid_file.exists(), "fake claude must record the survivor pid"
+        )
+        pid = int(pid_file.read_text())
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            pass  # killed by the runner, as required
+        else:
+            self.fail("survivor process outlived the runner's kill")
 
     def test_failed_exit_with_surviving_group_member_is_reaped(self) -> None:
         # R2 #1495 finding 3777668741: the failure path cleared in_flight
@@ -759,14 +764,18 @@ class MonitorRunnerE2ETests(unittest.TestCase):
             },
         )
         self.assertEqual(completed.returncode, 5, completed.stderr)
-        if pid_file.exists():
-            pid = int(pid_file.read_text())
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                pass  # reaped by the runner, as required
-            else:
-                self.fail("survivor outlived the failure-path reap")
+        # CR 3779091158/3784681489: same vacuity guard as the clean-exit
+        # survivor test.
+        self.assertTrue(
+            pid_file.exists(), "fake claude must record the survivor pid"
+        )
+        pid = int(pid_file.read_text())
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            pass  # reaped by the runner, as required
+        else:
+            self.fail("survivor outlived the failure-path reap")
 
     def test_child_launches_at_the_repository_root(self) -> None:
         # algo#1216 R2 finding 3779532263: state lives under <repo>/.claude;
@@ -873,12 +882,19 @@ class MonitorRunnerE2ETests(unittest.TestCase):
 
     def _direct_runner(self, mr):
         import argparse
-        return mr.Runner(argparse.Namespace(
+        runner = self._register_runner(mr.Runner(argparse.Namespace(
             state_file=str(self.state), skill_dir=str(SCRIPTS.parent),
             claude_bin=str(self.fake), schema_cli=str(SCHEMA),
             slice_budget=1.0, wait_scale=1.0, max_ticks=None,
             acknowledge_taint=None,
-        ))
+        )))
+        return runner
+
+    def _register_runner(self, runner):
+        # CR 3787358740: Runner.__init__ stages a wrapper file and the child
+        # skill snapshot; reclaim them per test instead of littering TMPDIR.
+        self.addCleanup(runner.cleanup_wrapper_stage)
+        return runner
 
     def test_replaced_lock_file_is_detected_by_the_holder(self) -> None:
         # algo#1216 R2 finding 3787189736: a child can unlink+recreate the
@@ -997,6 +1013,21 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         self.assertGreaterEqual(len(sidecars), 2, [s.name for s in sidecars])
         names = {s.name for s in sidecars}
         self.assertEqual(len(names), len(sidecars), "attempt-scoped names must be unique")
+
+    def test_child_prompt_names_the_skill_snapshot_not_the_live_package(
+        self,
+    ) -> None:
+        # admin#1495 R2 finding 3722356278: the child's prompt must point at
+        # the launch-time snapshot, never the live package directory a PR
+        # checkout can rewrite mid-run.
+        import re as _re
+        completed = self._run()
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        argv = self.argv_log.read_text(encoding="utf-8")
+        match = _re.search(r"package is at (\S+)\.", argv)
+        self.assertIsNotNone(match, "child prompt must name the skill dir")
+        self.assertIn("monitor-skill-snap-", match.group(1))
+        self.assertNotIn(str(SCRIPTS.parent), match.group(1))
 
     def test_unreadable_sidecar_fails_closed_before_launch(self) -> None:
         # matchmaking#3551 R2 finding 3790012750: a truncated, malformed, or

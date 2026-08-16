@@ -180,6 +180,105 @@ class LaunchSnapshotClearingTests(unittest.TestCase):
         self.assertEqual(stub.calls, 1)
 
 
+
+class ChildSkillSnapshotTests(unittest.TestCase):
+    """admin#1495 R2 finding 3722356278 (follow-up 3777166503): the
+    write-capable monitor child re-reads package prose and runs package
+    scripts, and the live skill_dir can sit inside the mutable PR checkout.
+    Those reads must hit a launch-time snapshot outside the package, pinned
+    at __init__ and re-verified before every launch."""
+
+    def _skill_fixture(self) -> Path:
+        tmp = Path(tempfile.mkdtemp(prefix="unit-skill-fixture-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        (tmp / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+        (tmp / "references").mkdir()
+        (tmp / "references" / "guide.md").write_text("ref\n", encoding="utf-8")
+        (tmp / "scripts").mkdir()
+        (tmp / "scripts" / "state_schema.py").write_text(
+            "# schema\n", encoding="utf-8"
+        )
+        return tmp
+
+    def _snapshot_runner(self, skill_dir: Path) -> Runner:
+        args = argparse.Namespace(
+            state_file=str(skill_dir / "state.md"),
+            skill_dir=str(skill_dir),
+            claude_bin="claude",
+            schema_cli=str(SCRIPTS / "state_schema.py"),
+            slice_budget=100.0,
+            wait_scale=1.0,
+            acknowledge_taint=None,
+        )
+        runner = Runner(args)
+        _HELPER_RUNNERS.append(runner)
+        return runner
+
+    def test_snapshot_copies_surface_and_pins_digests(self) -> None:
+        skill = self._skill_fixture()
+        runner = self._snapshot_runner(skill)
+        snapshot = runner.child_skill_dir
+        self.assertNotEqual(snapshot, skill)
+        self.assertEqual(
+            (snapshot / "SKILL.md").read_text(encoding="utf-8"), "# Skill\n"
+        )
+        self.assertEqual(
+            (snapshot / "references" / "guide.md").read_text(encoding="utf-8"),
+            "ref\n",
+        )
+        self.assertEqual(
+            (snapshot / "scripts" / "state_schema.py").read_text(
+                encoding="utf-8"
+            ),
+            "# schema\n",
+        )
+        self.assertEqual(
+            set(runner.skill_manifest),
+            {"SKILL.md", "references/guide.md", "scripts/state_schema.py"},
+        )
+
+    def test_post_init_mutation_of_the_live_package_never_reaches_it(
+        self,
+    ) -> None:
+        skill = self._skill_fixture()
+        runner = self._snapshot_runner(skill)
+        # The takeover shape: a checkout swaps the live package content
+        # AFTER the runner started.
+        (skill / "SKILL.md").write_text(
+            "# swapped by a checkout\n", encoding="utf-8"
+        )
+        (skill / "references" / "guide.md").write_text(
+            "attacker prose\n", encoding="utf-8"
+        )
+        self.assertEqual(
+            (runner.child_skill_dir / "SKILL.md").read_text(encoding="utf-8"),
+            "# Skill\n",
+        )
+        # Live-package mutation must NOT trip the staging check either —
+        # the snapshot is the pinned surface, the live dir is expected to
+        # move under a takeover.
+        runner._verify_skill_snapshot()
+
+    def test_tampered_snapshot_fails_closed_before_launch(self) -> None:
+        skill = self._skill_fixture()
+        runner = self._snapshot_runner(skill)
+        (runner.child_skill_dir / "SKILL.md").write_text(
+            "tampered\n", encoding="utf-8"
+        )
+        with self.assertRaises(RunnerExit) as caught:
+            runner._verify_skill_snapshot()
+        self.assertEqual(caught.exception.code, 4)
+        self.assertIn("skill snapshot drifted", caught.exception.reason)
+
+    def test_cleanup_removes_the_snapshot_directory(self) -> None:
+        skill = self._skill_fixture()
+        runner = self._snapshot_runner(skill)
+        snapshot = runner.child_skill_dir
+        self.assertTrue(snapshot.is_dir())
+        runner.cleanup_wrapper_stage()
+        self.assertFalse(snapshot.exists())
+
+
 class WrapperStagingTests(unittest.TestCase):
     """algo#1216 R2 finding 3779532260 composed with the in-memory trust base
     (pass-4 codex C-F1): the barrier wrapper's SOURCE bytes are pinned in the

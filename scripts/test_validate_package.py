@@ -114,6 +114,22 @@ class PackageFixture:
             # fails on the very invariant this fixture is supposed to satisfy.
             for statement in REQUIRED_PY_BINDINGS.get(relative_path, ()):
                 script_lines.append(statement)
+            # _validate_test_collection (CR 3761135481) requires every test
+            # module to define a collectable test* method — the fixture must
+            # satisfy the invariant it exists to defend, like the marker and
+            # binding loops above.
+            name = relative_path.rsplit("/", 1)[-1]
+            if name.startswith("test_") and name.endswith(".py"):
+                script_lines.extend(
+                    (
+                        "import unittest",
+                        "",
+                        "",
+                        "class FixtureSmokeTest(unittest.TestCase):",
+                        "    def test_fixture_collects(self) -> None:",
+                        "        self.assertTrue(True)",
+                    )
+                )
             (self.root / relative_path).write_text(
                 "\n".join(script_lines) + "\n", encoding="utf-8"
             )
@@ -131,6 +147,23 @@ class ValidatePackageTests(unittest.TestCase):
 
     def test_valid_package_passes(self) -> None:
         self.assertEqual(validate_package(self.package.root), [])
+
+    def test_required_test_module_with_zero_tests_is_rejected(self) -> None:
+        # CR 3761135481: unittest discover exits 0 after collecting zero
+        # tests, so existence checks alone cannot prove the CI gate runs
+        # anything. A required test module with no test* method must fail
+        # validation.
+        target = self.package.root / "scripts" / "test_cli_fail_closed.py"
+        target.write_text(
+            "import unittest\n\n\nclass Empty(unittest.TestCase):\n    pass\n",
+            encoding="utf-8",
+        )
+        errors = validate_package(self.package.root)
+        self.assertTrue(
+            any("defines no test* method" in error for error in errors),
+            errors,
+        )
+
 
     def test_missing_runtime_helper_fails(self) -> None:
         (self.package.root / "scripts" / "model_policy.py").unlink()
@@ -333,7 +366,12 @@ class ValidatePackageTests(unittest.TestCase):
                         lines = original.splitlines()
                         index = self._operative_index(lines, anchor, required)
                         head, sep, tail = lines[index].rpartition(substring)
-                        assert sep, "operative line lost its required text"
+                        # CR 3787358750: unittest assertion, not a bare
+                        # assert — python -O would remove the guard and the
+                        # case would pass vacuously on a missing substring.
+                        self.assertTrue(
+                            sep, "operative line lost its required text"
+                        )
                         lines[index] = f"{head}<!-- {substring} -->{tail}"
                         target.write_text(
                             "\n".join(lines) + "\n", encoding="utf-8"

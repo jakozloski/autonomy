@@ -27,6 +27,7 @@ class CliFailClosedTests(unittest.TestCase):
             [sys.executable, str(SCRIPTS / script)],
             input=b"\xff\xfe not json",
             capture_output=True,
+            timeout=120,
         )
 
     def test_model_policy_non_utf8_stdin_fails_closed_with_envelope(self) -> None:

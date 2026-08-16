@@ -45,6 +45,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -835,6 +836,32 @@ class Runner:
         )
         os.close(wrapper_fd)
         self.wrapper_stage_path = Path(wrapper_stage_name)
+        # admin#1495 R2 finding 3722356278 (follow-up 3777166503): the
+        # write-capable monitor child is ordered to re-read this package's
+        # SKILL.md/references and run its scripts, and the live skill_dir
+        # can sit INSIDE the mutable PR checkout — a mid-run push or
+        # re-checkout swaps the prose and scripts a later child trusts.
+        # Snapshot the whole instruction surface OUTSIDE the worktree now,
+        # digest-pinned, and hand every child the snapshot path instead.
+        # This pins the mid-run window only; like the wrapper/validator pins
+        # above it cannot authenticate boot-time content (the UID-writable
+        # boot-chain residual documented at SchemaCli._run).
+        self.child_skill_dir = Path(
+            tempfile.mkdtemp(prefix="monitor-skill-snap-")
+        )
+        self.skill_manifest: dict[str, str] = {}
+        snapshot_sources = [self.skill_dir / "SKILL.md"]
+        snapshot_sources += sorted((self.skill_dir / "references").glob("*.md"))
+        snapshot_sources += sorted((self.skill_dir / "scripts").glob("*.py"))
+        for snapshot_source in snapshot_sources:
+            relative = snapshot_source.relative_to(self.skill_dir)
+            staged = self.child_skill_dir / relative
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            payload = snapshot_source.read_bytes()
+            staged.write_bytes(payload)
+            self.skill_manifest[str(relative)] = hashlib.sha256(
+                payload
+            ).hexdigest()
         # algo#1216 R2 finding 3779532263: canonical state lives under
         # <repo>/.claude, and a child launched THERE gets default file access
         # only below it — Phase 6 could not touch application files. Launch
@@ -843,14 +870,17 @@ class Runner:
         # keeps the structured-exit doctrine: a host without git falls back
         # to the state directory instead of crashing __init__.
         try:
+            # CodeRabbit 3787358695/3784681433: bounded like every other
+            # subprocess site here — a hung git must not wedge __init__
+            # before the lock or any heartbeat exists.
             root_probe = subprocess.run(
                 ["git", "-C", str(self.state_path.parent), "rev-parse",
                  "--show-toplevel"],
-                capture_output=True, text=True,
+                capture_output=True, text=True, timeout=30,
             )
             root = root_probe.stdout.strip()
             probe_ok = root_probe.returncode == 0 and bool(root)
-        except OSError:
+        except (OSError, subprocess.TimeoutExpired):
             probe_ok = False
         self.child_cwd = root if probe_ok else str(self.state_path.parent)
         self.slice_deadline = time.monotonic() + args.slice_budget
@@ -1246,6 +1276,7 @@ class Runner:
             # from the __init__-pinned wrapper bytes immediately before the
             # launch — the interpreter reads only bytes this runner just
             # wrote from its own heap.
+            self._verify_skill_snapshot()
             self.wrapper_stage_path.write_bytes(self.wrapper_source)
             proc = subprocess.Popen(
                 wrapper,
@@ -1284,7 +1315,10 @@ class Runner:
         if not isinstance(base_digest, str):
             raise RunnerExit(4, "suspect_state", "canonical digest unavailable")
         prompt = monitor_child_prompt(
-            str(self.skill_dir),
+            # Finding 3722356278: the child reads prose/scripts from the
+            # launch-time snapshot, never the live (possibly checked-out)
+            # package directory.
+            str(self.child_skill_dir),
             str(self.state_path),
             str(candidate),
             attempt_id,
@@ -1659,15 +1693,38 @@ class Runner:
         except OSError:
             pass  # never destroy the write-ahead record
 
-    def cleanup_wrapper_stage(self) -> None:
-        """Remove the runner-lifetime wrapper stage file (main()'s finally).
+    def _verify_skill_snapshot(self) -> None:
+        """Re-verify the staged instruction surface against the __init__
+        manifest immediately before a launch (finding 3722356278): the
+        snapshot lives outside the worktree, so drift here means something
+        tampered with the runner's own staging area — never continue."""
+        for relative, digest in self.skill_manifest.items():
+            staged = self.child_skill_dir / relative
+            try:
+                live = hashlib.sha256(staged.read_bytes()).hexdigest()
+            except OSError:
+                live = None
+            if live != digest:
+                raise RunnerExit(
+                    4,
+                    "suspect_state",
+                    "child skill snapshot drifted before launch"
+                    f" ({relative}) — the staged instruction surface was"
+                    " modified outside the runner; reconcile per the Resume"
+                    " trust model",
+                )
 
-        Best-effort by design: the file is 0600 with an unpredictable name,
-        so a leak on a hard kill is bounded and harmless."""
+    def cleanup_wrapper_stage(self) -> None:
+        """Remove the runner-lifetime staged files (main()'s finally): the
+        wrapper stage file and the child skill snapshot directory.
+
+        Best-effort by design: both carry unpredictable names, so a leak on
+        a hard kill is bounded and harmless."""
         try:
             self.wrapper_stage_path.unlink()
         except OSError:
             pass
+        shutil.rmtree(self.child_skill_dir, ignore_errors=True)
 
     def _verify_and_commit(
         self,

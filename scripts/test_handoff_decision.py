@@ -1146,6 +1146,58 @@ class HandoffDecisionTest(unittest.TestCase):
             )
         )
 
+    def test_second_round_malformed_prior_record_blocks_not_prunes(
+        self,
+    ) -> None:
+        # CR 3777197527: the roundtrip stale sweep pruned prior-generation
+        # records by raw status BEFORE shape validation, while the QA sweep
+        # shape-gates first — a malformed record whose status said
+        # "complete" was silently laundered out of the ledger. The sweep
+        # must block on shape errors exactly like the QA path.
+        first_round = {
+            "scenario": "human_review_roundtrip",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+            "authenticated_actor": "jakozloski",
+            "reviewers": [reviewer("alice")],
+        }
+        first_ids = [
+            operation["id"]
+            for operation in plan_handoff(first_round)["operations"]
+        ]
+        malformed = {"status": "complete"}  # no attempts/timestamps/evidence
+        second_round = {
+            "scenario": "human_review_roundtrip",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+            "authenticated_actor": "jakozloski",
+            "reviewers": [
+                reviewer(
+                    "alice",
+                    review_bodies={
+                        "review-2": {
+                            "updated_at": "2026-07-10T09:00:00Z",
+                            "evaluated_updated_at": "2026-07-10T09:00:00Z",
+                            "evaluated_at": "2026-07-10T09:05:00Z",
+                            "acknowledgment_id": "ack-2",
+                            "acknowledgment_author": "jakozloski",
+                        }
+                    },
+                    current_review_body_ids=["review-2"],
+                )
+            ],
+            "operation_results": {first_ids[0]: malformed},
+        }
+        second_plan = plan_handoff(second_round)
+        self.assertEqual(second_plan["state"], "blocked")
+        self.assertFalse(
+            any(
+                "prior-generation" in warning
+                for warning in second_plan.get("warnings", [])
+            ),
+            "a malformed record must never be pruned as terminal history",
+        )
+
     def test_prior_generation_skipped_records_are_pruned_as_terminal(
         self,
     ) -> None:

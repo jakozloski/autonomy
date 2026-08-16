@@ -429,7 +429,7 @@ Before posting ANY content to PRs, comments, or logs (including the Prompt Trail
 - OpenAI / Codex key: `sk-((proj|svcacct)-)?[A-Za-z0-9_-]{20,}`
 - Anthropic key: `sk-ant-[A-Za-z0-9_-]{40,}`
 - JWT: `eyJ[A-Za-z0-9_\-=]{10,}\.eyJ[A-Za-z0-9_\-=]{10,}\.[A-Za-z0-9_\-=]+`
-- Password assignment (label-anchored, covers `DB_PASSWORD`-style names): `(?i)[\w-]*password["']?\s*[:=]\s*["']?[^\s"']{8,}`; Cookie/Set-Cookie header value: `(?i)\b(Set-)?Cookie:\s*[^\s;=]+=[^\s;]{8,}`
+- Password assignment (label-anchored; quoted values redact whole, so multi-word secrets never leak a suffix): `(?i)[\w-]*password["']?\s*[:=]\s*("[^"\r\n]{4,}"|'[^'\r\n]{4,}'|[^\s"']{8,})`; Cookie/Set-Cookie header (whole remainder — a short first pair must not expose later pairs): `(?i)\b(Set-)?Cookie:[^\r\n]{8,}`
 - Stripe live secret/restricted key: `(sk|rk)_live_[A-Za-z0-9]{16,}`; PEM private-key block (multi-line, any armor label): `-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----`
 - GCP API key: `AIza[0-9A-Za-z_-]{35}`; GCP OAuth access token: `ya29\.[A-Za-z0-9_-]{20,}`
 
