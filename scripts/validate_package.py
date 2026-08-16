@@ -492,6 +492,34 @@ REQUIRED_REDACTION_PATTERNS = {
         r"""(?i)\b(Set-)?Cookie:\s*[^\s;=]+=[^\s;]{8,}""",
         ("Cookie: " + "session=abcdef12345678", "Set-Cookie: " + "sid=0123456789abcdef"),
     ),
+    # algo#1216 R2 round-7 finding 3788363460: Keeper's own credential
+    # formats (Stripe live keys, GCP API keys / OAuth tokens, PEM private
+    # keys) had no enforced pattern — synthetic samples survived
+    # bounded_excerpt unchanged. All four are format-anchored per the
+    # doc's stated design rule. Fixtures are split literals so the
+    # fixtures themselves never trip push-protection secret scanners.
+    "stripe_live_key": (
+        r"(sk|rk)_live_[A-Za-z0-9]{16,}",
+        (
+            "sk" + "_live_" + "abcdefghijklmnop0123",
+            "rk" + "_live_" + "ABCDEFGHIJKLMNOP0123",
+        ),
+    ),
+    "gcp_api_key": (
+        r"AIza[0-9A-Za-z_-]{35}",
+        ("AIza" + "Sy" + "A" * 33,),
+    ),
+    "gcp_oauth_access_token": (
+        r"ya29\.[A-Za-z0-9_-]{20,}",
+        ("ya29" + ".a0AbCdEfGh0123456789_-x",),
+    ),
+    "pem_private_key_block": (
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
+        (
+            "-----BEGIN " + "PRIVATE KEY-----\nMIIEfakefakefakefake\n-----END " + "PRIVATE KEY-----",
+            "-----BEGIN " + "RSA PRIVATE KEY-----\nMIIEfakefakefakefake\n-----END " + "RSA PRIVATE KEY-----",
+        ),
+    ),
     "anthropic_key": (
         r"sk-ant-[A-Za-z0-9_-]{40,}",
         ("sk-" + "ant-abcdefghijklmnopqrstuvwxyz_1234567890-ABCDE",),

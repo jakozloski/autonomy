@@ -1479,6 +1479,67 @@ class MergeReadinessTests(unittest.TestCase):
             any("claims_audit.audited" in error for error in result["errors"])
         )
 
+
+    _BACKFILL_TMPL = "\n".join(
+        (
+            "  backfill:",
+            "    match_scores:",
+            "      required: REQ",
+            '      state: "ST"',
+            "      evidence: null",
+        )
+    )
+
+    def _with_backfill(self, required: str, state: str) -> str:
+        block = self._BACKFILL_TMPL.replace("REQ", required).replace("ST", state)
+        return _mutate(
+            self._with_blocks(),
+            '  ac_conformance: "pending"',
+            '  ac_conformance: "pending"\n' + block,
+        )
+
+    def test_required_backfill_rejects_n_a_state(self) -> None:
+        # algo#1216 R2 finding 3788363458: required: true + state: n_a
+        # validated with zero errors and derived merge_readiness_hold: false,
+        # silently releasing the deploy hold this gate exists to keep.
+        text = self._with_backfill("true", "n_a")
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any(
+                "a REQUIRED backfill cannot be" in error
+                for error in result["errors"]
+            )
+        )
+
+    def test_optional_backfill_n_a_stays_valid_without_hold(self) -> None:
+        # The legitimate n_a shape: not required. Guard must pass it through.
+        text = self._with_backfill("false", "n_a")
+        result = evaluate_state_text(text)
+        self.assertEqual(result["errors"], [])
+        self.assertFalse(monitor_extract(text)["merge_readiness_hold"])
+
+    def test_backfill_hold_derives_from_required_and_not_complete(self) -> None:
+        # Defensive derivation (same finding): required && state != complete
+        # holds — including the contradictory n_a shape validation rejects,
+        # so a stale/invalid doc still never reads as merge-ready.
+        for state, expected_hold in (
+            ("pending", True),
+            ("n_a", True),
+            ("complete", False),
+        ):
+            with self.subTest(state=state):
+                text = self._with_backfill("true", state)
+                if state == "complete":
+                    text = _mutate(
+                        text,
+                        "      evidence: null",
+                        '      evidence: "verified: 0 NULL rows (query link)"',
+                    )
+                self.assertIs(
+                    monitor_extract(text)["merge_readiness_hold"], expected_hold
+                )
+
     def test_dependencies_enum_accepts_check_2_completed_outcomes(self) -> None:
         # 28e13163ef: hazard_documented (merged-but-not-live, ordering
         # documented) and unverified (control plane / unreadable live state)

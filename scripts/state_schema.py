@@ -2303,6 +2303,14 @@ class _Validator:
                             f"{bf_path}.evidence: a required backfill marked"
                             " complete must name its verification evidence"
                         )
+                    # algo#1216 finding 3788363458: required + n_a is a
+                    # contradiction that silently released the deploy hold.
+                    if required is True and record.get("state") == "n_a":
+                        self.error(
+                            f"{bf_path}.state: a REQUIRED backfill cannot be"
+                            " n_a — mark it pending until verified complete,"
+                            " or set required: false with the rationale"
+                        )
         if "claims_audit" in value:
             audit = value.get("claims_audit")
             if not isinstance(audit, dict):
@@ -2845,8 +2853,11 @@ def monitor_extract(text: str) -> dict[str, Any]:
                 if (
                     isinstance(record, dict)
                     and record.get("required") is True
-                    and record.get("state") == "pending"
+                    and record.get("state") != "complete"
                 ):
+                    # Defensive derivation (3788363458): anything required
+                    # and not verified complete holds — including the
+                    # contradictory n_a shape validation now rejects.
                     hold = True
         # algo#1216 R2 finding 3787662319: a documented merged-but-not-live
         # dependency holds the clean exits unconditionally (not direction-

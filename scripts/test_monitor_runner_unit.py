@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import argparse
 import pathlib
+import shutil
+import tempfile
 import sys
 import unittest
 from pathlib import Path
@@ -72,6 +74,110 @@ _HELPER_RUNNERS: list[Runner] = []
 def tearDownModule() -> None:  # noqa: N802 — unittest hook name
     for helper_runner in _HELPER_RUNNERS:
         helper_runner.cleanup_wrapper_stage()
+
+
+class LaunchSnapshotClearingTests(unittest.TestCase):
+    """admin#1495 finding 3790049904 / algo#1216 finding 3788363456.
+
+    ``charge_failure`` and ``_clear_in_flight`` commit canonical state with
+    ``in_flight`` cleared; the launch snapshot MUST be dropped in the same
+    step. Pre-fix it was retained, so the next PRE-launch charge (a
+    ``spawn_failed`` before any new launch commit) compared moved-on
+    canonical state against the stale snapshot and raised a false
+    ``suspect_state`` instead of following bounded retry accounting. The
+    reproduced two-failure sequence is pinned here in-process (no child,
+    no subprocess: the schema CLI is stubbed; every other seam is real)."""
+
+    class _StubSchema:
+        """Stands in for the schema CLI only. ``extract`` is consulted
+        exclusively by the pre-commit canonical recheck, so the call count
+        doubles as the assertion that the recheck ran (or was skipped)."""
+
+        def __init__(self) -> None:
+            self.queued: list[dict] = []
+            self.calls = 0
+
+        def extract(self, path: object) -> dict:
+            self.calls += 1
+            return self.queued.pop(0)
+
+    def _state_runner(self) -> Runner:
+        tmp = Path(tempfile.mkdtemp(prefix="unit-launch-snapshot-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        state = tmp / "state.md"
+        state.write_text(
+            "---\nstate_schema_version: 1\n---\n\nbody\n", encoding="utf-8"
+        )
+        args = argparse.Namespace(
+            state_file=str(state),
+            skill_dir=str(SCRIPTS.parent),
+            claude_bin="claude",
+            schema_cli=str(SCRIPTS / "state_schema.py"),
+            slice_budget=100.0,
+            wait_scale=1.0,
+            acknowledge_taint=None,
+        )
+        runner = Runner(args)
+        _HELPER_RUNNERS.append(runner)
+        runner.owner_model = "claude-opus-5"
+        runner.owner_effort = None
+        return runner
+
+    def _launched(self, runner: Runner) -> tuple[dict, "LaunchSnapshotClearingTests._StubSchema"]:
+        launch_block = runner.current_block({})
+        launch_block["in_flight"] = {"attempt_id": "a" * 32}
+        stub = self._StubSchema()
+        runner.schema = stub
+        # As the launch commit records it, and as the healthy mid-tick
+        # recheck will re-read it: canonical still byte-true to the snapshot.
+        runner.launch_block = dict(launch_block)
+        runner.launch_base_digest = "digest-1"
+        stub.queued.append(
+            {"monitor_cli": dict(launch_block), "digest": "digest-1"}
+        )
+        return launch_block, stub
+
+    def test_charged_failure_drops_snapshot_and_pre_launch_charge_retries(
+        self,
+    ) -> None:
+        runner = self._state_runner()
+        launch_block, stub = self._launched(runner)
+        runner.charge_failure(
+            {"monitor_cli": dict(launch_block)}, "monitor-child:die_late"
+        )
+        # THE mechanism: the snapshot dies with the in_flight clear.
+        self.assertIsNone(runner.launch_block)
+        self.assertIsNone(runner.launch_base_digest)
+        self.assertEqual(stub.calls, 1)
+        # Next tick, spawn fails BEFORE any launch commit. Canonical has
+        # legitimately moved past the old snapshot (in_flight nulled); the
+        # queued entry is what a stale-snapshot compare would have read —
+        # pre-fix this call raised RunnerExit(4, "suspect_state").
+        post_commit = dict(launch_block)
+        post_commit["in_flight"] = None
+        stub.queued.append({"monitor_cli": post_commit, "digest": "digest-2"})
+        runner.charge_failure(
+            {"monitor_cli": dict(post_commit)}, "monitor-child:spawn_failed"
+        )
+        self.assertEqual(stub.calls, 1)  # no snapshot -> recheck skipped
+        self.assertEqual(
+            runner.consecutive_signature, "monitor-child:spawn_failed"
+        )
+        self.assertEqual(runner.consecutive_count, 1)
+        self.assertEqual(
+            [entry["signature"] for entry in runner.failures],
+            ["monitor-child:die_late", "monitor-child:spawn_failed"],
+        )
+        # Both charges committed real state writes through the splice path.
+        self.assertIn("monitor_cli:", runner.read_text())
+
+    def test_clear_in_flight_drops_snapshot_too(self) -> None:
+        runner = self._state_runner()
+        launch_block, stub = self._launched(runner)
+        runner._clear_in_flight({"monitor_cli": dict(launch_block)})
+        self.assertIsNone(runner.launch_block)
+        self.assertIsNone(runner.launch_base_digest)
+        self.assertEqual(stub.calls, 1)
 
 
 class WrapperStagingTests(unittest.TestCase):

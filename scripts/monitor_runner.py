@@ -1033,6 +1033,13 @@ class Runner:
         block = self.current_block(extract)
         block["in_flight"] = None
         self.commit_block(block)
+        # admin#1495 finding 3790049904 / algo#1216 finding 3788363456: once
+        # canonical in_flight is cleared, the launch snapshot is history — a
+        # later pre-launch charge comparing canonical against the stale
+        # snapshot raised a FALSE suspect_state ("unknown writer") instead of
+        # following the bounded retry policy.
+        self.launch_block = None
+        self.launch_base_digest = None
         if self.consecutive_count >= MONITOR_CHILD_FAILURE_LIMIT:
             raise RunnerExit(
                 5,
@@ -1581,6 +1588,10 @@ class Runner:
         # reloads the stale id and repeats the failed resume.
         block["child_session_id"] = self.child_session_id
         self.commit_block(block)
+        # Same stale-snapshot clearing as charge_failure (findings
+        # 3790049904 / 3788363456).
+        self.launch_block = None
+        self.launch_base_digest = None
 
 
     def _require_unmutated_canonical(

@@ -430,10 +430,10 @@ Before posting ANY content to PRs, comments, or logs (including the Prompt Trail
 - Anthropic key: `sk-ant-[A-Za-z0-9_-]{40,}`
 - JWT: `eyJ[A-Za-z0-9_\-=]{10,}\.eyJ[A-Za-z0-9_\-=]{10,}\.[A-Za-z0-9_\-=]+`
 - Password assignment (label-anchored, covers `DB_PASSWORD`-style names): `(?i)[\w-]*password["']?\s*[:=]\s*["']?[^\s"']{8,}`; Cookie/Set-Cookie header value: `(?i)\b(Set-)?Cookie:\s*[^\s;=]+=[^\s;]{8,}`
+- Stripe live secret/restricted key: `(sk|rk)_live_[A-Za-z0-9]{16,}`; PEM private-key block (multi-line, any armor label): `-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----`
+- GCP API key: `AIza[0-9A-Za-z_-]{35}`; GCP OAuth access token: `ya29\.[A-Za-z0-9_-]{20,}`
 
-**Action on match:** redact and proceed. Do NOT BLOCK the workflow on detection — that would make the skill unusable on PRs that happen to discuss credentials in comments. Log the redaction count in `attempt_log` as `redaction:<kind>:<count>` for audit.
-
-**Not in scope:** broad patterns like "any 40-character base64 string" or "any value preceded by 'secret'" — too many false positives on legitimate hashes, blob IDs, or unrelated content.
+**Action on match:** redact and proceed. Do NOT BLOCK the workflow on detection — that would make the skill unusable on PRs that happen to discuss credentials in comments. Log the redaction count in `attempt_log` as `redaction:<kind>:<count>` for audit. **Not in scope:** broad patterns like "any 40-character base64 string" or "any value preceded by 'secret'" — too many false positives on legitimate hashes, blob IDs, or unrelated content.
 
 ---
 
