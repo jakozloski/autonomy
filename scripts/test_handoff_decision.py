@@ -553,6 +553,104 @@ class HandoffDecisionTest(unittest.TestCase):
             ],
         )
 
+    def test_qa_code_reviewers_mint_write_ahead_request_operations(
+        self,
+    ) -> None:
+        # R2 #3551 finding 3737466462: the post-flip reviewer request had no
+        # write-ahead record — a crash between the ready flip and the request
+        # lost it with nothing for resume to replay. Routed code reviewers
+        # now mint request+verify operations (roundtrip's shapes) ahead of
+        # the assignee replacement. Reviewer identity is embedded in each
+        # operation id, so qa_generation needs no digest change: shared ops
+        # (assignee replace/verify) are content-identical across reviewer
+        # sets.
+        request = {
+            "scenario": "approved_qa",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+            "existing_assignees": ["jakozloski"],
+            "code_reviewers": ["motykadaw", "Motykadaw"],  # dedup, casefold
+            "issue_tracker": {
+                "type": "linear",
+                "qa_assignee": LINEAR_QA_ASSIGNEE,
+                "qa_state": LINEAR_QA_STATE_WEB,
+                "ticket_identifier": "WEB-8877",
+                "ticket_provider_id": "linear-ticket-web-8877",
+                "ticket_validated": True,
+                "write_path": "environment_tool",
+            },
+        }
+        plan = plan_handoff(request)
+        self.assertEqual(plan["state"], "pending")
+        self.assertEqual(plan["targets"]["reviewers"], ["motykadaw"])
+        ids = [operation["id"] for operation in plan["operations"]]
+        request_ids = [i for i in ids if ".request_review:" in i]
+        verify_ids = [i for i in ids if ".verify_review_request:" in i]
+        self.assertEqual(len(request_ids), 1)
+        self.assertEqual(len(verify_ids), 1)
+        self.assertIn("qa.github.request_review:motykadaw:g", request_ids[0])
+        by_id = {operation["id"]: operation for operation in plan["operations"]}
+        self.assertEqual(
+            by_id[verify_ids[0]]["depends_on"], [request_ids[0]]
+        )
+        replace_id = next(i for i in ids if "replace_assignees" in i)
+        self.assertEqual(
+            by_id[replace_id]["depends_on"], verify_ids,
+            "assignee replacement must wait for the reviewer request",
+        )
+
+    def test_qa_without_code_reviewers_plans_no_request_operations(
+        self,
+    ) -> None:
+        # Pass-through side: repos without routed reviewers keep the exact
+        # pre-existing plan shape.
+        request = {
+            "scenario": "approved_qa",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+            "existing_assignees": ["jakozloski"],
+            "issue_tracker": {
+                "type": "linear",
+                "qa_assignee": LINEAR_QA_ASSIGNEE,
+                "qa_state": LINEAR_QA_STATE_WEB,
+                "ticket_identifier": "WEB-8877",
+                "ticket_provider_id": "linear-ticket-web-8877",
+                "ticket_validated": True,
+                "write_path": "environment_tool",
+            },
+        }
+        plan = plan_handoff(request)
+        self.assertEqual(plan["state"], "pending")
+        self.assertEqual(plan["targets"]["reviewers"], [])
+        ids = [operation["id"] for operation in plan["operations"]]
+        self.assertFalse([i for i in ids if "request_review" in i])
+        by_id = {operation["id"]: operation for operation in plan["operations"]}
+        replace_id = next(i for i in ids if "replace_assignees" in i)
+        self.assertEqual(by_id[replace_id]["depends_on"], [])
+
+    def test_qa_invalid_code_reviewer_login_blocks(self) -> None:
+        request = {
+            "scenario": "approved_qa",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+            "existing_assignees": ["jakozloski"],
+            "code_reviewers": ["not a login!"],
+            "issue_tracker": {
+                "type": "linear",
+                "qa_assignee": LINEAR_QA_ASSIGNEE,
+                "qa_state": LINEAR_QA_STATE_WEB,
+                "ticket_identifier": "WEB-8877",
+                "ticket_provider_id": "linear-ticket-web-8877",
+                "ticket_validated": True,
+                "write_path": "environment_tool",
+            },
+        }
+        plan = plan_handoff(request)
+        self.assertEqual(plan["state"], "blocked")
+        self.assertTrue(
+            any("valid GitHub logins" in error for error in plan["errors"])
+        )
+
     def test_clean_unapproved_plans_the_same_qa_handoff_as_approved(self) -> None:
         # QA handoff fires at the FIRST clean exit: the clean-but-unapproved
         # paused exit plans the identical operations as the approved exit —

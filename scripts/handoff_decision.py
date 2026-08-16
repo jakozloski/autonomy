@@ -268,23 +268,81 @@ def _approved_qa_operations(
     github_login = owner["github_login"]
     linear_name = owner["linear_name"]
     generation = qa_generation(request)
+    # R2 #3551 finding 3737466462: the post-flip reviewer request needed the
+    # same write-ahead/replay coverage as the roundtrip scenario — a crash
+    # between the ready flip and the reviewer request otherwise loses the
+    # request with no ledger record for resume to replay. The caller passes
+    # the routed code reviewers (judgment stays with the workflow's routing
+    # rules); each mints request+verify operations ahead of the assignee
+    # replacement, mirroring roundtrip's shapes.
+    raw_code_reviewers = request.get("code_reviewers", [])
+    code_reviewers: list[str] = []
+    reviewer_errors: list[str] = []
+    if not isinstance(raw_code_reviewers, list):
+        reviewer_errors.append("code_reviewers must be a list of logins")
+    else:
+        for login in raw_code_reviewers:
+            if not isinstance(login, str) or GITHUB_LOGIN.fullmatch(login) is None:
+                reviewer_errors.append(
+                    "code_reviewers entries must be valid GitHub logins"
+                )
+                break
+            if login.casefold() not in {
+                seen.casefold() for seen in code_reviewers
+            }:
+                code_reviewers.append(login)
     targets = {
         "assignees": [github_login],
-        "reviewers": [],
+        "reviewers": list(code_reviewers),
         "linear_assignee": None,
     }
-    operations = [
+    operations = []
+    reviewer_verification_ids: list[str] = []
+    previous_operation_id: str | None = None
+    for login in code_reviewers:
+        identity = login.casefold()
+        request_id = f"qa.github.request_review:{identity}:g{generation}"
+        verify_id = (
+            f"qa.github.verify_review_request:{identity}:g{generation}"
+        )
+        operations.append(
+            _github_operation(
+                request_id,
+                "request_pull_request_review",
+                name_with_owner,
+                pull_request_number,
+                depends_on=(
+                    [previous_operation_id]
+                    if previous_operation_id is not None
+                    else []
+                ),
+                reviewer=login,
+            )
+        )
+        operations.append(
+            _github_operation(
+                verify_id,
+                "verify_pull_request_review_request",
+                name_with_owner,
+                pull_request_number,
+                depends_on=[request_id],
+                expected_reviewer=login,
+            )
+        )
+        reviewer_verification_ids.append(verify_id)
+        previous_operation_id = verify_id
+    operations.append(
         _github_operation(
             f"qa.github.replace_assignees:g{generation}",
             "replace_pull_request_assignees",
             name_with_owner,
             pull_request_number,
-            depends_on=[],
+            depends_on=list(reviewer_verification_ids),
             # This is the complete desired set, not an additive update.  Stale
             # assignees supplied by GitHub are intentionally absent.
             assignees=[github_login],
         )
-    ]
+    )
     operations.append(
         _github_operation(
             f"qa.github.verify_assignees:g{generation}",
@@ -295,7 +353,7 @@ def _approved_qa_operations(
             expected_assignees=[github_login],
         )
     )
-    errors: list[str] = []
+    errors: list[str] = list(reviewer_errors)
     advisory_warnings: list[str] = []
 
     issue_tracker = request.get("issue_tracker", {})
