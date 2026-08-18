@@ -37,8 +37,88 @@ SCHEMA_VERSION = 1
 APPROVED_QA = "approved_qa"
 CLEAN_UNAPPROVED = "clean_unapproved"
 HUMAN_REVIEW_ROUNDTRIP = "human_review_roundtrip"
-SCENARIOS = {APPROVED_QA, CLEAN_UNAPPROVED, HUMAN_REVIEW_ROUNDTRIP}
+REVIEWER_REQUEST = "reviewer_request"
+SCENARIOS = {
+    APPROVED_QA,
+    CLEAN_UNAPPROVED,
+    HUMAN_REVIEW_ROUNDTRIP,
+    REVIEWER_REQUEST,
+}
 GITHUB_LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?")
+# Post-merge codex F3 + pass-3 codex F4: a prunable prior-generation id
+# must match the COMPLETE grammar `family(:identity)?:g<12-hex>` - not
+# merely end in the digest tail. A tail-only check let an extra-segment id
+# like `qa.linear.assign_ticket:gBAD:g<hex>` prune as history while the
+# real mutation re-queued. \Z, not $: a stray trailing newline would
+# satisfy $ and launder a CURRENT completed id as history (replay).
+GENERATION_SCOPED_ID = re.compile(
+    r"(?P<family>[a-z_]+(?:\.[a-z_]+)+)"
+    r"(?::(?P<identity>[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?))?"
+    r":g[0-9a-f]{12}\Z"
+)
+
+
+# Static per-scenario family vocabularies for the prior-generation sweeps.
+# CR 3760683938 requires that prunable history name a family the scenario
+# MINTS - deriving that set from the current plan's ids broke down once
+# reviewer turnover could legitimately empty a family (a prior round's
+# request_review records must still prune when the new round routes no
+# reviewer), so the vocabulary is the scenario's static mint surface.
+# Maps family -> whether the id carries a per-reviewer identity segment.
+# Pass-4 codex F1: identity must be ARITY-CHECKED per family, not globally
+# optional - `qa.github.replace_assignees:bogus:g<current>` parsed as a
+# well-formed id under the optional grammar and pruned as history while
+# the real operation re-queued.
+QA_OPERATION_FAMILIES = {
+    "qa.github.replace_assignees": False,
+    "qa.github.verify_assignees": False,
+    "qa.github.request_review": True,
+    "qa.github.verify_review_request": True,
+    "qa.linear.verify_ticket_binding": False,
+    "qa.linear.assign_ticket": False,
+    "qa.linear.verify_ticket_assignee": False,
+    "qa.linear.set_ticket_state": False,
+    "qa.linear.verify_ticket_state": False,
+    "qa.linear.record_unavailable": False,
+    "qa.linear.record_state_unavailable": False,
+}
+REVIEWER_REQUEST_FAMILIES = {
+    "reviewer.github.request_review": True,
+    "reviewer.github.verify_review_request": True,
+    "reviewer.github.replace_assignees": False,
+    "reviewer.github.verify_assignees": False,
+}
+ROUNDTRIP_FAMILIES = {
+    "roundtrip.github.request_review": True,
+    "roundtrip.github.verify_review_request": True,
+    "roundtrip.github.replace_assignees": False,
+    "roundtrip.github.verify_assignees": False,
+}
+
+
+def parsed_generation_family(
+    operation_id: str, vocabulary: dict[str, bool]
+) -> str | None:
+    """Family of a well-formed generation-scoped id, else ``None``.
+
+    The sweeps prune a record as prior-generation history ONLY when this
+    returns a family the scenario mints AND the id's identity segment
+    matches that family's arity (pass-4 codex F1): a surplus identity on
+    an identity-free family, a missing identity on a per-reviewer family,
+    a wrong digest shape, extra segments, uppercase identity, or a
+    trailing newline all stay unknown-ID errors downstream.
+    """
+
+    match = GENERATION_SCOPED_ID.fullmatch(operation_id)
+    if match is None:
+        return None
+    family = match.group("family")
+    requires_identity = vocabulary.get(family)
+    if requires_identity is None:
+        return None
+    if (match.group("identity") is not None) != requires_identity:
+        return None
+    return family
 # Git accepts unambiguous abbreviated object IDs. Require at least seven hex
 # characters while allowing full SHA-1 and SHA-256 object IDs.
 GIT_OBJECT_ID = re.compile(r"[0-9a-fA-F]{7,64}")
@@ -182,7 +262,7 @@ def _repository_and_pr(
         errors.append("pull_request_number must be a positive integer")
         pull_request_number = None
 
-    if scenario == HUMAN_REVIEW_ROUNDTRIP:
+    if scenario in (HUMAN_REVIEW_ROUNDTRIP, REVIEWER_REQUEST):
         actor = request.get("authenticated_actor")
         if not isinstance(actor, str) or GITHUB_LOGIN.fullmatch(actor) is None:
             errors.append("authenticated_actor must be a valid GitHub login")
@@ -234,6 +314,15 @@ def qa_generation(request: dict[str, Any]) -> str:
     Malformed segments hash as ``None`` — the planner's own validation
     rejects them separately; this digest only has to CHANGE when a target
     changes.
+
+    ``plan_version`` is a plan-SHAPE component (post-fix review F1 of R2
+    round-3 finding 3774514905): inserting ``verify_ticket_binding`` into
+    the chain changed the operation set without changing the targets, so a
+    ledger persisted by the previous plan shape kept the same digest and
+    hit the prefix rule as an opaque generic error. Bumping the version
+    re-mints the IDs instead, so pre-upgrade ledgers take the DOCUMENTED
+    prior-generation path: terminal records pruned with a warning, an
+    in-flight record failing closed with the recovery named.
     """
 
     repository = request.get("repository")
@@ -252,7 +341,15 @@ def qa_generation(request: dict[str, Any]) -> str:
     qa_assignee = qa_assignee if isinstance(qa_assignee, dict) else {}
     qa_state = tracker.get("qa_state")
     qa_state = qa_state if isinstance(qa_state, dict) else {}
+    # Post-merge pass-3 codex F3 / opus F1: code_reviewers ALTER the minted
+    # operation set (per-reviewer request/verify ids), so they are a plan
+    # target and must move the digest - otherwise a reviewer change keeps
+    # the old generation, the prior round's identity-bearing ids are
+    # neither current nor prunable, and resume hard-blocks on unknown IDs.
+    # Normalized exactly like the operation ids (casefolded, deduped,
+    # sorted) so raw-case spelling differences never re-mint a plan.
     payload = {
+        "plan_version": 2,
         "nameWithOwner": name_with_owner,
         "pull_request_number": pull_request_number,
         "github_login": owner["github_login"] if owner else None,
@@ -295,6 +392,13 @@ def _approved_qa_operations(
     raw_code_reviewers = request.get("code_reviewers", [])
     code_reviewers: list[str] = []
     reviewer_errors: list[str] = []
+    # Post-merge pass-3 opus F3: mirror _reviewer_request_operations' actor
+    # guard - GitHub 422s a self-request into a permanent ledger failure.
+    # The QA handoff must still transfer ownership, so the actor is
+    # FILTERED (not blocked) and the drop is surfaced as a plan warning by
+    # the caller-visible targets delta.
+    actor = request.get("authenticated_actor")
+    actor_identity = actor.casefold() if isinstance(actor, str) else None
     if not isinstance(raw_code_reviewers, list):
         reviewer_errors.append("code_reviewers must be a list of logins")
     else:
@@ -304,6 +408,8 @@ def _approved_qa_operations(
                     "code_reviewers entries must be valid GitHub logins"
                 )
                 break
+            if login.casefold() == actor_identity:
+                continue
             if login.casefold() not in {
                 seen.casefold() for seen in code_reviewers
             }:
@@ -498,20 +604,47 @@ def _approved_qa_operations(
             "name": linear_name,
         }
 
+        # R2 round-3 finding 3774514905: the planner is a pure function, so
+        # the EXECUTION boundary owns ticket identity — before the first
+        # tracker mutation, the executor RESOLVES the identifier through
+        # the authorized path (the broker is identifier-keyed) and
+        # confirms the broker-resolved ticket is the validated one: its
+        # true provider id equals expected_ticket_provider_id and the
+        # ticket links THIS PR, at fetch time. A mismatch fails this read-only operation, and the
+        # dependency cascade renders every Linear mutation below it
+        # skipped_dependency — a stale or re-keyed provider ID can never
+        # reach an unrelated ticket.
+        binding_id = f"qa.linear.verify_ticket_binding:g{generation}"
+        operations.append(
+            {
+                "id": binding_id,
+                "service": "linear",
+                "action": "verify_ticket_binding",
+                "depends_on": [f"qa.github.verify_assignees:g{generation}"],
+                "payload": {
+                    "ticket_identifier": ticket_identifier,
+                    "expected_ticket_provider_id": ticket_provider_id,
+                    "expected_repository": name_with_owner,
+                    "expected_pull_request_number": pull_request_number,
+                    "write_path": write_path,
+                },
+            }
+        )
         operations.append(
             {
                 "id": f"qa.linear.assign_ticket:g{generation}",
                 "service": "linear",
                 "action": "assign_ticket",
-                "depends_on": [f"qa.github.verify_assignees:g{generation}"],
+                "depends_on": [binding_id],
                 # algo#1216 finding 3792942223: the managed broker resolves
                 # the IDENTIFIER and mutates that ticket — it exposes no
                 # expected-provider-id precondition, so a provider id in a
                 # MUTATION payload is a decoy implying a binding nothing
                 # enforces. Mutations are keyed by identifier alone; the
-                # recorded provider id moves to the VERIFY ops, where the
-                # postcondition re-fetch compares the broker-resolved
-                # ticket's true id and fails loudly on mismatch.
+                # recorded provider id moves to the VERIFY ops (and to the
+                # PRE-mutation verify_ticket_binding read above, which
+                # fetches by identifier and compares the broker-resolved
+                # id), where mismatch fails loudly.
                 "payload": {
                     "ticket_identifier": ticket_identifier,
                     "assignee_id": linear_provider_id,
@@ -877,6 +1010,161 @@ def roundtrip_generation(
     )
 
 
+def reviewer_request_generation(
+    name_with_owner: str,
+    pull_request_number: int,
+    reviewers: list[str],
+    ball_holder: str,
+) -> str:
+    """Digest of the targets a reviewer-request plan mutates.
+
+    R2 round-3 finding 3774515577: the draft-flip / R2-satisfaction
+    reviewer request had no write-ahead record, so a crash between the
+    flip and the request lost the request silently. These operations get
+    the same target-digest treatment as the QA handoff: the digest covers
+    repository, PR, the sorted reviewer set, and the ball-holder, so a
+    ledger persisted for different targets never satisfies the current
+    plan, while an unchanged round resumes its own pending operations.
+    Unlike ``roundtrip_generation`` this digests TARGETS, not feedback
+    evidence — at flip time no reviewer feedback exists yet. Scope: the
+    NON-KEEPER draft-flip moment only — in Keeper repositories the
+    R2-satisfied handback runs through the QA plan's ``code_reviewers``
+    ledger (admin#1495 finding 3791925155), never this scenario.
+    """
+
+    payload = {
+        "nameWithOwner": name_with_owner,
+        "pull_request_number": pull_request_number,
+        "reviewers": sorted(login.casefold() for login in reviewers),
+        "ball_holder": ball_holder.casefold(),
+    }
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), default=str
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+
+
+def _reviewer_request_operations(
+    request: dict[str, Any],
+    name_with_owner: str,
+    pull_request_number: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[str]]:
+    block = request.get("reviewer_requests")
+    targets: dict[str, Any] = {
+        "assignees": [],
+        "reviewers": [],
+        "linear_assignee": None,
+    }
+    if not isinstance(block, dict):
+        return targets, [], ["reviewer_requests must be an object"]
+    raw_reviewers = block.get("reviewers")
+    if not isinstance(raw_reviewers, list) or not raw_reviewers:
+        return targets, [], [
+            "reviewer_requests.reviewers must be a non-empty list of logins"
+        ]
+    # Post-fix review F3/F4: the actor can never be asked to review their
+    # own PR (the roundtrip path already excludes it — GitHub 422s a self
+    # request into a permanent ledger failure), and every login is
+    # canonicalized to its casefolded identity so the digest, payloads,
+    # and targets all describe the SAME spelling — GitHub logins are
+    # case-insensitive, and a raw-cased payload beside a casefolded digest
+    # broke both the digest's rebind promise and the exact-array
+    # verification.
+    actor_identity = str(request.get("authenticated_actor", "")).casefold()
+    seen: set[str] = set()
+    reviewers: list[str] = []
+    for login in raw_reviewers:
+        if not isinstance(login, str) or not GITHUB_LOGIN.fullmatch(login):
+            return targets, [], [
+                f"reviewer_requests.reviewers contains an invalid login: {login!r}"
+            ]
+        identity = login.casefold()
+        if identity == actor_identity:
+            return targets, [], [
+                "reviewer_requests.reviewers must not include the"
+                " authenticated actor"
+            ]
+        if identity in seen:
+            continue
+        seen.add(identity)
+        reviewers.append(identity)
+    reviewers.sort()
+    ball_holder_raw = block.get("ball_holder")
+    if (
+        not isinstance(ball_holder_raw, str)
+        or not GITHUB_LOGIN.fullmatch(ball_holder_raw)
+        or ball_holder_raw.casefold() not in seen
+    ):
+        return targets, [], [
+            "reviewer_requests.ball_holder must be one of the requested reviewers"
+        ]
+    ball_holder = ball_holder_raw.casefold()
+
+    targets["assignees"] = [ball_holder]
+    targets["reviewers"] = reviewers
+    generation = reviewer_request_generation(
+        name_with_owner, pull_request_number, reviewers, ball_holder
+    )
+    operations: list[dict[str, Any]] = []
+    verification_ids: list[str] = []
+    previous_operation_id: str | None = None
+    for login in reviewers:
+        identity = login.casefold()
+        request_id = f"reviewer.github.request_review:{identity}:g{generation}"
+        verify_id = (
+            f"reviewer.github.verify_review_request:{identity}:g{generation}"
+        )
+        operations.append(
+            _github_operation(
+                request_id,
+                "request_pull_request_review",
+                name_with_owner,
+                pull_request_number,
+                depends_on=(
+                    [previous_operation_id]
+                    if previous_operation_id is not None
+                    else []
+                ),
+                reviewer=login,
+            )
+        )
+        operations.append(
+            _github_operation(
+                verify_id,
+                "verify_pull_request_review_request",
+                name_with_owner,
+                pull_request_number,
+                depends_on=[request_id],
+                expected_reviewer=login,
+            )
+        )
+        verification_ids.append(verify_id)
+        previous_operation_id = verify_id
+
+    replace_id = f"reviewer.github.replace_assignees:g{generation}"
+    operations.append(
+        _github_operation(
+            replace_id,
+            "replace_pull_request_assignees",
+            name_with_owner,
+            pull_request_number,
+            depends_on=verification_ids,
+            assignees=[ball_holder],
+        )
+    )
+    operations.append(
+        _github_operation(
+            f"reviewer.github.verify_assignees:g{generation}",
+            "verify_pull_request_assignees",
+            name_with_owner,
+            pull_request_number,
+            depends_on=[replace_id],
+            expected_assignees=[ball_holder],
+        )
+    )
+    return targets, operations, []
+
+
 def _roundtrip_operations(
     request: dict[str, Any],
     name_with_owner: str,
@@ -1105,9 +1393,35 @@ def _apply_operation_state(
             if dependency in effective_failed
         )
         if not failed_dependencies:
+            # Pass-3 codex F5: a persisted skipped_dependency is a claim
+            # that a DECLARED dependency terminally failed. On a root (or
+            # any op whose dependencies all succeeded) that claim is
+            # fabricated - accepting it would cascade fake skips over the
+            # real plan. Fail closed instead.
+            if operation_id in canonical_skipped:
+                errors.append(
+                    f"operation {operation_id} cannot be skipped_dependency:"
+                    " no declared dependency terminally failed"
+                )
             continue
         detail = "dependency failed: " + ", ".join(failed_dependencies)
-        if operation_id in completed_all or operation_id in in_flight:
+        # Post-merge codex F2: a recorded `failed` on a descendant is just
+        # as impossible as a recorded `complete` - the executor stops at
+        # the first terminal failure, so ANY attempt evidence below one
+        # claims a mutation the planner never queued. Only the rendered
+        # skipped_dependency non-attempt is consistent. Local
+        # automatic_failure records are exempt: their `failed` IS the
+        # planner-derived outcome this module itself renders and callers
+        # legitimately persist on round-trip.
+        inconsistent_attempt = (
+            operation_id in completed_all
+            or operation_id in in_flight
+            or (
+                operation_id in canonical_failed
+                and "automatic_failure" not in spec
+            )
+        )
+        if inconsistent_attempt:
             errors.append(f"operation {operation_id} cannot have results: {detail}")
             continue
         if operation_id not in effective_failed:
@@ -1338,15 +1652,15 @@ def plan_handoff(request: Any) -> dict[str, Any]:
                     # operation family the current plan mints — a fabricated
                     # "qa.bogus:g..." id stays an unknown-ID error, never
                     # laundered as a prior-target record. admin#1495 finding
-                    # 3806647937: the compare is identity-INDEPENDENT (first
-                    # ":", matching the roundtrip sweep) — splitting at ":g"
-                    # kept the reviewer identity in the base, so a removed
-                    # reviewer's terminal request ops were never recognized
-                    # as stale and blocked every later generation as
-                    # permanent unknown IDs.
-                    if operation_id.split(":", 1)[0] not in {
-                        known.split(":", 1)[0] for known in known_ids
-                    }:
+                    # 3806647937: the compare is identity-INDEPENDENT — a
+                    # removed reviewer's terminal request ops must still be
+                    # recognized as stale. The full-grammar parser goes one
+                    # step further (pass-4 codex F1): it also enforces
+                    # per-family identity ARITY, so a surplus identity on an
+                    # identity-free family never launders as history either.
+                    if parsed_generation_family(
+                        operation_id, QA_OPERATION_FAMILIES
+                    ) is None:
                         continue
                     status = (
                         record.get("status")
@@ -1383,6 +1697,73 @@ def plan_handoff(request: Any) -> dict[str, Any]:
                         + ", ".join(sorted(stale_terminal))
                     )
                     plan["warnings"].extend(extra_warnings)
+                    return plan
+    elif scenario == REVIEWER_REQUEST:
+        targets, operations, errors = _reviewer_request_operations(
+            request, name_with_owner, pull_request_number
+        )
+        if not errors and operations:
+            # Same generation-turnover tolerance as the QA and roundtrip
+            # sweeps: a prior-TARGET ledger (different reviewers or ball
+            # holder) is that round's completed history — terminal records
+            # are pruned with a warning, an in-flight record marks a
+            # mutation that may already have fired remotely and fails
+            # closed. Non-reviewer IDs stay unknown-ID errors downstream.
+            raw_results = request.get("operation_results")
+            if isinstance(raw_results, dict):
+                _, shape_errors = _operation_results(request)
+                if shape_errors:
+                    return _blocked(scenario, *shape_errors)
+                known_ids = {operation["id"] for operation in operations}
+                stale_terminal = []
+                stale_in_flight = []
+                for operation_id, record in raw_results.items():
+                    if not isinstance(operation_id, str):
+                        continue
+                    if operation_id in known_ids:
+                        continue
+                    if not operation_id.startswith("reviewer."):
+                        continue
+                    if parsed_generation_family(
+                        operation_id, REVIEWER_REQUEST_FAMILIES
+                    ) is None:
+                        continue
+                    status = (
+                        record.get("status")
+                        if isinstance(record, dict)
+                        else None
+                    )
+                    if status in ("complete", "failed", "skipped_dependency"):
+                        stale_terminal.append(operation_id)
+                    else:
+                        stale_in_flight.append(operation_id)
+                if stale_in_flight:
+                    return _blocked(
+                        scenario,
+                        "prior-target reviewer-request operation(s) still"
+                        " in flight: "
+                        + ", ".join(sorted(stale_in_flight))
+                        + " - verify each mutation's postcondition and"
+                        " record a terminal result before planning the"
+                        " current targets",
+                    )
+                if stale_terminal:
+                    pruned = dict(request)
+                    pruned["operation_results"] = {
+                        operation_id: record
+                        for operation_id, record in raw_results.items()
+                        if operation_id not in set(stale_terminal)
+                    }
+                    plan = _apply_operation_state(
+                        scenario, targets, operations, pruned
+                    )
+                    plan["warnings"].append(
+                        "ignored "
+                        + str(len(stale_terminal))
+                        + " prior-target terminal reviewer-request"
+                        " record(s): "
+                        + ", ".join(sorted(stale_terminal))
+                    )
                     return plan
     else:
         targets, operations, errors = _roundtrip_operations(
@@ -1442,9 +1823,9 @@ def plan_handoff(request: Any) -> dict[str, Any]:
                     # match a family the current plan mints. Roundtrip ids
                     # carry per-reviewer identity (base:identity:gDIGEST), so
                     # compare on the leading dotted family name alone.
-                    if operation_id.split(":", 1)[0] not in {
-                        known.split(":", 1)[0] for known in known_ids
-                    }:
+                    if parsed_generation_family(
+                        operation_id, ROUNDTRIP_FAMILIES
+                    ) is None:
                         continue
                     status = (
                         record.get("status")

@@ -422,14 +422,13 @@ Before posting ANY content to PRs, comments, or logs (including the Prompt Trail
 
 - AWS access/session key: `(AKIA|ASIA)[0-9A-Z]{16}`
 - AWS secret value (label-anchored): `(?i)AWS_SECRET_ACCESS_KEY["']?\s*[:=]\s*["']?[A-Za-z0-9/+=]{40}["']?`; AWS session token (label-anchored): `(?i)AWS_SESSION_TOKEN["']?\s*[:=]\s*["']?[A-Za-z0-9/+=]{16,4096}["']?`
-- GitHub user/OAuth token: `gh[pour]_[A-Za-z0-9]{20,255}`; fine-grained PAT: `github_pat_[A-Za-z0-9_]{20,255}`
-- GitHub server token: `ghs_([A-Za-z0-9]{20,255}|[A-Za-z0-9]+_[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})`
+- GitHub user/OAuth token: `gh[pour]_[A-Za-z0-9]{20,255}`; fine-grained PAT: `github_pat_[A-Za-z0-9_]{20,255}`; server token: `ghs_([A-Za-z0-9]{20,255}|[A-Za-z0-9]+_[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})`
 - Authorization Bearer header: `(?i)Authorization:\s*Bearer\s+[A-Za-z0-9._~+/-]{8,}=*` — the header form model_policy.py's excerpt handling defers to this list; that deferral was previously a promise with no pattern behind it
 - Slack token: `xox[baprs]-[A-Za-z0-9-]{10,}`; Linear API key: `lin_api_[A-Za-z0-9_]{40,}`
 - OpenAI / Codex key: `sk-((proj|svcacct)-)?[A-Za-z0-9_-]{20,}`
 - Anthropic key: `sk-ant-[A-Za-z0-9_-]{40,}`
 - JWT: `eyJ[A-Za-z0-9_\-=]{10,}\.eyJ[A-Za-z0-9_\-=]{10,}\.[A-Za-z0-9_\-=]+`
-- Password assignment (label-anchored; quoted values redact whole, so multi-word secrets never leak a suffix): `(?i)[\w-]*password["']?\s*[:=]\s*("[^"\r\n]{4,}"|'[^'\r\n]{4,}'|[^\s"']{8,})`; Cookie/Set-Cookie header (whole remainder — a short first pair must not expose later pairs): `(?i)\b(Set-)?Cookie:[^\r\n]{8,}`
+- Password assignment (label-anchored; quoted values redact whole, so multi-word secrets never leak a suffix): `(?i)[\w-]*password["']?\s*[:=]\s*("(?:\\.|[^"\\\r\n]){4,}"|'(?:\\.|[^'\\\r\n]){4,}'|[^\s"']{8,})`; Cookie/Set-Cookie header (whole remainder — a short first pair must not expose later pairs): `(?i)\b(Set-)?Cookie:[^\r\n]{8,}`
 - Stripe live secret/restricted key: `(sk|rk)_live_[A-Za-z0-9]{16,}`; PEM private-key block (multi-line, any armor label): `-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----`
 - GCP API key: `AIza[0-9A-Za-z_-]{35}`; GCP OAuth access token: `ya29\.[A-Za-z0-9_-]{20,}`
 

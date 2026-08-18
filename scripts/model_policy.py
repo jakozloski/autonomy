@@ -503,7 +503,10 @@ REDACTION_PATTERNS: tuple[tuple[str, str], ...] = (
     ('github_fine_grained_pat', r"github_pat_[A-Za-z0-9_]{20,255}"),
     ('linear_api_key', r"lin_api_[A-Za-z0-9_]{40,}"),
     ('openai_key', r"sk-((proj|svcacct)-)?[A-Za-z0-9_-]{20,}"),
-    ('password_assignment', r"""(?i)[\w-]*password["']?\s*[:=]\s*("[^"\r\n]{4,}"|'[^'\r\n]{4,}'|[^\s"']{8,})"""),
+    # Pass-4 series codex F1 (PR #3551): quoted branches are escape-aware -
+    # a backslash-escaped quote inside the value must not terminate the
+    # match early and leak the remainder.
+    ('password_assignment', r"""(?i)[\w-]*password["']?\s*[:=]\s*("(?:\\.|[^"\\\r\n]){4,}"|'(?:\\.|[^'\\\r\n]){4,}'|[^\s"']{8,})"""),
     ('cookie_header_value', r"""(?i)\b(Set-)?Cookie:[^\r\n]{8,}"""),
     ('stripe_live_key', r"(sk|rk)_live_[A-Za-z0-9]{16,}"),
     ('gcp_api_key', r"AIza[0-9A-Za-z_-]{35}"),

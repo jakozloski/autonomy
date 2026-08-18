@@ -408,8 +408,7 @@ REQUIRED_REDACTION_PATTERNS = {
     # format-anchored Secret/Token Redaction" — but the pattern list had
     # no such pattern (a comment promising coverage that did not exist).
     # Slack tokens are equally format-anchored; both fit the doc's own
-    # stated design rule. Labeled passwords stay out of scope by that
-    # same rule (too many false positives), as the doc already records.
+    # stated design rule.
     "authorization_bearer_header": (
         r"(?i)Authorization:\s*Bearer\s+[A-Za-z0-9._~+/-]{8,}=*",
         (
@@ -486,19 +485,26 @@ REQUIRED_REDACTION_PATTERNS = {
         # CR 3787358691: quoted values redact the WHOLE quoted string —
         # the unquoted branch stops at whitespace, so a multi-word secret
         # ("correct horse battery staple") previously leaked its suffix.
-        r"""(?i)[\w-]*password["']?\s*[:=]\s*("[^"\r\n]{4,}"|'[^'\r\n]{4,}'|[^\s"']{8,})""",
+        # Pass-3 codex F1: the quoted branches are escape-aware - a
+        # backslash-escaped quote inside the value no longer terminates
+        # the match early and leaks the remainder.
+        r"""(?i)[\w-]*password["']?\s*[:=]\s*("(?:\\.|[^"\\\r\n]){4,}"|'(?:\\.|[^'\\\r\n]){4,}'|[^\s"']{8,})""",
         (
             "password=" + "SuperSecret99",
             "PASSWORD: " + "hunter2hunter2",
             "DB_PASSWORD=" + "prodsecret99",
             "MYSQL_PASSWORD: " + "hunter2hunter2",
             'PASSWORD="' + 'correct horse battery staple"',
+            'PASSWORD="' + 'correct \\"horse\\" battery staple"',
         ),
     ),
     "cookie_header_value": (
-        # CR 3787358691/3779091168: redact the whole header remainder — the
+        # CR 3787358691/3779091168 (converging with PR #3551 r2 3774515260
+        # + its pass-2 findings): redact the whole header remainder — the
         # old per-pair form let a short first pair (theme=x) expose the
-        # session token in a later pair.
+        # session token in a later pair, rejected quoted values, and its
+        # \s* separators crossed line endings. [^\r\n]{8,} handles all
+        # three at once and stays line-confined by construction.
         r"""(?i)\b(Set-)?Cookie:[^\r\n]{8,}""",
         (
             "Cookie: " + "session=abcdef12345678",

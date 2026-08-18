@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import sys
@@ -13,6 +14,7 @@ from handoff_decision import (
     QA_STATE_NAME_BY_TEAM,
     main,
     plan_handoff,
+    reviewer_request_generation,
     roundtrip_generation,
 )
 
@@ -211,11 +213,25 @@ class HandoffDecisionTest(unittest.TestCase):
             "waiting",
             [f"qa.github.replace_assignees:g{QA_G}"],
         )
+        binding = {
+            "id": f"qa.linear.verify_ticket_binding:g{QA_G}",
+            "service": "linear",
+            "action": "verify_ticket_binding",
+            "depends_on": [f"qa.github.verify_assignees:g{QA_G}"],
+            "payload": {
+                "ticket_identifier": "WEB-8877",
+                "expected_ticket_provider_id": "linear-ticket-web-8877",
+                "expected_repository": "Keeper-Dating/matchmaking",
+                "expected_pull_request_number": PR_NUMBER,
+                "write_path": "environment_tool",
+            },
+            "status": "waiting",
+        }
         linear = {
             "id": f"qa.linear.assign_ticket:g{QA_G}",
             "service": "linear",
             "action": "assign_ticket",
-            "depends_on": [f"qa.github.verify_assignees:g{QA_G}"],
+            "depends_on": [f"qa.linear.verify_ticket_binding:g{QA_G}"],
             "payload": {
                 "ticket_identifier": "WEB-8877",
                 "assignee_id": "4d5aed4e-076c-47e5-94a1-0a39287364e1",
@@ -281,6 +297,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 "operations": [
                     github,
                     verify_github,
+                    binding,
                     linear,
                     verify_linear,
                     set_state,
@@ -478,6 +495,7 @@ class HandoffDecisionTest(unittest.TestCase):
         request["operation_results"] = {
             f"qa.github.replace_assignees:g{g}": operation_result("complete"),
             f"qa.github.verify_assignees:g{g}": operation_result("complete"),
+            f"qa.linear.verify_ticket_binding:g{g}": operation_result("complete"),
             f"qa.linear.assign_ticket:g{g}": operation_result("complete"),
             f"qa.linear.verify_ticket_assignee:g{g}": operation_result("complete"),
         }
@@ -528,7 +546,11 @@ class HandoffDecisionTest(unittest.TestCase):
                 for operation in plan["operations"]
                 if operation["service"] == "linear"
             ],
-            [f"qa.linear.assign_ticket:g{g}", f"qa.linear.verify_ticket_assignee:g{g}"],
+            [
+                f"qa.linear.verify_ticket_binding:g{g}",
+                f"qa.linear.assign_ticket:g{g}",
+                f"qa.linear.verify_ticket_assignee:g{g}",
+            ],
         )
 
         supplied_state = plan_handoff(
@@ -661,16 +683,20 @@ class HandoffDecisionTest(unittest.TestCase):
         # write-ahead record — a crash between the ready flip and the request
         # lost it with nothing for resume to replay. Routed code reviewers
         # now mint request+verify operations (roundtrip's shapes) ahead of
-        # the assignee replacement. Reviewer identity is embedded in each
-        # operation id, so qa_generation needs no digest change: shared ops
-        # (assignee replace/verify) are content-identical across reviewer
-        # sets.
+        # the assignee replacement. Pass-3 codex F3 / opus F1: the reviewer
+        # set IS a plan target - qa_generation digests its normalized form,
+        # so a reviewer change re-mints the plan and the prior round's
+        # identity-bearing records take the prune path instead of hard-
+        # blocking as unknown IDs.
         request = {
             "scenario": "approved_qa",
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
             "existing_assignees": ["jakozloski"],
-            "code_reviewers": ["motykadaw", "Motykadaw"],  # dedup, casefold
+            # Uppercase FIRST (pass-3 opus F6): dedup keeps the first-seen
+            # raw spelling, so this ordering is the one that can fail if
+            # the id-level casefold normalization is dropped.
+            "code_reviewers": ["Motykadaw", "motykadaw"],
             "issue_tracker": {
                 "type": "linear",
                 "qa_assignee": LINEAR_QA_ASSIGNEE,
@@ -683,7 +709,10 @@ class HandoffDecisionTest(unittest.TestCase):
         }
         plan = plan_handoff(request)
         self.assertEqual(plan["state"], "pending")
-        self.assertEqual(plan["targets"]["reviewers"], ["motykadaw"])
+        # Targets keep the FIRST-SEEN raw spelling (GitHub-canonical-ish);
+        # only the operation ids casefold. With uppercase first, this
+        # assertion fails if either half of that split is dropped.
+        self.assertEqual(plan["targets"]["reviewers"], ["Motykadaw"])
         ids = [operation["id"] for operation in plan["operations"]]
         request_ids = [i for i in ids if ".request_review:" in i]
         verify_ids = [i for i in ids if ".verify_review_request:" in i]
@@ -838,6 +867,9 @@ class HandoffDecisionTest(unittest.TestCase):
                 {
                     f"qa.github.replace_assignees:g{QA_G}": operation_result("complete"),
                     f"qa.github.verify_assignees:g{QA_G}": operation_result("complete"),
+                    f"qa.linear.verify_ticket_binding:g{QA_G}": operation_result(
+                        "complete"
+                    ),
                     f"qa.linear.assign_ticket:g{QA_G}": operation_result(
                         "failed", error="Linear returned 500"
                     ),
@@ -853,6 +885,7 @@ class HandoffDecisionTest(unittest.TestCase):
             {
                 f"qa.github.replace_assignees:g{QA_G}": "complete",
                 f"qa.github.verify_assignees:g{QA_G}": "complete",
+                f"qa.linear.verify_ticket_binding:g{QA_G}": "complete",
                 f"qa.linear.assign_ticket:g{QA_G}": "failed",
                 f"qa.linear.verify_ticket_assignee:g{QA_G}": "skipped_dependency",
                 f"qa.linear.set_ticket_state:g{QA_G}": "skipped_dependency",
@@ -898,6 +931,9 @@ class HandoffDecisionTest(unittest.TestCase):
                 {
                     f"qa.github.replace_assignees:g{QA_G}": operation_result("complete"),
                     f"qa.github.verify_assignees:g{QA_G}": operation_result("complete"),
+                    f"qa.linear.verify_ticket_binding:g{QA_G}": operation_result(
+                        "complete"
+                    ),
                     f"qa.linear.assign_ticket:g{QA_G}": operation_result(
                         "failed", error="Linear returned 500"
                     ),
@@ -939,6 +975,9 @@ class HandoffDecisionTest(unittest.TestCase):
                 {
                     f"qa.github.replace_assignees:g{QA_G}": operation_result("complete"),
                     f"qa.github.verify_assignees:g{QA_G}": operation_result("complete"),
+                    f"qa.linear.verify_ticket_binding:g{QA_G}": operation_result(
+                        "complete"
+                    ),
                     f"qa.linear.assign_ticket:g{QA_G}": operation_result(
                         "failed", error="Linear returned 500"
                     ),
@@ -988,7 +1027,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 for operation in plan["operations"]
                 if operation["service"] == "linear"
             ],
-            ["environment_tool"] * 4,
+            ["environment_tool"] * 5,
         )
         self.assertNotIn("api_key", json.dumps(plan))
 
@@ -1044,7 +1083,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 for operation in plan["operations"]
                 if operation["service"] == "linear"
             ],
-            ["local_api"] * 4,
+            ["local_api"] * 5,
         )
 
     def test_unknown_tracker_type_is_rejected(self) -> None:
@@ -1704,6 +1743,7 @@ class HandoffDecisionTest(unittest.TestCase):
             for base in (
                 "qa.github.replace_assignees",
                 "qa.github.verify_assignees",
+                "qa.linear.verify_ticket_binding",
                 "qa.linear.assign_ticket",
                 "qa.linear.verify_ticket_assignee",
                 "qa.linear.set_ticket_state",
@@ -1726,7 +1766,7 @@ class HandoffDecisionTest(unittest.TestCase):
             f"qa.github.replace_assignees:g{current_g}",
         )
         self.assertEqual(len(plan["warnings"]), 1)
-        self.assertIn("6 prior-target terminal QA record(s)", plan["warnings"][0])
+        self.assertIn("7 prior-target terminal QA record(s)", plan["warnings"][0])
 
     def test_in_flight_prior_target_qa_record_fails_closed(self) -> None:
         # An in-flight record persisted for different targets marks a
@@ -1907,21 +1947,36 @@ class HandoffDecisionTest(unittest.TestCase):
 
         # GitHub mutation and verification succeeded. Every Linear mutation and
         # verification reached terminal failure without undoing GitHub.
+        # Post-merge codex F2: the executor stops at the first terminal
+        # failure, so the descendants of the failed mutation carry rendered
+        # skipped_dependency non-attempt records - persisted `failed`
+        # records below a failed dependency are now rejected as an
+        # inconsistent ledger (see the failed-descendant test above).
         request["operation_results"] = {
             f"qa.github.replace_assignees:g{QA_G}": operation_result("complete"),
             f"qa.github.verify_assignees:g{QA_G}": operation_result("complete"),
+            f"qa.linear.verify_ticket_binding:g{QA_G}": operation_result("complete"),
             f"qa.linear.assign_ticket:g{QA_G}": operation_result(
                 "failed", error="assignment failed"
             ),
-            f"qa.linear.verify_ticket_assignee:g{QA_G}": operation_result(
-                "failed", error="verification failed"
-            ),
-            f"qa.linear.set_ticket_state:g{QA_G}": operation_result(
-                "failed", error="state move failed"
-            ),
-            f"qa.linear.verify_ticket_state:g{QA_G}": operation_result(
-                "failed", error="state verification failed"
-            ),
+            f"qa.linear.verify_ticket_assignee:g{QA_G}": {
+                "status": "skipped_dependency",
+                "attempts": 0,
+                "error": f"dependency failed: qa.linear.assign_ticket:g{QA_G}",
+            },
+            f"qa.linear.set_ticket_state:g{QA_G}": {
+                "status": "skipped_dependency",
+                "attempts": 0,
+                "error": (
+                    "dependency failed:"
+                    f" qa.linear.verify_ticket_assignee:g{QA_G}"
+                ),
+            },
+            f"qa.linear.verify_ticket_state:g{QA_G}": {
+                "status": "skipped_dependency",
+                "attempts": 0,
+                "error": f"dependency failed: qa.linear.set_ticket_state:g{QA_G}",
+            },
         }
 
         self.assertEqual(
@@ -1951,10 +2006,24 @@ class HandoffDecisionTest(unittest.TestCase):
                         [f"qa.github.replace_assignees:g{QA_G}"],
                     ),
                     {
+                        "id": f"qa.linear.verify_ticket_binding:g{QA_G}",
+                        "service": "linear",
+                        "action": "verify_ticket_binding",
+                        "depends_on": [f"qa.github.verify_assignees:g{QA_G}"],
+                        "payload": {
+                            "ticket_identifier": "WEB-8877",
+                            "expected_ticket_provider_id": "linear-ticket-web-8877",
+                            "expected_repository": "Keeper-Dating/matchmaking",
+                            "expected_pull_request_number": PR_NUMBER,
+                            "write_path": "environment_tool",
+                        },
+                        "status": "complete",
+                    },
+                    {
                         "id": f"qa.linear.assign_ticket:g{QA_G}",
                         "service": "linear",
                         "action": "assign_ticket",
-                        "depends_on": [f"qa.github.verify_assignees:g{QA_G}"],
+                        "depends_on": [f"qa.linear.verify_ticket_binding:g{QA_G}"],
                         "payload": {
                             "ticket_identifier": "WEB-8877",
                             "assignee_id": "4d5aed4e-076c-47e5-94a1-0a39287364e1",
@@ -1976,7 +2045,10 @@ class HandoffDecisionTest(unittest.TestCase):
                             "expected_assignee_name": "Timothy Jhon Pascual",
                             "write_path": "environment_tool",
                         },
-                        "status": "failed",
+                        "status": "skipped_dependency",
+                        "error": (
+                            f"dependency failed: qa.linear.assign_ticket:g{QA_G}"
+                        ),
                     },
                     {
                         "id": f"qa.linear.set_ticket_state:g{QA_G}",
@@ -1989,7 +2061,11 @@ class HandoffDecisionTest(unittest.TestCase):
                             "state_name": "Vercel Preview QA",
                             "write_path": "environment_tool",
                         },
-                        "status": "failed",
+                        "status": "skipped_dependency",
+                        "error": (
+                            "dependency failed:"
+                            f" qa.linear.verify_ticket_assignee:g{QA_G}"
+                        ),
                     },
                     {
                         "id": f"qa.linear.verify_ticket_state:g{QA_G}",
@@ -2003,15 +2079,21 @@ class HandoffDecisionTest(unittest.TestCase):
                             "expected_state_name": "Vercel Preview QA",
                             "write_path": "environment_tool",
                         },
-                        "status": "failed",
+                        "status": "skipped_dependency",
+                        "error": (
+                            f"dependency failed: qa.linear.set_ticket_state:g{QA_G}"
+                        ),
                     },
                 ],
                 "call_plan": [],
                 "warnings": [
                     f"Remote operation qa.linear.assign_ticket:g{QA_G} failed; complete it manually.",
-                    f"Remote operation qa.linear.verify_ticket_assignee:g{QA_G} failed; complete it manually.",
-                    f"Remote operation qa.linear.set_ticket_state:g{QA_G} failed; complete it manually.",
-                    f"Remote operation qa.linear.verify_ticket_state:g{QA_G} failed; complete it manually.",
+                    f"Operation qa.linear.verify_ticket_assignee:g{QA_G} not executed "
+                    f"(dependency failed: qa.linear.assign_ticket:g{QA_G}); complete it manually.",
+                    f"Operation qa.linear.set_ticket_state:g{QA_G} not executed "
+                    f"(dependency failed: qa.linear.verify_ticket_assignee:g{QA_G}); complete it manually.",
+                    f"Operation qa.linear.verify_ticket_state:g{QA_G} not executed "
+                    f"(dependency failed: qa.linear.set_ticket_state:g{QA_G}); complete it manually.",
                 ],
                 "errors": [],
             },
@@ -2640,6 +2722,713 @@ class MalformedLedgerZeroReviewerTests(unittest.TestCase):
                 )
                 self.assertEqual(plan["state"], "blocked", plan)
                 self.assertTrue(plan["errors"], plan)
+
+
+class TicketBindingGateTests(unittest.TestCase):
+    """R2 round-3 finding 3774514905: the pure planner need not fetch, but
+    the EXECUTION boundary must re-fetch and bind the ticket before any
+    tracker mutation - otherwise a stale/mismatched ``validated_ticket``
+    provider ID drives Linear mutations against an unrelated ticket. The
+    plan therefore opens the Linear chain with a read-only
+    ``verify_ticket_binding`` operation whose failure cascades
+    ``skipped_dependency`` over every Linear mutation."""
+
+    def _qa_request(
+        self, operation_results: dict[str, object] | None = None
+    ) -> dict[str, object]:
+        request: dict[str, object] = {
+            "scenario": "approved_qa",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+            "issue_tracker": {
+                "type": "linear",
+                "qa_assignee": LINEAR_QA_ASSIGNEE,
+                "qa_state": LINEAR_QA_STATE_WEB,
+                "ticket_identifier": "WEB-8877",
+                "ticket_provider_id": "linear-ticket-web-8877",
+                "ticket_validated": True,
+                "write_path": "environment_tool",
+            },
+        }
+        if operation_results is not None:
+            request["operation_results"] = operation_results
+        return request
+
+    def test_binding_verification_precedes_every_linear_mutation(self) -> None:
+        plan = plan_handoff(self._qa_request())
+        operations = {op["id"]: op for op in plan["operations"]}
+        binding_id = f"qa.linear.verify_ticket_binding:g{QA_G}"
+        self.assertIn(binding_id, operations, sorted(operations))
+        binding = operations[binding_id]
+        self.assertEqual(binding["service"], "linear")
+        self.assertEqual(binding["action"], "verify_ticket_binding")
+        # The binding is the execution-boundary re-fetch: it carries every
+        # fact the executor must confirm against the freshly fetched ticket
+        # BEFORE the first mutation fires.
+        payload = binding["payload"]
+        self.assertEqual(payload["ticket_identifier"], "WEB-8877")
+        # Identifier-keyed read (algo#1216 finding 3792942223): the broker
+        # resolves the identifier; the recorded provider id is the
+        # COMPARISON value the read must confirm, not a mutation key.
+        self.assertEqual(
+            payload["expected_ticket_provider_id"], "linear-ticket-web-8877"
+        )
+        self.assertEqual(
+            payload["expected_repository"], "Keeper-Dating/matchmaking"
+        )
+        self.assertEqual(payload["expected_pull_request_number"], PR_NUMBER)
+        self.assertEqual(payload["write_path"], "environment_tool")
+        # The first Linear mutation depends on the binding, so a mismatch
+        # can never be ordered after the mutation it exists to prevent.
+        assign = operations[f"qa.linear.assign_ticket:g{QA_G}"]
+        self.assertIn(binding_id, assign["depends_on"])
+        # The binding itself runs only after GitHub assignment verified -
+        # the plan's existing chain stays intact ahead of it.
+        self.assertIn(
+            f"qa.github.verify_assignees:g{QA_G}", binding["depends_on"]
+        )
+
+    def test_failed_descendant_of_failed_binding_is_blocked(self) -> None:
+        # Post-merge codex F2: the cascade guard rejected complete/pending/
+        # retryable descendants of a failed dependency but silently ACCEPTED
+        # a recorded `failed` - yet the executor may never attempt a
+        # mutation whose dependency terminally failed, so a failed record
+        # there claims an attempt the plan forbade. Only skipped_dependency
+        # is a consistent descendant record.
+        plan = plan_handoff(
+            self._qa_request(
+                {
+                    f"qa.github.replace_assignees:g{QA_G}": operation_result(
+                        "complete"
+                    ),
+                    f"qa.github.verify_assignees:g{QA_G}": operation_result(
+                        "complete"
+                    ),
+                    f"qa.linear.verify_ticket_binding:g{QA_G}": operation_result(
+                        "failed", error="identifier mismatch"
+                    ),
+                    f"qa.linear.assign_ticket:g{QA_G}": operation_result(
+                        "failed", error="Linear returned 500"
+                    ),
+                }
+            )
+        )
+        self.assertEqual(plan["state"], "blocked", plan)
+        self.assertTrue(
+            any("cannot have results" in error for error in plan["errors"]),
+            plan["errors"],
+        )
+
+    def test_failed_binding_skips_every_linear_mutation(self) -> None:
+        plan = plan_handoff(
+            self._qa_request(
+                {
+                    f"qa.github.replace_assignees:g{QA_G}": operation_result(
+                        "complete"
+                    ),
+                    f"qa.github.verify_assignees:g{QA_G}": operation_result(
+                        "complete"
+                    ),
+                    f"qa.linear.verify_ticket_binding:g{QA_G}": operation_result(
+                        "failed",
+                        error=(
+                            "fetched identifier WEB-9999 does not match"
+                            " validated WEB-8877"
+                        ),
+                    ),
+                }
+            )
+        )
+        self.assertEqual(plan["state"], "failed", plan)
+        rendered = {op["id"]: op for op in plan["operations"]}
+        for suffix in (
+            "assign_ticket",
+            "verify_ticket_assignee",
+            "set_ticket_state",
+            "verify_ticket_state",
+        ):
+            record = rendered[f"qa.linear.{suffix}:g{QA_G}"]
+            self.assertEqual(
+                record["status"], "skipped_dependency", (suffix, record)
+            )
+
+    def test_write_path_none_plans_no_binding_operation(self) -> None:
+        # With no authorized write path there is no tracker mutation to
+        # protect: the plan records the unavailable outcome and must not
+        # demand a Linear read it has no path to perform.
+        request = self._qa_request()
+        tracker = dict(request["issue_tracker"])  # type: ignore[arg-type]
+        tracker["write_path"] = "none"
+        tracker.pop("qa_assignee")
+        tracker.pop("qa_state")
+        request["issue_tracker"] = tracker
+        plan = plan_handoff(request)
+        ids = {op["id"] for op in plan["operations"]}
+        self.assertFalse(
+            {op_id for op_id in ids if "verify_ticket_binding" in op_id}, ids
+        )
+
+
+class ReviewerRequestPlanTests(unittest.TestCase):
+    """R2 round-3 finding 3774515577: the NON-KEEPER draft-flip reviewer
+    request was a bare ``gh pr edit`` with no write-ahead record - a crash
+    between the flip and the request lost the request silently. The
+    ``reviewer_request`` scenario plans it as ledgered operations with the
+    same write-ahead -> execute -> verify lifecycle as the handoffs. The
+    Keeper R2-satisfied handback is NOT this scenario: it runs through the
+    QA plan's code_reviewers ledger (admin#1495 finding 3791925155)."""
+
+    def _request(
+        self,
+        reviewers: list[str] | None = None,
+        ball_holder: str | None = "motykadaw",
+        operation_results: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        request: dict[str, object] = {
+            "scenario": "reviewer_request",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+            "authenticated_actor": "jakozloski",
+            "reviewer_requests": {
+                "reviewers": (
+                    reviewers if reviewers is not None else ["motykadaw"]
+                ),
+                "ball_holder": ball_holder,
+            },
+        }
+        if operation_results is not None:
+            request["operation_results"] = operation_results
+        return request
+
+    def test_plans_request_verify_and_ball_holder_operations(self) -> None:
+        plan = plan_handoff(self._request(reviewers=["tjkeeper", "motykadaw"]))
+        self.assertEqual(plan["state"], "pending", plan)
+        generation = reviewer_request_generation(
+            "Keeper-Dating/matchmaking",
+            PR_NUMBER,
+            ["tjkeeper", "motykadaw"],
+            "motykadaw",
+        )
+        operations = {op["id"]: op for op in plan["operations"]}
+        for login in ("motykadaw", "tjkeeper"):
+            request_id = (
+                f"reviewer.github.request_review:{login}:g{generation}"
+            )
+            verify_id = (
+                f"reviewer.github.verify_review_request:{login}:g{generation}"
+            )
+            self.assertIn(request_id, operations, sorted(operations))
+            self.assertIn(verify_id, operations, sorted(operations))
+            self.assertEqual(
+                operations[verify_id]["depends_on"], [request_id]
+            )
+        replace = operations[
+            f"reviewer.github.replace_assignees:g{generation}"
+        ]
+        # Exactly ONE ball-holder assignee, atomic replacement.
+        self.assertEqual(replace["payload"]["assignees"], ["motykadaw"])
+        verify_assignees = operations[
+            f"reviewer.github.verify_assignees:g{generation}"
+        ]
+        self.assertEqual(
+            verify_assignees["payload"]["expected_assignees"], ["motykadaw"]
+        )
+
+    def test_generation_rebinds_when_targets_change(self) -> None:
+        first = reviewer_request_generation(
+            "Keeper-Dating/matchmaking", PR_NUMBER, ["motykadaw"], "motykadaw"
+        )
+        second = reviewer_request_generation(
+            "Keeper-Dating/matchmaking", PR_NUMBER, ["tjkeeper"], "tjkeeper"
+        )
+        self.assertNotEqual(first, second)
+
+    def test_requires_nonempty_reviewers_and_member_ball_holder(self) -> None:
+        empty = plan_handoff(self._request(reviewers=[]))
+        self.assertEqual(empty["state"], "blocked", empty)
+        outsider = plan_handoff(
+            self._request(reviewers=["motykadaw"], ball_holder="tjkeeper")
+        )
+        self.assertEqual(outsider["state"], "blocked", outsider)
+
+    def test_malformed_generation_ids_are_never_pruned_as_history(self) -> None:
+        # Post-merge codex F3 (opus F3 corroborating): the sweeps matched
+        # prior-target records by leading operation family alone, so a
+        # malformed ID with a known family but no valid :g<12-hex> digest
+        # tail was laundered as prunable history instead of failing closed
+        # as an unknown ID. All three sweeps require the full digest tail.
+        malformed = {
+            "reviewer_request": (
+                self._request(
+                    operation_results={
+                        "reviewer.github.replace_assignees:not-a-valid-generation": (
+                            operation_result("complete")
+                        )
+                    }
+                )
+            ),
+            "qa": {
+                "scenario": "approved_qa",
+                "repository": REPOSITORY,
+                "pull_request_number": PR_NUMBER,
+                "issue_tracker": {
+                    "type": "linear",
+                    "qa_assignee": LINEAR_QA_ASSIGNEE,
+                    "qa_state": LINEAR_QA_STATE_WEB,
+                    "ticket_identifier": "WEB-8877",
+                    "ticket_provider_id": "linear-ticket-web-8877",
+                    "ticket_validated": True,
+                    "write_path": "environment_tool",
+                },
+                "operation_results": {
+                    "qa.linear.assign_ticket:gNOTHEXNOTHEX": operation_result(
+                        "complete"
+                    )
+                },
+            },
+            # Pass-3 opus F7: the roundtrip sweep's malformed-id path was
+            # the uncovered third of the "all three sweeps" claim.
+            "roundtrip": {
+                "scenario": "human_review_roundtrip",
+                "repository": REPOSITORY,
+                "pull_request_number": PR_NUMBER,
+                "authenticated_actor": "jakozloski",
+                "reviewers": [reviewer("motykadaw")],
+                "operation_results": {
+                    "roundtrip.github.request_review:motykadaw:gBADBADBAD": (
+                        operation_result("complete")
+                    )
+                },
+            },
+        }
+        for label, request in malformed.items():
+            with self.subTest(label=label):
+                plan = plan_handoff(request)
+                self.assertEqual(plan["state"], "blocked", plan)
+                self.assertTrue(
+                    any(
+                        "unknown operation IDs" in error
+                        for error in plan["errors"]
+                    ),
+                    plan["errors"],
+                )
+
+    def test_reviewer_turnover_reminted_digest_prunes_prior_round(self) -> None:
+        # Pass-3 codex F3 / opus F1: switching the routed reviewer must
+        # re-mint the QA digest so the prior round's identity-bearing
+        # records become prunable prior-generation history - not unknown
+        # IDs that hard-block the terminal exit.
+        def qa_request(reviewers: list[str], results: dict[str, object]) -> dict[str, object]:
+            return {
+                "scenario": "approved_qa",
+                "repository": REPOSITORY,
+                "pull_request_number": PR_NUMBER,
+                "code_reviewers": reviewers,
+                "issue_tracker": {
+                    "type": "linear",
+                    "qa_assignee": LINEAR_QA_ASSIGNEE,
+                    "qa_state": LINEAR_QA_STATE_WEB,
+                    "ticket_identifier": "WEB-8877",
+                    "ticket_provider_id": "linear-ticket-web-8877",
+                    "ticket_validated": True,
+                    "write_path": "environment_tool",
+                },
+                "operation_results": results,
+            }
+
+        old_generation = qa_generation(qa_request(["motykadaw"], {}))
+        new_generation = qa_generation(qa_request(["michal-janicki"], {}))
+        self.assertNotEqual(old_generation, new_generation)
+
+        # Terminal prior-reviewer records prune with a warning.
+        plan = plan_handoff(
+            qa_request(
+                ["michal-janicki"],
+                {
+                    "qa.github.request_review:motykadaw:g"
+                    f"{old_generation}": operation_result("complete"),
+                    "qa.github.verify_review_request:motykadaw:g"
+                    f"{old_generation}": operation_result("complete"),
+                },
+            )
+        )
+        self.assertEqual(plan["state"], "pending", plan)
+        self.assertTrue(
+            any("prior-target" in warning for warning in plan["warnings"]),
+            plan["warnings"],
+        )
+
+        # An in-flight prior-reviewer record fails closed.
+        in_flight = plan_handoff(
+            qa_request(
+                ["michal-janicki"],
+                {
+                    "qa.github.request_review:motykadaw:g"
+                    f"{old_generation}": {
+                        "status": "pending",
+                        "attempts": 1,
+                        "started_at": TIMESTAMP,
+                    },
+                },
+            )
+        )
+        self.assertEqual(in_flight["state"], "blocked", in_flight)
+
+    def test_extra_segment_ids_are_never_pruned_as_history(self) -> None:
+        # Pass-3 codex F4: a tail-only check accepted extra-segment ids
+        # like family:gBAD:g<hex> as prunable history. The full grammar
+        # (family, optional identity, digest - nothing else) rejects them
+        # in ALL THREE sweeps, so they stay unknown-ID errors.
+        good_tail = "0" * 12
+        qa_request = {
+            "scenario": "approved_qa",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+            "issue_tracker": {
+                "type": "linear",
+                "qa_assignee": LINEAR_QA_ASSIGNEE,
+                "qa_state": LINEAR_QA_STATE_WEB,
+                "ticket_identifier": "WEB-8877",
+                "ticket_provider_id": "linear-ticket-web-8877",
+                "ticket_validated": True,
+                "write_path": "environment_tool",
+            },
+            "operation_results": {
+                f"qa.linear.assign_ticket:gBAD:g{good_tail}": operation_result(
+                    "complete"
+                )
+            },
+        }
+        reviewer_request = self._request(
+            operation_results={
+                "reviewer.github.request_review:motykadaw:extra:g"
+                f"{good_tail}": operation_result("complete")
+            }
+        )
+        roundtrip_request = {
+            "scenario": "human_review_roundtrip",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+            "authenticated_actor": "jakozloski",
+            "reviewers": [reviewer("motykadaw")],
+            "operation_results": {
+                f"roundtrip.github.request_review:gBAD:g{good_tail}": (
+                    operation_result("complete")
+                )
+            },
+        }
+        for label, request in {
+            "qa": qa_request,
+            "reviewer_request": reviewer_request,
+            "roundtrip": roundtrip_request,
+        }.items():
+            with self.subTest(label=label):
+                plan = plan_handoff(request)
+                self.assertEqual(plan["state"], "blocked", plan)
+                self.assertTrue(
+                    any(
+                        "unknown operation IDs" in error
+                        for error in plan["errors"]
+                    ),
+                    plan["errors"],
+                )
+
+    def test_wrong_identity_arity_is_never_pruned_as_history(self) -> None:
+        # Pass-4 codex F1: identity arity is per-family. A surplus identity
+        # on an identity-free family and a missing identity on a
+        # per-reviewer family both stay unknown-ID errors in all sweeps.
+        current_reviewer_generation = reviewer_request_generation(
+            "Keeper-Dating/matchmaking", PR_NUMBER, ["motykadaw"], "motykadaw"
+        )
+        cases = {
+            "qa_surplus": {
+                "scenario": "approved_qa",
+                "repository": REPOSITORY,
+                "pull_request_number": PR_NUMBER,
+                "issue_tracker": {
+                    "type": "linear",
+                    "qa_assignee": LINEAR_QA_ASSIGNEE,
+                    "qa_state": LINEAR_QA_STATE_WEB,
+                    "ticket_identifier": "WEB-8877",
+                    "ticket_provider_id": "linear-ticket-web-8877",
+                    "ticket_validated": True,
+                    "write_path": "environment_tool",
+                },
+                "operation_results": {
+                    "qa.github.replace_assignees:bogus:g"
+                    + "0" * 12: operation_result("complete")
+                },
+            },
+            "reviewer_missing": self._request(
+                operation_results={
+                    "reviewer.github.request_review:g"
+                    f"{current_reviewer_generation}": operation_result(
+                        "complete"
+                    )
+                }
+            ),
+            "roundtrip_surplus": {
+                "scenario": "human_review_roundtrip",
+                "repository": REPOSITORY,
+                "pull_request_number": PR_NUMBER,
+                "authenticated_actor": "jakozloski",
+                "reviewers": [reviewer("motykadaw")],
+                "operation_results": {
+                    "roundtrip.github.replace_assignees:bogus:g"
+                    + "0" * 12: operation_result("complete")
+                },
+            },
+        }
+        for label, request in cases.items():
+            with self.subTest(label=label):
+                plan = plan_handoff(request)
+                self.assertEqual(plan["state"], "blocked", plan)
+                self.assertTrue(
+                    any(
+                        "unknown operation IDs" in error
+                        for error in plan["errors"]
+                    ),
+                    plan["errors"],
+                )
+
+    def test_fabricated_root_skip_is_blocked(self) -> None:
+        # Pass-3 codex F5: a persisted skipped_dependency on an operation
+        # with no failed declared dependency claims a skip the plan never
+        # produced - accepting it cascades fabricated skips.
+        plan = plan_handoff(
+            self._request(
+                operation_results={
+                    "reviewer.github.request_review:motykadaw:g"
+                    + reviewer_request_generation(
+                        "Keeper-Dating/matchmaking",
+                        PR_NUMBER,
+                        ["motykadaw"],
+                        "motykadaw",
+                    ): {
+                        "status": "skipped_dependency",
+                        "attempts": 0,
+                        "error": "dependency failed: fabricated",
+                    }
+                }
+            )
+        )
+        self.assertEqual(plan["state"], "blocked", plan)
+        self.assertTrue(
+            any(
+                "cannot be skipped_dependency" in error
+                for error in plan["errors"]
+            ),
+            plan["errors"],
+        )
+
+    def test_newline_suffixed_ids_are_never_pruned_as_history(self) -> None:
+        # Post-merge pass-2 codex F1: $ matches before a trailing newline,
+        # so a completed CURRENT id suffixed with '\n' pruned as history
+        # and the same mutation re-queued. \Z closes that in ALL THREE
+        # sweeps (qa, reviewer_request, roundtrip).
+        qa_request = {
+            "scenario": "approved_qa",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+            "issue_tracker": {
+                "type": "linear",
+                "qa_assignee": LINEAR_QA_ASSIGNEE,
+                "qa_state": LINEAR_QA_STATE_WEB,
+                "ticket_identifier": "WEB-8877",
+                "ticket_provider_id": "linear-ticket-web-8877",
+                "ticket_validated": True,
+                "write_path": "environment_tool",
+            },
+            "operation_results": {
+                f"qa.github.replace_assignees:g{QA_G}\n": operation_result(
+                    "complete"
+                )
+            },
+        }
+        reviewer_generation = reviewer_request_generation(
+            "Keeper-Dating/matchmaking", PR_NUMBER, ["motykadaw"], "motykadaw"
+        )
+        reviewer_request = self._request(
+            operation_results={
+                "reviewer.github.request_review:motykadaw:g"
+                f"{reviewer_generation}\n": operation_result("complete")
+            }
+        )
+        roundtrip_request = {
+            "scenario": "human_review_roundtrip",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+            "authenticated_actor": "jakozloski",
+            "reviewers": [reviewer("motykadaw")],
+            "operation_results": {
+                "roundtrip.github.request_review:motykadaw:g"
+                + "0" * 12
+                + "\n": operation_result("complete")
+            },
+        }
+        cases = {
+            "qa": qa_request,
+            "reviewer_request": reviewer_request,
+            "roundtrip": roundtrip_request,
+        }
+        for label, request in cases.items():
+            with self.subTest(label=label):
+                plan = plan_handoff(request)
+                self.assertEqual(plan["state"], "blocked", plan)
+                self.assertTrue(
+                    any(
+                        "unknown operation IDs" in error
+                        for error in plan["errors"]
+                    ),
+                    plan["errors"],
+                )
+
+    def test_rejects_the_authenticated_actor_as_reviewer(self) -> None:
+        # Post-fix review F3: GitHub 422s a self review-request, which the
+        # ledger would then carry as a permanent failure. The plan rejects
+        # it up front instead - including by case-variant spelling.
+        for spelling in ("jakozloski", "JakOzloski"):
+            with self.subTest(spelling=spelling):
+                plan = plan_handoff(
+                    self._request(
+                        reviewers=[spelling, "motykadaw"],
+                        ball_holder="motykadaw",
+                    )
+                )
+                self.assertEqual(plan["state"], "blocked", plan)
+                self.assertTrue(
+                    any("authenticated actor" in e for e in plan["errors"]),
+                    plan["errors"],
+                )
+        missing_actor = dict(self._request())
+        missing_actor.pop("authenticated_actor")
+        plan = plan_handoff(missing_actor)
+        self.assertEqual(plan["state"], "blocked", plan)
+
+    def test_case_variants_canonicalize_to_one_plan(self) -> None:
+        # Post-fix review F4: the digest casefolds, so payloads and targets
+        # must too - otherwise two case-variant requests share a generation
+        # while their payload spellings differ, breaking both the rebind
+        # promise and the exact-array assignee verification.
+        upper = plan_handoff(
+            self._request(reviewers=["MotykaDaw"], ball_holder="MOTYKADAW")
+        )
+        lower = plan_handoff(
+            self._request(reviewers=["motykadaw"], ball_holder="motykadaw")
+        )
+        self.assertEqual(upper, lower)
+        replace = next(
+            op
+            for op in lower["operations"]
+            if op["action"] == "replace_pull_request_assignees"
+        )
+        self.assertEqual(replace["payload"]["assignees"], ["motykadaw"])
+
+
+class QaPlanVersionRolloutTests(unittest.TestCase):
+    """Post-fix review F1: inserting the binding op changed the plan SHAPE
+    without changing the targets, so a pre-upgrade ledger kept its digest
+    and died on the opaque prefix rule. ``plan_version`` in the digest
+    re-mints the IDs, routing pre-upgrade ledgers through the documented
+    prior-generation path instead.
+
+    Pass-2 convergent finding (codex P2 / opus MEDIUM): a synthetic
+    ``"0" * 12`` digest tested arbitrary generation turnover, not the
+    version bump - both tests passed with ``plan_version`` ablated. The
+    stale ledger is therefore keyed on the REAL pre-v2 digest, computed
+    from the version-less payload, so removing the version component
+    collapses the two digests and both tests fail at the prefix rule."""
+
+    def _request(self, operation_results: dict[str, object]) -> dict[str, object]:
+        return {
+            "scenario": "approved_qa",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+            "issue_tracker": {
+                "type": "linear",
+                "qa_assignee": LINEAR_QA_ASSIGNEE,
+                "qa_state": LINEAR_QA_STATE_WEB,
+                "ticket_identifier": "WEB-8877",
+                "ticket_provider_id": "linear-ticket-web-8877",
+                "ticket_validated": True,
+                "write_path": "environment_tool",
+            },
+            "operation_results": operation_results,
+        }
+
+    @property
+    def OLD_G(self) -> str:
+        # The pre-upgrade digest: byte-identical canonicalization over the
+        # CURRENT payload minus ONLY the plan_version component - that
+        # exact mirror is what keeps the premise assert sensitive to a
+        # plan_version ablation and nothing else (pass-3 opus F8: when a
+        # field is added to qa_generation, add it here too, else the
+        # digests differ for two reasons and the ablation goes blind).
+        payload = {
+            "nameWithOwner": "Keeper-Dating/matchmaking",
+            "pull_request_number": PR_NUMBER,
+            "github_login": "tjkeeper",
+            "ticket_identifier": "WEB-8877",
+            "ticket_provider_id": "linear-ticket-web-8877",
+            "write_path": "environment_tool",
+            "qa_assignee_provider_id": LINEAR_QA_ASSIGNEE["provider_id"],
+            "qa_state_provider_id": LINEAR_QA_STATE_WEB["provider_id"],
+            "code_reviewers": [],
+        }
+        canonical = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), default=str
+        )
+        old = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+        # The rollout premise itself: the version component must move the
+        # digest for UNCHANGED targets, else pre-upgrade ledgers stay
+        # same-generation and die on the opaque prefix rule.
+        assert old != QA_G, "plan_version no longer changes the digest"
+        return old
+
+    def test_pre_upgrade_terminal_ledger_prunes_with_warning(self) -> None:
+        plan = plan_handoff(
+            self._request(
+                {
+                    f"qa.github.replace_assignees:g{self.OLD_G}": operation_result(
+                        "complete"
+                    ),
+                    f"qa.github.verify_assignees:g{self.OLD_G}": operation_result(
+                        "complete"
+                    ),
+                }
+            )
+        )
+        self.assertEqual(plan["state"], "pending", plan)
+        self.assertTrue(
+            any("prior-target terminal QA record" in w for w in plan["warnings"]),
+            plan["warnings"],
+        )
+        # The fresh plan re-mints under the current digest and starts over.
+        self.assertEqual(
+            plan["call_plan"][0]["id"],
+            f"qa.github.replace_assignees:g{QA_G}",
+        )
+
+    def test_pre_upgrade_in_flight_ledger_fails_closed(self) -> None:
+        plan = plan_handoff(
+            self._request(
+                {
+                    f"qa.github.replace_assignees:g{self.OLD_G}": operation_result(
+                        "complete"
+                    ),
+                    f"qa.linear.assign_ticket:g{self.OLD_G}": {
+                        "status": "pending",
+                        "attempts": 1,
+                        "started_at": TIMESTAMP,
+                    },
+                }
+            )
+        )
+        self.assertEqual(plan["state"], "blocked", plan)
+        self.assertTrue(
+            any("still in flight" in e for e in plan["errors"]),
+            plan["errors"],
+        )
 
 
 if __name__ == "__main__":

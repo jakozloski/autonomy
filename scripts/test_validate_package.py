@@ -1141,6 +1141,66 @@ class ValidatePackageTests(unittest.TestCase):
                 for sample in samples:
                     self.assertIsNotNone(compiled.fullmatch(sample))
 
+    def test_password_and_cookie_patterns_cover_r2_probes(self) -> None:
+        # R2 round-3 finding 3774515260 (PR #3551) reconciled with algo#1216
+        # finding 3779532276: label/header-anchored password and cookie
+        # forms are in scope. The exact probes from both findings must
+        # redact, including DB_PASSWORD-style prefixed labels the
+        # \b-anchored form missed.
+        self.assertIn("password_assignment", REQUIRED_REDACTION_PATTERNS)
+        self.assertIn("cookie_header_value", REQUIRED_REDACTION_PATTERNS)
+        password = re.compile(
+            REQUIRED_REDACTION_PATTERNS["password_assignment"][0]
+        )
+        cookie = re.compile(REQUIRED_REDACTION_PATTERNS["cookie_header_value"][0])
+        self.assertIsNotNone(password.search("Password: " + "S3cretpass!"))
+        self.assertIsNotNone(password.search("DB_PASSWORD=" + "prodsecret99"))
+        self.assertIsNone(password.search("password: short"))
+        self.assertIsNone(password.search("the password field is required"))
+        # Pass-3 codex F1: an escaped quote inside a quoted value must not
+        # terminate the match early - the WHOLE quoted secret redacts.
+        escaped = password.search(
+            'PASSWORD="' + 'correct \\"horse\\" battery staple"'
+        )
+        self.assertIsNotNone(escaped)
+        assert escaped is not None
+        self.assertTrue(escaped.group(0).endswith('staple"'))
+        self.assertIsNotNone(
+            cookie.search("Cookie: sessionid=" + "abcdef1234567890")
+        )
+        # Whole-remainder semantics (CR 3787358691/3779091168, converging
+        # with this PR's pass-2 findings): once a Cookie header carries 8+
+        # chars the ENTIRE remainder redacts - a short first pair cannot
+        # expose a later credential, quoted values sit inside the span,
+        # and valueless attribute tails ride along.
+        behind_short = cookie.search(
+            "Cookie: consent=true; sessionid=" + "abcdef1234567890"
+        )
+        self.assertIsNotNone(behind_short)
+        assert behind_short is not None
+        self.assertTrue(behind_short.group(0).endswith("abcdef1234567890"))
+        self.assertIsNotNone(
+            cookie.search('Cookie: sessionid="' + 'abcdef1234567890"')
+        )
+        attr_tail = cookie.search(
+            "Set-Cookie: sid=" + "0123456789abcdef" + "; Path=/; HttpOnly; Secure"
+        )
+        self.assertIsNotNone(attr_tail)
+        assert attr_tail is not None
+        self.assertTrue(attr_tail.group(0).endswith("HttpOnly; Secure"))
+        # Post-merge pass-2 codex F2, still binding under the simpler form:
+        # the span never crosses a line ending - the following line stays
+        # outside the redaction.
+        crossing = cookie.search(
+            "Cookie: consent=true;\nnotcookie=abcdefgh12345678"
+        )
+        self.assertIsNotNone(crossing)
+        assert crossing is not None
+        self.assertNotIn("notcookie", crossing.group(0))
+        self.assertNotIn("\n", crossing.group(0))
+        # Sub-threshold remainders stay unredacted.
+        self.assertIsNone(cookie.search("Cookie: a=b"))
+
     def test_missing_current_redaction_pattern_is_rejected(self) -> None:
         state_path = self.package.root / "references" / "state-and-safety.md"
         pattern, _samples = REQUIRED_REDACTION_PATTERNS["github_server_token"]
