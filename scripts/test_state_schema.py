@@ -1653,6 +1653,42 @@ class MergeReadinessTests(unittest.TestCase):
                     result["errors"],
                 )
 
+    def test_legacy_reentry_marker_permits_in_progress_gate(self) -> None:
+        # algo#1216 finding 3806595010: the documented pre-4b re-entry
+        # (completed chain + active monitor, gate written in_progress) needs
+        # the explicit migration marker; without it the combination stays
+        # the bypass invariant(ii) rejects. Base = the chain-consistent
+        # paused-monitor fixture with the gate + AC blocks added.
+        base = _terminal_monitor_state()
+        base = _mutate(base, '  monitor: "paused"', '  monitor: "in_progress"')
+        base = _mutate(base, "decision_audit_trail: []", self._AC_BLOCK)
+        text = _mutate(
+            base,
+            '  monitor: "in_progress"',
+            '  monitor: "in_progress"\n  merge_readiness: "in_progress"',
+        )
+        result = evaluate_state_text(text)
+        self.assertTrue(
+            any(
+                "requires the present phases.merge_readiness gate" in error
+                for error in result["errors"]
+            ),
+            result["errors"],
+        )
+        marked = _mutate(
+            text,
+            "decision_audit_trail: []",
+            'decision_audit_trail:\n  - "legacy-4b-reentry:2026-08-18T18:00:00Z"',
+        )
+        result = evaluate_state_text(marked)
+        self.assertFalse(
+            any(
+                "requires the present phases.merge_readiness gate" in error
+                for error in result["errors"]
+            ),
+            result["errors"],
+        )
+
     def test_dependencies_enum_accepts_check_2_completed_outcomes(self) -> None:
         # 28e13163ef: hazard_documented (merged-but-not-live, ordering
         # documented) and unverified (control plane / unreadable live state)
@@ -1669,17 +1705,43 @@ class MergeReadinessTests(unittest.TestCase):
                 self.assertEqual(result["state"], VALID)
 
     def test_hazard_direction_valid_values_accepted_with_hazard(self) -> None:
+        # mm#3551 finding 3806719714: additive/mixed hazards additionally
+        # require non-empty per-environment applied_state records.
         for direction in ("additive", "destructive", "mixed"):
             with self.subTest(direction=direction):
-                text = _mutate(
-                    self._with_blocks(),
-                    '  deploy_order: "pending"',
+                replacement = (
                     '  deploy_order: "hazard_documented"\n'
-                    f'  hazard_direction: "{direction}"',
+                    f'  hazard_direction: "{direction}"'
                 )
+                text = _mutate(
+                    self._with_blocks(), '  deploy_order: "pending"', replacement
+                )
+                if direction in ("additive", "mixed"):
+                    text = _mutate(
+                        text,
+                        "  applied_state: {}",
+                        '  applied_state:\n    "0042_add_column":\n      dev: "applied"',
+                    )
                 result = evaluate_state_text(text)
                 self.assertEqual(result["errors"], [])
                 self.assertEqual(result["state"], VALID)
+
+    def test_additive_hazard_with_empty_applied_state_is_rejected_and_holds(
+        self,
+    ) -> None:
+        # Finding 3806719714's exact repro: completed additive hazard with
+        # applied_state: {} validated clean and derived hold false.
+        text = _mutate(
+            self._with_blocks(),
+            '  deploy_order: "pending"',
+            '  deploy_order: "hazard_documented"\n  hazard_direction: "additive"',
+        )
+        result = evaluate_state_text(text)
+        self.assertTrue(
+            any("applied_state" in error for error in result["errors"]),
+            result["errors"],
+        )
+        self.assertTrue(monitor_extract(text)["merge_readiness_hold"])
 
     def test_hazard_documented_requires_a_direction(self) -> None:
         # A missing or null direction would silently default the

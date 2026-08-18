@@ -973,6 +973,13 @@ class MonitorRunnerE2ETests(unittest.TestCase):
             '      state: "pending"\n'
             "      evidence: null",
         )
+        # Finding 3806719714: an additive hazard now requires non-empty
+        # per-environment applied-state records to be schema-valid — the
+        # fixture's own empty map is populated in place.
+        state = state.replace(
+            "  applied_state: {}",
+            '  applied_state:\n    "0042_seed_scores":\n      dev: "applied"',
+        )
         self.state.write_text(state, encoding="utf-8")
         completed = self._run(
             budget="900", timeout=90, wait_scale="0.02", max_ticks="3",
@@ -1924,7 +1931,10 @@ class MonitorRunnerE2ETests(unittest.TestCase):
             budget="365",
             timeout=60,
             env_extra={
-                "PATH": f"{fake_ps_dir}:{os.environ['PATH']}",
+                # Finding 3806719679 made PATH-prepend injection inert (the
+                # runner resolves ps against the sanitized system PATH);
+                # the hermetic seam is the explicit binary override.
+                "MONITOR_RUNNER_BIN_PS": str(fake_ps),
                 "FAKE_PS_FAIL": "1",
             },
         )

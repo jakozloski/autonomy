@@ -488,6 +488,32 @@ def _has_auth_signature(text: str) -> bool:
     return auth_signature_offset(text) is not None
 
 
+# admin#1495/algo#1216 finding 3806595004: the canonical redaction
+# pattern list lives IN CODE so bounded_excerpt applies it at runtime;
+# validate_package derives its doc byte-match from this same tuple, and
+# state-and-safety.md's inventory is validated against it — one source.
+REDACTION_PATTERNS: tuple[tuple[str, str], ...] = (
+    ('aws_access_or_session_key', r"(AKIA|ASIA)[0-9A-Z]{16}"),
+    ('authorization_bearer_header', r"(?i)Authorization:\s*Bearer\s+[A-Za-z0-9._~+/-]{8,}=*"),
+    ('slack_token', r"xox[baprs]-[A-Za-z0-9-]{10,}"),
+    ('aws_secret_access_key', r"""(?i)AWS_SECRET_ACCESS_KEY["']?\s*[:=]\s*["']?[A-Za-z0-9/+=]{40}["']?"""),
+    ('aws_session_token', r"""(?i)AWS_SESSION_TOKEN["']?\s*[:=]\s*["']?[A-Za-z0-9/+=]{16,4096}["']?"""),
+    ('github_user_or_oauth_token', r"gh[pour]_[A-Za-z0-9]{20,255}"),
+    ('github_server_token', r"ghs_([A-Za-z0-9]{20,255}|[A-Za-z0-9]+_[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})"),
+    ('github_fine_grained_pat', r"github_pat_[A-Za-z0-9_]{20,255}"),
+    ('linear_api_key', r"lin_api_[A-Za-z0-9_]{40,}"),
+    ('openai_key', r"sk-((proj|svcacct)-)?[A-Za-z0-9_-]{20,}"),
+    ('password_assignment', r"""(?i)[\w-]*password["']?\s*[:=]\s*("[^"\r\n]{4,}"|'[^'\r\n]{4,}'|[^\s"']{8,})"""),
+    ('cookie_header_value', r"""(?i)\b(Set-)?Cookie:[^\r\n]{8,}"""),
+    ('stripe_live_key', r"(sk|rk)_live_[A-Za-z0-9]{16,}"),
+    ('gcp_api_key', r"AIza[0-9A-Za-z_-]{35}"),
+    ('gcp_oauth_access_token', r"ya29\.[A-Za-z0-9_-]{20,}"),
+    ('pem_private_key_block', r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
+    ('anthropic_key', r"sk-ant-[A-Za-z0-9_-]{40,}"),
+    ('jwt_base64url', r"eyJ[A-Za-z0-9_\-=]{10,}\.eyJ[A-Za-z0-9_\-=]{10,}\.[A-Za-z0-9_\-=]+"),
+)
+
+
 def bounded_excerpt(existing: str, addition: str) -> str:
     """Append *addition* to *existing*, URL-stripped and byte-capped.
 
@@ -495,13 +521,19 @@ def bounded_excerpt(existing: str, addition: str) -> str:
     passed here; assistant/tool/unknown payloads (which can embed repository
     source) never reach persisted evidence.
 
-    This strips URL-embedded credentials ONLY.  A bare ``Authorization:
-    Bearer ...`` or ``OPENAI_API_KEY=...`` in stderr survives, so the caller
-    must still apply the package's format-anchored Secret/Token Redaction
-    before persisting the excerpt anywhere.
+    Finding 3806595004: the format-anchored Secret/Token Redaction runs
+    HERE, in code — prose deferral let a bare ``Authorization: Bearer ...``
+    survive verbatim into persisted evidence. URL-embedded credentials are
+    stripped first, then every canonical pattern is applied.
     """
 
-    combined = f"{existing}\n{strip_url_secrets(addition)}" if existing else strip_url_secrets(addition)
+    def _redact(text: str) -> str:
+        for kind, pattern in REDACTION_PATTERNS:
+            text = re.sub(pattern, f"[REDACTED: {kind}]", text)
+        return text
+
+    cleaned = _redact(strip_url_secrets(addition))
+    combined = f"{existing}\n{cleaned}" if existing else cleaned
     encoded = combined.encode("utf-8", "surrogatepass")
     if len(encoded) <= MAX_EXCERPT_BYTES:
         return combined
@@ -1788,6 +1820,15 @@ def monitor_child_arguments(
         "--verbose",
         "--disable-slash-commands",
         "--no-chrome",
+        # admin#1495 finding 3806647922: the takeover flow checks out the
+        # TARGET PR before monitoring, so project-level settings under the
+        # child's cwd are attacker-writable — a crafted PR could grant
+        # itself hooks, MCP servers, and wider permissions. The child loads
+        # USER-level settings only; deployments grant the monitor child's
+        # write permissions there (Keeper VM bootstrap already provisions
+        # user-level settings), never through the mutable checkout.
+        "--setting-sources",
+        "user",
     ]
     return arguments
 

@@ -639,6 +639,32 @@ class ChildEnvAllowlistTests(unittest.TestCase):
         # claude_bin is the real name "claude" here, so FAKE_* is stripped.
         self.assertNotIn("FAKE_MODE", captured)
 
+    def test_claude_prefixed_secrets_never_reach_the_child(self) -> None:
+        # mm#3551 finding 3806719670: Keeper's VM bootstrap stores OAuth
+        # tokens under CLAUDE_*-named variables — the prefix allowlist
+        # forwarded them. Exact names only.
+        runner = _runner("claude-opus-5", None)
+        with mock.patch.dict(os.environ, {
+            "CLAUDE_CODE_OAUTH_TOKEN": "secret-token",
+            "CLAUDE_ACCOUNT_TOKENS_JSON": "{\"bundle\": true}",
+            "CLAUDE_CONFIG_DIR": "/keep/me",
+            "PATH": os.environ.get("PATH", "/usr/bin"),
+        }):
+            captured = {}
+
+            def fake_popen(argv, **kwargs):
+                captured.update(kwargs.get("env") or {})
+                raise OSError("stop before real spawn")
+
+            with mock.patch.object(
+                mr_module().subprocess, "Popen", fake_popen
+            ):
+                with self.assertRaises(RunnerExit):
+                    runner.launch_child("prompt", None, 60)
+        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", captured)
+        self.assertNotIn("CLAUDE_ACCOUNT_TOKENS_JSON", captured)
+        self.assertIn("CLAUDE_CONFIG_DIR", captured)
+
 
 def mr_module():
     import monitor_runner

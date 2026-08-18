@@ -53,6 +53,7 @@ import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, IO
 
@@ -158,7 +159,17 @@ class RunnerExit(Exception):
 class SchemaCli:
     """All state parsing/validation via the trusted CLI — never imported."""
 
-    def __init__(self, schema_source: bytes) -> None:
+    def __init__(
+        self,
+        schema_source: bytes,
+        remaining_seconds: "Callable[[], float] | None" = None,
+    ) -> None:
+        # algo#1216 finding 3806594995: four post-child CLI calls at a fixed
+        # 120s each could overrun the parent's 2700s attempt ceiling by 60s.
+        # When the runner provides its slice clock, every call's timeout is
+        # capped at the remaining budget (floor 5s so a call can still fail
+        # fast rather than hang the accounting).
+        self._remaining_seconds = remaining_seconds
         # C-F1: the validator's SOURCE is pinned in the RUNNER's heap and
         # fed to the interpreter over stdin on every call, so there is no
         # on-disk copy a same-UID child can swap during a validation window.
@@ -235,11 +246,16 @@ class SchemaCli:
         # documented deployment requirement, not code, as the common user-pyenv
         # + working-copy setup is UID-writable by design.)
         try:
+            call_timeout = 120.0
+            if self._remaining_seconds is not None:
+                call_timeout = min(
+                    call_timeout, max(5.0, self._remaining_seconds())
+                )
             completed = subprocess.run(
                 [sys.executable, "-I", "-S", "-", *mode, str(target)],
                 input=self._source,
                 capture_output=True,
-                timeout=120,
+                timeout=call_timeout,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
             return {
@@ -323,6 +339,15 @@ def render_monitor_cli_block(block: dict[str, Any]) -> str:
 
     lines = ["monitor_cli:"]
     lines.append(f"  schema_version: {block['schema_version']}")
+    liveness = block.get("liveness")
+    if liveness is None:
+        lines.append("  liveness: null")
+    else:
+        lines.append("  liveness:")
+        lines.append(f"    rung: {liveness['rung']}")
+        lines.append(
+            f"    next_retry_at: {_render_scalar(liveness.get('next_retry_at'))}"
+        )
     lines.append(f"  child_session_id: {_render_scalar(block['child_session_id'])}")
     lines.append(f"  owner_model: {_render_scalar(block['owner_model'])}")
     lines.append(
@@ -520,12 +545,36 @@ def _read_regular_file(path: Path, ceiling: int) -> bytes:
         os.close(fd)
 
 
+_SANITIZED_SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"
+
+
+def _resolve_system_binary(name: str) -> str:
+    """mm#3551 finding 3806719679: resolve a bare command against the
+    sanitized system PATH (user-writable ambient PATH entries excluded).
+    Falls back to the bare name when nothing matches — the subsequent probe
+    or spawn then fails loudly with the real cause instead of silently
+    resolving through a writable directory."""
+
+    import shutil as shutil_module
+
+    # Hermetic-test seam (same class as --claude-bin/--wait-scale): an
+    # explicit MONITOR_RUNNER_BIN_<NAME> override names the binary directly.
+    # The runner's own environment is the operator's trust domain — the
+    # finding's hazard was the ambient PATH's writable first directory,
+    # which this resolution still never consults.
+    override = os.environ.get(f"MONITOR_RUNNER_BIN_{name.upper()}")
+    if override:
+        return override
+    found = shutil_module.which(name, path=_SANITIZED_SYSTEM_PATH)
+    return found or name
+
+
 def process_fingerprint(pid: int) -> str | None:
     # R6-F8: a denied/hung ps is a fingerprint failure, not a runner crash —
     # None already routes the launch into the structured spawn-failure path.
     try:
         completed = subprocess.run(
-            ["ps", "-o", "lstart=", "-p", str(pid)],
+            [_resolve_system_binary("ps"), "-o", "lstart=", "-p", str(pid)],
             capture_output=True,
             text=True,
             timeout=10,
@@ -549,7 +598,7 @@ def _live_group_members(pgid: int) -> list[str]:
 
     try:
         completed = subprocess.run(
-            ["ps", "-o", "pid=,stat=", "-g", str(pgid)],
+            [_resolve_system_binary("ps"), "-o", "pid=,stat=", "-g", str(pgid)],
             capture_output=True,
             text=True,
             timeout=10,
@@ -858,10 +907,16 @@ class Runner:
         # (or stop resolving) after the version probe already passed from
         # the runner's own cwd. Bare command names keep PATH resolution,
         # which is cwd-independent.
+        # mm#3551 finding 3806719679 (in-package half): a bare command name
+        # resolved through the ambient PATH trusts a same-UID-writable first
+        # PATH directory. Bare names resolve ONCE, at startup, against the
+        # sanitized system PATH; path-shaped values resolve absolute as
+        # before. (The mutable-checkout import chain half of that finding
+        # remains the host deployment contract.)
         self.claude_bin = (
             str(Path(args.claude_bin).resolve())
             if os.sep in args.claude_bin
-            else args.claude_bin
+            else _resolve_system_binary(args.claude_bin)
         )
         # R2 #1328 finding 3767068783 / pass-4 codex C-F1: the schema CLI
         # must not execute from the writable skill package after a
@@ -878,7 +933,9 @@ class Runner:
         # commit-time digest recheck is needed.
         source_cli = Path(args.schema_cli).resolve()
         self.schema_source = source_cli.read_bytes()
-        self.schema = SchemaCli(self.schema_source)
+        self.schema = SchemaCli(
+            self.schema_source, remaining_seconds=lambda: self.remaining()
+        )
         # algo#1216 R2 finding 3779532260, composed with the same in-memory
         # trust base: the exec-barrier wrapper is trust-bearing code too — a
         # prior tick's child could rewrite the worktree wrapper and thereby
@@ -937,7 +994,7 @@ class Runner:
             # subprocess site here — a hung git must not wedge __init__
             # before the lock or any heartbeat exists.
             root_probe = subprocess.run(
-                ["git", "-C", str(self.state_path.parent), "rev-parse",
+                [_resolve_system_binary("git"), "-C", str(self.state_path.parent), "rev-parse",
                  "--show-toplevel"],
                 capture_output=True, text=True, timeout=30,
             )
@@ -1080,7 +1137,12 @@ class Runner:
 
     # -- state helpers ---------------------------------------------------
     def read_text(self) -> str:
-        return self.state_path.read_text(encoding="utf-8")
+        # algo#1216 finding 3806594992 / mm#3551 finding 3806719734:
+        # canonical state is child-writable between ticks — its reads get
+        # the same FIFO-safe bounded treatment as candidates.
+        return _read_regular_file(
+            self.state_path, MAX_CANDIDATE_BYTES
+        ).decode("utf-8")
 
     def current_block(self, extract: dict[str, Any]) -> dict[str, Any]:
         block = extract.get("monitor_cli")
@@ -1090,7 +1152,9 @@ class Runner:
             "owner_model": self.owner_model,
             "last_completed_attempt_id": None,
             "in_flight": None,
+            "liveness": None,
         }
+        base.setdefault("liveness", None)
         # The failure ledger is runner-memory truth (bounded diagnostic
         # history in state) — a child that erased it changes nothing.
         base["child_failures"] = list(self.failures[-10:])
@@ -1337,11 +1401,17 @@ class Runner:
         # the role/credential separation R2 asks for remains a host
         # contract. FAKE_* passes only under the test harness's fake
         # claude bin, never a real one.
-        allowed_prefixes = ("LC_", "CLAUDE_")
+        # mm#3551 finding 3806719670: the CLAUDE_ PREFIX forwarded Keeper's
+        # VM bootstrap secrets (lazy-init stores the active OAuth token and
+        # the full account bundle under CLAUDE_*-named variables). Exact
+        # names only: the child needs its config dir; every other CLAUDE_*
+        # variable is either one of the three deliberately-unset overrides
+        # or something the child must not inherit.
+        allowed_prefixes = ("LC_",)
         allowed_names = {
             "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TERM",
             "TZ", "LANG", "COLUMNS", "LINES", "SSH_AUTH_SOCK", "XDG_CACHE_HOME",
-            "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+            "XDG_CONFIG_HOME", "XDG_DATA_HOME", "CLAUDE_CONFIG_DIR",
         }
         fake_child = Path(self.claude_bin).name != "claude"
         child_env = {
@@ -2156,7 +2226,19 @@ class Runner:
         launch_results = fresh.get("handoff_results") or {}
         cand_results = candidate_extract.get("handoff_results") or {}
         cand_ops = candidate_extract.get("handoff_operations") or {}
+        launch_digests = fresh.get("handoff_result_digests") or {}
+        cand_digests = candidate_extract.get("handoff_result_digests") or {}
+        launch_attempts = fresh.get("handoff_result_attempts") or {}
+        cand_attempts = candidate_extract.get("handoff_result_attempts") or {}
         handoffs_monotonic = True
+        # algo#1216 finding 3806594975: a terminal claim over an EMPTY
+        # handoff map is vacuously "consistent" — require the launch-time
+        # handoff-kind set to survive into the candidate (a kind may gain
+        # records, never vanish), so zero-evidence terminal commits fail.
+        if outcome == "terminal":
+            for kind in launch_results:
+                if kind not in cand_results:
+                    handoffs_monotonic = False
         for kind, ops in launch_results.items():
             for op_id, status in ops.items():
                 new_status = (cand_results.get(kind) or {}).get(op_id)
@@ -2183,11 +2265,34 @@ class Runner:
                         handoffs_monotonic = False
                 elif status in terminal_statuses and new_status != status:
                     handoffs_monotonic = False
+                elif status in terminal_statuses and new_status == status:
+                    # Finding 3806594980: a terminal record is IMMUTABLE —
+                    # same-status evidence rewrites must not commit. Compare
+                    # the full-record digests both extracts expose.
+                    if (launch_digests.get(kind) or {}).get(op_id) != (
+                        cand_digests.get(kind) or {}
+                    ).get(op_id):
+                        handoffs_monotonic = False
                 elif status in ("pending", "retryable") and new_status not in (
                     "pending",
                     "retryable",
                 ) + terminal_statuses:
                     handoffs_monotonic = False
+                elif status in ("pending", "retryable") and new_status in (
+                    "pending",
+                    "retryable",
+                ):
+                    # Finding 3806594980: attempts on an in-flight record
+                    # are NONDECREASING — a reset re-opens the three-attempt
+                    # side-effect cap.
+                    old_attempts = (launch_attempts.get(kind) or {}).get(op_id)
+                    new_attempts = (cand_attempts.get(kind) or {}).get(op_id)
+                    if (
+                        isinstance(old_attempts, int)
+                        and isinstance(new_attempts, int)
+                        and new_attempts < old_attempts
+                    ):
+                        handoffs_monotonic = False
                 elif (
                     status in ("pending", "retryable")
                     and new_status == "skipped_dependency"
@@ -2329,6 +2434,36 @@ class Runner:
         return str(outcome)
 
     # -- waits -----------------------------------------------------------
+    def _persist_liveness(
+        self, extract: dict[str, Any], rung: int, wait_seconds: float
+    ) -> None:
+        """algo#1216 finding 3806594998 (+admin 3806647918, mm 3806719722):
+        the ladder rung persists BEFORE the wait, so a slice_exhausted
+        re-invocation resumes the escalation instead of restarting at rung
+        1 — state-and-safety's persist-next_retry_at-before-wait rule."""
+        from datetime import timedelta
+
+        block = self.current_block(extract)
+        block["liveness"] = {
+            "rung": rung,
+            "next_retry_at": (
+                datetime.now(timezone.utc) + timedelta(seconds=wait_seconds)
+            ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        self.commit_block(block)
+
+    def _resume_liveness_rung(self, extract: dict[str, Any]) -> int:
+        block = extract.get("monitor_cli")
+        liveness = block.get("liveness") if isinstance(block, dict) else None
+        if not isinstance(liveness, dict):
+            return 0
+        rung = liveness.get("rung")
+        return rung if isinstance(rung, int) and rung >= 1 else 0
+
+    def _ladder_wait_seconds(self, ladder_rung: int) -> float:
+        index = min(ladder_rung - 1, len(LIVENESS_BACKOFF_LADDER_SECONDS) - 1)
+        return LIVENESS_BACKOFF_LADDER_SECONDS[index] * self.wait_scale
+
     def wait_between_ticks(self, ladder_rung: int = 0) -> bool:
         base = WAIT_CHUNK_SECONDS
         if ladder_rung:
@@ -2474,7 +2609,9 @@ class Runner:
                 " (merge readiness) to completion before monitoring; a"
                 " pre-4b legacy state must not bypass the gate",
             )
-        retries = 0
+        # Finding 3806594998: resume the persisted ladder rung so a fresh
+        # slice continues the escalation instead of restarting at rung 1.
+        retries = self._resume_liveness_rung(extract)
         # Bounded like every loop in this package (scanner rule + doctrine):
         # the slice deadline is the real bound and always fires first; the
         # iteration cap is an unreachable fail-closed backstop, never a
@@ -2523,6 +2660,11 @@ class Runner:
                 continue
             if result == "retry":
                 retries += 1
+                # Persist the rung BEFORE the wait (finding 3806594998) so
+                # a slice boundary mid-ladder resumes, not restarts.
+                self._persist_liveness(
+                    extract, retries, self._ladder_wait_seconds(retries)
+                )
                 if not self.wait_between_ticks(ladder_rung=retries):
                     return {
                         "runner_outcome": "slice_exhausted",
@@ -2530,6 +2672,12 @@ class Runner:
                         "child_session_id": self.child_session_id,
                     }
                 continue
+            if retries:
+                # A non-retry outcome ends the ladder: clear the persisted
+                # rung so the next escalation starts fresh.
+                cleared = self.current_block(extract)
+                cleared["liveness"] = None
+                self.commit_block(cleared)
             retries = 0
             if not self.wait_between_ticks():
                 return {

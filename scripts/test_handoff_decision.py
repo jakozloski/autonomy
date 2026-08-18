@@ -588,6 +588,72 @@ class HandoffDecisionTest(unittest.TestCase):
             "ordering/case/duplicates must not roll the generation",
         )
 
+    def test_reviewer_removal_prunes_terminal_request_ops(self) -> None:
+        # admin#1495 finding 3806647937: after removing bob from a completed
+        # alice,bob handoff, bob's terminal request/verify records must
+        # prune as prior-target history — the ":g"-based compare kept the
+        # identity in the base and blocked forever on unknown IDs.
+        def request(reviewers, results=None):
+            payload = {
+                "scenario": "approved_qa",
+                "repository": REPOSITORY,
+                "pull_request_number": PR_NUMBER,
+                "existing_assignees": ["jakozloski"],
+                "code_reviewers": reviewers,
+                "issue_tracker": {
+                    "type": "linear",
+                    "qa_assignee": LINEAR_QA_ASSIGNEE,
+                    "qa_state": LINEAR_QA_STATE_WEB,
+                    "ticket_identifier": "WEB-8877",
+                    "ticket_provider_id": "linear-ticket-web-8877",
+                    "ticket_validated": True,
+                    "write_path": "environment_tool",
+                },
+            }
+            if results is not None:
+                payload["operation_results"] = results
+            return payload
+
+        first = plan_handoff(request(["alice", "bob"]))
+        completed = {
+            operation["id"]: operation_result("complete")
+            for operation in first["operations"]
+            if operation["service"] != "local"
+        }
+        shrunk = plan_handoff(request(["alice"], completed))
+        self.assertEqual(shrunk["state"], "pending", shrunk.get("errors"))
+        self.assertTrue(
+            any("prior-target" in warning for warning in shrunk["warnings"]),
+            shrunk["warnings"],
+        )
+
+    def test_qa_reviewer_order_is_canonical(self) -> None:
+        # admin#1495 finding 3806647929: reordering reviewers kept the same
+        # generation while operations followed request order — a partially
+        # completed ledger then failed the prefix rule. Operations now use
+        # the digest's canonical (casefold-sorted) order.
+        def request(reviewers):
+            return {
+                "scenario": "approved_qa",
+                "repository": REPOSITORY,
+                "pull_request_number": PR_NUMBER,
+                "existing_assignees": ["jakozloski"],
+                "code_reviewers": reviewers,
+                "issue_tracker": {
+                    "type": "linear",
+                    "qa_assignee": LINEAR_QA_ASSIGNEE,
+                    "qa_state": LINEAR_QA_STATE_WEB,
+                    "ticket_identifier": "WEB-8877",
+                    "ticket_provider_id": "linear-ticket-web-8877",
+                    "ticket_validated": True,
+                    "write_path": "environment_tool",
+                },
+            }
+
+        first = plan_handoff(request(["alice", "bob"]))
+        second = plan_handoff(request(["bob", "alice"]))
+        self.assertEqual(first, second)
+
     def test_qa_code_reviewers_mint_write_ahead_request_operations(
         self,
     ) -> None:

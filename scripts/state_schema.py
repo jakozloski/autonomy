@@ -106,6 +106,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import datetime, timedelta, timezone
 import re
 import sys
@@ -224,9 +225,17 @@ MONITOR_OWNERSHIP_KEYS = MONITOR_OWNERSHIP_REQUIRED_KEYS | frozenset(
 # RUNNER-OWNED: the runner is the sole writer, a child candidate must carry
 # it value-identical, and every field is required when the block is present
 # (fail closed — a half-written control block is corruption, not progress).
+# Mirrors monitor_runner.MAX_CANDIDATE_BYTES (language-boundary twin — the
+# CLI must not import the runner); a canonical state past this is corruption.
+STATE_READ_CEILING_BYTES = 8 * 1_048_576
+
 MONITOR_CLI_SCHEMA_VERSION = 1
+# "liveness" is OPTIONAL (migration tolerance for in-flight states written
+# before it existed); every other key is required when the block exists.
+MONITOR_CLI_OPTIONAL_KEYS = frozenset(("liveness",))
 MONITOR_CLI_KEYS = frozenset(
     (
+        "liveness",
         "schema_version",
         "child_session_id",
         "owner_model",
@@ -1313,8 +1322,35 @@ class _Validator:
                 for key in cli:
                     if key not in MONITOR_CLI_KEYS:
                         self.error(f"monitor_cli: unknown key {_safe_key(str(key))!r}")
-                for key in sorted(MONITOR_CLI_KEYS - set(cli)):
+                for key in sorted(
+                    MONITOR_CLI_KEYS - MONITOR_CLI_OPTIONAL_KEYS - set(cli)
+                ):
                     self.error(f"monitor_cli: required key {key!r} is missing")
+                # algo#1216 finding 3806594998 (+admin/mm twins): the
+                # liveness ladder persists so a fresh slice resumes the
+                # rung instead of restarting at 1.
+                if "liveness" in cli and cli.get("liveness") is not None:
+                    liveness = cli.get("liveness")
+                    if not isinstance(liveness, dict):
+                        self.error("monitor_cli.liveness: must be a mapping or null")
+                    else:
+                        for lkey in liveness:
+                            if lkey not in ("rung", "next_retry_at"):
+                                self.error(
+                                    "monitor_cli.liveness: unknown key"
+                                    f" {_safe_key(str(lkey))!r}"
+                                )
+                        rung = liveness.get("rung")
+                        if not isinstance(rung, int) or isinstance(rung, bool) or rung < 1:
+                            self.error(
+                                "monitor_cli.liveness.rung: must be an integer >= 1"
+                            )
+                        nra = liveness.get("next_retry_at")
+                        if nra is not None and normalize_iso_timestamp(nra) is None:
+                            self.error(
+                                "monitor_cli.liveness.next_retry_at: must be an"
+                                " ISO 8601 timestamp or null"
+                            )
                 if "schema_version" in cli and cli.get("schema_version") != MONITOR_CLI_SCHEMA_VERSION:
                     self.error(
                         "monitor_cli.schema_version: must be"
@@ -1618,7 +1654,7 @@ class _Validator:
         if isinstance(conventions, dict):
             self.validate_conventions(conventions)
         if "decision_audit_trail" in state:
-            trail = state.get("decision_audit_trail")
+            trail = self.state.get("decision_audit_trail")
             if not isinstance(trail, list) or any(
                 not isinstance(item, str) or not item for item in trail
             ):
@@ -1709,12 +1745,27 @@ class _Validator:
         gate_status = statuses.get("merge_readiness")
         monitor_state = statuses.get("monitor")
         if gate_status in ("pending", "in_progress"):
-            if statuses.get("pr") == "complete" or (
-                monitor_state and monitor_state != "pending"
+            # algo#1216 finding 3806595010: the documented LEGACY re-entry
+            # (a pre-4b state with completed pr / active monitor running
+            # Phase 4b now) must be able to write in_progress without
+            # invalidating its own state. The explicit migration marker in
+            # the Decision Audit Trail records that transition; without it,
+            # the combination stays the bypass this invariant rejects.
+            trail = self.state.get("decision_audit_trail")
+            legacy_reentry = isinstance(trail, list) and any(
+                isinstance(entry, str)
+                and entry.startswith("legacy-4b-reentry:")
+                for entry in trail
+            )
+            if not legacy_reentry and (
+                statuses.get("pr") == "complete"
+                or (monitor_state and monitor_state != "pending")
             ):
                 self.error(
                     "invariant(ii): pr completion or monitor progress requires the "
-                    "present phases.merge_readiness gate to be terminal"
+                    "present phases.merge_readiness gate to be terminal (a "
+                    "documented legacy re-entry records legacy-4b-reentry:<ts> "
+                    "in the Decision Audit Trail before writing in_progress)"
                 )
         elif gate_status == "blocked" and monitor_state in ("paused", "complete"):
             # A blocked gate may legally coexist with a blocked monitor (the
@@ -2391,6 +2442,19 @@ class _Validator:
                 self.check_enum(
                     direction, HAZARD_DIRECTION_ENUM, "merge_readiness.hazard_direction"
                 )
+                # mm#3551 finding 3806719714: an additive/mixed documented
+                # hazard with EMPTY applied_state validated clean and
+                # derived no hold — the per-environment recording contract
+                # requires at least one recorded environment.
+                if direction in ("additive", "mixed"):
+                    applied_record = value.get("applied_state")
+                    if not isinstance(applied_record, dict) or not applied_record:
+                        self.error(
+                            "merge_readiness.applied_state: an additive/mixed"
+                            " hazard_documented deploy order requires per-"
+                            "environment applied-state records (empty means"
+                            " the recheck never ran)"
+                        )
         elif direction is not None:
             self.check_enum(
                 direction, HAZARD_DIRECTION_ENUM, "merge_readiness.hazard_direction"
@@ -2950,6 +3014,7 @@ def monitor_extract(text: str) -> dict[str, Any]:
         "handoff_operations": {},
         "handoff_results": {},
         "handoff_result_digests": {},
+        "handoff_result_attempts": {},
         "merge_readiness_backfill": {},
         "phases_merge_readiness": None,
         "merge_readiness_hold": False,
@@ -2994,6 +3059,7 @@ def monitor_extract(text: str) -> dict[str, Any]:
     operations_map: dict[str, list[str]] = {}
     results_map: dict[str, dict[str, str]] = {}
     digests_map: dict[str, dict[str, str]] = {}
+    attempts_map: dict[str, dict[str, int]] = {}
     if isinstance(handoffs, dict):
         for kind, record in handoffs.items():
             if not isinstance(record, dict):
@@ -3004,12 +3070,18 @@ def monitor_extract(text: str) -> dict[str, Any]:
             ] if isinstance(ops, list) else []
             results: dict[str, str] = {}
             digests: dict[str, str] = {}
+            attempts: dict[str, int] = {}
             raw = record.get("operation_results")
             if isinstance(raw, dict):
                 for op_id, res in raw.items():
                     status = res.get("status") if isinstance(res, dict) else None
                     if isinstance(op_id, str) and isinstance(status, str):
                         results[op_id] = status
+                        attempts_value = res.get("attempts")
+                        if isinstance(attempts_value, int) and not isinstance(
+                            attempts_value, bool
+                        ):
+                            attempts[op_id] = attempts_value
                         # admin#1495 R2 follow-up 3793041749: sidecar
                         # compaction must compare the ENTIRE record, not the
                         # status — attempts/evidence/timestamps that differ
@@ -3025,9 +3097,11 @@ def monitor_extract(text: str) -> dict[str, Any]:
                         ).hexdigest()
             results_map[str(kind)] = results
             digests_map[str(kind)] = digests
+            attempts_map[str(kind)] = attempts
     extract["handoff_operations"] = operations_map
     extract["handoff_results"] = results_map
     extract["handoff_result_digests"] = digests_map
+    extract["handoff_result_attempts"] = attempts_map
     phases_map = state.get("phases")
     if isinstance(phases_map, dict):
         mr_phase = phases_map.get("merge_readiness")
@@ -3052,7 +3126,11 @@ def monitor_extract(text: str) -> dict[str, Any]:
             "hazard_direction"
         ) in ("additive", "mixed"):
             applied = gate.get("applied_state")
-            if isinstance(applied, dict):
+            if not isinstance(applied, dict) or not applied:
+                # Finding 3806719714: no recorded environments = the recheck
+                # never ran — the hold stays live, never silently released.
+                hold = True
+            else:
                 for env_map in applied.values():
                     if isinstance(env_map, dict) and any(
                         status == "pending" for status in env_map.values()
@@ -3114,8 +3192,31 @@ def main(argv: list[str]) -> int:
         )
         return 2
     try:
-        with open(args[0], encoding="utf-8") as handle:
-            text = handle.read()
+        # mm#3551 finding 3806719734: the CLI's target is child-writable —
+        # refuse special files without blocking and bound the read (the
+        # ceiling mirrors the runner's MAX_CANDIDATE_BYTES; a state past it
+        # is corruption, not progress). O_NONBLOCK is harmless on regular
+        # files; S_ISREG is proven on the OPEN descriptor.
+        import stat as _stat
+
+        _fd = os.open(args[0], os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        try:
+            if not _stat.S_ISREG(os.fstat(_fd).st_mode):
+                raise OSError("target is not a regular file")
+            _chunks = []
+            _budget = STATE_READ_CEILING_BYTES + 1
+            while _budget > 0:
+                _chunk = os.read(_fd, min(1_048_576, _budget))
+                if not _chunk:
+                    break
+                _chunks.append(_chunk)
+                _budget -= len(_chunk)
+        finally:
+            os.close(_fd)
+        _raw = b"".join(_chunks)
+        if len(_raw) > STATE_READ_CEILING_BYTES:
+            raise OSError("target exceeds the state read ceiling")
+        text = _raw.decode("utf-8")
     except (OSError, UnicodeDecodeError):
         print(
             json.dumps(

@@ -308,6 +308,11 @@ def _approved_qa_operations(
                 seen.casefold() for seen in code_reviewers
             }:
                 code_reviewers.append(login)
+    # admin#1495 finding 3806647929: the digest normalizes (casefold sort)
+    # but operations preserved REQUEST order — reordering reviewers kept
+    # the generation while the ledger prefix no longer matched. Operations
+    # use the digest's own canonical order, so order is never load-bearing.
+    code_reviewers = sorted(code_reviewers, key=str.casefold)
     targets = {
         "assignees": [github_login],
         "reviewers": list(code_reviewers),
@@ -1328,13 +1333,19 @@ def plan_handoff(request: Any) -> dict[str, Any]:
                     if not operation_id.startswith("qa."):
                         continue
                     # CR 3760683938 (keeper-agents#1328), applied to both
-                    # sweeps: prunable history is ONLY an id whose base
-                    # (before the :g digest) names an operation family the
-                    # current plan mints — a fabricated "qa.bogus:g..." id
-                    # must stay an unknown-ID error, never laundered as a
-                    # prior-target record.
-                    if operation_id.split(":g", 1)[0] not in {
-                        known.split(":g", 1)[0] for known in known_ids
+                    # sweeps: prunable history is ONLY an id whose FAMILY
+                    # (the dotted verb before any ":" segment) names an
+                    # operation family the current plan mints — a fabricated
+                    # "qa.bogus:g..." id stays an unknown-ID error, never
+                    # laundered as a prior-target record. admin#1495 finding
+                    # 3806647937: the compare is identity-INDEPENDENT (first
+                    # ":", matching the roundtrip sweep) — splitting at ":g"
+                    # kept the reviewer identity in the base, so a removed
+                    # reviewer's terminal request ops were never recognized
+                    # as stale and blocked every later generation as
+                    # permanent unknown IDs.
+                    if operation_id.split(":", 1)[0] not in {
+                        known.split(":", 1)[0] for known in known_ids
                     }:
                         continue
                     status = (

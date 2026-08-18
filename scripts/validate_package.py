@@ -395,6 +395,9 @@ REQUIRED_ANCHORED_MARKERS = {
 
 _LIST_MARKER_PREFIXES = ("- ", "* ", "+ ")
 
+# Patterns are canonical in model_policy.REDACTION_PATTERNS (runtime
+# enforcement, finding 3806595004); this dict binds each to its
+# fixtures. The parity check below fails if the two sets drift.
 REQUIRED_REDACTION_PATTERNS = {
     "aws_access_or_session_key": (
         r"(AKIA|ASIA)[0-9A-Z]{16}",
@@ -541,6 +544,16 @@ REQUIRED_REDACTION_PATTERNS = {
         ("eyJ" + "abcde-fghijk.eyJlmno_pqrstuv.signature-part",),
     ),
 }
+_POLICY_PATTERNS = dict(model_policy.REDACTION_PATTERNS)
+if set(_POLICY_PATTERNS) != set(REQUIRED_REDACTION_PATTERNS) or any(
+    _POLICY_PATTERNS[kind] != pattern
+    for kind, (pattern, _samples) in REQUIRED_REDACTION_PATTERNS.items()
+):
+    raise ValueError(
+        "REQUIRED_REDACTION_PATTERNS drifted from"
+        " model_policy.REDACTION_PATTERNS — one canonical list"
+    )
+
 # This is the complete heading inventory moved out of the former monolithic
 # SKILL.md. Exact headings are deliberate: renaming one is a navigation change
 # and must update this inventory (or an explicitly supplied JSON manifest).

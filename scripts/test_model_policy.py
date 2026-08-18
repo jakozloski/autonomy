@@ -2237,6 +2237,10 @@ class MonitorChildInvocationTests(unittest.TestCase):
                 "--verbose",
                 "--disable-slash-commands",
                 "--no-chrome",
+                # admin#1495 finding 3806647922: user-level settings only —
+                # the checked-out PR's project settings are untrusted.
+                "--setting-sources",
+                "user",
             ],
         )
 
@@ -2551,6 +2555,21 @@ class AuthSignatureOffsetUnicodeTests(unittest.TestCase):
         # Companion guardrail: an incidental millisecond count must NOT read as
         # an auth marker — that would turn a retryable transient into a kill.
         self.assertIsNone(auth_signature_offset("read timeout after 401ms"))
+
+
+class BoundedExcerptRedactionTests(unittest.TestCase):
+    def test_bearer_header_is_redacted_in_code(self) -> None:
+        # Finding 3806595004: prose deferral let the header survive — the
+        # canonical patterns now run inside bounded_excerpt itself.
+        excerpt = bounded_excerpt(
+            "", "error: Authorization: Bearer abc123def456ghi789 rejected"
+        )
+        self.assertNotIn("abc123def456ghi789", excerpt)
+        self.assertIn("[REDACTED: authorization_bearer_header]", excerpt)
+
+    def test_password_assignment_is_redacted_in_code(self) -> None:
+        excerpt = bounded_excerpt("", "DB_PASSWORD=prodsecret99")
+        self.assertNotIn("prodsecret99", excerpt)
 
 
 if __name__ == "__main__":
