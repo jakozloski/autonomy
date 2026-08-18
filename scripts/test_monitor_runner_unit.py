@@ -23,6 +23,7 @@ does not trip the skill scanner and needs no split.
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
 import shutil
 import tempfile
@@ -239,6 +240,8 @@ class SidecarGateTests(unittest.TestCase):
         return sidecar
 
     def test_redundant_terminal_sidecar_is_compacted(self) -> None:
+        # R2 follow-up 3793041749: compaction now requires the FULL record
+        # to match (canonical-JSON digest), not just the status.
         runner = self._runner_with_state()
         stub = self._StubSchema()
         runner.schema = stub
@@ -247,13 +250,42 @@ class SidecarGateTests(unittest.TestCase):
             {
                 "state": "valid",
                 "handoff_results": {"qa": {"op-1": "complete"}},
+                "handoff_result_digests": {"qa": {"op-1": "d" * 64}},
             }
         )
-        canonical = {"handoff_results": {"qa": {"op-1": "complete"}}}
+        canonical = {
+            "handoff_results": {"qa": {"op-1": "complete"}},
+            "handoff_result_digests": {"qa": {"op-1": "d" * 64}},
+        }
         runner._gate_sidecars(canonical)  # no raise
         self.assertFalse(
             sidecar.exists(), "redundant terminal evidence must compact"
         )
+
+    def test_same_status_differing_record_blocks_as_conflict(self) -> None:
+        # R2 follow-up 3793041749: matching status with differing
+        # attempts/evidence history is CONFLICTING evidence, never
+        # redundant — the sidecar must survive and the gate must block.
+        runner = self._runner_with_state()
+        stub = self._StubSchema()
+        runner.schema = stub
+        sidecar = self._sidecar(runner, "ee")
+        stub.queued.append(
+            {
+                "state": "valid",
+                "handoff_results": {"qa": {"op-7": "complete"}},
+                "handoff_result_digests": {"qa": {"op-7": "a" * 64}},
+            }
+        )
+        canonical = {
+            "handoff_results": {"qa": {"op-7": "complete"}},
+            "handoff_result_digests": {"qa": {"op-7": "b" * 64}},
+        }
+        with self.assertRaises(RunnerExit) as caught:
+            runner._gate_sidecars(canonical)
+        self.assertEqual(caught.exception.code, 5)
+        self.assertIn("CONFLICTS", caught.exception.reason)
+        self.assertTrue(sidecar.exists())
 
     def test_unmerged_terminal_sidecar_blocks(self) -> None:
         runner = self._runner_with_state()
@@ -272,6 +304,55 @@ class SidecarGateTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 5)
         self.assertIn("TERMINAL operation evidence", caught.exception.reason)
         self.assertTrue(sidecar.exists(), "never delete unmerged evidence")
+
+    def test_no_status_valid_sidecar_is_compacted(self) -> None:
+        # admin#1495 finding 3793025403: a valid sidecar with zero operation
+        # results records no external intents — it must compact instead of
+        # accumulating toward the retention block.
+        runner = self._runner_with_state()
+        stub = self._StubSchema()
+        runner.schema = stub
+        sidecar = self._sidecar(runner, "ff")
+        stub.queued.append(
+            {"state": "valid", "handoff_results": {"qa": {}}}
+        )
+        # Entry passes compact_no_status=True; mid-slice gates never compact
+        # (the attempt-scoped preservation contract keeps the current
+        # streak's evidence).
+        runner._gate_sidecars(
+            {"handoff_results": {}}, compact_no_status=True
+        )  # no raise
+        self.assertFalse(sidecar.exists())
+        stub.queued.append(
+            {"state": "valid", "handoff_results": {"qa": {}}}
+        )
+        survivor = self._sidecar(runner, "gg")
+        runner._gate_sidecars({"handoff_results": {}})  # mid-slice default
+        self.assertTrue(survivor.exists())
+
+    def test_attempt_stray_is_gated_like_a_sidecar(self) -> None:
+        # algo#1216 finding 3792942215 (residue): a failed _preserve_failed
+        # rename leaves the raw .attempt-* candidate behind — the gate must
+        # classify it exactly like a failed-candidate sidecar.
+        runner = self._runner_with_state()
+        stub = self._StubSchema()
+        runner.schema = stub
+        stray = runner.state_path.parent / (
+            runner.state_path.name + ".attempt-" + "e" * 32 + ".md"
+        )
+        stray.write_text("---\nstate_schema_version: 1\n---\n", encoding="utf-8")
+        self.addCleanup(lambda: stray.unlink(missing_ok=True))
+        stub.queued.append(
+            {
+                "state": "valid",
+                "handoff_results": {"qa": {"op-8": "pending"}},
+            }
+        )
+        with self.assertRaises(RunnerExit) as caught:
+            runner._gate_sidecars({"handoff_results": {}})
+        self.assertEqual(caught.exception.code, 5)
+        self.assertIn("pending external intents", caught.exception.reason)
+        self.assertTrue(stray.exists())
 
     def test_retention_limit_blocks_before_any_parse(self) -> None:
         # R2 re-reply 3792845972: the count ceiling is enforced BEFORE any
@@ -426,6 +507,142 @@ class ChildSkillSnapshotTests(unittest.TestCase):
         self.assertTrue(snapshot.is_dir())
         runner.cleanup_wrapper_stage()
         self.assertFalse(snapshot.exists())
+
+
+
+class DurableReplaceTests(unittest.TestCase):
+    def test_fsync_failure_raises_instead_of_reporting_success(self) -> None:
+        # admin#1495 finding 3793025395: injected EIO was swallowed and
+        # durable_replace reported success on an unproven commit.
+        import monitor_runner as mr
+        tmp = Path(tempfile.mkdtemp(prefix="unit-durable-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        source = tmp / "a"
+        target = tmp / "b"
+        source.write_text("x", encoding="utf-8")
+        real_fsync = os.fsync
+
+        def failing_fsync(fd: int) -> None:
+            import errno
+            raise OSError(errno.EIO, "injected")
+
+        with mock.patch.object(mr.os, "fsync", failing_fsync):
+            with self.assertRaises(RunnerExit) as caught:
+                mr.durable_replace(source, target)
+        self.assertEqual(caught.exception.code, 4)
+        self.assertIn("fsync failed", caught.exception.reason)
+        # Best-effort class (ENOTSUP) still succeeds silently.
+        source.write_text("y", encoding="utf-8")
+
+        def unsupported_fsync(fd: int) -> None:
+            import errno
+            raise OSError(errno.ENOTSUP, "unsupported")
+
+        with mock.patch.object(mr.os, "fsync", unsupported_fsync):
+            mr.durable_replace(source, target)  # no raise
+        self.assertEqual(target.read_text(encoding="utf-8"), "y")
+
+
+class SnapshotIntegrityTests(unittest.TestCase):
+    def _fixture_runner(self):
+        tmp = Path(tempfile.mkdtemp(prefix="unit-snap-fixture-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        (tmp / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+        (tmp / "references").mkdir()
+        (tmp / "references" / "guide.md").write_text("ref\n", encoding="utf-8")
+        (tmp / "scripts").mkdir()
+        (tmp / "scripts" / "state_schema.py").write_text(
+            "# schema\n", encoding="utf-8"
+        )
+        args = argparse.Namespace(
+            state_file=str(tmp / "state.md"),
+            skill_dir=str(tmp),
+            claude_bin="claude",
+            schema_cli=str(SCRIPTS / "state_schema.py"),
+            slice_budget=100.0,
+            wait_scale=1.0,
+            acknowledge_taint=None,
+        )
+        runner = Runner(args)
+        _HELPER_RUNNERS.append(runner)
+        return runner
+
+    def test_planted_extra_file_fails_snapshot_verification(self) -> None:
+        # admin#1495 finding 3793025406: hashing manifest entries alone
+        # accepted ADDITIONS — a planted scripts/hashlib.py shadows stdlib
+        # for the child's plain script invocations.
+        runner = self._fixture_runner()
+        (runner.child_skill_dir / "scripts" / "hashlib.py").write_text(
+            "EVIL = True\n", encoding="utf-8"
+        )
+        with self.assertRaises(RunnerExit) as caught:
+            runner._verify_skill_snapshot()
+        self.assertEqual(caught.exception.code, 4)
+        self.assertIn("does not equal the manifest", caught.exception.reason)
+
+    def test_symlink_in_snapshot_fails_verification(self) -> None:
+        runner = self._fixture_runner()
+        staged = runner.child_skill_dir / "SKILL.md"
+        staged.unlink()
+        staged.symlink_to("/etc/hosts")
+        with self.assertRaises(RunnerExit) as caught:
+            runner._verify_skill_snapshot()
+        self.assertEqual(caught.exception.code, 4)
+
+    def test_fifo_read_fails_closed(self) -> None:
+        # algo#1216 finding 3792942225: a planted FIFO blocked the runner
+        # past its slice deadline; _read_regular_file refuses special files
+        # without blocking.
+        import monitor_runner as mr
+        tmp = Path(tempfile.mkdtemp(prefix="unit-fifo-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        fifo = tmp / "candidate.md"
+        os.mkfifo(fifo)
+        with self.assertRaises(RunnerExit) as caught:
+            mr._read_regular_file(fifo, 1024)
+        self.assertEqual(caught.exception.code, 4)
+        self.assertIn("not a regular file", caught.exception.reason)
+
+
+class ChildEnvAllowlistTests(unittest.TestCase):
+    def test_ambient_sentinel_never_reaches_the_child_env(self) -> None:
+        # algo#1216 finding 3792942221 (in-package half): the child env is
+        # allowlist-built — an unrelated ambient variable provably reached
+        # the child under the old denylist.
+        runner = _runner("claude-opus-5", None)
+        with mock.patch.dict(os.environ, {
+            "AMBIENT_SENTINEL_XYZ": "leak",
+            "PATH": os.environ.get("PATH", "/usr/bin"),
+            "CLAUDE_CONFIG_DIR": "/keep/me",
+            "FAKE_MODE": "ok",
+        }):
+            captured = {}
+
+            class _Proc:
+                pid = 4242
+                stdin = None
+                stdout = None
+                stderr = None
+
+            def fake_popen(argv, **kwargs):
+                captured.update(kwargs.get("env") or {})
+                raise OSError("stop before real spawn")
+
+            with mock.patch.object(
+                mr_module().subprocess, "Popen", fake_popen
+            ):
+                with self.assertRaises(RunnerExit):
+                    runner.launch_child("prompt", None, 60)
+        self.assertNotIn("AMBIENT_SENTINEL_XYZ", captured)
+        self.assertIn("PATH", captured)
+        self.assertIn("CLAUDE_CONFIG_DIR", captured)
+        # claude_bin is the real name "claude" here, so FAKE_* is stripped.
+        self.assertNotIn("FAKE_MODE", captured)
+
+
+def mr_module():
+    import monitor_runner
+    return monitor_runner
 
 
 class WrapperStagingTests(unittest.TestCase):

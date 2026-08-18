@@ -218,7 +218,6 @@ class HandoffDecisionTest(unittest.TestCase):
             "depends_on": [f"qa.github.verify_assignees:g{QA_G}"],
             "payload": {
                 "ticket_identifier": "WEB-8877",
-                "ticket_provider_id": "linear-ticket-web-8877",
                 "assignee_id": "4d5aed4e-076c-47e5-94a1-0a39287364e1",
                 "assignee_email": "tj@keeper.ai",
                 "assignee_name": "Timothy Jhon Pascual",
@@ -233,7 +232,7 @@ class HandoffDecisionTest(unittest.TestCase):
             "depends_on": [f"qa.linear.assign_ticket:g{QA_G}"],
             "payload": {
                 "ticket_identifier": "WEB-8877",
-                "ticket_provider_id": "linear-ticket-web-8877",
+                "expected_ticket_provider_id": "linear-ticket-web-8877",
                 "expected_assignee_id": "4d5aed4e-076c-47e5-94a1-0a39287364e1",
                 "expected_assignee_name": "Timothy Jhon Pascual",
                 "write_path": "environment_tool",
@@ -247,7 +246,6 @@ class HandoffDecisionTest(unittest.TestCase):
             "depends_on": [f"qa.linear.verify_ticket_assignee:g{QA_G}"],
             "payload": {
                 "ticket_identifier": "WEB-8877",
-                "ticket_provider_id": "linear-ticket-web-8877",
                 "state_id": "linear-state-vercel-preview-qa",
                 "state_name": "Vercel Preview QA",
                 "write_path": "environment_tool",
@@ -261,7 +259,7 @@ class HandoffDecisionTest(unittest.TestCase):
             "depends_on": [f"qa.linear.set_ticket_state:g{QA_G}"],
             "payload": {
                 "ticket_identifier": "WEB-8877",
-                "ticket_provider_id": "linear-ticket-web-8877",
+                "expected_ticket_provider_id": "linear-ticket-web-8877",
                 "expected_state_id": "linear-state-vercel-preview-qa",
                 "expected_state_name": "Vercel Preview QA",
                 "write_path": "environment_tool",
@@ -884,11 +882,17 @@ class HandoffDecisionTest(unittest.TestCase):
         )
 
         self.assertEqual(plan["state"], "blocked")
+        # algo#1216 finding 3792942228: the dependency check moved into the
+        # SHARED validate_operation_collection (schema + runner + planner all
+        # reject this ledger via one definition), so the shared error text
+        # fires first.
         self.assertEqual(
             plan["errors"],
             [
-                f"operation qa.linear.verify_ticket_assignee:g{QA_G} cannot have results: "
-                f"dependency failed: qa.linear.assign_ticket:g{QA_G}"
+                f"operation 'qa.linear.verify_ticket_assignee:g{QA_G}' is"
+                " complete after failed/skipped predecessor"
+                f" 'qa.linear.assign_ticket:g{QA_G}' — the ordered executor"
+                " cannot produce this ledger"
             ],
         )
 
@@ -1887,7 +1891,6 @@ class HandoffDecisionTest(unittest.TestCase):
                         "depends_on": [f"qa.github.verify_assignees:g{QA_G}"],
                         "payload": {
                             "ticket_identifier": "WEB-8877",
-                            "ticket_provider_id": "linear-ticket-web-8877",
                             "assignee_id": "4d5aed4e-076c-47e5-94a1-0a39287364e1",
                             "assignee_email": "tj@keeper.ai",
                             "assignee_name": "Timothy Jhon Pascual",
@@ -1902,7 +1905,7 @@ class HandoffDecisionTest(unittest.TestCase):
                         "depends_on": [f"qa.linear.assign_ticket:g{QA_G}"],
                         "payload": {
                             "ticket_identifier": "WEB-8877",
-                            "ticket_provider_id": "linear-ticket-web-8877",
+                            "expected_ticket_provider_id": "linear-ticket-web-8877",
                             "expected_assignee_id": "4d5aed4e-076c-47e5-94a1-0a39287364e1",
                             "expected_assignee_name": "Timothy Jhon Pascual",
                             "write_path": "environment_tool",
@@ -1916,7 +1919,6 @@ class HandoffDecisionTest(unittest.TestCase):
                         "depends_on": [f"qa.linear.verify_ticket_assignee:g{QA_G}"],
                         "payload": {
                             "ticket_identifier": "WEB-8877",
-                            "ticket_provider_id": "linear-ticket-web-8877",
                             "state_id": "linear-state-vercel-preview-qa",
                             "state_name": "Vercel Preview QA",
                             "write_path": "environment_tool",
@@ -1930,7 +1932,7 @@ class HandoffDecisionTest(unittest.TestCase):
                         "depends_on": [f"qa.linear.set_ticket_state:g{QA_G}"],
                         "payload": {
                             "ticket_identifier": "WEB-8877",
-                            "ticket_provider_id": "linear-ticket-web-8877",
+                            "expected_ticket_provider_id": "linear-ticket-web-8877",
                             "expected_state_id": "linear-state-vercel-preview-qa",
                             "expected_state_name": "Vercel Preview QA",
                             "write_path": "environment_tool",

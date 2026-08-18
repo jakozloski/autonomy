@@ -90,6 +90,11 @@ acceptance_criteria:
     source: "description"
     verdict: "met"
     evidence: "validator green; suite green"
+acceptance_criteria_capture:
+  captured_at: "2026-08-16T12:00:00Z"
+  requester: "jakozloski"
+  source_revision: "2026-08-15T09:00:00Z"
+  digest: "3c0963cca3a4999a"
 merge_readiness:
   deploy_order: "n_a"
   applied_state: {}
@@ -288,7 +293,7 @@ if mode == "leave_survivor":
     # GO barrier, so the pre-GO baseline extract ran with no trigger. The
     # schema shim keys a one-shot canonical drift on this file so the drift
     # lands only in the post-drain window the survivor recheck defends.
-    trigger = os.environ.get("SURVIVOR_TRIGGER")
+    trigger = os.environ.get("FAKE_SURVIVOR_TRIGGER")
     if trigger:
         open(trigger, "w", encoding="utf-8").close()
 
@@ -491,8 +496,8 @@ FAKE_SCHEMA_CANONICAL_DRIFT = '''\
 import os, subprocess, sys
 
 REAL = {real!r}
-STATE_FILE = os.environ.get("DRIFT_STATE_FILE", "")
-TRIGGER = os.environ.get("SURVIVOR_TRIGGER", "")
+STATE_FILE = os.environ.get("FAKE_DRIFT_STATE_FILE", "")
+TRIGGER = os.environ.get("FAKE_SURVIVOR_TRIGGER", "")
 DRIFTED = TRIGGER + ".drifted" if TRIGGER else ""
 
 argv = sys.argv[1:]
@@ -1097,9 +1102,14 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         finally:
             sidecar.rmdir()
 
-    def test_valid_idle_sidecar_does_not_block_the_launch(self) -> None:
-        # Pass-through side of the fail-closed guard: a fully valid preserved
-        # sidecar with no pending external intents must not block work.
+    def test_valid_idle_sidecar_compacts_at_entry_and_launch_proceeds(
+        self,
+    ) -> None:
+        # Pass-through side of the fail-closed guard, updated for admin#1495
+        # finding 3793025403: a fully valid preserved sidecar with ZERO
+        # operation results carries no external intents — entry COMPACTS it
+        # (mid-slice gates never do, preserving the current streak's
+        # evidence) and the launch proceeds.
         sidecar = self.state.with_suffix(".failed-candidate-feedf00d.md")
         sidecar.write_text(
             self.state.read_text(encoding="utf-8"), encoding="utf-8"
@@ -1110,8 +1120,12 @@ class MonitorRunnerE2ETests(unittest.TestCase):
             self.assertTrue(
                 self.argv_log.exists(), "the launch must proceed"
             )
+            self.assertFalse(
+                sidecar.exists(),
+                "a no-intent sidecar must compact at entry",
+            )
         finally:
-            sidecar.unlink()
+            sidecar.unlink(missing_ok=True)
 
     def test_pending_sidecar_blocks_the_next_write_capable_tick(self) -> None:
         # algo#1216 R2 finding 3787662312 (third leg): unreconciled pending
@@ -2024,8 +2038,8 @@ class MonitorRunnerE2ETests(unittest.TestCase):
             mode="leave_survivor", budget="900", timeout=120,
             wait_scale="0.02", max_ticks="3",
             env_extra={
-                "DRIFT_STATE_FILE": str(self.state),
-                "SURVIVOR_TRIGGER": str(trigger),
+                "FAKE_DRIFT_STATE_FILE": str(self.state),
+                "FAKE_SURVIVOR_TRIGGER": str(trigger),
             },
             extra_args=["--schema-cli", str(shim)],
         )

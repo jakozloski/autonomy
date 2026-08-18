@@ -444,20 +444,28 @@ def atomic_write(path: Path, text: str) -> None:
     durable_replace(tmp, path)
 
 
-def _fsync_parent(path: Path) -> None:
+def _fsync_parent(path: Path) -> bool:
     # R6-F14: fsync the parent directory so a rename itself survives a
     # power loss — a data fsync does not make the directory entry durable.
-    # Best-effort where the platform disallows directory opens.
+    # admin#1495 finding 3793025395: an fsync I/O failure is a DURABILITY
+    # FAILURE and must surface (injected EIO was silently swallowed while
+    # durable_replace reported success). Only the platform's genuine
+    # inability to open/fsync a directory (ENOTSUP/EINVAL/EACCES-class,
+    # e.g. some non-POSIX filesystems) stays best-effort.
+    import errno
+
+    best_effort = (errno.ENOTSUP, errno.EINVAL, errno.EACCES, errno.EPERM)
     try:
         dir_fd = os.open(path.parent, os.O_RDONLY)
-    except OSError:
-        return
+    except OSError as error:
+        return error.errno in best_effort
     try:
         os.fsync(dir_fd)
-    except OSError:
-        pass
+    except OSError as error:
+        return error.errno in best_effort
     finally:
         os.close(dir_fd)
+    return True
 
 
 def durable_replace(source: Path, target: Path) -> None:
@@ -466,9 +474,50 @@ def durable_replace(source: Path, target: Path) -> None:
     target's parent after the rename — previously only atomic_write's
     internal rename was durable, so a crash after the final
     candidate-to-canonical replace could roll a reported-committed tick
-    back."""
+    back. Finding 3793025395: a failed directory fsync raises — the caller
+    must never report a commit the disk may not hold."""
     os.replace(source, target)
-    _fsync_parent(target)
+    if not _fsync_parent(target):
+        raise RunnerExit(
+            4,
+            "suspect_state",
+            f"directory fsync failed after replacing {target.name} — the"
+            " rename may not be durable on disk; treat the commit as"
+            " unproven and reconcile per the Resume trust model",
+        )
+
+
+def _read_regular_file(path: Path, ceiling: int) -> bytes:
+    """algo#1216 finding 3792942225: a plain open() follows child-plantable
+    special files — a FIFO blocks the runner past its slice deadline until
+    a writer supplies bytes. Open O_NONBLOCK|O_NOFOLLOW, prove S_ISREG on
+    the OPEN descriptor, and read at most ceiling+1 bytes (the caller's
+    size checks stay meaningful). O_NONBLOCK on a regular file has no
+    effect on reads, so normal candidates are unaffected."""
+
+    import stat as stat_module
+
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    try:
+        if not stat_module.S_ISREG(os.fstat(fd).st_mode):
+            raise RunnerExit(
+                4,
+                "suspect_state",
+                f"{path.name} is not a regular file — a planted special"
+                " file cannot be trusted input; reconcile per the Resume"
+                " trust model",
+            )
+        chunks: list[bytes] = []
+        remaining_budget = ceiling + 1
+        while remaining_budget > 0:
+            chunk = os.read(fd, min(1_048_576, remaining_budget))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining_budget -= len(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
 
 
 def process_fingerprint(pid: int) -> str | None:
@@ -1280,10 +1329,30 @@ class Runner:
         # CLAUDE_CODE_PERMISSION_MODE would defeat the pinned --effort and the
         # child's intended posture. The child's write access comes from the
         # workspace .claude settings at its cwd, not from these overrides.
+        # algo#1216 finding 3792942221 (in-package half): the child env is
+        # built from an ALLOWLIST, not ambient-minus-three — an unrelated
+        # ambient sentinel provably reached the child under the old
+        # denylist. This is leakage hygiene, not a credential boundary: the
+        # child still reaches gh/claude auth through HOME by design, and
+        # the role/credential separation R2 asks for remains a host
+        # contract. FAKE_* passes only under the test harness's fake
+        # claude bin, never a real one.
+        allowed_prefixes = ("LC_", "CLAUDE_")
+        allowed_names = {
+            "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TERM",
+            "TZ", "LANG", "COLUMNS", "LINES", "SSH_AUTH_SOCK", "XDG_CACHE_HOME",
+            "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+        }
+        fake_child = Path(self.claude_bin).name != "claude"
         child_env = {
             key: value
             for key, value in os.environ.items()
             if key not in CLAUDE_READ_ONLY_ENV_UNSET
+            and (
+                key in allowed_names
+                or key.startswith(allowed_prefixes)
+                or (fake_child and key.startswith("FAKE_"))
+            )
         }
         try:
             # algo#1216 R2 finding 3779532260: restore the stage file
@@ -1343,10 +1412,17 @@ class Runner:
             attempt_id,
             tick_ordinal,
         )
+        # admin#1495 finding 3793025396: the ceiling is computed HERE,
+        # after the sidecar gate above (each sidecar extract can consume up
+        # to 120s) — an exact-head repro launched with a NEGATIVE ceiling
+        # computed before that spend. A floor-or-less ceiling never
+        # launches: the slice returns exhausted and the parent re-invokes.
         ceiling = min(
             PER_ATTEMPT_CEILING_SECONDS,
             self.remaining() - MONITOR_SLICE_CLEANUP_MARGIN_SECONDS,
         )
+        if ceiling < MONITOR_CHILD_MIN_VIABLE_SECONDS:
+            return "exhausted"
         resumed = self.child_session_id is not None
         self.tick_attempts += 1
         launched = self.launch_child(prompt, self.child_session_id, ceiling)
@@ -1471,7 +1547,7 @@ class Runner:
         fresh = self.schema.extract(self.state_path)
         self._require_unmutated_canonical(fresh, candidate)
         if drained["outcome"] == "unreaped":
-            self._discard(candidate)
+            self._preserve_failed(candidate)
             raise RunnerExit(
                 5,
                 "blocked",
@@ -1500,7 +1576,7 @@ class Runner:
             ):
                 time.sleep(0.3)
             if _live_group_members(child_pgid):
-                self._discard(candidate)
+                self._preserve_failed(candidate)
                 raise RunnerExit(
                     5,
                     "blocked",
@@ -1559,7 +1635,7 @@ class Runner:
             self.charge_failure(fresh, "monitor-child:identity_unreported")
             return "retry"
         if served != self.owner_model:
-            self._discard(candidate)
+            self._preserve_failed(candidate)
             self._clear_in_flight(fresh)
             raise RunnerExit(
                 5,
@@ -1673,21 +1749,21 @@ class Runner:
         ):
             return
         if candidate is not None:
-            self._discard(candidate)
+            # algo#1216 finding 3792942218: the candidate is the only
+            # durable record of external mutations the child may already
+            # have fired — a suspect stop PRESERVES it for the human
+            # reconciliation it demands, never destroys it. (Supersedes the
+            # earlier discard-on-suspect semantics.)
+            self._preserve_failed(candidate)
         raise RunnerExit(
             4,
             "suspect_state",
             "canonical state changed under the monitor lock (digest or"
-            " control drift vs the launch snapshot) — unknown writer;"
+            " control drift vs the launch snapshot) — unknown writer; the"
+            " child's candidate is preserved as a failed-candidate sidecar;"
             " reconcile per the Resume trust model before resuming"
             " monitoring",
         )
-
-    def _discard(self, candidate: Path) -> None:
-        try:
-            candidate.unlink()
-        except OSError:
-            pass
 
     def _preserve_failed(self, candidate: Path) -> None:
         """algo#1216 R2 findings 3779532272 + 3787662312: a failed child's
@@ -1695,8 +1771,11 @@ class Runner:
         already have fired. Preservation is ATTEMPT-SCOPED (consecutive
         failures never overwrite each other), and an archival failure leaves
         the source candidate IN PLACE — deleting the evidence because the
-        rename failed would be strictly worse than an unarchived candidate.
-        Suspect-stop paths keep their documented discard semantics."""
+        rename failed would be strictly worse than an unarchived candidate
+        (the sidecar gate also scans raw `.attempt-*` strays for exactly
+        this case). Suspect stops preserve too (finding 3792942218): the
+        stop demands human reconciliation, and the candidate is its
+        evidence."""
         marker = candidate.name
         prefix = self.state_path.name + ".attempt-"
         attempt = (
@@ -1717,7 +1796,9 @@ class Runner:
     # startup work is unbounded and the audit unreadable — a human cleans up.
     SIDECAR_RETENTION_LIMIT = 20
 
-    def _gate_sidecars(self, extract: dict[str, Any]) -> None:
+    def _gate_sidecars(
+        self, extract: dict[str, Any], compact_no_status: bool = False
+    ) -> None:
         """admin#1495 R2 finding 3791925160: reconcile every preserved
         sidecar before EVERY launch, not only at startup — a candidate
         preserved by tick N must gate tick N+1's launch in the same slice.
@@ -1738,6 +1819,7 @@ class Runner:
         unmerged_sidecars: list[str] = []
         conflicting_sidecars: list[str] = []
         canonical_results = extract.get("handoff_results") or {}
+        canonical_digests = extract.get("handoff_result_digests") or {}
         canonical_terminal = {
             (kind_name, operation_id): status
             for kind_name, kind in canonical_results.items()
@@ -1745,9 +1827,26 @@ class Runner:
             for operation_id, status in kind.items()
             if status in ("complete", "failed", "skipped_dependency")
         }
+        canonical_record_digests = {
+            (kind_name, operation_id): digest
+            for kind_name, kind in canonical_digests.items()
+            if isinstance(kind, dict)
+            for operation_id, digest in kind.items()
+        }
+        # algo#1216 finding 3792942215 (residue): a failed _preserve_failed
+        # rename leaves the raw `.attempt-*` candidate behind — it carries
+        # the same possibly-fired-mutation evidence, so the gate covers
+        # BOTH name shapes.
         sidecars = sorted(
-            self.state_path.parent.glob(
-                self.state_path.stem + ".failed-candidate*"
+            set(
+                self.state_path.parent.glob(
+                    self.state_path.stem + ".failed-candidate*"
+                )
+            )
+            | set(
+                self.state_path.parent.glob(
+                    self.state_path.name + ".attempt-*"
+                )
             )
         )
         # R2 re-reply 3792845972: enforce count and byte ceilings BEFORE any
@@ -1779,12 +1878,32 @@ class Runner:
                 unreadable_sidecars.append(sidecar.name)
                 continue
             results = side_extract.get("handoff_results") or {}
+            side_digests = side_extract.get("handoff_result_digests") or {}
             statuses = [
                 (kind_name, operation_id, status)
                 for kind_name, kind in results.items()
                 if isinstance(kind, dict)
                 for operation_id, status in kind.items()
             ]
+            if not statuses:
+                # admin#1495 finding 3793025403: a valid sidecar recording
+                # ZERO operation results carries no external intents to
+                # reconcile — retaining it only feeds the retention block.
+                # Compaction runs at ENTRY only (compact_no_status): the
+                # attempt-scoped preservation contract (3779532272) keeps
+                # the CURRENT slice's failure evidence intact for resume
+                # diagnosis, so a mid-slice launch gate never deletes what
+                # the previous tick just preserved; a later session's entry
+                # sweeps them.
+                if compact_no_status:
+                    try:
+                        sidecar.unlink()
+                        _heartbeat(
+                            f"sidecar compacted (no operation evidence): {sidecar.name}"
+                        )
+                    except OSError:
+                        pass
+                continue
             if any(
                 status in ("pending", "retryable")
                 for _, _, status in statuses
@@ -1796,12 +1915,23 @@ class Runner:
                 for entry in statuses
                 if entry[2] in ("complete", "failed", "skipped_dependency")
             ]
-            # R2 re-reply 3792845972: compare terminal RECORDS, not keys —
-            # key-only matching deleted a sidecar recording "complete" while
-            # canonical said "failed", destroying exactly the conflicting
-            # evidence a human must reconcile.
+            # R2 re-reply 3792845972 + follow-up 3793041749: compare the
+            # ENTIRE terminal record (canonical-JSON digest covering
+            # attempts/evidence/timestamps), not the status — matching
+            # status with differing history is still evidence a human must
+            # reconcile, never "redundant".
+            def _record_digest(kind_name: str, operation_id: str) -> str | None:
+                kind_map = side_digests.get(kind_name)
+                if isinstance(kind_map, dict):
+                    value = kind_map.get(operation_id)
+                    return value if isinstance(value, str) else None
+                return None
+
             if terminal and all(
                 canonical_terminal.get((kind_name, operation_id)) == status
+                and canonical_record_digests.get((kind_name, operation_id))
+                == _record_digest(kind_name, operation_id)
+                and _record_digest(kind_name, operation_id) is not None
                 for kind_name, operation_id, status in terminal
             ):
                 # Redundant evidence: canonical already carries the SAME
@@ -1816,7 +1946,13 @@ class Runner:
                 continue
             if terminal and any(
                 (kind_name, operation_id) in canonical_terminal
-                and canonical_terminal[(kind_name, operation_id)] != status
+                and (
+                    canonical_terminal[(kind_name, operation_id)] != status
+                    or canonical_record_digests.get(
+                        (kind_name, operation_id)
+                    )
+                    != _record_digest(kind_name, operation_id)
+                )
                 for kind_name, operation_id, status in terminal
             ):
                 conflicting_sidecars.append(sidecar.name)
@@ -1878,12 +2014,45 @@ class Runner:
         manifest immediately before a launch (finding 3722356278): the
         snapshot lives outside the worktree, so drift here means something
         tampered with the runner's own staging area — never continue."""
+        # admin#1495 finding 3793025406: hashing manifest entries alone
+        # accepts ADDITIONS — a planted scripts/hashlib.py shadows stdlib
+        # when the child runs `python3 scripts/state_schema.py` (that
+        # invocation puts the script dir on sys.path). The staged tree must
+        # EQUAL the manifest: no extra files, regular files only (lstat —
+        # a symlink is a redirect out of the staging area).
+        actual: set[str] = set()
+        for found in self.child_skill_dir.rglob("*"):
+            if found.is_dir() and not found.is_symlink():
+                continue
+            rel = str(found.relative_to(self.child_skill_dir))
+            actual.add(rel)
+            mode = os.lstat(found).st_mode
+            import stat as stat_module
+            if not stat_module.S_ISREG(mode):
+                raise RunnerExit(
+                    4,
+                    "suspect_state",
+                    f"child skill snapshot contains a non-regular file"
+                    f" ({rel}) — the staged instruction surface was"
+                    " tampered with; reconcile per the Resume trust model",
+                )
+        expected = set(self.skill_manifest)
+        if actual != expected:
+            unexpected = sorted(actual - expected)[:5]
+            missing = sorted(expected - actual)[:5]
+            raise RunnerExit(
+                4,
+                "suspect_state",
+                "child skill snapshot tree does not equal the manifest"
+                f" (unexpected: {unexpected}; missing: {missing}) — the"
+                " staged instruction surface was modified outside the"
+                " runner; reconcile per the Resume trust model",
+            )
         for relative, digest in self.skill_manifest.items():
             staged = self.child_skill_dir / relative
-            try:
-                live = hashlib.sha256(staged.read_bytes()).hexdigest()
-            except OSError:
-                live = None
+            live = hashlib.sha256(
+                _read_regular_file(staged, MAX_CANDIDATE_BYTES)
+            ).hexdigest()
             if live != digest:
                 raise RunnerExit(
                     4,
@@ -1934,12 +2103,18 @@ class Runner:
             # guard let it escape as a raw traceback that killed the slice
             # mid-finalize. Either fault becomes a charged retry, never a crash.
             try:
-                with open(candidate, "r", encoding="utf-8") as handle:
-                    candidate_text = handle.read(self.max_candidate_bytes + 1)
+                # Finding 3792942225: FIFO-safe — a planted special file at
+                # the candidate path must fail closed, never block the read.
+                raw_candidate = _read_regular_file(
+                    candidate, self.max_candidate_bytes
+                )
+                candidate_text = raw_candidate.decode("utf-8")
             except (OSError, UnicodeDecodeError):
                 candidate_text = None
+            except RunnerExit:
+                candidate_text = None
             else:
-                if len(candidate_text) > self.max_candidate_bytes:
+                if len(raw_candidate) > self.max_candidate_bytes:
                     candidate_text = None
         if checks_failed or candidate_text is None:
             self._preserve_failed(candidate)
@@ -1948,7 +2123,7 @@ class Runner:
         snapshot = self.launch_block
         base_digest = self.launch_base_digest
         if snapshot is None or base_digest is None:
-            self._discard(candidate)
+            self._preserve_failed(candidate)
             raise RunnerExit(4, "suspect_state", "launch snapshot missing — runner defect")
         # F1: canonical control must still equal the runner-memory snapshot
         # (a child that edited canonical state or its control block is a
@@ -1995,7 +2170,13 @@ class Runner:
                         continue
                     family = op_id.split(":", 1)[0]
                     planned = cand_ops.get(kind) or []
-                    if not any(
+                    # admin#1495 finding 3793025410: same-family rollover
+                    # tolerance must never cover an operation whose EXACT id
+                    # is still in the candidate's plan — that erased a
+                    # completed result for a currently-planned op.
+                    if op_id in planned:
+                        handoffs_monotonic = False
+                    elif not any(
                         planned_id.split(":", 1)[0] == family
                         for planned_id in planned
                     ):
@@ -2007,6 +2188,42 @@ class Runner:
                     "retryable",
                 ) + terminal_statuses:
                     handoffs_monotonic = False
+                elif (
+                    status in ("pending", "retryable")
+                    and new_status == "skipped_dependency"
+                ):
+                    # algo#1216 finding 3792942214: skipped_dependency is
+                    # schema-defined proof that NO attempt occurred
+                    # (attempts 0) — a record that was already in flight can
+                    # never become one.
+                    handoffs_monotonic = False
+        # admin#1495 finding 3793025414: gate records are compared against
+        # launch state, not only the candidate's own derived hold — a child
+        # must never DELETE a required backfill or flip required to false
+        # (hold released by record surgery instead of verified completion).
+        # pending -> complete is the one legitimate forward transition.
+        launch_backfill = fresh.get("merge_readiness_backfill") or {}
+        cand_backfill = candidate_extract.get("merge_readiness_backfill") or {}
+        backfill_monotonic = True
+        for name, launch_record in launch_backfill.items():
+            if launch_record.get("required") is not True:
+                continue
+            cand_record = cand_backfill.get(name)
+            if not isinstance(cand_record, dict):
+                backfill_monotonic = False
+                continue
+            if cand_record.get("required") is not True:
+                backfill_monotonic = False
+                continue
+            launch_state = launch_record.get("state")
+            cand_state = cand_record.get("state")
+            if launch_state == "complete" and cand_state != "complete":
+                backfill_monotonic = False
+            elif launch_state == "pending" and cand_state not in (
+                "pending",
+                "complete",
+            ):
+                backfill_monotonic = False
         outcome_consistent = (
             (outcome == "continue" and monitor_status == "in_progress")
             or (
@@ -2046,6 +2263,7 @@ class Runner:
             and candidate_extract.get("monitor_cli") == snapshot
             and outcome_consistent
             and handoffs_monotonic
+            and backfill_monotonic
             # algo#1216 R2 finding 3787189747: a terminal claim with a live
             # direction-aware deploy/backfill hold is exactly the premature
             # merge-readiness the hold exists to prevent.
@@ -2245,8 +2463,9 @@ class Runner:
         # algo#1216 R2 finding 3787662312 (third leg): preserved sidecars
         # carrying PENDING external intents must be reconciled before another
         # write-capable child runs — otherwise the loop can duplicate the
-        # very mutations the sidecar records.
-        self._gate_sidecars(extract)
+        # very mutations the sidecar records. Entry additionally compacts
+        # no-status sidecars (finding 3793025403).
+        self._gate_sidecars(extract, compact_no_status=True)
         if extract.get("phases_merge_readiness") != "complete":
             raise RunnerExit(
                 5,
@@ -2285,6 +2504,15 @@ class Runner:
             # and the next write-capable launch needs the same confirmation.
             self._gate_taint(extract)
             result = self.run_tick(extract)
+            if result == "exhausted":
+                # Finding 3793025396: run_tick's own pre-launch gates spent
+                # the ceiling below the viable floor — return the slice
+                # instead of launching a child with no time to live.
+                return {
+                    "runner_outcome": "slice_exhausted",
+                    "ticks_completed": self.ticks_completed,
+                    "child_session_id": self.child_session_id,
+                }
             if result == "terminal" or result == "blocked":
                 return {
                     "runner_outcome": result,

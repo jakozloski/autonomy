@@ -1574,7 +1574,9 @@ class MergeReadinessTests(unittest.TestCase):
             '  captured_at: "2026-08-16T12:00:00Z"',
             '  requester: "jakozloski"',
             '  source_revision: "2026-08-15T09:00:00Z"',
-            '  digest: "abcdef0123456789"',
+            # The TRUE recomputed digest of _with_blocks()'s AC list
+            # (finding 3793025389: fabricated digests now fail).
+            '  digest: "c0a3d7b48bb743f7"',
         )
     )
 
@@ -1589,6 +1591,47 @@ class MergeReadinessTests(unittest.TestCase):
         result = evaluate_state_text(text)
         self.assertEqual(result["errors"], [])
 
+    def test_fabricated_capture_digest_is_rejected(self) -> None:
+        # admin#1495 finding 3793025389: an arbitrary fixed digest survived
+        # a criteria edit — the validator now recomputes from the captured
+        # id/text/source fields and rejects a mismatch.
+        text = _mutate(
+            self._with_blocks(),
+            "decision_audit_trail: []",
+            self._CAPTURE_BLOCK.replace(
+                "c0a3d7b48bb743f7", "abcdef0123456789"
+            )
+            + "\ndecision_audit_trail: []",
+        )
+        result = evaluate_state_text(text)
+        self.assertTrue(
+            any(
+                "does not match the digest recomputed" in error
+                for error in result["errors"]
+            ),
+            result["errors"],
+        )
+
+    def test_complete_gate_requires_the_capture_block(self) -> None:
+        # Finding 3793025389: a completed merge-readiness gate with no
+        # kickoff snapshot was accepted.
+        text = _mutate(
+            self._with_blocks(),
+            '  monitor: "pending"',
+            '  monitor: "pending"\n  merge_readiness: "complete"',
+        )
+        for check in ("deploy_order", "dependencies", "ac_conformance"):
+            text = _mutate(text, f'  {check}: "pending"', f'  {check}: "complete"')
+        text = _mutate(text, '    verdict: "pending"', '    verdict: "met"')
+        result = evaluate_state_text(text)
+        self.assertTrue(
+            any(
+                "requires the acceptance_criteria_capture" in error
+                for error in result["errors"]
+            ),
+            result["errors"],
+        )
+
     def test_acceptance_criteria_capture_rejects_bad_shapes(self) -> None:
         base = _mutate(
             self._with_blocks(),
@@ -1596,7 +1639,7 @@ class MergeReadinessTests(unittest.TestCase):
             self._CAPTURE_BLOCK + "\ndecision_audit_trail: []",
         )
         for mutation, needle in (
-            (('  digest: "abcdef0123456789"', '  digest: "not-hex"'), "digest"),
+            (('  digest: "c0a3d7b48bb743f7"', '  digest: "not-hex"'), "digest"),
             (('  captured_at: "2026-08-16T12:00:00Z"', '  captured_at: "yesterday"'), "captured_at"),
             (('  requester: "jakozloski"', '  requester: ""'), "requester"),
             (('  source_revision: "2026-08-15T09:00:00Z"', '  source_revision: ""'), "source_revision"),
@@ -2016,6 +2059,22 @@ class ResumeValueContractCoverageTests(unittest.TestCase):
 
 
 class RoundtripGenerationSerializerTests(unittest.TestCase):
+    def test_roundtrip_generation_binds_repository_and_pr(self) -> None:
+        # admin#1495 finding 3793025386: identical reviewer evidence on a
+        # DIFFERENT repo or PR must mint a different generation — replanning
+        # a completed ledger cross-PR returned complete with zero calls.
+        entry = {"login": "alice", "pushed_through_sha": "a" * 40}
+        base = roundtrip_generation([entry], ["alice"], "o/r", 1)
+        self.assertNotEqual(
+            base, roundtrip_generation([entry], ["alice"], "o/other", 1)
+        )
+        self.assertNotEqual(
+            base, roundtrip_generation([entry], ["alice"], "o/r", 2)
+        )
+        self.assertEqual(
+            base, roundtrip_generation([entry], ["alice"], "o/r", 1)
+        )
+
     def test_roundtrip_generation_hashes_non_json_values(self) -> None:
         # CR 3761135391: same default=str serializer as qa_generation — a
         # direct caller's non-JSON pushed_through_sha (validated only when

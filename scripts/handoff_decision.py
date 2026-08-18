@@ -499,9 +499,16 @@ def _approved_qa_operations(
                 "service": "linear",
                 "action": "assign_ticket",
                 "depends_on": [f"qa.github.verify_assignees:g{generation}"],
+                # algo#1216 finding 3792942223: the managed broker resolves
+                # the IDENTIFIER and mutates that ticket — it exposes no
+                # expected-provider-id precondition, so a provider id in a
+                # MUTATION payload is a decoy implying a binding nothing
+                # enforces. Mutations are keyed by identifier alone; the
+                # recorded provider id moves to the VERIFY ops, where the
+                # postcondition re-fetch compares the broker-resolved
+                # ticket's true id and fails loudly on mismatch.
                 "payload": {
                     "ticket_identifier": ticket_identifier,
-                    "ticket_provider_id": ticket_provider_id,
                     "assignee_id": linear_provider_id,
                     "assignee_email": owner["linear_email"],
                     "assignee_name": linear_name,
@@ -517,7 +524,7 @@ def _approved_qa_operations(
                 "depends_on": [f"qa.linear.assign_ticket:g{generation}"],
                 "payload": {
                     "ticket_identifier": ticket_identifier,
-                    "ticket_provider_id": ticket_provider_id,
+                    "expected_ticket_provider_id": ticket_provider_id,
                     "expected_assignee_id": linear_provider_id,
                     "expected_assignee_name": linear_name,
                     "write_path": write_path,
@@ -587,9 +594,10 @@ def _approved_qa_operations(
                 "service": "linear",
                 "action": "set_ticket_state",
                 "depends_on": [f"qa.linear.verify_ticket_assignee:g{generation}"],
+                # Finding 3792942223: mutation keyed by identifier only —
+                # see qa.linear.assign_ticket's comment.
                 "payload": {
                     "ticket_identifier": ticket_identifier,
-                    "ticket_provider_id": ticket_provider_id,
                     "state_id": state_provider_id,
                     "state_name": expected_state_name,
                     "write_path": write_path,
@@ -604,7 +612,7 @@ def _approved_qa_operations(
                 "depends_on": [f"qa.linear.set_ticket_state:g{generation}"],
                 "payload": {
                     "ticket_identifier": ticket_identifier,
-                    "ticket_provider_id": ticket_provider_id,
+                    "expected_ticket_provider_id": ticket_provider_id,
                     "expected_state_id": state_provider_id,
                     "expected_state_name": expected_state_name,
                     "write_path": write_path,
@@ -852,7 +860,16 @@ def roundtrip_generation(
     # refuse a prior round's ledger. This wrapper keeps the planner's
     # request-shaped call site; the entry filtering, payload shape, and
     # digest are byte-identical to the pre-move implementation.
-    return state_schema.roundtrip_generation(request.get("reviewers"), reviewers)
+    repository = request.get("repository")
+    name_with_owner = (
+        repository.get("nameWithOwner") if isinstance(repository, dict) else None
+    )
+    return state_schema.roundtrip_generation(
+        request.get("reviewers"),
+        reviewers,
+        name_with_owner,
+        request.get("pull_request_number"),
+    )
 
 
 def _roundtrip_operations(

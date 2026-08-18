@@ -8,7 +8,7 @@
 
 If `<branch>` is not persisted, capture it **immediately after the head is established** — Entry A step 8 (`git checkout -b <resolved-prefix>/<name>`) or Entry B step 3. Do not persist it with Entry A's earlier `base_branch`, which would record the protected/default branch.
 
-Track state in `.claude/workflow-state.local.md` (fallback: also check `.cursor/workflow-state.local.md` for migration from older versions):
+Track state in `.claude/workflow-state.local.md` (fallback: also check `.cursor/workflow-state.local.md` for migration from older versions). The repository's `.gitignore` must cover the state file AND every runner derivative — `<state>.monitor.lock`, `<state>.attempt-*`, `<state>.failed-candidate-*`, glob forms for both stems (admin#1495 finding 3793025381: ignoring only the two exact filenames leaves every runner artifact visible as untracked dirt):
 
 ```yaml
 ---

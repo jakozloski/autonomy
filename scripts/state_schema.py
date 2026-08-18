@@ -938,6 +938,31 @@ def validate_operation_collection(
             break
         if operation_id in in_flight or not has_result:
             saw_unfinished = True
+    # algo#1216 finding 3792942228: dependency semantics existed only in the
+    # planner — the schema and runner accepted a failed parent with a
+    # completed dependent. The ordered-prefix protocol above already implies
+    # the edge DIRECTION (each operation depends on its predecessors in the
+    # planned order), so the portable check needs no persisted edge list: a
+    # completed or pending result AFTER a failed/skipped predecessor in the
+    # same plan cannot have been produced by the write-ahead executor, which
+    # stops (or skips forward as skipped_dependency) at the first failure.
+    blocking_parent: str | None = None
+    for operation_id in operations:
+        status = result_statuses.get(operation_id)
+        if blocking_parent is not None and status in (
+            "complete",
+            "pending",
+            "retryable",
+        ):
+            errors.append(
+                f"{prefix}operation {operation_id!r} is"
+                f" {status} after failed/skipped predecessor"
+                f" {blocking_parent!r} — the ordered executor cannot"
+                " produce this ledger"
+            )
+            break
+        if status in ("failed", "skipped_dependency") and blocking_parent is None:
+            blocking_parent = operation_id
     return errors
 
 
@@ -1447,7 +1472,8 @@ class _Validator:
             self.validate_acceptance_criteria(state.get("acceptance_criteria"))
         if "acceptance_criteria_capture" in state:
             self.validate_acceptance_criteria_capture(
-                state.get("acceptance_criteria_capture")
+                state.get("acceptance_criteria_capture"),
+                state.get("acceptance_criteria"),
             )
         if "merge_readiness" in state:
             self.validate_merge_readiness(state.get("merge_readiness"))
@@ -1495,6 +1521,25 @@ class _Validator:
                 self.error(
                     "invariant(v): phases.merge_readiness complete requires "
                     "acceptance_criteria to be present"
+                )
+            # admin#1495 finding 3793025389: a complete gate without the
+            # kickoff authorization snapshot accepted every repro — the
+            # capture block is REQUIRED once the gate completes, and
+            # "unavailable" criteria additionally need the typed waiver.
+            capture = state.get("acceptance_criteria_capture")
+            if not isinstance(capture, dict):
+                self.error(
+                    "invariant(v): phases.merge_readiness complete requires "
+                    "the acceptance_criteria_capture kickoff snapshot"
+                )
+            elif criteria == "unavailable" and not (
+                isinstance(capture.get("unavailable_waiver"), str)
+                and capture.get("unavailable_waiver")
+            ):
+                self.error(
+                    "invariant(v): unavailable acceptance criteria require "
+                    "acceptance_criteria_capture.unavailable_waiver (the "
+                    "typed user waiver)"
                 )
             if isinstance(criteria, list) and any(
                 isinstance(entry, dict)
@@ -2233,7 +2278,9 @@ class _Validator:
                     )
 
 
-    def validate_acceptance_criteria_capture(self, value: Any) -> None:
+    def validate_acceptance_criteria_capture(
+        self, value: Any, criteria_for_digest: Any = None
+    ) -> None:
         """admin#1495 R2 finding 3791925150: the kickoff authorization
         snapshot. Captured ACs come from MUTABLE ticket prose; without a
         recorded source revision and capture digest, a post-kickoff ticket
@@ -2247,7 +2294,13 @@ class _Validator:
             self.error("acceptance_criteria_capture: must be a mapping")
             return
         for key in value:
-            if key not in ("captured_at", "requester", "source_revision", "digest"):
+            if key not in (
+                "captured_at",
+                "requester",
+                "source_revision",
+                "digest",
+                "unavailable_waiver",
+            ):
                 self.error(
                     "acceptance_criteria_capture: unknown key"
                     f" {_safe_key(str(key))!r}"
@@ -2275,6 +2328,42 @@ class _Validator:
             self.error(
                 "acceptance_criteria_capture.digest: must be 12-64 lowercase"
                 " hex (sha256 of the normalized captured AC list)"
+            )
+        elif isinstance(criteria_for_digest, list):
+            # admin#1495 finding 3793025389: shape-checking the digest let an
+            # arbitrary fixed value survive a criteria edit. Recompute it
+            # from the normalized IMMUTABLE captured fields (id/text/source
+            # — verdicts and evidence legitimately change later) and require
+            # a prefix match at the recorded length.
+            normalized = sorted(
+                (
+                    {
+                        "id": entry.get("id"),
+                        "text": entry.get("text"),
+                        "source": entry.get("source"),
+                    }
+                    for entry in criteria_for_digest
+                    if isinstance(entry, dict)
+                ),
+                key=lambda item: str(item.get("id")),
+            )
+            recomputed = hashlib.sha256(
+                json.dumps(
+                    normalized, sort_keys=True, separators=(",", ":"), default=str
+                ).encode("utf-8")
+            ).hexdigest()
+            if recomputed[: len(digest)] != digest:
+                self.error(
+                    "acceptance_criteria_capture.digest: does not match the"
+                    " digest recomputed from acceptance_criteria (id/text/"
+                    "source) — the captured list drifted or the digest was"
+                    " fabricated; re-authorize the capture"
+                )
+        waiver = value.get("unavailable_waiver")
+        if waiver is not None and (not isinstance(waiver, str) or not waiver):
+            self.error(
+                "acceptance_criteria_capture.unavailable_waiver: must be a"
+                " non-empty string when present"
             )
 
     def validate_merge_readiness(self, value: Any) -> None:
@@ -2606,7 +2695,12 @@ _CONFLICT_COMPLEX_KEY = re.compile(
 )
 
 
-def roundtrip_generation(raw_reviewers: Any, targets: Any) -> str:
+def roundtrip_generation(
+    raw_reviewers: Any,
+    targets: Any,
+    name_with_owner: Any = None,
+    pull_request_number: Any = None,
+) -> str:
     """Digest of the feedback evidence a roundtrip plan answers.
 
     Canonical single source (pass-3 codex #2): ``handoff_decision`` embeds
@@ -2663,6 +2757,18 @@ def roundtrip_generation(raw_reviewers: Any, targets: Any) -> str:
             }
         )
     payload.sort(key=lambda item: item["login"])
+    # admin#1495 finding 3793025386: the digest binds the PLAN TARGET too —
+    # replanning a completed ledger from one PR onto another produced the
+    # same generation and returned complete with zero calls. Repo + PR join
+    # the payload; a missing value hashes as null on BOTH producer and
+    # recompute sides, so older states simply roll the generation once.
+    payload = {
+        "repository": name_with_owner if isinstance(name_with_owner, str) else None,
+        "pull_request": pull_request_number
+        if isinstance(pull_request_number, int)
+        else None,
+        "reviewers": payload,
+    }
     # CR 3761135391: same serializer settings as qa_generation — a direct
     # caller's non-JSON pushed_through_sha (unchecked when fix_shas is
     # empty) must hash per the malformed-segments contract, not raise.
@@ -2799,7 +2905,10 @@ def monitor_blocked_evidence_present(state: Any) -> bool:
                     if isinstance(login, str) and isinstance(record, dict):
                         entries.append({**record, "login": login})
             suffix = ":g" + roundtrip_generation(
-                entries, target_logins if isinstance(target_logins, list) else []
+                entries,
+                target_logins if isinstance(target_logins, list) else [],
+                rt.get("repository_name_with_owner"),
+                state.get("pr_number"),
             )
             if any(
                 isinstance(op, str) and op.endswith(suffix) for op in operations
@@ -2840,6 +2949,8 @@ def monitor_extract(text: str) -> dict[str, Any]:
         "handoff_statuses": [],
         "handoff_operations": {},
         "handoff_results": {},
+        "handoff_result_digests": {},
+        "merge_readiness_backfill": {},
         "phases_merge_readiness": None,
         "merge_readiness_hold": False,
         "blocked_evidence_present": False,
@@ -2882,6 +2993,7 @@ def monitor_extract(text: str) -> dict[str, Any]:
     # backfill hold, and (c) the merge-readiness PHASE for the pre-4b gate.
     operations_map: dict[str, list[str]] = {}
     results_map: dict[str, dict[str, str]] = {}
+    digests_map: dict[str, dict[str, str]] = {}
     if isinstance(handoffs, dict):
         for kind, record in handoffs.items():
             if not isinstance(record, dict):
@@ -2891,15 +3003,31 @@ def monitor_extract(text: str) -> dict[str, Any]:
                 op for op in ops if isinstance(op, str)
             ] if isinstance(ops, list) else []
             results: dict[str, str] = {}
+            digests: dict[str, str] = {}
             raw = record.get("operation_results")
             if isinstance(raw, dict):
                 for op_id, res in raw.items():
                     status = res.get("status") if isinstance(res, dict) else None
                     if isinstance(op_id, str) and isinstance(status, str):
                         results[op_id] = status
+                        # admin#1495 R2 follow-up 3793041749: sidecar
+                        # compaction must compare the ENTIRE record, not the
+                        # status — attempts/evidence/timestamps that differ
+                        # are history a human must reconcile, never
+                        # "redundant". One canonical-JSON digest per record.
+                        digests[op_id] = hashlib.sha256(
+                            json.dumps(
+                                res,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                                default=str,
+                            ).encode("utf-8")
+                        ).hexdigest()
             results_map[str(kind)] = results
+            digests_map[str(kind)] = digests
     extract["handoff_operations"] = operations_map
     extract["handoff_results"] = results_map
+    extract["handoff_result_digests"] = digests_map
     phases_map = state.get("phases")
     if isinstance(phases_map, dict):
         mr_phase = phases_map.get("merge_readiness")
@@ -2908,6 +3036,18 @@ def monitor_extract(text: str) -> dict[str, Any]:
     gate = state.get("merge_readiness")
     hold = False
     if isinstance(gate, dict):
+        # admin#1495 finding 3793025414: the runner compares candidate
+        # backfill records against launch state — expose them.
+        raw_backfill = gate.get("backfill")
+        if isinstance(raw_backfill, dict):
+            extract["merge_readiness_backfill"] = {
+                str(name): {
+                    "required": record.get("required"),
+                    "state": record.get("state"),
+                }
+                for name, record in raw_backfill.items()
+                if isinstance(record, dict)
+            }
         if gate.get("deploy_order") == "hazard_documented" and gate.get(
             "hazard_direction"
         ) in ("additive", "mixed"):
