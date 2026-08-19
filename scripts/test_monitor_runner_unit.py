@@ -23,11 +23,13 @@ does not trip the skill scanner and needs no split.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import os
 import pathlib
 import shutil
 import tempfile
 import sys
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -35,6 +37,7 @@ from unittest import mock
 from model_policy import REVIEWER_EFFORT
 from monitor_runner import (
     Runner,
+    atomic_write,
     durable_replace,
     RunnerExit,
     SchemaCli,
@@ -54,7 +57,7 @@ def _runner(owner_model: str, owner_effort: str | None) -> Runner:
     args = argparse.Namespace(
         state_file=str(SCRIPTS / "unit-nonexistent-state.md"),
         skill_dir=str(SCRIPTS.parent),
-        claude_bin="claude",
+        claude_bin="/opt/homebrew/bin/claude",
         schema_cli=str(SCRIPTS / "state_schema.py"),
         slice_budget=100.0,
         wait_scale=1.0,
@@ -113,7 +116,7 @@ class LaunchSnapshotClearingTests(unittest.TestCase):
         args = argparse.Namespace(
             state_file=str(state),
             skill_dir=str(SCRIPTS.parent),
-            claude_bin="claude",
+            claude_bin="/opt/homebrew/bin/claude",
             schema_cli=str(SCRIPTS / "state_schema.py"),
             slice_budget=100.0,
             wait_scale=1.0,
@@ -222,7 +225,7 @@ class SidecarGateTests(unittest.TestCase):
         args = argparse.Namespace(
             state_file=str(state),
             skill_dir=str(SCRIPTS.parent),
-            claude_bin="claude",
+            claude_bin="/opt/homebrew/bin/claude",
             schema_cli=str(SCRIPTS / "state_schema.py"),
             slice_budget=100.0,
             wait_scale=1.0,
@@ -434,7 +437,7 @@ class ChildSkillSnapshotTests(unittest.TestCase):
         args = argparse.Namespace(
             state_file=str(skill_dir / "state.md"),
             skill_dir=str(skill_dir),
-            claude_bin="claude",
+            claude_bin="/opt/homebrew/bin/claude",
             schema_cli=str(SCRIPTS / "state_schema.py"),
             slice_budget=100.0,
             wait_scale=1.0,
@@ -557,7 +560,7 @@ class SnapshotIntegrityTests(unittest.TestCase):
         args = argparse.Namespace(
             state_file=str(tmp / "state.md"),
             skill_dir=str(tmp),
-            claude_bin="claude",
+            claude_bin="/opt/homebrew/bin/claude",
             schema_cli=str(SCRIPTS / "state_schema.py"),
             slice_budget=100.0,
             wait_scale=1.0,
@@ -640,9 +643,11 @@ class ChildEnvAllowlistTests(unittest.TestCase):
         self.assertNotIn("FAKE_MODE", captured)
 
     def test_claude_prefixed_secrets_never_reach_the_child(self) -> None:
-        # mm#3551 finding 3806719670: Keeper's VM bootstrap stores OAuth
-        # tokens under CLAUDE_*-named variables — the prefix allowlist
-        # forwarded them. Exact names only.
+        # mm#3551 finding 3806719670 + algo#1216 finding 3807740755: the
+        # ACCOUNT-token bundle must never reach the child, while the
+        # child's OWN session auth (CLAUDE_CODE_OAUTH_TOKEN — Keeper VMs
+        # run an OAuth-only contract) must — stripping it left the child
+        # unauthenticated. Exact names either way.
         runner = _runner("claude-opus-5", None)
         with mock.patch.dict(os.environ, {
             "CLAUDE_CODE_OAUTH_TOKEN": "secret-token",
@@ -661,7 +666,7 @@ class ChildEnvAllowlistTests(unittest.TestCase):
             ):
                 with self.assertRaises(RunnerExit):
                     runner.launch_child("prompt", None, 60)
-        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", captured)
+        self.assertIn("CLAUDE_CODE_OAUTH_TOKEN", captured)
         self.assertNotIn("CLAUDE_ACCOUNT_TOKENS_JSON", captured)
         self.assertIn("CLAUDE_CONFIG_DIR", captured)
 
@@ -730,7 +735,10 @@ class ChildCommandThreadingTests(unittest.TestCase):
 
     def test_child_command_starts_with_the_pinned_binary(self) -> None:
         command = _runner("claude-opus-5", "max")._child_command(None)
-        self.assertEqual(command[0], "claude")
+        # admin#1495 finding 3807823238 / mm#3551 finding 3808151945: hosts
+        # legitimately resolve the binary to an absolute path — pin the
+        # BASENAME, not the literal bare name.
+        self.assertEqual(Path(command[0]).name, "claude")
 
 
 class BindOwnerProducerTests(unittest.TestCase):
@@ -904,8 +912,97 @@ class LaunchChildIsolationTests(unittest.TestCase):
         # the owner-pinned model argv follows the separator (binary first,
         # prompt last); the runner's -I -S gate only the wrapper's own boot and
         # are gone by the time the wrapper launches THIS:
-        self.assertEqual(argv[5], "claude")
+        self.assertEqual(Path(argv[5]).name, "claude")
         self.assertEqual(argv[-1], "the-prompt")
+
+
+# The glob set state-and-safety.md tells consuming repos to .gitignore —
+# stated as literals on purpose (the shapes ARE the contract under test).
+GITIGNORE_ARTIFACT_GLOBS = (
+    "workflow-state.local.md.monitor.lock",
+    "workflow-state.local.md.attempt-*",
+    "workflow-state.local.md.tmp-*",
+    "workflow-state.local.failed-candidate-*.md",
+)
+
+
+class GitignoreArtifactShapeTests(unittest.TestCase):
+    """admin#1495 finding 3807823247: two documented globs matched nothing
+    the runner writes — ``with_suffix`` REPLACES ``.md`` on the
+    failed-candidate sidecar, and the atomic-write temp was undocumented.
+    Each artifact name here comes from the runner's REAL constructor
+    (never a re-derived expression), so a constructor shape change or a
+    glob drift fails this test instead of surfacing as untracked dirt in
+    a consuming repository."""
+
+    def _covered(self, name: str) -> bool:
+        return any(
+            fnmatch.fnmatch(name, glob) for glob in GITIGNORE_ARTIFACT_GLOBS
+        )
+
+    def test_runner_artifact_names_match_the_documented_globs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "workflow-state.local.md"
+
+            args = argparse.Namespace(
+                state_file=str(state),
+                skill_dir=str(SCRIPTS.parent),
+                claude_bin="/opt/homebrew/bin/claude",
+                schema_cli=str(SCRIPTS / "state_schema.py"),
+                slice_budget=100.0,
+                wait_scale=1.0,
+                acknowledge_taint=None,
+            )
+            runner = Runner(args)
+            _HELPER_RUNNERS.append(runner)
+            self.assertEqual(
+                runner.lock_path.name, "workflow-state.local.md.monitor.lock"
+            )
+            self.assertTrue(self._covered(runner.lock_path.name))
+
+            # atomic_write's temp: capture the real source of the final
+            # replace instead of re-deriving the with_suffix expression.
+            replaced: list[Path] = []
+            with mock.patch(
+                "monitor_runner.durable_replace",
+                side_effect=lambda source, target: replaced.append(source),
+            ):
+                atomic_write(state, "content\n")
+            self.assertEqual(len(replaced), 1)
+            tmp_name = replaced[0].name
+            self.assertTrue(
+                tmp_name.startswith("workflow-state.local.md.tmp-"), tmp_name
+            )
+            self.assertTrue(self._covered(tmp_name))
+
+            # Attempt candidate + failed-candidate sidecar, round-tripped
+            # through _preserve_failed's own parser: if run_tick's candidate
+            # shape drifted from this synthesis, the parsed attempt id would
+            # come back "unknown" and the equality below would fail.
+            attempt_id = "0123456789abcdef"
+            candidate_name = state.name + f".attempt-{attempt_id}.md"
+            self.assertTrue(self._covered(candidate_name))
+            preserved: list[Path] = []
+            stub = types.SimpleNamespace(state_path=state)
+            with mock.patch(
+                "monitor_runner.durable_replace",
+                side_effect=lambda source, target: preserved.append(target),
+            ):
+                Runner._preserve_failed(stub, Path(tmp) / candidate_name)
+            self.assertEqual(len(preserved), 1)
+            sidecar_name = preserved[0].name
+            self.assertEqual(
+                sidecar_name,
+                f"workflow-state.local.failed-candidate-{attempt_id}.md",
+            )
+            self.assertTrue(self._covered(sidecar_name))
+            # The r15 glob this finding corrected must NOT match the real
+            # sidecar — with_suffix replaced the .md rather than appending.
+            self.assertFalse(
+                fnmatch.fnmatch(
+                    sidecar_name, "workflow-state.local.md.failed-candidate-*"
+                )
+            )
 
 
 if __name__ == "__main__":  # pragma: no cover

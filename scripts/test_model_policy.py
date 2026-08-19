@@ -2571,6 +2571,28 @@ class BoundedExcerptRedactionTests(unittest.TestCase):
         excerpt = bounded_excerpt("", "DB_PASSWORD=prodsecret99")
         self.assertNotIn("prodsecret99", excerpt)
 
+    def test_pii_email_phone_and_webhook_secret_are_redacted(self) -> None:
+        # admin#1495 finding 3807823274: the probe showed email and phone
+        # surviving the sanitizer verbatim; whsec_ was called out with them.
+        excerpt = bounded_excerpt(
+            "",
+            "auth failed for jane.doe+qa@example.com, callback "
+            "+14155550123 / (415) 555-0123, whsec_abcdefghijklmnop1234",
+        )
+        self.assertNotIn("jane.doe", excerpt)
+        self.assertNotIn("4155550123", excerpt)
+        self.assertNotIn("555-0123", excerpt)
+        self.assertNotIn("abcdefghijklmnop1234", excerpt)
+        self.assertIn("[REDACTED: email_address]", excerpt)
+        self.assertIn("[REDACTED: phone_number]", excerpt)
+        self.assertIn("[REDACTED: stripe_webhook_secret]", excerpt)
+        # Anchoring guard: a bare numeric id has no separators and must
+        # survive — over-matching ordinary integers would shred evidence.
+        self.assertIn(
+            "request 4155550123999 stayed",
+            bounded_excerpt("", "request 4155550123999 stayed"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

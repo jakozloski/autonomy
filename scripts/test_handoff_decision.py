@@ -610,6 +610,52 @@ class HandoffDecisionTest(unittest.TestCase):
             "ordering/case/duplicates must not roll the generation",
         )
 
+    def test_qa_generation_digests_the_actor_filtered_reviewer_set(
+        self,
+    ) -> None:
+        # #3551 finding 3808151926: the operation builder drops the
+        # authenticated actor AFTER the digest ran, so hashing the raw list
+        # let an actor rotation change the minted operation set while the
+        # generation stayed fixed — the prior actor's completed ledger then
+        # satisfied a plan that now includes that login as a real reviewer,
+        # silently skipping their review request on resume.
+        base = {
+            "scenario": "approved_qa",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+            "existing_assignees": ["jakozloski"],
+            "issue_tracker": {
+                "type": "linear",
+                "qa_assignee": LINEAR_QA_ASSIGNEE,
+                "qa_state": LINEAR_QA_STATE_WEB,
+                "ticket_identifier": "WEB-8877",
+                "ticket_provider_id": "linear-ticket-web-8877",
+                "ticket_validated": True,
+                "write_path": "environment_tool",
+            },
+            "code_reviewers": ["alice", "bob"],
+        }
+        as_bob = qa_generation({**base, "authenticated_actor": "bob"})
+        as_carol = qa_generation({**base, "authenticated_actor": "carol"})
+        self.assertNotEqual(
+            as_bob, as_carol,
+            "actor rotation changes the effective reviewer set and must "
+            "roll the generation",
+        )
+        filtered_equivalent = qa_generation(
+            {**base, "code_reviewers": ["alice"], "authenticated_actor": "bob"}
+        )
+        self.assertEqual(
+            as_bob, filtered_equivalent,
+            "the digest must hash the post-filter set: actor-in-list and "
+            "actor-absent requests mint the same plan",
+        )
+        self.assertEqual(
+            as_bob,
+            qa_generation({**base, "authenticated_actor": "BOB"}),
+            "the actor filter matches the builder's casefolded skip",
+        )
+
     def test_reviewer_removal_prunes_terminal_request_ops(self) -> None:
         # admin#1495 finding 3806647937: after removing bob from a completed
         # alice,bob handoff, bob's terminal request/verify records must

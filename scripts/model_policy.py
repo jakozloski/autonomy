@@ -514,6 +514,18 @@ REDACTION_PATTERNS: tuple[tuple[str, str], ...] = (
     ('pem_private_key_block', r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
     ('anthropic_key', r"sk-ant-[A-Za-z0-9_-]{40,}"),
     ('jwt_base64url', r"eyJ[A-Za-z0-9_\-=]{10,}\.eyJ[A-Za-z0-9_\-=]{10,}\.[A-Za-z0-9_\-=]+"),
+    # admin#1495 finding 3807823274: customer-PII detection was entirely
+    # manual judgment; the targeted probe showed emails and phone numbers
+    # surviving the sanitizer verbatim. Email and phone HAVE reliable
+    # format anchors, so they join the executable list (phone: E.164, or
+    # US forms anchored by parens/separators so bare numeric IDs never
+    # match). Postal addresses and free-text identity stay judgment-scoped
+    # — no anchor exists that does not swallow ordinary prose — and
+    # generic `secret=` labels stay excluded per the documented
+    # false-positive rule in state-and-safety.md.
+    ('email_address', r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
+    ('phone_number', r"\+[1-9]\d{7,14}|\(\d{3}\)[-.\s]?\d{3}[-.\s]\d{4}|\b\d{3}[-.\s]\d{3}[-.\s]\d{4}\b"),
+    ('stripe_webhook_secret', r"whsec_[A-Za-z0-9]{16,}"),
 )
 
 

@@ -549,6 +549,23 @@ REQUIRED_REDACTION_PATTERNS = {
         r"eyJ[A-Za-z0-9_\-=]{10,}\.eyJ[A-Za-z0-9_\-=]{10,}\.[A-Za-z0-9_\-=]+",
         ("eyJ" + "abcde-fghijk.eyJlmno_pqrstuv.signature-part",),
     ),
+    # admin#1495 finding 3807823274: email/phone are the two customer-PII
+    # classes with reliable format anchors; the probe showed both surviving
+    # the sanitizer. Stripe webhook secrets were called out in the same
+    # finding. Address/free-text PII stays judgment-scoped (documented in
+    # state-and-safety.md's Secret/Token Redaction intro).
+    "email_address": (
+        r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+        ("jane.doe+qa@example.com", "ops-alerts@mail.example.co"),
+    ),
+    "phone_number": (
+        r"\+[1-9]\d{7,14}|\(\d{3}\)[-.\s]?\d{3}[-.\s]\d{4}|\b\d{3}[-.\s]\d{3}[-.\s]\d{4}\b",
+        ("+14155550123", "(415) 555-0123", "415-555-0123"),
+    ),
+    "stripe_webhook_secret": (
+        r"whsec_[A-Za-z0-9]{16,}",
+        ("whsec_" + "abcdefghijklmnop1234",),
+    ),
 }
 _POLICY_PATTERNS = dict(model_policy.REDACTION_PATTERNS)
 if set(_POLICY_PATTERNS) != set(REQUIRED_REDACTION_PATTERNS) or any(

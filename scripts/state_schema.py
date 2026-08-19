@@ -392,6 +392,19 @@ TAINT_PATTERNS = tuple(
         r"rm\s+-rf\s+[~/]",
         r"you (must|should) now (run|execute)",
         r"sudo\s+rm\s",
+        # #3551 finding 3808151911: the probed credential-publication/push
+        # paraphrases sailed past the seven families above. Four more
+        # families cover that class: credential-disclosure verb+object,
+        # credential-file exfiltration, push to an explicit foreign
+        # URL/remote rewire, and force-push instructions. Still advisory —
+        # surfaced, never obeyed — and still not the authorization
+        # boundary; the architectural split (credential-free
+        # interpretation, typed mutation executor) is tracked as the
+        # standing host-contract thread on the same finding.
+        r"(post|publish|paste|share|send|upload|copy|leak|expose|echo|print|dump|reveal)[^\n]{0,80}\b(token|secret|credential|password|api[ _-]?key|private[ _-]?key|ssh[ _-]?key)s?\b",
+        r"(upload|send|post|copy|attach|exfiltrate)[^\n]{0,60}(id_rsa|\.pem\b|~/\.(ssh|aws|config)|\.env\b|keychain)",
+        r"git\s+remote\s+(add|set-url)|push[^\n]{0,80}(https?://|git@)[^\s\n]{4,}",
+        r"force[- ]?push|push\s+(-f\b|--force(?!-with-lease))",
     )
 )
 
@@ -2476,6 +2489,16 @@ class _Validator:
             else:
                 for env, migrations in applied.items():
                     env_path = f"merge_readiness.applied_state.{_safe_key(str(env))}"
+                    # algo#1216 finding 3807740761: an EMPTY nested map
+                    # ({prod: {}}) satisfied the outer non-empty rule while
+                    # recording nothing — each environment entry must carry
+                    # at least one migration status.
+                    if isinstance(migrations, dict) and not migrations:
+                        self.error(
+                            f"{env_path}: must record at least one migration"
+                            " status (an empty environment map means the"
+                            " recheck never ran for it)"
+                        )
                     if not isinstance(migrations, dict):
                         self.error(f"{env_path}: must be a mapping")
                         continue
@@ -3132,7 +3155,11 @@ def monitor_extract(text: str) -> dict[str, Any]:
                 hold = True
             else:
                 for env_map in applied.values():
-                    if isinstance(env_map, dict) and any(
+                    if not isinstance(env_map, dict) or not env_map:
+                        # Finding 3807740761: an empty environment map is an
+                        # unran recheck for that environment — hold.
+                        hold = True
+                    elif any(
                         status == "pending" for status in env_map.values()
                     ):
                         hold = True

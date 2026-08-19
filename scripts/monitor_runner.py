@@ -566,7 +566,20 @@ def _resolve_system_binary(name: str) -> str:
     if override:
         return override
     found = shutil_module.which(name, path=_SANITIZED_SYSTEM_PATH)
-    return found or name
+    if found is None:
+        # admin#1495 finding 3807823288: falling back to the bare name let
+        # later spawns resolve through the ambient PATH — the exact hole
+        # this resolver exists to close. A host without the binary on the
+        # system paths is broken; fail closed with the sanctioned fixes.
+        raise RunnerExit(
+            5,
+            "blocked",
+            f"required binary {name!r} not found on the sanitized system"
+            f" PATH ({_SANITIZED_SYSTEM_PATH}) — install it there or set"
+            f" MONITOR_RUNNER_BIN_{name.upper()} to its absolute path;"
+            " ambient-PATH fallback is disabled by design",
+        )
+    return found
 
 
 def process_fingerprint(pid: int) -> str | None:
@@ -756,9 +769,19 @@ def _drain_child(
             # rolling cap — a chatty child could otherwise evict its own
             # auth error and downgrade the deterministic block to a
             # generic three-strike charge.
+            lowered_line = decoded.lower()
             if len(stderr_sticky) < 5 and (
                 WRAPPER_EXEC_FAILED_MARKER in decoded
                 or _has_auth_signature(decoded)
+                # admin#1495 finding 3807823268: rate-limit and
+                # resume-not-found classification read only the rolling
+                # 20-line tail — a 429 followed by 30 cleanup lines lost
+                # its marker and decayed to a generic retry charge. These
+                # deterministic signatures are sticky like auth/exec ones.
+                or "429" in lowered_line
+                or "rate limit" in lowered_line
+                or "overloaded" in lowered_line
+                or "no conversation found" in lowered_line
             ):
                 # R7 codex #12: retain a marker-ANCHORED window, not a fixed
                 # head — a signature past char 400 must survive into the tail
@@ -1412,6 +1435,13 @@ class Runner:
             "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TERM",
             "TZ", "LANG", "COLUMNS", "LINES", "SSH_AUTH_SOCK", "XDG_CACHE_HOME",
             "XDG_CONFIG_HOME", "XDG_DATA_HOME", "CLAUDE_CONFIG_DIR",
+            # algo#1216 finding 3807740755: Keeper agent VMs run an
+            # OAuth-only Claude contract — the child's OWN session auth
+            # arrives through this one variable (startup.sh / the
+            # orchestrator token refresher), and stripping it left the
+            # child unauthenticated. The ACCOUNT-token bundle and every
+            # other CLAUDE_* name stay excluded (finding 3806719670).
+            "CLAUDE_CODE_OAUTH_TOKEN",
         }
         fake_child = Path(self.claude_bin).name != "claude"
         child_env = {
@@ -1430,7 +1460,24 @@ class Runner:
             # launch — the interpreter reads only bytes this runner just
             # wrote from its own heap.
             self._verify_skill_snapshot()
-            self.wrapper_stage_path.write_bytes(self.wrapper_source)
+            # mm#3551 finding 3808151918: Path.write_bytes FOLLOWS a
+            # child-planted symlink at the stage path, turning the rewrite
+            # into a write-through to an arbitrary target. Unlink and
+            # recreate with O_EXCL|O_NOFOLLOW so the bytes land only in a
+            # brand-new regular file owned by this runner.
+            try:
+                self.wrapper_stage_path.unlink()
+            except OSError:
+                pass
+            stage_fd = os.open(
+                self.wrapper_stage_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+            )
+            try:
+                os.write(stage_fd, self.wrapper_source)
+            finally:
+                os.close(stage_fd)
             proc = subprocess.Popen(
                 wrapper,
                 stdin=subprocess.PIPE,
@@ -2452,6 +2499,34 @@ class Runner:
         }
         self.commit_block(block)
 
+    def _resume_liveness_wait(self, extract: dict[str, Any]) -> None:
+        block = extract.get("monitor_cli")
+        liveness = block.get("liveness") if isinstance(block, dict) else None
+        if not isinstance(liveness, dict):
+            return
+        deadline_raw = liveness.get("next_retry_at")
+        if not isinstance(deadline_raw, str):
+            return
+        try:
+            deadline = datetime.strptime(
+                deadline_raw, "%Y-%m-%dT%H:%M:%SZ"
+            ).replace(tzinfo=timezone.utc)
+        except ValueError:
+            return
+        remaining_wait = (deadline - datetime.now(timezone.utc)).total_seconds()
+        while remaining_wait > 0:
+            budget = self.remaining() - MONITOR_SLICE_CLEANUP_MARGIN_SECONDS
+            if budget <= MONITOR_CHILD_MIN_VIABLE_SECONDS:
+                return  # the loop's own budget check returns the slice
+            chunk = min(remaining_wait, WAIT_CHUNK_SECONDS * self.wait_scale, budget)
+            _heartbeat(
+                f"resuming interrupted ladder wait ({int(remaining_wait)}s left)"
+            )
+            time.sleep(max(0.0, chunk))
+            remaining_wait = (
+                deadline - datetime.now(timezone.utc)
+            ).total_seconds()
+
     def _resume_liveness_rung(self, extract: dict[str, Any]) -> int:
         block = extract.get("monitor_cli")
         liveness = block.get("liveness") if isinstance(block, dict) else None
@@ -2612,6 +2687,11 @@ class Runner:
         # Finding 3806594998: resume the persisted ladder rung so a fresh
         # slice continues the escalation instead of restarting at rung 1.
         retries = self._resume_liveness_rung(extract)
+        # Finding 3807740769: an interrupted ladder WAIT resumes too — a
+        # persisted next_retry_at still in the future is time the previous
+        # slice already owed; launching immediately would collapse the
+        # backoff. Sleep the remainder (slice-budget-bounded chunks).
+        self._resume_liveness_wait(extract)
         # Bounded like every loop in this package (scanner rule + doctrine):
         # the slice deadline is the real bound and always fires first; the
         # iteration cap is an unreachable fail-closed backstop, never a
@@ -2674,8 +2754,13 @@ class Runner:
                 continue
             if retries:
                 # A non-retry outcome ends the ladder: clear the persisted
-                # rung so the next escalation starts fresh.
-                cleared = self.current_block(extract)
+                # rung so the next escalation starts fresh. Finding
+                # 3807740774: rebuild from a FRESH extract — the pre-tick
+                # one predates the tick's own commit, and reusing it
+                # overwrote the just-committed child_session_id and
+                # last_completed_attempt_id with their stale values.
+                fresh_after_tick = self.schema.extract(self.state_path)
+                cleared = self.current_block(fresh_after_tick)
                 cleared["liveness"] = None
                 self.commit_block(cleared)
             retries = 0

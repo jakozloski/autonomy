@@ -341,6 +341,24 @@ def qa_generation(request: dict[str, Any]) -> str:
     qa_assignee = qa_assignee if isinstance(qa_assignee, dict) else {}
     qa_state = tracker.get("qa_state")
     qa_state = qa_state if isinstance(qa_state, dict) else {}
+    # #3551 finding 3808151926: the operation builder drops the
+    # authenticated actor from the reviewer set AFTER this digest runs, so
+    # the digest must hash the same POST-filter set the plan actually mints
+    # operations for. Hashing the raw list let an actor rotation change the
+    # minted operation set while the generation stayed fixed — a ledger
+    # completed under the prior actor then satisfied a plan that now
+    # includes that login as a real reviewer, skipping its request/verify
+    # operations. The filter below mirrors the builder's own skip
+    # (casefolded equality) exactly.
+    actor = request.get("authenticated_actor")
+    actor_identity = actor.casefold() if isinstance(actor, str) else None
+    normalized_reviewers = _normalized_reviewer_logins(
+        request.get("code_reviewers", [])
+    )
+    if normalized_reviewers is not None and actor_identity is not None:
+        normalized_reviewers = [
+            login for login in normalized_reviewers if login != actor_identity
+        ]
     # Post-merge pass-3 codex F3 / opus F1: code_reviewers ALTER the minted
     # operation set (per-reviewer request/verify ids), so they are a plan
     # target and must move the digest - otherwise a reviewer change keeps
@@ -362,10 +380,9 @@ def qa_generation(request: dict[str, Any]) -> str:
         # shapes operation IDs and dependencies, so it is a TARGET fact —
         # omitting it reused a generation across reviewer changes and
         # stranded resumes on unknown-operation errors. Normalized (casefold,
-        # sorted, deduplicated) so ordering is never a spurious rollover.
-        "code_reviewers": _normalized_reviewer_logins(
-            request.get("code_reviewers", [])
-        ),
+        # sorted, deduplicated) so ordering is never a spurious rollover;
+        # actor-filtered above so the digest tracks the EFFECTIVE set.
+        "code_reviewers": normalized_reviewers,
     }
     canonical = json.dumps(
         payload, sort_keys=True, separators=(",", ":"), default=str
