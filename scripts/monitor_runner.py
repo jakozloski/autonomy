@@ -1460,24 +1460,7 @@ class Runner:
             # launch — the interpreter reads only bytes this runner just
             # wrote from its own heap.
             self._verify_skill_snapshot()
-            # mm#3551 finding 3808151918: Path.write_bytes FOLLOWS a
-            # child-planted symlink at the stage path, turning the rewrite
-            # into a write-through to an arbitrary target. Unlink and
-            # recreate with O_EXCL|O_NOFOLLOW so the bytes land only in a
-            # brand-new regular file owned by this runner.
-            try:
-                self.wrapper_stage_path.unlink()
-            except OSError:
-                pass
-            stage_fd = os.open(
-                self.wrapper_stage_path,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                0o600,
-            )
-            try:
-                os.write(stage_fd, self.wrapper_source)
-            finally:
-                os.close(stage_fd)
+            self._restage_wrapper()
             proc = subprocess.Popen(
                 wrapper,
                 stdin=subprocess.PIPE,
@@ -2499,6 +2482,42 @@ class Runner:
         }
         self.commit_block(block)
 
+    def _restage_wrapper(self) -> None:
+        """Rewrite the wrapper stage from the __init__-pinned bytes.
+
+        mm#3551 finding 3808151918: ``Path.write_bytes`` FOLLOWS a
+        child-planted symlink at the stage path, turning the rewrite into a
+        write-through to an arbitrary same-UID target. Unlink (removing any
+        planted link NAME, never its target) and recreate with
+        ``O_EXCL|O_NOFOLLOW`` so the bytes land only in a brand-new regular
+        file owned by this runner — a re-plant inside the unlink→create
+        window makes ``O_EXCL`` fail closed instead of following."""
+        try:
+            self.wrapper_stage_path.unlink()
+        except OSError:
+            pass
+        stage_fd = os.open(
+            self.wrapper_stage_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            os.write(stage_fd, self.wrapper_source)
+        finally:
+            os.close(stage_fd)
+
+    def _clear_liveness_ladder(self) -> None:
+        """End-of-ladder cleanup after a non-retry outcome.
+
+        Finding 3807740774: rebuild from a FRESH extract — the run loop's
+        pre-tick extract predates the tick's own commit, and reusing it
+        overwrote the just-committed ``child_session_id`` and
+        ``last_completed_attempt_id`` with their stale values."""
+        fresh_after_tick = self.schema.extract(self.state_path)
+        cleared = self.current_block(fresh_after_tick)
+        cleared["liveness"] = None
+        self.commit_block(cleared)
+
     def _resume_liveness_wait(self, extract: dict[str, Any]) -> None:
         block = extract.get("monitor_cli")
         liveness = block.get("liveness") if isinstance(block, dict) else None
@@ -2753,16 +2772,7 @@ class Runner:
                     }
                 continue
             if retries:
-                # A non-retry outcome ends the ladder: clear the persisted
-                # rung so the next escalation starts fresh. Finding
-                # 3807740774: rebuild from a FRESH extract — the pre-tick
-                # one predates the tick's own commit, and reusing it
-                # overwrote the just-committed child_session_id and
-                # last_completed_attempt_id with their stale values.
-                fresh_after_tick = self.schema.extract(self.state_path)
-                cleared = self.current_block(fresh_after_tick)
-                cleared["liveness"] = None
-                self.commit_block(cleared)
+                self._clear_liveness_ladder()
             retries = 0
             if not self.wait_between_ticks():
                 return {

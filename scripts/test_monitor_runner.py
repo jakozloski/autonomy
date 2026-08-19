@@ -184,6 +184,12 @@ argv_log = os.environ.get("FAKE_ARGV_LOG")
 if argv_log:
     with open(argv_log, "a", encoding="utf-8") as h:
         h.write(json.dumps(sys.argv[1:]) + "\n")
+time_log = os.environ.get("FAKE_TIME_LOG")
+if time_log:
+    # Wall-clock launch stamps: the cross-slice ladder test asserts the
+    # resumed wait held the launch past the persisted next_retry_at.
+    with open(time_log, "a", encoding="utf-8") as h:
+        h.write(f"{time.time()}\n")
 cwd_file = os.environ.get("FAKE_CWD_FILE")
 if cwd_file:
     with open(cwd_file, "w", encoding="utf-8") as h:
@@ -238,6 +244,27 @@ if mode == "rate_limited":
     sys.stderr.write("429 Too Many Requests: rate limit exceeded\n")
     sys.stderr.flush()
     sys.exit(1)
+
+if mode == "rate_limited_noise":
+    # admin#1495 finding 3807823268: the 429 marker followed by enough
+    # noise to overflow the 20-line rolling tail — the sticky capture must
+    # preserve it so this still classifies as ladder, not a charged exit_1.
+    sys.stderr.write("429 Too Many Requests: rate limit exceeded\n")
+    for i in range(30):
+        sys.stderr.write(f"cleanup line {i}\n")
+    sys.stderr.flush()
+    sys.exit(1)
+
+if mode == "rate_then_ok":
+    # algo#1216 finding 3807740774 regression: attempt 1 rate-limits (the
+    # ladder), attempt 2 falls through to the normal ok flow. The argv log
+    # already contains THIS call's own line, so the first call sees 1.
+    with open(argv_log, "r", encoding="utf-8") as h:
+        calls_so_far = sum(1 for _ in h)
+    if calls_so_far <= 1:
+        sys.stderr.write("429 Too Many Requests: rate limit exceeded\n")
+        sys.stderr.flush()
+        sys.exit(1)
 
 if mode == "resume_not_found" and "--resume" in sys.argv:
     # Only the RESUMED attempt fails; the fresh relaunch (no --resume)
@@ -2083,6 +2110,99 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         extract = self._extract()
         signatures = [f["signature"] for f in extract["monitor_cli"]["child_failures"]]
         self.assertEqual(signatures, [], "rate limits must not charge the budget")
+
+    def test_rate_limit_marker_survives_stderr_noise(self) -> None:
+        # admin#1495 finding 3807823268: 30 cleanup lines after the 429
+        # evicted the marker from the rolling 20-line tail, so the failure
+        # classified as a chargeable exit_1 instead of the ladder. The
+        # sticky capture now retains rate-limit markers like auth ones;
+        # revert the sticky condition and this charges the budget.
+        completed = self._run(
+            mode="rate_limited_noise", budget="900", timeout=90,
+            wait_scale="0.02", max_ticks="2",
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        summary = self._summary(completed)
+        self.assertEqual(summary["runner_outcome"], "slice_exhausted")
+        self.assertEqual(len(self._argv_calls()), 2, "ladder should retry")
+        extract = self._extract()
+        signatures = [f["signature"] for f in extract["monitor_cli"]["child_failures"]]
+        self.assertEqual(signatures, [], "buried 429 must not charge the budget")
+
+    def test_ladder_clear_preserves_continuity_after_retry_then_success(
+        self,
+    ) -> None:
+        # algo#1216 finding 3807740774 (admin 3807823251 / mm 3808151939):
+        # the end-of-ladder liveness clear rebuilt the block from the
+        # pre-tick extract, nulling the child_session_id and
+        # last_completed_attempt_id the successful tick had just committed.
+        # The clear now re-extracts canonical state first; revert
+        # _clear_liveness_ladder to reuse the loop's extract and both
+        # continuity assertions below fail.
+        completed = self._run(
+            mode="rate_then_ok", budget="900", timeout=90,
+            wait_scale="0.02", max_ticks="2",
+            env_extra={"FAKE_SID": "sid-after-retry"},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        summary = self._summary(completed)
+        self.assertEqual(summary["ticks_completed"], 1)
+        self.assertEqual(len(self._argv_calls()), 2, "one retry then success")
+        extract = self._extract()
+        block = extract["monitor_cli"]
+        self.assertEqual(block["child_session_id"], "sid-after-retry")
+        self.assertIsNotNone(block["last_completed_attempt_id"])
+        self.assertIsNone(block["liveness"], "ladder rung must still clear")
+
+    def test_resume_honors_persisted_ladder_deadline_across_slices(self) -> None:
+        # algo#1216 finding 3807740769 (admin 3807823260 / mm 3808151933):
+        # WIRING pin for _resume_liveness_wait — a fresh runner invocation
+        # must sleep out the persisted next_retry_at before its first
+        # launch. Slice 1 rate-limits and exhausts during the ladder wait,
+        # persisting rung + deadline (~12s ahead at wait_scale 0.2). Slice
+        # 2 must consume the remainder before launching; drop the
+        # _resume_liveness_wait call from run() and slice 2 finishes in
+        # ~2s, failing the duration floor.
+        from datetime import datetime, timezone
+
+        time_log = self.dir / "launch-times.txt"
+        first = self._run(
+            mode="rate_limited", budget="365", timeout=60, wait_scale="0.2",
+            env_extra={"FAKE_TIME_LOG": str(time_log)},
+        )
+        self.assertEqual(
+            self._summary(first)["runner_outcome"], "slice_exhausted"
+        )
+        liveness = self._extract()["monitor_cli"]["liveness"]
+        self.assertIsNotNone(liveness, "slice 1 must persist the wait")
+        deadline_epoch = (
+            datetime.strptime(liveness["next_retry_at"], "%Y-%m-%dT%H:%M:%SZ")
+            .replace(tzinfo=timezone.utc)
+            .timestamp()
+        )
+        # 500, not 365: the ~10s resumed wait must leave the slice above
+        # the 240s+120s launch-viability floor afterwards. max_ticks=1 so
+        # the slice ends after that launch instead of ticking out the
+        # remaining ~140s of budget.
+        second = self._run(
+            mode="ok", budget="500", timeout=90, wait_scale="0.2",
+            max_ticks="1",
+            env_extra={"FAKE_TIME_LOG": str(time_log)},
+        )
+        summary = self._summary(second)
+        self.assertEqual(summary["ticks_completed"], 1, second.stderr)
+        stamps = [
+            float(line)
+            for line in time_log.read_text().splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(len(stamps), 2, "one launch per slice")
+        # The persisted deadline is floored to whole seconds, so comparing
+        # against it (not the true instant) keeps the assert exact.
+        self.assertGreaterEqual(
+            stamps[1], deadline_epoch,
+            "slice 2 launched before the persisted next_retry_at elapsed",
+        )
 
     def test_resume_not_found_clears_session_and_retries_fresh(self) -> None:
         # opus L4: the fresh_session branch — a vanished resume target clears

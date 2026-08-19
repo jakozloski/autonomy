@@ -31,9 +31,11 @@ import tempfile
 import sys
 import types
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
+import monitor_runner
 from model_policy import REVIEWER_EFFORT
 from monitor_runner import (
     Runner,
@@ -914,6 +916,101 @@ class LaunchChildIsolationTests(unittest.TestCase):
         # are gone by the time the wrapper launches THIS:
         self.assertEqual(Path(argv[5]).name, "claude")
         self.assertEqual(argv[-1], "the-prompt")
+
+
+class _ScriptedDatetime:
+    """Stand-in for monitor_runner.datetime with a scripted now() sequence
+    (the last entry repeats). strptime delegates to the real class so the
+    method under test parses exactly as production does."""
+
+    script: list[datetime] = []
+
+    @staticmethod
+    def strptime(raw: str, fmt: str) -> datetime:
+        return datetime.strptime(raw, fmt)
+
+    @classmethod
+    def now(cls, tz: timezone | None = None) -> datetime:
+        return cls.script.pop(0) if len(cls.script) > 1 else cls.script[0]
+
+
+class ResumeLivenessWaitTests(unittest.TestCase):
+    """algo#1216 finding 3807740769 (admin 3807823260 / mm 3808151933):
+    resume restored the ladder rung but never consumed the persisted
+    next_retry_at, so a new slice launched immediately with backoff time
+    remaining. _resume_liveness_wait must sleep out the remainder
+    (budget-bounded) before the loop may launch."""
+
+    T0 = datetime(2026, 8, 19, 12, 0, 0, tzinfo=timezone.utc)
+
+    def _extract_with_deadline(self, deadline: datetime) -> dict:
+        return {
+            "monitor_cli": {
+                "liveness": {
+                    "rung": 1,
+                    "next_retry_at": deadline.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                }
+            }
+        }
+
+    def _wait_with(self, extract: dict, now_script: list, remaining: float):
+        runner = _runner("claude-opus-5", None)
+        runner.remaining = lambda: remaining
+        sleeps: list[float] = []
+        _ScriptedDatetime.script = list(now_script)
+        with mock.patch.object(monitor_runner, "datetime", _ScriptedDatetime):
+            with mock.patch("time.sleep", side_effect=sleeps.append):
+                runner._resume_liveness_wait(extract)
+        return sleeps
+
+    def test_future_deadline_is_slept_out_before_any_launch(self) -> None:
+        deadline = self.T0 + timedelta(seconds=4)
+        sleeps = self._wait_with(
+            self._extract_with_deadline(deadline),
+            [self.T0, self.T0 + timedelta(seconds=5)],
+            remaining=10_000.0,
+        )
+        self.assertEqual(sleeps, [4.0], "the persisted remainder must be slept")
+
+    def test_elapsed_deadline_passes_straight_through(self) -> None:
+        deadline = self.T0 + timedelta(seconds=4)
+        sleeps = self._wait_with(
+            self._extract_with_deadline(deadline),
+            [self.T0 + timedelta(seconds=10)],
+            remaining=10_000.0,
+        )
+        self.assertEqual(sleeps, [], "an elapsed deadline must not wait")
+
+    def test_exhausted_budget_returns_without_sleeping(self) -> None:
+        # The loop's own budget check then ends the slice — the wait must
+        # not eat into cleanup margin.
+        deadline = self.T0 + timedelta(seconds=4)
+        sleeps = self._wait_with(
+            self._extract_with_deadline(deadline),
+            [self.T0],
+            remaining=0.0,
+        )
+        self.assertEqual(sleeps, [], "no budget means no wait, not a launch")
+
+
+class RestageWrapperTests(unittest.TestCase):
+    def test_restage_never_writes_through_a_planted_symlink(self) -> None:
+        # mm#3551 finding 3808151918: Path.write_bytes followed a
+        # child-planted symlink at the stage path, redirecting the trusted
+        # rewrite into an arbitrary same-UID target. _restage_wrapper
+        # unlinks the planted NAME and recreates with O_EXCL|O_NOFOLLOW;
+        # revert it to write_bytes and the victim assertion fails.
+        runner = _runner("claude-opus-5", None)
+        with tempfile.TemporaryDirectory() as tmp:
+            victim = Path(tmp) / "victim-state.md"
+            victim.write_bytes(b"KEEP")
+            stage = runner.wrapper_stage_path
+            stage.unlink()
+            os.symlink(victim, stage)
+            runner._restage_wrapper()
+            self.assertEqual(victim.read_bytes(), b"KEEP")
+            self.assertFalse(stage.is_symlink())
+            self.assertEqual(stage.read_bytes(), runner.wrapper_source)
 
 
 # The glob set state-and-safety.md tells consuming repos to .gitignore —
