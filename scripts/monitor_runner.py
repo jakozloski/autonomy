@@ -598,6 +598,105 @@ def process_fingerprint(pid: int) -> str | None:
     return value or None
 
 
+def _descendant_snapshot(root_pid: int) -> dict[int, int]:
+    """Best-effort {pid: pgid} of every live descendant of ``root_pid``.
+
+    #3551 finding 3808151914: a descendant that calls ``setsid`` leaves the
+    recorded process group, so group inspection alone cannot see it — but
+    while its ANCESTRY is intact the ``ppid`` chain still reaches it. The
+    drain loop calls this periodically while the leader lives, and the
+    extinction gate then proves every snapshotted pid dead in addition to
+    the group. Residual (documented, not silent): a descendant spawned and
+    orphaned entirely BETWEEN two snapshots evades the chain walk — the
+    poll cadence bounds that window; the strict boundary is a cgroup/PID
+    namespace, available only on Linux hosts. Failures here return the
+    facts gathered so far (empty on total failure): the snapshot only
+    ADDS coverage on top of the fail-closed group gate, so a snapshot
+    error must not convert a provable group answer into a block.
+    """
+
+    try:
+        completed = subprocess.run(
+            [_resolve_system_binary("ps"), "-eo", "pid=,ppid=,pgid=,stat="],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if completed.returncode != 0:
+        return {}
+    children: dict[int, list[tuple[int, int, str]]] = {}
+    for row in completed.stdout.splitlines():
+        parts = row.split()
+        if len(parts) < 4:
+            continue
+        try:
+            pid, ppid, pgid = int(parts[0]), int(parts[1]), int(parts[2])
+        except ValueError:
+            continue
+        children.setdefault(ppid, []).append((pid, pgid, parts[3]))
+    found: dict[int, int] = {}
+    frontier = [root_pid]
+    while frontier:
+        parent = frontier.pop()
+        for pid, pgid, stat in children.get(parent, []):
+            if pid in found:
+                continue
+            if not stat.startswith("Z"):
+                found[pid] = pgid
+            frontier.append(pid)
+    return found
+
+
+def _live_snapshot_pids(snapshot: dict[int, int]) -> list[int]:
+    """Fail-closed liveness over a recorded descendant snapshot.
+
+    Mirrors ``_live_group_members``: an uninspectable table blocks rather
+    than reading as extinction, because these pids were RECORDED live and
+    only a trusted answer may clear them. Zombies do not count.
+    """
+
+    if not snapshot:
+        return []
+    pid_args = [str(pid) for pid in sorted(snapshot)]
+    try:
+        completed = subprocess.run(
+            [_resolve_system_binary("ps"), "-o", "pid=,stat=", "-p", ",".join(pid_args)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RunnerExit(
+            5,
+            "blocked",
+            "process-table inspection failed"
+            f" ({error.__class__.__name__}) — cannot prove recorded"
+            " descendants extinct; needs a human",
+        )
+    if completed.returncode not in (0, 1):
+        raise RunnerExit(
+            5,
+            "blocked",
+            "process-table inspection returned"
+            f" {completed.returncode} — cannot prove recorded descendants"
+            " extinct; needs a human",
+        )
+    live: list[int] = []
+    for row in completed.stdout.splitlines():
+        parts = row.split()
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        if not parts[1].startswith("Z"):
+            live.append(pid)
+    return live
+
+
 def _live_group_members(pgid: int) -> list[str]:
     """R5-4: fail-closed, bounded process-table inspection.
 
@@ -741,6 +840,10 @@ def _drain_child(
             selector.register(pipe, selectors.EVENT_READ)
     last_activity = time.monotonic()
     last_heartbeat = time.monotonic()
+    # #3551 finding 3808151914: record descendants while ancestry is intact
+    # so session-escaped ones remain provable after the leader dies.
+    descendant_snapshot: dict[int, int] = {}
+    last_snapshot = 0.0
     outcome = "clean"
 
     def _consume(decoded: str, from_stdout: bool) -> None:
@@ -800,6 +903,9 @@ def _drain_child(
         if now - last_heartbeat >= 60:
             _heartbeat(f"supervising child (remaining ceiling {int(deadline - now)}s)")
             last_heartbeat = now
+        if now - last_snapshot >= 1.0:
+            descendant_snapshot.update(_descendant_snapshot(proc.pid))
+            last_snapshot = now
         for key, _ in selector.select(timeout=1.0):
             pipe = key.fileobj
             try:
@@ -863,6 +969,7 @@ def _drain_child(
                 last_heartbeat = now
             time.sleep(0.5)
     return {
+        "descendant_snapshot": descendant_snapshot,
         "outcome": outcome,
         "exit_code": proc.returncode,
         "protocol": protocol,
@@ -1664,24 +1771,40 @@ class Runner:
         # by this runner this tick) and boundedly rechecked; a group that
         # cannot be proven extinct needs a human, and a clean tick that
         # needed the kill is charged and retried.
-        if _live_group_members(child_pgid):
+        # #3551 finding 3808151914: the group gate cannot see a descendant
+        # that re-sessioned away from the recorded pgid, so the drain's
+        # ancestry snapshot extends the extinction proof to every pid that
+        # was ever observed as a descendant while the leader lived.
+        escaped = _live_snapshot_pids(drained.get("descendant_snapshot") or {})
+        if _live_group_members(child_pgid) or escaped:
             try:
                 os.killpg(child_pgid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
+            snapshot = drained.get("descendant_snapshot") or {}
+            for pid in escaped:
+                for target in {snapshot.get(pid), None}:
+                    try:
+                        if target is not None:
+                            os.killpg(target, signal.SIGKILL)
+                        else:
+                            os.kill(pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
             recheck_deadline = time.monotonic() + 15
-            while (
-                time.monotonic() < recheck_deadline
-                and _live_group_members(child_pgid)
+            while time.monotonic() < recheck_deadline and (
+                _live_group_members(child_pgid)
+                or _live_snapshot_pids(snapshot)
             ):
                 time.sleep(0.3)
-            if _live_group_members(child_pgid):
+            if _live_group_members(child_pgid) or _live_snapshot_pids(snapshot):
                 self._preserve_failed(candidate)
                 raise RunnerExit(
                     5,
                     "blocked",
-                    "same-group descendants of the monitor child survived"
-                    " SIGKILL — a possibly-live writer needs a human",
+                    "descendants of the monitor child (same-group or"
+                    " re-sessioned) survived SIGKILL — a possibly-live"
+                    " writer needs a human",
                 )
             # R7 (opus L5), widened to every outcome: the survivor may have
             # written canonical in the window between the post-drain extract

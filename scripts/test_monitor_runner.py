@@ -306,6 +306,21 @@ if mode == "auth_overflow":
     sys.stderr.flush()
     sys.exit(1)
 
+if mode == "leave_sessioned_survivor":
+    # #3551 finding 3808151914: a descendant that calls setsid leaves the
+    # recorded process group entirely — the group gate cannot see it, only
+    # the drain's ancestry snapshot can. Sleep long enough to outlive the
+    # leader and the recheck window unless the runner kills it.
+    subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    # Keep the leader alive briefly so at least one 1s snapshot cycle in
+    # the drain observes the descendant while ancestry is intact.
+    time.sleep(2.5)
+
 if mode == "leave_survivor":
     # Same-group descendant that outlives the clean leader exit (R6-F6).
     # Detached stdio: a survivor holding the supervised pipes would delay
@@ -2049,6 +2064,22 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         self.assertEqual(extract["counters"]["monitor_poll_ticks"], 0)
         strays = list(self.dir.glob("workflow-state.local.md.attempt-*"))
         self.assertEqual(strays, [])
+
+    def test_sessioned_descendant_after_clean_exit_is_never_trusted(self) -> None:
+        # #3551 finding 3808151914: the committed watcher fixture proves a
+        # start_new_session descendant escapes the recorded group. The
+        # drain's ancestry snapshot must still see it, and the extinction
+        # gate must kill it (or block) instead of returning terminal
+        # success with an authenticated writer alive.
+        completed = self._run(
+            mode="leave_sessioned_survivor", budget="900", timeout=120,
+            wait_scale="0.02", max_ticks="3",
+        )
+        self.assertEqual(completed.returncode, 5, completed.stdout + completed.stderr)
+        extract = self._extract()
+        signatures = [f["signature"] for f in extract["monitor_cli"]["child_failures"]]
+        self.assertIn("monitor-child:group_survivors", signatures)
+        self.assertEqual(extract["counters"]["monitor_poll_ticks"], 0)
 
     def test_survivor_recheck_catches_canonical_drift_in_the_kill_window(self) -> None:
         # R7 codex #18: the survivor-path recheck (monitor_runner.py L5,
