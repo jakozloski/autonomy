@@ -270,6 +270,26 @@ def _repository_and_pr(
     return name_with_owner, pull_request_number, errors
 
 
+def _assignee_precondition(request: dict[str, Any]) -> dict[str, Any] | None:
+    """algo#1216 finding 3813491647: the observed pre-mutation assignee set,
+    embedded in every ``replace_pull_request_assignees`` payload so the
+    write-ahead record pins what the mutation replaces. The executor
+    persists it with the pending record; resume's three-way compare
+    (current vs precondition vs desired) turns "differs from both" into a
+    superseded stop instead of a blind replay over a newer human action.
+    Observational context, deliberately NOT part of the plan digest — a
+    drifted observation must never re-mint an in-flight plan."""
+
+    raw = request.get("existing_assignees")
+    if not isinstance(raw, list):
+        return None
+    observed = sorted(
+        {login for login in raw if isinstance(login, str)},
+        key=str.casefold,
+    )
+    return {"assignees": observed}
+
+
 def _github_operation(
     operation_id: str,
     action: str,
@@ -484,8 +504,15 @@ def _approved_qa_operations(
             pull_request_number,
             depends_on=list(reviewer_verification_ids),
             # This is the complete desired set, not an additive update.  Stale
-            # assignees supplied by GitHub are intentionally absent.
+            # assignees supplied by GitHub are intentionally absent from the
+            # TARGET; the observed set rides along as the write-ahead
+            # precondition instead (finding 3813491647).
             assignees=[github_login],
+            **(
+                {"precondition": precondition}
+                if (precondition := _assignee_precondition(request)) is not None
+                else {}
+            ),
         )
     )
     operations.append(
@@ -1167,6 +1194,11 @@ def _reviewer_request_operations(
             pull_request_number,
             depends_on=verification_ids,
             assignees=[ball_holder],
+            **(
+                {"precondition": precondition}
+                if (precondition := _assignee_precondition(request)) is not None
+                else {}
+            ),
         )
     )
     operations.append(
@@ -1240,6 +1272,11 @@ def _roundtrip_operations(
             pull_request_number,
             depends_on=reviewer_verification_ids,
             assignees=reviewers,
+            **(
+                {"precondition": precondition}
+                if (precondition := _assignee_precondition(request)) is not None
+                else {}
+            ),
         )
     )
     operations.append(
@@ -1544,6 +1581,24 @@ def _apply_operation_state(
                 scenario,
                 f"pending operation {pending_id!r} has no deterministic verification step",
             )
+        # algo#1216 finding 3813491647: surface the pre-mutation
+        # fingerprint with the verification step. The PERSISTED record's
+        # precondition wins — it captured the remote state before attempt
+        # 1 fired; the spec's copy is a fresh observation that may already
+        # include the drift being adjudicated. Three-way rule (documented
+        # in state-and-safety.md): current == desired → complete; current
+        # == precondition → retry; matches neither → superseded, record
+        # failed and reconcile — never replay over a newer human action.
+        persisted_precondition = result_records[pending_id].get("precondition")
+        if not isinstance(persisted_precondition, dict):
+            persisted_precondition = next(
+                (
+                    spec.get("payload", {}).get("precondition")
+                    for spec in operation_specs
+                    if spec.get("id") == pending_id
+                ),
+                None,
+            )
         call_plan = [
             {
                 "id": f"resume.verify_before_retry:{pending_id}",
@@ -1554,6 +1609,7 @@ def _apply_operation_state(
                     "operation_id": pending_id,
                     "attempts": result_records[pending_id]["attempts"],
                     "verification_operation": copy.deepcopy(verification),
+                    "precondition": copy.deepcopy(persisted_precondition),
                 },
             }
         ]
@@ -1567,6 +1623,18 @@ def _apply_operation_state(
         retry_operation["attempt"] = result_records[retryable_id]["attempts"] + 1
         retry_operation["requires_pending_write"] = True
         retry_operation.pop("result", None)
+        # Same record-wins rule for the replay: the persisted precondition
+        # from attempt 1 rides the retried operation, so the executor's
+        # pre-fire check adjudicates against the ORIGINAL observation.
+        persisted_precondition = result_records[retryable_id].get(
+            "precondition"
+        )
+        if isinstance(persisted_precondition, dict) and isinstance(
+            retry_operation.get("payload"), dict
+        ):
+            retry_operation["payload"]["precondition"] = copy.deepcopy(
+                persisted_precondition
+            )
         call_plan = [retry_operation]
     else:
         call_plan = [

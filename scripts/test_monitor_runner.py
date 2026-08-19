@@ -364,12 +364,19 @@ if side_effect and mode == "die_after_side_effect":
     sys.exit(1)
 
 text = open(state_path, encoding="utf-8").read()
-ticks = re.search(r"monitor_poll_ticks: (\d+)", text)
-count = int(ticks.group(1))
-if mode != "counter_noop":
+if os.environ.get("FAKE_BUMP_ITERATIONS") == "1":
+    iters = re.search(r"monitor_iterations: (\d+)", text)
+    icount = int(iters.group(1))
     text = text.replace(
-        f"monitor_poll_ticks: {count}", f"monitor_poll_ticks: {count + 1}", 1
+        f"monitor_iterations: {icount}", f"monitor_iterations: {icount + 1}", 1
     )
+else:
+    ticks = re.search(r"monitor_poll_ticks: (\d+)", text)
+    count = int(ticks.group(1))
+    if mode != "counter_noop":
+        text = text.replace(
+            f"monitor_poll_ticks: {count}", f"monitor_poll_ticks: {count + 1}", 1
+        )
 outcome_env = os.environ.get("FAKE_OUTCOME", "continue")
 if outcome_env == "terminal" and os.environ.get("FAKE_SKIP_STATUS_FLIP") != "1":
     text = text.replace('monitor: "in_progress"', 'monitor: "paused"', 1)
@@ -1816,6 +1823,121 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         self.assertEqual(summary["ticks_completed"], 1)
         extract = self._extract()
         self.assertEqual(extract["monitor_status"], "blocked")
+
+    def _bind_origin(self, url: str) -> None:
+        """Make the fixture directory a git repository with ``origin`` set,
+        so the runner's repository probe resolves a binding."""
+        for argv in (
+            ["git", "init", "-q"],
+            ["git", "remote", "add", "origin", url],
+        ):
+            probe = subprocess.run(
+                argv, cwd=self.dir, capture_output=True, text=True
+            )
+            self.assertEqual(probe.returncode, 0, probe.stderr)
+
+    def test_mapped_repo_terminal_with_idle_qa_handoff_is_rejected(
+        self,
+    ) -> None:
+        # algo#1216 finding 3813491661 (exact repro): a Keeper-mapped run
+        # reported terminal with BOTH handoff aggregates idle — completion
+        # without assigning QA, moving the ticket, or any handoff record.
+        # The runner's manifest now rejects it under a distinct signature.
+        self._bind_origin("git@github.com:Keeper-Dating/matchmaking.git")
+        completed = self._run(
+            budget="900", timeout=90, wait_scale="0.02", max_ticks="3",
+            env_extra={"FAKE_OUTCOME": "terminal"},
+        )
+        self.assertEqual(completed.returncode, 5, completed.stderr)
+        extract = self._extract()
+        signatures = [
+            f["signature"] for f in extract["monitor_cli"]["child_failures"]
+        ]
+        self.assertIn("monitor-child:handoff_missing", signatures)
+        self.assertEqual(extract["monitor_status"], "in_progress")
+        # The sticky runner-owned binding persisted with the failure
+        # commit — a later slice stays mapped even if the probe breaks.
+        self.assertEqual(
+            extract["monitor_cli"]["repository"], "Keeper-Dating/matchmaking"
+        )
+
+    def test_mapped_repo_terminal_with_planned_qa_commits(self) -> None:
+        # The pass-through side: a mapped run whose qa handoff was planned
+        # (terminal `failed` here — non-idle) still commits terminal.
+        self._bind_origin("https://github.com/Keeper-Dating/matchmaking")
+        self._mutate_state(self._IDLE_QA_HANDOFF, self._FAILED_QA_HANDOFF)
+        completed = self._run(
+            budget="2000", env_extra={"FAKE_OUTCOME": "terminal"}
+        )
+        summary = self._summary(completed)
+        self.assertEqual(
+            completed.returncode, 0, completed.stdout + completed.stderr
+        )
+        self.assertEqual(summary["runner_outcome"], "terminal")
+
+    def test_unmapped_repo_terminal_with_idle_handoffs_commits(self) -> None:
+        # Idle handoffs stay valid for deliberately unmapped repositories.
+        self._bind_origin("git@github.com:someone-else/sandbox.git")
+        completed = self._run(
+            budget="2000", env_extra={"FAKE_OUTCOME": "terminal"}
+        )
+        summary = self._summary(completed)
+        self.assertEqual(
+            completed.returncode, 0, completed.stdout + completed.stderr
+        )
+        self.assertEqual(summary["runner_outcome"], "terminal")
+
+    def test_work_cap_overrun_terminal_is_rejected(self) -> None:
+        # algo#1216 finding 3813491642 (exact repro): a candidate advancing
+        # monitor_iterations 50→51 with a successful terminal outcome was
+        # accepted — the documented MAX_ITERATIONS cap lived only in the
+        # child-facing reference. The trusted runner now rejects any
+        # over-cap candidate that is not the documented blocked
+        # transition, under a distinct signature.
+        self._mutate_state("monitor_iterations: 0", "monitor_iterations: 50")
+        completed = self._run(
+            budget="900", timeout=90, wait_scale="0.02", max_ticks="3",
+            env_extra={
+                "FAKE_OUTCOME": "terminal",
+                "FAKE_BUMP_ITERATIONS": "1",
+            },
+        )
+        self.assertEqual(completed.returncode, 5, completed.stderr)
+        extract = self._extract()
+        signatures = [
+            f["signature"] for f in extract["monitor_cli"]["child_failures"]
+        ]
+        self.assertIn("monitor-child:work_cap_exceeded", signatures)
+        self.assertNotIn("monitor-child:success", signatures)
+        self.assertEqual(extract["monitor_status"], "in_progress")
+
+    def test_work_cap_blocked_transition_commits(self) -> None:
+        # The conversion path the cap demands: at 50 cumulative iterations
+        # the child's human:user-confirm:work-cap blocked transition (the
+        # one monitor-ci-feedback.md documents) must still commit — the
+        # cap forces a human stop, never a stuck loop.
+        self._mutate_state("monitor_iterations: 0", "monitor_iterations: 50")
+        self._mutate_state(
+            "attempt_log: {}",
+            'attempt_log:\n  "human:user-confirm:work-cap": 1',
+        )
+        completed = self._run(
+            budget="2000",
+            env_extra={
+                "FAKE_OUTCOME": "blocked",
+                "FAKE_BUMP_ITERATIONS": "1",
+            },
+        )
+        summary = self._summary(completed)
+        self.assertEqual(
+            completed.returncode, 0, completed.stdout + completed.stderr
+        )
+        self.assertEqual(summary["runner_outcome"], "blocked")
+        extract = self._extract()
+        self.assertEqual(extract["monitor_status"], "blocked")
+        self.assertEqual(
+            extract["counters"]["monitor_iterations"], 51
+        )
 
     def test_blocked_verdict_with_three_strike_ci_evidence_commits(self) -> None:
         self._mutate_state(

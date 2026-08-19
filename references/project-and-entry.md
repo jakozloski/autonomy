@@ -220,6 +220,13 @@ The user provides a PR number or URL from another agent or person.
      STASH_NONCE="autonomy-$(date +%s)-$$-$RANDOM"
      STASH_MSG="autonomy-workflow: $STASH_NONCE before PR takeover"
 
+     # WRITE-AHEAD (admin#1495 finding 3813789199): persist
+     # `stash_intent: {nonce: $STASH_NONCE, original_branch: $PRE_TAKEOVER_BRANCH,
+     # status: pending}` to the state file BEFORE the push. A crash in the
+     # push→persist window otherwise leaves the developer's work in a stash
+     # no state field points at; the durable nonce is what resume
+     # reconciles against (see the resume rule below step 3).
+
      # Snapshot the stash stack head BEFORE push so we can detect the "nothing
      # to stash" case (git stash push exits 0 even when no entry is created).
      STASH_STACK_BEFORE=$(git rev-parse --verify --quiet refs/stash || echo "")
@@ -261,7 +268,10 @@ The user provides a PR number or URL from another agent or person.
        fi
      fi
      # Persist $STASH_REF (full SHA, possibly empty if no-op) in state file
-     # before any checkout runs.
+     # before any checkout runs — and clear `stash_intent` to null IN THE
+     # SAME write: intent + ref answer "is a stash in flight?" between
+     # them, and a write that binds one without clearing the other
+     # re-opens the crash window it exists to close.
    fi
    # Exit-0 plus an unchanged refs/stash may be a legitimate no-op, but checkout
    # is safe only if the working tree is now actually clean.
@@ -275,6 +285,8 @@ The user provides a PR number or URL from another agent or person.
    ```
 
    **Note:** `STASH_REF` is captured by exact-message match using a unique nonce; this is race-free regardless of concurrent stash-push activity from other processes.
+
+   **Resume reconciliation (finding 3813789199):** a non-null `stash_intent` with `stash_ref: null` means the crash window hit. Walk `git stash list --format='%H%x09%s'` matching the persisted nonce by containment: found → bind `stash_ref` to that SHA and clear the intent (one write); not found with a clean tree → the push never created an entry — clear the intent; not found with a DIRTY tree → BLOCK for manual reconciliation before any checkout (the dirty work is unstashed and a checkout could destroy it). Never proceed to PR checkout with a pending intent unresolved.
 
 4. **Resolve Project Profile, then run the Model-Gate Entry Preflight** — execute the discovery steps above to populate `resolved_conventions` in the state file, then run the **Model-Gate Entry Preflight** (above) and BLOCK on its verdict before any further work. `base_branch` was already persisted in step 2. This MUST complete before any phase begins. After profile resolution, initialize EVERY remaining top-level block from the documented state template — `phases` (including `merge_readiness`), `regression_evidence`, `variant_analysis`, `acceptance_criteria`, `merge_readiness`, ledgers, tracking/acknowledgment maps, monitor counters, and handoffs — the full v1 mapping, so the full-tier schema requirement is satisfiable from Phase 1 onward.
 5. Read the PR description and all feedback from the paginated issue-comment, review, and inline-comment REST endpoints; use GraphQL only to supplement thread resolution state. **In the same step, capture acceptance criteria** (see AC Capture in [merge-readiness.md](merge-readiness.md)) — resolve the linked ticket from the PR title/body/branch name and persist `acceptance_criteria` to state; takeovers MUST NOT skip AC capture, because the original author's reading of the ticket is unverified input, not settled fact

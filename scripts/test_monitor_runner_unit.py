@@ -26,6 +26,7 @@ import argparse
 import fnmatch
 import os
 import pathlib
+import re
 import shutil
 import tempfile
 import sys
@@ -375,6 +376,59 @@ class SidecarGateTests(unittest.TestCase):
         self.assertIn("retention limit", caught.exception.reason)
         self.assertEqual(
             len(stub.queued), count, "no sidecar may be parsed past the cap"
+        )
+
+    def test_retention_scan_stops_at_first_over_limit_match(self) -> None:
+        # admin#1495 finding 3813789211: the enumeration itself is bounded —
+        # glob() materialized all 128 matches under the monitor lock in R2's
+        # repro. The scan streams os.scandir entries and stops at limit + 1,
+        # so the yield count stays far below the accumulated pile.
+        runner = self._runner_with_state()
+        stub = self._StubSchema()
+        runner.schema = stub
+        limit = runner.SIDECAR_RETENTION_LIMIT
+        total = limit + 50
+        for index in range(total):
+            self._sidecar(runner, f"{index:03d}")
+        real_scandir = os.scandir
+        counted: list[str] = []
+
+        class _CountingScandir:
+            def __init__(self, path: object) -> None:
+                self._inner = real_scandir(path)
+
+            def __enter__(self) -> "_CountingScandir":
+                return self
+
+            def __exit__(self, *exc: object) -> bool:
+                self._inner.close()
+                return False
+
+            def __iter__(self) -> "_CountingScandir":
+                return self
+
+            def __next__(self):
+                entry = next(self._inner)
+                counted.append(entry.name)
+                return entry
+
+        with mock.patch.object(monitor_runner.os, "scandir", _CountingScandir):
+            with self.assertRaises(RunnerExit) as caught:
+                runner._gate_sidecars({"handoff_results": {}})
+        self.assertEqual(caught.exception.code, 5)
+        self.assertIn("more than", caught.exception.reason)
+        matching = sum(
+            1
+            for name in counted
+            if ".failed-candidate" in name or ".attempt-" in name
+        )
+        self.assertEqual(
+            matching, limit + 1,
+            "the scan must stop at the first over-limit match",
+        )
+        self.assertLess(
+            len(counted), total,
+            "an over-limit pile must never be fully enumerated",
         )
 
     def test_conflicting_terminal_evidence_blocks_never_compacts(self) -> None:
@@ -1100,6 +1154,55 @@ class GitignoreArtifactShapeTests(unittest.TestCase):
                     sidecar_name, "workflow-state.local.md.failed-candidate-*"
                 )
             )
+
+
+class MappedRepositoryParityTests(unittest.TestCase):
+    def test_manifest_matches_the_qa_owner_map(self) -> None:
+        # algo#1216 finding 3813491661: the runner is import-free of
+        # package modules, so its mapped-repository set restates the key
+        # set of handoff_decision.QA_OWNER_BY_REPOSITORY — that map is
+        # canonical, and this regression fails on any drift in either
+        # direction.
+        import handoff_decision
+
+        self.assertEqual(
+            monitor_runner.MAPPED_QA_REPOSITORIES,
+            {
+                key.casefold()
+                for key in handoff_decision.QA_OWNER_BY_REPOSITORY
+            },
+        )
+
+    def test_origin_url_parsing_covers_the_three_git_shapes(self) -> None:
+        for url, expected in (
+            ("git@github.com:Keeper-Dating/matchmaking.git", "Keeper-Dating/matchmaking"),
+            ("https://github.com/Keeper-Dating/algo", "Keeper-Dating/algo"),
+            ("ssh://git@github.com/Keeper-Dating/admin-portal.git", "Keeper-Dating/admin-portal"),
+            ("https://github.com/Keeper-Dating/matchmaking.git/", "Keeper-Dating/matchmaking"),
+            ("not a url", None),
+            ("", None),
+        ):
+            self.assertEqual(
+                monitor_runner._repo_name_with_owner(url), expected, url
+            )
+
+
+class WorkCapDocParityTests(unittest.TestCase):
+    def test_reference_cap_matches_the_runner_constant(self) -> None:
+        # algo#1216 finding 3813491642: the cap the trusted runner enforces
+        # and the MAX_ITERATIONS literal the child-facing reference
+        # documents must be the same number — a doc edit that moves one
+        # without the other silently splits the contract.
+        doc = (
+            SCRIPTS.parent / "references" / "monitor-ci-feedback.md"
+        ).read_text(encoding="utf-8")
+        match = re.search(r"MAX_ITERATIONS\s*=\s*(\d+)", doc)
+        self.assertIsNotNone(
+            match, "monitor-ci-feedback.md no longer states MAX_ITERATIONS"
+        )
+        self.assertEqual(
+            int(match.group(1)), monitor_runner.MAX_WORK_ITERATIONS
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

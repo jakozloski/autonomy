@@ -166,8 +166,21 @@ HANDOFF_STATUS_ENUM = frozenset(("idle", "pending", "complete", "failed"))
 OPERATION_STATUS_ENUM = frozenset(
     ("pending", "retryable", "complete", "failed", "skipped_dependency")
 )
+# "precondition" (algo#1216 finding 3813491647): the observed pre-mutation
+# remote state, persisted write-ahead with the pending record so resume's
+# verify_before_retry can three-way compare instead of blindly replaying
+# over a newer human action.
 OPERATION_RESULT_ALLOWED_KEYS = frozenset(
-    ("status", "attempts", "started_at", "verified_at", "response_id", "error", "evidence")
+    (
+        "status",
+        "attempts",
+        "started_at",
+        "verified_at",
+        "response_id",
+        "error",
+        "evidence",
+        "precondition",
+    )
 )
 
 # Canonical cross-helper constants — single source of truth. Consumers REBIND
@@ -231,11 +244,15 @@ STATE_READ_CEILING_BYTES = 8 * 1_048_576
 
 MONITOR_CLI_SCHEMA_VERSION = 1
 # "liveness" is OPTIONAL (migration tolerance for in-flight states written
-# before it existed); every other key is required when the block exists.
-MONITOR_CLI_OPTIONAL_KEYS = frozenset(("liveness",))
+# before it existed); so is "repository" (algo#1216 finding 3813491661:
+# the runner's sticky origin binding for the required-handoff manifest,
+# absent from pre-r18 states); every other key is required when the block
+# exists.
+MONITOR_CLI_OPTIONAL_KEYS = frozenset(("liveness", "repository"))
 MONITOR_CLI_KEYS = frozenset(
     (
         "liveness",
+        "repository",
         "schema_version",
         "child_session_id",
         "owner_model",
@@ -317,6 +334,12 @@ KNOWN_TOP_LEVEL_KEYS = frozenset(
         "current_phase",
         "pr_number",
         "stash_ref",
+        # admin#1495 finding 3813789199: the write-ahead stash record —
+        # persisted BEFORE `git stash push` so a crash between the push
+        # and the stash_ref persist leaves a durable nonce pointer for
+        # resume to reconcile instead of stranding work in an unbound
+        # stash.
+        "stash_intent",
         "resolved_conventions",
         "validated_ticket",
         "regression_evidence",
@@ -372,6 +395,10 @@ OPTIONAL_TOP_LEVEL_KEYS = frozenset(
         "monitor_cli",
         "next_retry_at",
         "hold_started_at",
+        # Migration tolerance (finding 3813789199): pre-r18 states never
+        # wrote a stash intent; the write-ahead record is required by the
+        # PROTOCOL when stashing, not by the tier.
+        "stash_intent",
     )
 )
 
@@ -793,7 +820,16 @@ def validate_operation_result_record(record: Any, *, label: str) -> tuple[str | 
             ]
         evidence_fields = sorted(
             key
-            for key in ("started_at", "verified_at", "response_id", "evidence")
+            for key in (
+                "started_at",
+                "verified_at",
+                "response_id",
+                "evidence",
+                # A precondition is observed at write-ahead time, i.e. by
+                # an attempt — a never-queued record carrying one is
+                # fabricated evidence (finding 3813491647).
+                "precondition",
+            )
             if record.get(key) is not None
         )
         if evidence_fields:
@@ -802,6 +838,11 @@ def validate_operation_result_record(record: Any, *, label: str) -> tuple[str | 
                 + ", ".join(evidence_fields)
             ]
         return status, []
+    precondition = record.get("precondition")
+    if precondition is not None and not isinstance(precondition, dict):
+        return status, [
+            f"{label}.precondition must be a mapping when present"
+        ]
     attempts = record.get("attempts")
     if (
         not isinstance(attempts, int)
@@ -929,6 +970,21 @@ def validate_model_runtime_shape(model_runtime: Any) -> list[str]:
     return errors
 
 
+# algo#1216 finding 3813491655: the ordered executor stops at the first
+# terminal failure, so a persisted `failed` DESCENDANT (attempts >= 1 by
+# the record contract) claims an attempt that cannot have run — accepting
+# it let a terminal ledger conceal a misdirected external mutation behind
+# a failed safety prerequisite. The one legitimate shape is a
+# planner-rendered local automatic_failure (service "local": the planner
+# knows the outcome without any remote call and callers persist it on
+# round-trip), so those families are exempt BY NAME here. Kept in
+# lockstep with handoff_decision's spec-side `automatic_failure`
+# exemption by test_state_schema's planner-parity regression.
+LOCAL_AUTOMATIC_FAILURE_FAMILIES = frozenset(
+    {"qa.linear.record_unavailable", "qa.linear.record_state_unavailable"}
+)
+
+
 def validate_operation_collection(
     operations: list, result_statuses: dict, *, label: str
 ) -> list[str]:
@@ -971,11 +1027,21 @@ def validate_operation_collection(
     blocking_parent: str | None = None
     for operation_id in operations:
         status = result_statuses.get(operation_id)
-        if blocking_parent is not None and status in (
+        # algo#1216 finding 3813491655: `failed` joins the rejected
+        # descendant statuses — its record contract proves a started
+        # attempt (attempts >= 1), which the stopped executor cannot have
+        # made. Only the named local automatic-failure families above may
+        # legitimately persist `failed` below a failed predecessor.
+        impossible_descendant = status in (
             "complete",
             "pending",
             "retryable",
-        ):
+        ) or (
+            status == "failed"
+            and str(operation_id).split(":", 1)[0]
+            not in LOCAL_AUTOMATIC_FAILURE_FAMILIES
+        )
+        if blocking_parent is not None and impossible_descendant:
             errors.append(
                 f"{prefix}operation {operation_id!r} is"
                 f" {status} after failed/skipped predecessor"
@@ -1089,6 +1155,38 @@ class _Validator:
             value = state.get(sha_key)
             if value is not None and sha_key in state and not _is_full_hex(value):
                 self.error(f"{sha_key}: must be a full-length hex object ID")
+        # admin#1495 finding 3813789199: the write-ahead stash record.
+        # Null when no stash is in flight; while pending it pins the nonce
+        # (resume's reconciliation key into `git stash list`) and the
+        # branch the work belongs to.
+        intent = state.get("stash_intent")
+        if "stash_intent" in state and intent is not None:
+            if not isinstance(intent, dict):
+                self.error("stash_intent: must be a mapping or null")
+            else:
+                for key in intent:
+                    if key not in ("nonce", "original_branch", "status"):
+                        self.error(
+                            f"stash_intent: unknown key {_safe_key(str(key))!r}"
+                        )
+                nonce = intent.get("nonce")
+                if not isinstance(nonce, str) or not nonce.strip():
+                    self.error("stash_intent.nonce: must be a non-empty string")
+                original_branch = intent.get("original_branch")
+                if original_branch is not None and (
+                    not isinstance(original_branch, str)
+                    or not original_branch
+                ):
+                    self.error(
+                        "stash_intent.original_branch: must be a non-empty"
+                        " string or null"
+                    )
+                if intent.get("status") != "pending":
+                    self.error(
+                        "stash_intent.status: must be 'pending' — a bound or"
+                        " abandoned intent is cleared to null in the same"
+                        " write that records the outcome"
+                    )
         # R5-F1: the per-project grace-window override is validated where it
         # is DECLARED, not only where it is consumed — a silently-applied
         # default would surface only as a confusing ceiling error at the
@@ -1369,7 +1467,11 @@ class _Validator:
                         "monitor_cli.schema_version: must be"
                         f" {MONITOR_CLI_SCHEMA_VERSION}"
                     )
-                for nullable in ("child_session_id", "last_completed_attempt_id"):
+                for nullable in (
+                    "child_session_id",
+                    "last_completed_attempt_id",
+                    "repository",
+                ):
                     value = cli.get(nullable)
                     if nullable in cli and value is not None and (
                         not isinstance(value, str) or not value
@@ -2503,11 +2605,66 @@ class _Validator:
                         self.error(f"{env_path}: must be a mapping")
                         continue
                     for migration, status in migrations.items():
-                        self.check_enum(
-                            status,
-                            APPLIED_STATE_ENUM,
-                            f"{env_path}.{_safe_key(str(migration))}",
-                        )
+                        entry_path = f"{env_path}.{_safe_key(str(migration))}"
+                        # admin#1495 finding 3813789228: a mixed change is
+                        # additive migrations (pre-deploy, hold until
+                        # applied) PLUS destructive ones (post-deploy —
+                        # holding them forces running destructive DDL
+                        # under the old code). One undifferentiated status
+                        # cannot say which side a migration is, so each
+                        # entry may carry the per-migration form
+                        # {direction, status}; under a mixed hazard it
+                        # MUST.
+                        if isinstance(status, dict):
+                            for key in status:
+                                if key not in ("direction", "status"):
+                                    self.error(
+                                        f"{entry_path}: unknown key"
+                                        f" {_safe_key(str(key))!r}"
+                                    )
+                            entry_direction = status.get("direction")
+                            if entry_direction == "mixed":
+                                self.error(
+                                    f"{entry_path}.direction: a single"
+                                    " migration cannot be 'mixed' — it has"
+                                    " no compatible midpoint; split it into"
+                                    " an additive and a destructive step"
+                                )
+                            else:
+                                self.check_enum(
+                                    entry_direction,
+                                    frozenset(("additive", "destructive")),
+                                    f"{entry_path}.direction",
+                                )
+                                if (
+                                    direction in ("additive", "destructive")
+                                    and entry_direction is not None
+                                    and entry_direction != direction
+                                ):
+                                    self.error(
+                                        f"{entry_path}.direction: conflicts"
+                                        " with merge_readiness"
+                                        f".hazard_direction {direction!r}"
+                                    )
+                            self.check_enum(
+                                status.get("status"),
+                                APPLIED_STATE_ENUM,
+                                f"{entry_path}.status",
+                            )
+                        else:
+                            if direction == "mixed":
+                                self.error(
+                                    f"{entry_path}: a mixed hazard requires"
+                                    " the per-migration form {direction,"
+                                    " status} — an undifferentiated scalar"
+                                    " cannot say which side this migration"
+                                    " is on"
+                                )
+                            self.check_enum(
+                                status,
+                                APPLIED_STATE_ENUM,
+                                entry_path,
+                            )
         if "backfill" in value:
             backfill = value.get("backfill")
             if not isinstance(backfill, dict):
@@ -3034,6 +3191,7 @@ def monitor_extract(text: str) -> dict[str, Any]:
         "current_phase": None,
         "monitor_status": None,
         "handoff_statuses": [],
+        "handoff_status_by_kind": {},
         "handoff_operations": {},
         "handoff_results": {},
         "handoff_result_digests": {},
@@ -3041,6 +3199,7 @@ def monitor_extract(text: str) -> dict[str, Any]:
         "merge_readiness_backfill": {},
         "phases_merge_readiness": None,
         "merge_readiness_hold": False,
+        "merge_readiness_post_deploy": [],
         "blocked_evidence_present": False,
     }
     try:
@@ -3070,11 +3229,18 @@ def monitor_extract(text: str) -> dict[str, Any]:
         extract["monitor_status"] = monitor_status
     handoffs = state.get("handoffs")
     statuses: list[str] = []
+    # algo#1216 finding 3813491661: the runner's required-handoff manifest
+    # needs statuses BY KIND — the unnamed list cannot say whether the qa
+    # handoff specifically was ever planned.
+    status_by_kind: dict[str, str] = {}
     if isinstance(handoffs, dict):
-        for record in handoffs.values():
+        for kind, record in handoffs.items():
             status = record.get("status") if isinstance(record, dict) else None
-            statuses.append(status if isinstance(status, str) else "malformed")
+            normalized = status if isinstance(status, str) else "malformed"
+            statuses.append(normalized)
+            status_by_kind[str(kind)] = normalized
     extract["handoff_statuses"] = statuses
+    extract["handoff_status_by_kind"] = status_by_kind
     # algo#1216 R2 findings 3787189747/3787189752/3787189757: the runner's
     # terminal/launch decisions need schema-owned views of (a) per-operation
     # handoff results for monotonicity, (b) the direction-aware deploy/
@@ -3159,10 +3325,42 @@ def monitor_extract(text: str) -> dict[str, Any]:
                         # Finding 3807740761: an empty environment map is an
                         # unran recheck for that environment — hold.
                         hold = True
-                    elif any(
-                        status == "pending" for status in env_map.values()
-                    ):
-                        hold = True
+                        continue
+                    for status in env_map.values():
+                        # admin#1495 finding 3813789228: only PRE-deploy
+                        # requirements hold. A per-migration destructive
+                        # entry pending is the DOCUMENTED post-deploy step
+                        # of a mixed sequence — holding on it forced the
+                        # destructive DDL to run under the old code.
+                        if isinstance(status, dict):
+                            if (
+                                status.get("direction") == "additive"
+                                and status.get("status") == "pending"
+                            ):
+                                hold = True
+                        elif status == "pending":
+                            hold = True
+        # Post-deploy destructive work is a separate required state, never
+        # silently dropped: destructive entries still pending are exposed
+        # for the terminal gate / PR-body deferred-work contract.
+        post_deploy: list[str] = []
+        applied_any = gate.get("applied_state")
+        top_direction = gate.get("hazard_direction")
+        if isinstance(applied_any, dict):
+            for env, env_map in applied_any.items():
+                if not isinstance(env_map, dict):
+                    continue
+                for migration, status in env_map.items():
+                    entry_destructive_pending = (
+                        isinstance(status, dict)
+                        and status.get("direction") == "destructive"
+                        and status.get("status") == "pending"
+                    ) or (
+                        top_direction == "destructive" and status == "pending"
+                    )
+                    if entry_destructive_pending:
+                        post_deploy.append(f"{env}:{migration}")
+        extract["merge_readiness_post_deploy"] = sorted(post_deploy)
         backfill = gate.get("backfill")
         if isinstance(backfill, dict):
             for record in backfill.values():

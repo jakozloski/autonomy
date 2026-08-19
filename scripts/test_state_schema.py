@@ -1752,11 +1752,26 @@ class MergeReadinessTests(unittest.TestCase):
                 text = _mutate(
                     self._with_blocks(), '  deploy_order: "pending"', replacement
                 )
-                if direction in ("additive", "mixed"):
+                if direction == "additive":
                     text = _mutate(
                         text,
                         "  applied_state: {}",
                         '  applied_state:\n    "0042_add_column":\n      dev: "applied"',
+                    )
+                elif direction == "mixed":
+                    # admin#1495 finding 3813789228: a mixed hazard requires
+                    # the per-migration {direction, status} form.
+                    text = _mutate(
+                        text,
+                        "  applied_state: {}",
+                        "  applied_state:\n"
+                        '    dev:\n'
+                        '      "0042_add_column":\n'
+                        '        direction: "additive"\n'
+                        '        status: "applied"\n'
+                        '      "0043_drop_column":\n'
+                        '        direction: "destructive"\n'
+                        '        status: "pending"',
                     )
                 result = evaluate_state_text(text)
                 self.assertEqual(result["errors"], [])
@@ -1803,6 +1818,145 @@ class MergeReadinessTests(unittest.TestCase):
             result["errors"],
         )
         self.assertTrue(monitor_extract(text)["merge_readiness_hold"])
+
+    def test_stash_intent_contract(self) -> None:
+        # admin#1495 finding 3813789199: the write-ahead stash record is a
+        # nullable optional key; while present it must pin a non-empty
+        # nonce and status "pending" (bound/abandoned intents clear to
+        # null in the same write that records the outcome).
+        base = self._with_blocks()
+        valid = _mutate(
+            base,
+            "stash_ref: null",
+            "stash_ref: null\n"
+            "stash_intent:\n"
+            '  nonce: "autonomy-1755600000-77-1234"\n'
+            '  original_branch: "main"\n'
+            '  status: "pending"',
+        )
+        result = evaluate_state_text(valid)
+        self.assertEqual(result["errors"], [])
+        for mutation, expected in (
+            ('  nonce: ""', "stash_intent.nonce"),
+            ('  status: "bound"', "stash_intent.status"),
+        ):
+            with self.subTest(mutation=mutation):
+                broken = valid.replace(
+                    '  nonce: "autonomy-1755600000-77-1234"'
+                    if "nonce" in mutation
+                    else '  status: "pending"',
+                    mutation,
+                )
+                result = evaluate_state_text(broken)
+                self.assertTrue(
+                    any(expected in error for error in result["errors"]),
+                    result["errors"],
+                )
+
+    def _mixed_hazard(self, applied_yaml: str) -> str:
+        text = _mutate(
+            self._with_blocks(),
+            '  deploy_order: "pending"',
+            '  deploy_order: "hazard_documented"\n  hazard_direction: "mixed"',
+        )
+        return _mutate(text, "  applied_state: {}", applied_yaml)
+
+    def test_mixed_hazard_rejects_undifferentiated_scalars(self) -> None:
+        # admin#1495 finding 3813789228: one undifferentiated status cannot
+        # say which side of a mixed change a migration is on.
+        text = self._mixed_hazard(
+            '  applied_state:\n    dev:\n      "0042_add_column": "applied"'
+        )
+        result = evaluate_state_text(text)
+        self.assertTrue(
+            any(
+                "requires the per-migration form" in error
+                for error in result["errors"]
+            ),
+            result["errors"],
+        )
+
+    def test_mixed_destructive_pending_is_post_deploy_not_a_hold(
+        self,
+    ) -> None:
+        # The finding's exact repro: additive applied + destructive pending
+        # is the SAFE expand→deploy→contract midpoint. Pre-fix it held
+        # until the destructive step was applied — forcing destructive DDL
+        # under the old deployed code. Now: valid, NO hold, and the
+        # destructive step is surfaced as named post-deploy work.
+        text = self._mixed_hazard(
+            "  applied_state:\n"
+            '    prod:\n'
+            '      "0042_add_column":\n'
+            '        direction: "additive"\n'
+            '        status: "applied"\n'
+            '      "0043_drop_column":\n'
+            '        direction: "destructive"\n'
+            '        status: "pending"'
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["errors"], [])
+        extract = monitor_extract(text)
+        self.assertFalse(extract["merge_readiness_hold"])
+        self.assertEqual(
+            extract["merge_readiness_post_deploy"],
+            ["prod:0043_drop_column"],
+        )
+
+    def test_mixed_additive_pending_still_holds(self) -> None:
+        text = self._mixed_hazard(
+            "  applied_state:\n"
+            '    prod:\n'
+            '      "0042_add_column":\n'
+            '        direction: "additive"\n'
+            '        status: "pending"\n'
+            '      "0043_drop_column":\n'
+            '        direction: "destructive"\n'
+            '        status: "pending"'
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["errors"], [])
+        self.assertTrue(monitor_extract(text)["merge_readiness_hold"])
+
+    def test_single_step_mixed_migration_is_rejected(self) -> None:
+        text = self._mixed_hazard(
+            "  applied_state:\n"
+            '    prod:\n'
+            '      "0044_rename_column":\n'
+            '        direction: "mixed"\n'
+            '        status: "pending"'
+        )
+        result = evaluate_state_text(text)
+        self.assertTrue(
+            any(
+                "no compatible midpoint" in error
+                for error in result["errors"]
+            ),
+            result["errors"],
+        )
+
+    def test_entry_direction_conflicting_with_hazard_is_rejected(
+        self,
+    ) -> None:
+        text = _mutate(
+            self._with_blocks(),
+            '  deploy_order: "pending"',
+            '  deploy_order: "hazard_documented"\n  hazard_direction: "additive"',
+        )
+        text = _mutate(
+            text,
+            "  applied_state: {}",
+            "  applied_state:\n"
+            '    prod:\n'
+            '      "0043_drop_column":\n'
+            '        direction: "destructive"\n'
+            '        status: "pending"',
+        )
+        result = evaluate_state_text(text)
+        self.assertTrue(
+            any("conflicts with" in error for error in result["errors"]),
+            result["errors"],
+        )
 
     def test_hazard_documented_requires_a_direction(self) -> None:
         # A missing or null direction would silently default the
@@ -3020,6 +3174,146 @@ class OperationContractDifferentialTests(unittest.TestCase):
         self.assertTrue(
             any("prefix with at most one in-flight tail" in e for e in schema_errors)
         )
+
+    def test_failed_descendant_after_failed_prerequisite_is_rejected(
+        self,
+    ) -> None:
+        # algo#1216 finding 3813491655: `failed → failed` validated clean
+        # here while handoff_decision rejects the same ledger — a persisted
+        # failed record proves a started attempt (attempts >= 1), which the
+        # ordered executor cannot have made after its prerequisite failed.
+        from state_schema import LOCAL_AUTOMATIC_FAILURE_FAMILIES
+
+        ops = [
+            "qa.github.request_review:alice:g0badc0de1234",
+            "qa.github.verify_review_request:alice:g0badc0de1234",
+        ]
+        errors = validate_operation_collection(
+            ops,
+            {ops[0]: "failed", ops[1]: "failed"},
+            label="probe",
+        )
+        self.assertTrue(
+            any(
+                "is failed after failed/skipped predecessor" in e
+                for e in errors
+            ),
+            errors,
+        )
+        # The named local automatic-failure families stay persistable: the
+        # planner renders their failed outcome without any remote attempt
+        # and callers legitimately round-trip it.
+        for family in sorted(LOCAL_AUTOMATIC_FAILURE_FAMILIES):
+            exempt_ops = [ops[0], f"{family}:g0badc0de1234"]
+            exempt_errors = validate_operation_collection(
+                exempt_ops,
+                {exempt_ops[0]: "failed", exempt_ops[1]: "failed"},
+                label="probe",
+            )
+            self.assertEqual(exempt_errors, [], family)
+
+    def test_precondition_record_field_contract(self) -> None:
+        # algo#1216 finding 3813491647: the write-ahead pre-mutation
+        # fingerprint is a first-class optional record field — a mapping
+        # when present, and forbidden on skipped_dependency (a never-queued
+        # record observed nothing).
+        from state_schema import validate_operation_result_record
+
+        _status, errors = validate_operation_result_record(
+            {
+                "status": "pending",
+                "attempts": 1,
+                "started_at": "2026-07-14T16:59:00Z",
+                "precondition": {"assignees": []},
+            },
+            label="probe",
+        )
+        self.assertEqual(errors, [])
+        _status, errors = validate_operation_result_record(
+            {
+                "status": "pending",
+                "attempts": 1,
+                "started_at": "2026-07-14T16:59:00Z",
+                "precondition": "drifted",
+            },
+            label="probe",
+        )
+        self.assertTrue(
+            any("precondition must be a mapping" in e for e in errors),
+            errors,
+        )
+        _status, errors = validate_operation_result_record(
+            {
+                "status": "skipped_dependency",
+                "attempts": 0,
+                "error": "dependency failed: x",
+                "precondition": {"assignees": []},
+            },
+            label="probe",
+        )
+        self.assertTrue(
+            any(
+                "forbids attempt evidence" in e and "precondition" in e
+                for e in errors
+            ),
+            errors,
+        )
+
+    def test_automatic_failure_families_match_the_planner(self) -> None:
+        # Drift gate for the schema-side exemption, both directions: every
+        # spec the planner marks automatic_failure must belong to a named
+        # family (a new planner-side automatic failure without a schema
+        # entry would be rejected as an impossible descendant on
+        # round-trip), and every named family must still exist in the
+        # planner (a renamed family would leave a dead exemption). The
+        # rendered plan drops the marker, so the raw spec builder is
+        # probed directly.
+        import handoff_decision
+        from state_schema import LOCAL_AUTOMATIC_FAILURE_FAMILIES
+
+        request = {
+            "scenario": "approved_qa",
+            "repository": {"nameWithOwner": "Keeper-Dating/matchmaking"},
+            "pull_request_number": 3551,
+            "authenticated_actor": "jakozloski",
+            "existing_assignees": ["jakozloski"],
+            "issue_tracker": {
+                "type": "linear",
+                "ticket_identifier": "WEB-8877",
+                "ticket_provider_id": "linear-ticket-web-8877",
+                "ticket_validated": True,
+                # No authorized write path: forces the planner to render
+                # its local automatic_failure operation.
+                "write_path": "none",
+            },
+        }
+        owner = handoff_decision.QA_OWNER_BY_REPOSITORY[
+            "Keeper-Dating/matchmaking"
+        ]
+        _targets, specs, errors, _warnings = (
+            handoff_decision._approved_qa_operations(
+                request, "Keeper-Dating/matchmaking", 3551, owner
+            )
+        )
+        self.assertEqual(errors, [])
+        automatic = [spec for spec in specs if "automatic_failure" in spec]
+        self.assertTrue(
+            automatic,
+            "fixture must exercise at least one automatic_failure spec",
+        )
+        for spec in automatic:
+            family = str(spec["id"]).split(":", 1)[0]
+            self.assertIn(family, LOCAL_AUTOMATIC_FAILURE_FAMILIES)
+        import pathlib
+
+        source = pathlib.Path(handoff_decision.__file__).read_text(
+            encoding="utf-8"
+        )
+        for family in LOCAL_AUTOMATIC_FAILURE_FAMILIES:
+            self.assertIn(
+                f"{family}:g", source,
+                "exempt family no longer minted by the planner",
+            )
 
 
 _OMIT = object()
