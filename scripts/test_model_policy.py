@@ -2594,5 +2594,34 @@ class BoundedExcerptRedactionTests(unittest.TestCase):
         )
 
 
+class SanitizePublicationChokepointTests(unittest.TestCase):
+    def test_every_canonical_fixture_is_redacted(self) -> None:
+        # admin#1495 finding 3813789220: the publication sanitizer is one
+        # public chokepoint applying the COMPLETE canonical pattern list —
+        # validated against validate_package's fixture samples so a new
+        # pattern can never land without this path covering it.
+        import model_policy
+        import validate_package
+
+        for kind, (
+            _pattern,
+            samples,
+        ) in validate_package.REQUIRED_REDACTION_PATTERNS.items():
+            for sample in samples:
+                cleaned = model_policy.sanitize_for_publication(
+                    f"prompt text {sample} more text"
+                )
+                # The security property is sample ABSENCE; the label may
+                # be a sibling kind when patterns overlap (an sk-ant key
+                # legitimately matches the earlier openai pattern).
+                self.assertIn("[REDACTED:", cleaned, kind)
+                self.assertNotIn(sample, cleaned, kind)
+
+    # The subprocess test of the `--sanitize` CLI mode lives in
+    # test_cli_fail_closed.py: the AI Skill Security Scan flags any single
+    # file pairing subprocess with an eval-substring call name, and this
+    # file imports evaluate_model_policy (see that file's docstring).
+
+
 if __name__ == "__main__":
     unittest.main()

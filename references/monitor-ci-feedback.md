@@ -15,7 +15,7 @@
 BOT_GRACE_WINDOW = 900       # seconds — 15 min; covers Bugbot's ~13min scan time
 WATCH_TIMEOUT    = 540       # aggregate seconds, never one blocking call
 POLL_CHUNK       = 60        # max async poll/wait; emit progress each chunk (in-turn; keeps prompt cache warm)
-MAX_ITERATIONS   = 50
+MAX_ITERATIONS   = 50  # cumulative; ALSO enforced by the trusted runner at candidate acceptance (algo#1216 3813491642: over-cap + non-blocked -> monitor-child:work_cap_exceeded; only the work-cap blocked transition commits past it)
 work_iteration                  = state.monitor_iterations or 0
 poll_ticks                      = state.monitor_poll_ticks or 0
 loop_reason                     = "work" # wait_repoll skips work counter

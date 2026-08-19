@@ -1536,6 +1536,49 @@ def validate_package(package_dir: Path) -> list[str]:
     errors.extend(_validate_py_bindings(package_dir))
     errors.extend(_validate_anchored_markers(package_dir))
     errors.extend(_validate_openai_yaml(package_dir))
+    errors.extend(_validate_entry_points(package_dir))
+    return errors
+
+
+def _validate_entry_points(package_dir: Path) -> list[str]:
+    """Reject non-delegating legacy autonomy entry points in the host repo.
+
+    admin#1495 finding 3813789192: replacing the legacy skill with a
+    delegating alias left `.cursor/commands/autonomous-*.md` still driving
+    the OLD state machine (its own state file, direct `git push`/`gh pr
+    create`) — a Cursor user invoking one bypassed every write-ahead,
+    merge-readiness, review, and monitored-handoff gate while believing
+    they ran the canonical workflow. Every discoverable autonomy entry
+    point outside this package must either be gone or visibly delegate to
+    it. The scan walks up from the package to the repository root (the
+    directory whose `.cursor`/`.agents` could shadow this package); repos
+    without such surfaces no-op.
+    """
+
+    errors: list[str] = []
+    root = package_dir.resolve()
+    for candidate in (root.parent, root.parent.parent, root.parent.parent.parent):
+        if candidate == candidate.parent:
+            break
+        if (candidate / ".git").exists():
+            commands_dir = candidate / ".cursor" / "commands"
+            if commands_dir.is_dir():
+                for entry in sorted(commands_dir.glob("autonomous-*.md")):
+                    try:
+                        content = entry.read_text(encoding="utf-8")
+                    except OSError:
+                        errors.append(
+                            f"unreadable legacy entry point: {entry}"
+                        )
+                        continue
+                    if "skills/autonomy" not in content:
+                        errors.append(
+                            "legacy autonomy entry point does not delegate"
+                            f" to the canonical package: {entry} — make it"
+                            " a thin pointer at the autonomy skill or"
+                            " remove it (finding 3813789192)"
+                        )
+            break
     return errors
 
 def _validate_test_collection(package_dir: Path) -> list[str]:

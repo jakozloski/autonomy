@@ -1457,5 +1457,41 @@ class ValidatePackageTests(unittest.TestCase):
         self.assertIn("package validation passed", output.getvalue())
 
 
+class EntryPointScanTests(unittest.TestCase):
+    def test_non_delegating_legacy_command_is_rejected(self) -> None:
+        # admin#1495 finding 3813789192: a `.cursor/commands/autonomous-*.md`
+        # still driving the legacy state machine bypasses every gate while
+        # reading as the canonical workflow. The scan rejects any such
+        # entry point that does not visibly delegate to the package, and
+        # stays quiet for delegating or absent ones.
+        from validate_package import _validate_entry_points
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            (repo / ".git").mkdir(parents=True)
+            commands = repo / ".cursor" / "commands"
+            commands.mkdir(parents=True)
+            legacy = commands / "autonomous-feature.md"
+            legacy.write_text(
+                "Create .cursor/workflow-state.local.md then git push"
+                " and gh pr create\n",
+                encoding="utf-8",
+            )
+            package = repo / ".agents" / "skills" / "autonomy"
+            package.mkdir(parents=True)
+            errors = _validate_entry_points(package)
+            self.assertTrue(
+                any("3813789192" in error for error in errors), errors
+            )
+            legacy.write_text(
+                "Delegate: read .agents/skills/autonomy/SKILL.md and"
+                " follow it.\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(_validate_entry_points(package), [])
+            legacy.unlink()
+            self.assertEqual(_validate_entry_points(package), [])
+
+
 if __name__ == "__main__":
     unittest.main()
