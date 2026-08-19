@@ -529,27 +529,6 @@ REDACTION_PATTERNS: tuple[tuple[str, str], ...] = (
 )
 
 
-def sanitize_for_publication(text: str) -> str:
-    """The ONE executable sanitizer for anything persisted or published.
-
-    admin#1495 finding 3813789220: the format-anchored redactor was
-    private to ``bounded_excerpt`` (diagnostic stderr only), so Prompt
-    Ledger appends and PR-body trail syncs relied on manual judgment
-    alone — a targeted probe published an uncommon secret assignment
-    verbatim. Every ledger/PR/archive write now routes through this
-    function (CLI: ``model_policy.py --sanitize``, stdin → stdout) before
-    persisting. Scope is deliberate and stated: URL-embedded credentials
-    plus the canonical format-anchored ``REDACTION_PATTERNS`` — this
-    function does NOT claim free-text name/address detection; that
-    remains the documented manual-judgment obligation on top of, never
-    instead of, this pass.
-    """
-
-    for kind, pattern in REDACTION_PATTERNS:
-        text = re.sub(pattern, f"[REDACTED: {kind}]", text)
-    return text
-
-
 def bounded_excerpt(existing: str, addition: str) -> str:
     """Append *addition* to *existing*, URL-stripped and byte-capped.
 
@@ -560,11 +539,15 @@ def bounded_excerpt(existing: str, addition: str) -> str:
     Finding 3806595004: the format-anchored Secret/Token Redaction runs
     HERE, in code — prose deferral let a bare ``Authorization: Bearer ...``
     survive verbatim into persisted evidence. URL-embedded credentials are
-    stripped first, then every canonical pattern is applied via the shared
-    ``sanitize_for_publication`` chokepoint.
+    stripped first, then every canonical pattern is applied.
     """
 
-    cleaned = sanitize_for_publication(strip_url_secrets(addition))
+    def _redact(text: str) -> str:
+        for kind, pattern in REDACTION_PATTERNS:
+            text = re.sub(pattern, f"[REDACTED: {kind}]", text)
+        return text
+
+    cleaned = _redact(strip_url_secrets(addition))
     combined = f"{existing}\n{cleaned}" if existing else cleaned
     encoded = combined.encode("utf-8", "surrogatepass")
     if len(encoded) <= MAX_EXCERPT_BYTES:
@@ -2782,14 +2765,6 @@ def evaluate_model_policy(request: Any) -> dict[str, Any]:
 
 
 def main() -> int:
-    # finding 3813789220: the publication-sanitizer chokepoint, invokable
-    # without JSON plumbing so every ledger append / PR trail sync can
-    # shell through it: `model_policy.py --sanitize < raw > clean`.
-    if "--sanitize" in sys.argv[1:]:
-        sys.stdout.write(
-            sanitize_for_publication(strip_url_secrets(sys.stdin.read()))
-        )
-        return 0
     try:
         request = json.load(sys.stdin)
     except (ValueError, OSError) as error:

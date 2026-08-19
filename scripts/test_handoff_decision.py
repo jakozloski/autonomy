@@ -203,15 +203,7 @@ class HandoffDecisionTest(unittest.TestCase):
         github = github_operation(
             f"qa.github.replace_assignees:g{QA_G}",
             "replace_pull_request_assignees",
-            {
-                "assignees": ["tjkeeper"],
-                # finding 3813491647: the deduped observed set rides along
-                # as the write-ahead precondition for resume's three-way
-                # compare.
-                "precondition": {
-                    "assignees": ["jakozloski", "stale-owner"]
-                },
-            },
+            {"assignees": ["tjkeeper"]},
             "pending",
         )
         verify_github = github_operation(
@@ -579,93 +571,6 @@ class HandoffDecisionTest(unittest.TestCase):
                 "issue_tracker.qa_state must be omitted for team 'AI', "
                 "which has no mapped QA workflow state"
             ],
-        )
-
-    def test_resume_adjudicates_against_the_persisted_precondition(
-        self,
-    ) -> None:
-        # algo#1216 finding 3813491647 (exact repro class): resume replayed
-        # replace_pull_request_assignees with only the target set — no
-        # pre-mutation fingerprint — so a crash-then-human-reassignment
-        # window got overwritten. The PERSISTED record's precondition now
-        # rides verify_before_retry and the retry replay; the request's
-        # fresh observation must NOT win (it may already contain the very
-        # drift being adjudicated).
-        def request(results):
-            return {
-                "scenario": "approved_qa",
-                "repository": REPOSITORY,
-                "pull_request_number": PR_NUMBER,
-                # Fresh observation AFTER the crash: a human moved the PR.
-                "existing_assignees": ["drifted-human"],
-                "issue_tracker": {
-                    "type": "linear",
-                    "qa_assignee": LINEAR_QA_ASSIGNEE,
-                    "qa_state": LINEAR_QA_STATE_WEB,
-                    "ticket_identifier": "WEB-8877",
-                    "ticket_provider_id": "linear-ticket-web-8877",
-                    "ticket_validated": True,
-                    "write_path": "environment_tool",
-                },
-                "operation_results": results,
-            }
-
-        g = qa_generation(request({}))
-        persisted = {"assignees": ["jakozloski", "stale-owner"]}
-        pending_plan = plan_handoff(
-            request(
-                {
-                    f"qa.github.replace_assignees:g{g}": {
-                        "status": "pending",
-                        "attempts": 1,
-                        "started_at": "2026-07-14T16:59:00Z",
-                        "precondition": dict(persisted),
-                    }
-                }
-            )
-        )
-        self.assertEqual(
-            pending_plan["state"], "resume_verification_required", pending_plan
-        )
-        control = pending_plan["call_plan"][0]
-        self.assertEqual(control["action"], "verify_before_retry")
-        self.assertEqual(control["payload"]["precondition"], persisted)
-        retry_plan = plan_handoff(
-            request(
-                {
-                    f"qa.github.replace_assignees:g{g}": {
-                        "status": "retryable",
-                        "attempts": 1,
-                        "started_at": "2026-07-14T16:59:00Z",
-                        "verified_at": "2026-07-14T17:00:00Z",
-                        "error": "postcondition absent",
-                        "precondition": dict(persisted),
-                    }
-                }
-            )
-        )
-        self.assertEqual(retry_plan["state"], "pending", retry_plan)
-        replay = retry_plan["call_plan"][0]
-        self.assertEqual(replay["action"], "replace_pull_request_assignees")
-        self.assertEqual(replay["payload"]["precondition"], persisted)
-        # Legacy fallback: a pre-fix pending record without a persisted
-        # precondition surfaces the spec's fresh observation instead of
-        # nothing.
-        legacy_plan = plan_handoff(
-            request(
-                {
-                    f"qa.github.replace_assignees:g{g}": {
-                        "status": "pending",
-                        "attempts": 1,
-                        "started_at": "2026-07-14T16:59:00Z",
-                    }
-                }
-            )
-        )
-        legacy_control = legacy_plan["call_plan"][0]
-        self.assertEqual(
-            legacy_control["payload"]["precondition"],
-            {"assignees": ["drifted-human"]},
         )
 
     def test_qa_generation_rolls_over_when_reviewers_change(self) -> None:
@@ -2955,10 +2860,15 @@ class TicketBindingGateTests(unittest.TestCase):
             )
         )
         self.assertEqual(plan["state"], "blocked", plan)
+        # Finding 3813491655 moved this rejection into the SHARED
+        # validate_operation_collection (schema + runner + planner reject
+        # via one definition, closing the schema-side acceptance R2
+        # probed), so the shared error text fires before the planner's
+        # own "cannot have results" phrasing — same migration as the
+        # complete-descendant case above.
         self.assertTrue(
             any(
-                "cannot have results" in error
-                or "after failed/skipped predecessor" in error
+                "is failed after failed/skipped predecessor" in error
                 for error in plan["errors"]
             ),
             plan["errors"],

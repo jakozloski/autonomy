@@ -60,6 +60,7 @@ from typing import Any, IO
 SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
+from handoff_decision import QA_OWNER_BY_REPOSITORY  # noqa: E402
 from model_policy import (  # noqa: E402
     CLAUDE_READ_ONLY_ENV_UNSET,
     MIN_CLAUDE_VERSION,
@@ -88,52 +89,6 @@ PIPE_BUFFER_CAP = 1_048_576
 MAX_CANDIDATE_BYTES = 8 * 1_048_576
 
 WAIT_CHUNK_SECONDS = 60
-
-# algo#1216 finding 3813491642: the cumulative logical-work cap is enforced
-# by the TRUSTED runner, not just documented for the child —
-# monitor-ci-feedback.md's `MAX_ITERATIONS = 50` pseudocode is advisory to
-# a faulty or compromised write-capable monitor, and the per-tick +1 delta
-# check alone accepted a 50→51 candidate with a successful terminal
-# outcome. Past this many cumulative monitor_iterations the only
-# acceptable candidate is the documented blocked transition
-# (`human:user-confirm:work-cap`). Kept in lockstep with the reference's
-# literal by test_monitor_runner_unit's doc-parity regression.
-MAX_WORK_ITERATIONS = 50
-
-# algo#1216 finding 3813491661: repositories whose workflows carry a
-# REQUIRED clean-exit QA handoff — a terminal candidate for one of these
-# with the qa handoff still idle/unplanned is rejected. Casefolded for
-# membership tests (GitHub owner/name is case-insensitive). The runner is
-# deliberately import-free of package modules (it shells to the schema
-# CLI), so this restates the key set of
-# handoff_decision.QA_OWNER_BY_REPOSITORY — that map stays canonical, and
-# test_monitor_runner_unit's parity regression fails on any drift.
-MAPPED_QA_REPOSITORIES = frozenset(
-    {
-        "keeper-dating/matchmaking",
-        "keeper-dating/admin-portal",
-        "keeper-dating/calculator-api",
-        "keeper-dating/keeper-lead-generator",
-    }
-)
-
-
-def _repo_name_with_owner(url: str) -> str | None:
-    """``owner/name`` from a git origin URL, or None when unrecognized.
-
-    Accepts the three shapes git actually emits (scp-like ssh, https,
-    ssh://) and strips a trailing ``.git``/slash. Unrecognized shapes map
-    to None — the workflow is then treated as unmapped, and the sticky
-    persisted binding in the monitor block keeps an already-mapped run
-    mapped regardless (see current_block)."""
-
-    text = url.strip().rstrip("/")
-    if text.endswith(".git"):
-        text = text[:-4]
-    match = re.search(r"[:/]([^/:\s]+/[^/:\s]+)$", text)
-    if match is None:
-        return None
-    return match.group(1)
 
 
 def _utcnow_iso() -> str:
@@ -394,7 +349,6 @@ def render_monitor_cli_block(block: dict[str, Any]) -> str:
         lines.append(
             f"    next_retry_at: {_render_scalar(liveness.get('next_retry_at'))}"
         )
-    lines.append(f"  repository: {_render_scalar(block.get('repository'))}")
     lines.append(f"  child_session_id: {_render_scalar(block['child_session_id'])}")
     lines.append(f"  owner_model: {_render_scalar(block['owner_model'])}")
     lines.append(
@@ -1074,6 +1028,28 @@ def classify_child_failure(
     return ("charge", f"monitor-child:exit_{exit_code}")
 
 
+def _remote_name_with_owner(remote_url: str) -> str | None:
+    """Parse `Org/Repo` from an origin remote URL (ssh or https shapes).
+
+    Exact-match consumers (the QA mapping) treat any unparseable shape as
+    unmapped — fail-inert, mirroring the prose gate's exact-nameWithOwner
+    rule."""
+    tail = remote_url
+    if tail.endswith(".git"):
+        tail = tail[: -len(".git")]
+    if ":" in tail and "@" in tail.split(":", 1)[0]:
+        tail = tail.split(":", 1)[1]
+    else:
+        parts = tail.split("//", 1)
+        if len(parts) == 2:
+            segments = parts[1].split("/")
+            tail = "/".join(segments[1:])
+    pieces = [piece for piece in tail.split("/") if piece]
+    if len(pieces) == 2:
+        return "/".join(pieces)
+    return None
+
+
 class Runner:
     def __init__(self, args: argparse.Namespace) -> None:
         self.state_path = Path(args.state_file).resolve()
@@ -1163,17 +1139,15 @@ class Runner:
         # <repo>/.claude, and a child launched THERE gets default file access
         # only below it — Phase 6 could not touch application files. Launch
         # at the repository root when one exists (state/skill/candidate
-        # paths in the prompt are absolute, so nothing else moves). A
-        # missing-git host exits structured through _resolve_system_binary's
-        # fail-closed RunnerExit (r17, admin#1495 3807823288); the OSError
-        # arm below covers only probe execution faults.
-        git_bin = _resolve_system_binary("git")
+        # paths in the prompt are absolute, so nothing else moves). The probe
+        # keeps the structured-exit doctrine: a host without git falls back
+        # to the state directory instead of crashing __init__.
         try:
             # CodeRabbit 3787358695/3784681433: bounded like every other
             # subprocess site here — a hung git must not wedge __init__
             # before the lock or any heartbeat exists.
             root_probe = subprocess.run(
-                [git_bin, "-C", str(self.state_path.parent), "rev-parse",
+                [_resolve_system_binary("git"), "-C", str(self.state_path.parent), "rev-parse",
                  "--show-toplevel"],
                 capture_output=True, text=True, timeout=30,
             )
@@ -1182,26 +1156,26 @@ class Runner:
         except (OSError, subprocess.TimeoutExpired):
             probe_ok = False
         self.child_cwd = root if probe_ok else str(self.state_path.parent)
-        # algo#1216 finding 3813491661: resolve the workflow's repository
-        # binding from the origin remote — runner-owned truth for the
-        # required-handoff manifest, independent of anything the child
-        # writes into the handoff blocks. Best-effort here; current_block
-        # makes a successful resolution sticky in runner-owned state so a
-        # later failed probe (or a child rewiring .git/config between
-        # slices) never un-maps an already-mapped run.
-        self.repository_hint: str | None = None
+        # algo#1216 R2 finding 3813491661: terminal acceptance must know
+        # whether this repository is QA-mapped, and an all-idle handoffs
+        # block carries no repo name — so derive nameWithOwner from the
+        # repository's own origin remote (environmental truth the child
+        # cannot rewrite via a candidate), matched EXACTLY against the
+        # planner's mapping table. No remote / no repo ⇒ unmapped, and the
+        # gate stays inert.
+        self.qa_mapped_repository: str | None = None
         if probe_ok:
             try:
-                origin_probe = subprocess.run(
-                    [git_bin, "-C", root, "remote", "get-url", "origin"],
-                    capture_output=True, text=True, timeout=30,
+                url_probe = subprocess.run(
+                    ["git", "-C", root, "remote", "get-url", "origin"],
+                    capture_output=True, text=True,
                 )
-                if origin_probe.returncode == 0:
-                    self.repository_hint = _repo_name_with_owner(
-                        origin_probe.stdout
-                    )
-            except (OSError, subprocess.TimeoutExpired):
-                self.repository_hint = None
+            except OSError:
+                url_probe = None
+            if url_probe is not None and url_probe.returncode == 0:
+                name = _remote_name_with_owner(url_probe.stdout.strip())
+                if name in QA_OWNER_BY_REPOSITORY:
+                    self.qa_mapped_repository = name
         self.slice_deadline = time.monotonic() + args.slice_budget
         # Testability seam (same class as --claude-bin): scales ladder and
         # poll waits so hermetic failure-path tests finish in seconds. The
@@ -1354,13 +1328,6 @@ class Runner:
             "liveness": None,
         }
         base.setdefault("liveness", None)
-        # algo#1216 finding 3813491661: the repository binding is STICKY
-        # runner-owned state — once a mapped origin is persisted, a later
-        # failed probe (or a child rewiring .git/config between slices)
-        # never downgrades it back to unmapped.
-        persisted_repo = base.get("repository")
-        if not (isinstance(persisted_repo, str) and persisted_repo):
-            base["repository"] = self.repository_hint
         # The failure ledger is runner-memory truth (bounded diagnostic
         # history in state) — a child that erased it changes nothing.
         base["child_failures"] = list(self.failures[-10:])
@@ -1444,37 +1411,6 @@ class Runner:
                 " resume (reset clears the record)",
             )
 
-    def _scan_sidecars(self, limit: int) -> tuple[list[Path], bool]:
-        """Bounded single-pass sidecar enumeration (admin#1495 finding
-        3813789211).
-
-        Streams ``os.scandir`` entries matching either preserved-sidecar
-        name shape and stops as soon as ``limit + 1`` matches are seen,
-        so an unbounded accumulation costs O(limit) memory instead of a
-        full directory materialization while the monitor lock is held.
-        Returns ``(matches, exceeded)``; ``matches`` is meaningful only
-        when ``exceeded`` is False.
-        """
-
-        failed_prefix = self.state_path.stem + ".failed-candidate"
-        attempt_prefix = self.state_path.name + ".attempt-"
-        matches: list[Path] = []
-        try:
-            with os.scandir(self.state_path.parent) as entries:
-                for entry in entries:
-                    name = entry.name
-                    if not (
-                        name.startswith(failed_prefix)
-                        or name.startswith(attempt_prefix)
-                    ):
-                        continue
-                    matches.append(self.state_path.parent / name)
-                    if len(matches) > limit:
-                        return matches, True
-        except OSError:
-            return [], False
-        return matches, False
-
     def recover_in_flight(self, extract: dict[str, Any]) -> None:
         """State-writing half of recovery: discard candidates and charge the
         unknown-outcome budget. Runs only on a VALID state (writes go through
@@ -1495,37 +1431,33 @@ class Runner:
         # preserved-candidate contract before any fresh mutation.
         recorded_attempt = in_flight.get("attempt_id")
         preserved_any = False
-        # admin#1495 finding 3813789211 (recovery half): the recorded
-        # candidate is recovered by its EXACT constructed path — no
-        # directory walk — and stray cleanup streams os.scandir entries
-        # one at a time, so recovery memory stays O(1) regardless of how
-        # many strays accumulated.
-        recorded_name: str | None = None
+        # Finding 3813789211 (recovery half): address the RECORDED candidate
+        # by its exact path — recovery knows the attempt id, so it never
+        # needs a directory walk to find it — and bound the stray sweep with
+        # the same scandir ceiling as the launch gate. An over-limit
+        # accumulation deletes one bounded batch here; the launch gate's
+        # retention block then owns the remainder.
+        recorded_name = None
         if (
             isinstance(recorded_attempt, str)
             and re.fullmatch(r"[0-9a-f]{32}", recorded_attempt) is not None
         ):
-            recorded_name = (
-                self.state_path.name + f".attempt-{recorded_attempt}.md"
-            )
+            recorded_name = self.state_path.name + f".attempt-{recorded_attempt}.md"
             recorded_path = self.state_path.parent / recorded_name
             if recorded_path.exists():
                 self._preserve_failed(recorded_path)
                 preserved_any = True
-        attempt_prefix = self.state_path.name + ".attempt-"
-        try:
-            with os.scandir(self.state_path.parent) as entries:
-                for entry in entries:
-                    if not entry.name.startswith(attempt_prefix):
-                        continue
-                    if recorded_name is not None and entry.name == recorded_name:
-                        continue
-                    try:
-                        os.unlink(entry.path)
-                    except OSError:
-                        pass
-        except OSError:
-            pass
+        strays, _over = self._bounded_sidecar_scan(
+            (self.state_path.name + ".attempt-",),
+            self.SIDECAR_RETENTION_LIMIT,
+        )
+        for stray in strays:
+            if recorded_name is not None and stray.name == recorded_name:
+                continue
+            try:
+                stray.unlink()
+            except OSError:
+                pass
         _heartbeat(
             "recovery: unknown prior attempt reconciled ("
             + ("candidate preserved for reconciliation" if preserved_any else "no recorded candidate found")
@@ -2141,6 +2073,44 @@ class Runner:
     # Sidecars a run may retain at once even after compaction: past this,
     # startup work is unbounded and the audit unreadable — a human cleans up.
     SIDECAR_RETENTION_LIMIT = 20
+    # Default work cap when canonical state resolves no override; the
+    # canonical definition is monitor-ci-feedback.md's MAX_ITERATIONS = 50
+    # (state override key: resolved_conventions.monitor_constants
+    # .max_iterations, per the state-and-safety template).
+    WORK_CAP_DEFAULT = 50
+
+    def _bounded_sidecar_scan(
+        self, prefixes: tuple[str, ...], limit: int
+    ) -> tuple[list[Path], bool]:
+        """admin#1495 R2 finding 3813789211: never materialize an unbounded
+        sidecar listing while the monitor lock is held. os.scandir stops at
+        limit+1 matches, so runaway accumulation costs O(limit) name checks
+        instead of a full-directory glob/set/sort. Returns (paths, over):
+        paths is sorted and complete only when over is False; when over is
+        True the caller blocks on count alone and never parses anything.
+        A directory that cannot be enumerated is suspect, not a crash."""
+        matches: list[Path] = []
+        over = False
+        try:
+            with os.scandir(self.state_path.parent) as entries:
+                for entry in entries:
+                    if not any(
+                        entry.name.startswith(prefix) for prefix in prefixes
+                    ):
+                        continue
+                    matches.append(self.state_path.parent / entry.name)
+                    if len(matches) > limit:
+                        over = True
+                        break
+        except OSError as error:
+            raise RunnerExit(
+                4,
+                "suspect_state",
+                "cannot enumerate the state directory for sidecar"
+                f" reconciliation ({error.__class__.__name__}) — resolve the"
+                " filesystem fault and resume",
+            )
+        return (sorted(matches), over)
 
     def _gate_sidecars(
         self, extract: dict[str, Any], compact_no_status: bool = False
@@ -2183,28 +2153,29 @@ class Runner:
         # rename leaves the raw `.attempt-*` candidate behind — it carries
         # the same possibly-fired-mutation evidence, so the gate covers
         # BOTH name shapes.
-        # R2 re-reply 3792845972: enforce count and byte ceilings BEFORE any
-        # parsing or compaction — schema-extracting every globbed sidecar
-        # first made startup work unbounded (one arbitrarily large failed
-        # candidate, or an unbounded accumulation, costs a full parse each).
-        # admin#1495 finding 3813789211: the enumeration itself is bounded
-        # too — glob() materialized every match under the monitor lock
-        # (128 paths walked before the block fired in R2's repro), so the
-        # scan streams os.scandir entries and stops at limit + 1: the gate
-        # only needs "over the cap", never the full census.
-        found, exceeded = self._scan_sidecars(self.SIDECAR_RETENTION_LIMIT)
-        if exceeded:
+        # R2 re-reply 3792845972 + finding 3813789211: enforce count and
+        # byte ceilings BEFORE any parsing or compaction, and bound the
+        # ENUMERATION itself — the old glob/set/sort materialized every
+        # matching path (reproduced at 128) before the count check ran.
+        sidecars, over_limit = self._bounded_sidecar_scan(
+            (
+                self.state_path.stem + ".failed-candidate",
+                self.state_path.name + ".attempt-",
+            ),
+            self.SIDECAR_RETENTION_LIMIT,
+        )
+        if over_limit:
             raise RunnerExit(
                 5,
                 "blocked",
-                f"more than {self.SIDECAR_RETENTION_LIMIT} preserved"
-                " sidecars exceed the retention limit — reconcile and"
+                f"more than {self.SIDECAR_RETENTION_LIMIT} preserved sidecars"
+                " exceed the retention"
+                f" limit ({self.SIDECAR_RETENTION_LIMIT}) — reconcile and"
                 " delete them per state-and-safety.md before resuming;"
                 " unbounded sidecar accumulation makes startup work"
-                " unbounded (bound enforced before any sidecar is parsed,"
-                " and enumeration stops at the first over-limit match)",
+                " unbounded (bound enforced before any sidecar is"
+                " enumerated past the limit or parsed)",
             )
-        sidecars = sorted(found)
         for sidecar in sidecars:
             try:
                 sidecar_bytes = sidecar.stat().st_size
@@ -2483,50 +2454,6 @@ class Runner:
             counters_after.get(name, 0) - counters_before.get(name, 0)
             for name in ("monitor_iterations", "monitor_poll_ticks")
         )
-        # algo#1216 finding 3813491642: enforce the cumulative work cap
-        # here, before any other acceptance math — a candidate past
-        # MAX_WORK_ITERATIONS may only be the documented blocked
-        # transition, so a runaway monitor converts to a human stop
-        # instead of a green exit. Cross-slice by construction: the
-        # counter is cumulative canonical state, not per-slice.
-        iterations_after = counters_after.get("monitor_iterations", 0)
-        over_cap = (
-            isinstance(iterations_after, int)
-            and iterations_after > MAX_WORK_ITERATIONS
-        )
-        if over_cap and outcome != "blocked":
-            self._preserve_failed(candidate)
-            self.charge_failure(fresh, "monitor-child:work_cap_exceeded")
-            return "retry"
-        # algo#1216 finding 3813491661: repository-bound required-handoff
-        # manifest. For a mapped repository a terminal candidate must show
-        # the clean-exit QA handoff actually planned — both aggregates
-        # idle on a Keeper run meant completion was reported without
-        # assigning QA, moving the ticket, or recording any handoff
-        # artifact. Idle stays valid for unmapped repositories.
-        if outcome == "terminal":
-            launch_cli = fresh.get("monitor_cli")
-            persisted_repo = (
-                launch_cli.get("repository")
-                if isinstance(launch_cli, dict)
-                else None
-            )
-            bound_repo = (
-                persisted_repo
-                if isinstance(persisted_repo, str) and persisted_repo
-                else self.repository_hint
-            )
-            mapped = (
-                isinstance(bound_repo, str)
-                and bound_repo.casefold() in MAPPED_QA_REPOSITORIES
-            )
-            qa_status = (
-                candidate_extract.get("handoff_status_by_kind") or {}
-            ).get("qa")
-            if mapped and qa_status in (None, "idle"):
-                self._preserve_failed(candidate)
-                self.charge_failure(fresh, "monitor-child:handoff_missing")
-                return "retry"
         # F2: the verdict's outcome must agree with the candidate's own
         # monitor lifecycle — a "terminal" claim over a still-in-progress
         # monitor is exactly the false-completion the audit exists to stop.
@@ -2672,6 +2599,47 @@ class Runner:
                 and candidate_extract.get("blocked_evidence_present") is True
             )
         )
+        # algo#1216 R2 finding 3813491661: on a QA-mapped repository the
+        # clean-exit contract runs the QA handoff at the FIRST terminal exit
+        # (complete or paused) — yet the runner accepted a terminal candidate
+        # whose every handoff was still idle, so a child could report
+        # completion with QA never assigned, the ticket never moved, and no
+        # handoff artifact recorded. The kind-keyed view makes the check
+        # direct: mapped repo + terminal claim + idle (or absent) qa record
+        # is a contract violation, never progress. Pending/retryable stay
+        # governed by the terminal-consistency rule; durably failed is
+        # schema-terminal and passes here.
+        if (
+            outcome == "terminal"
+            and self.qa_mapped_repository is not None
+            and candidate_extract.get("handoff_kind_statuses", {}).get("qa")
+            in (None, "idle")
+        ):
+            self._preserve_failed(candidate)
+            self.charge_failure(fresh, "monitor-child:qa_handoff_missing")
+            return "retry"
+        # algo#1216 R2 finding 3813491642: the documented MAX_ITERATIONS
+        # work cap bound only the UNTRUSTED child's prose loop — the trusted
+        # runner accepted any one-step advance, so a faulty child could work
+        # past the cap forever (probe: 50→51 committed as a success). The
+        # cap is read from the LAUNCH-time canonical (never the candidate —
+        # see the constants-stability term in `valid`), and an over-cap work
+        # advance is acceptable ONLY as the documented keyed blocked exit.
+        # Distinct signature so a three-strike block names the real cause.
+        fresh_constants = fresh.get("monitor_constants") or {}
+        work_cap = fresh_constants.get("max_iterations", self.WORK_CAP_DEFAULT)
+        if (
+            deltas == (1, 0)
+            and counters_after.get("monitor_iterations", 0) > work_cap
+            and not (
+                outcome == "blocked"
+                and monitor_status == "blocked"
+                and candidate_extract.get("blocked_evidence_present") is True
+            )
+        ):
+            self._preserve_failed(candidate)
+            self.charge_failure(fresh, "monitor-child:work_cap_exceeded")
+            return "retry"
         # Candidate taint is NOT rejected here: feedback excerpts land in
         # state by design, and the acknowledge-aware _gate_taint re-gates
         # every subsequent write-capable launch (R6-F5) — commit-time
@@ -2682,6 +2650,12 @@ class Runner:
             and candidate_digest == verdict.get("post_workflow_digest")
             and deltas in ((1, 0), (0, 1))
             and candidate_extract.get("monitor_cli") == snapshot
+            # Finding 3813491642 (second half): a candidate that edits the
+            # resolved monitor constants would loosen what the NEXT tick's
+            # launch-time read enforces — constants are resolved at entry
+            # and never legitimately change mid-monitor.
+            and candidate_extract.get("monitor_constants")
+            == fresh.get("monitor_constants")
             and outcome_consistent
             and handoffs_monotonic
             and backfill_monotonic

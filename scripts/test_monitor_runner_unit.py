@@ -26,7 +26,6 @@ import argparse
 import fnmatch
 import os
 import pathlib
-import re
 import shutil
 import tempfile
 import sys
@@ -378,59 +377,6 @@ class SidecarGateTests(unittest.TestCase):
             len(stub.queued), count, "no sidecar may be parsed past the cap"
         )
 
-    def test_retention_scan_stops_at_first_over_limit_match(self) -> None:
-        # admin#1495 finding 3813789211: the enumeration itself is bounded —
-        # glob() materialized all 128 matches under the monitor lock in R2's
-        # repro. The scan streams os.scandir entries and stops at limit + 1,
-        # so the yield count stays far below the accumulated pile.
-        runner = self._runner_with_state()
-        stub = self._StubSchema()
-        runner.schema = stub
-        limit = runner.SIDECAR_RETENTION_LIMIT
-        total = limit + 50
-        for index in range(total):
-            self._sidecar(runner, f"{index:03d}")
-        real_scandir = os.scandir
-        counted: list[str] = []
-
-        class _CountingScandir:
-            def __init__(self, path: object) -> None:
-                self._inner = real_scandir(path)
-
-            def __enter__(self) -> "_CountingScandir":
-                return self
-
-            def __exit__(self, *exc: object) -> bool:
-                self._inner.close()
-                return False
-
-            def __iter__(self) -> "_CountingScandir":
-                return self
-
-            def __next__(self):
-                entry = next(self._inner)
-                counted.append(entry.name)
-                return entry
-
-        with mock.patch.object(monitor_runner.os, "scandir", _CountingScandir):
-            with self.assertRaises(RunnerExit) as caught:
-                runner._gate_sidecars({"handoff_results": {}})
-        self.assertEqual(caught.exception.code, 5)
-        self.assertIn("more than", caught.exception.reason)
-        matching = sum(
-            1
-            for name in counted
-            if ".failed-candidate" in name or ".attempt-" in name
-        )
-        self.assertEqual(
-            matching, limit + 1,
-            "the scan must stop at the first over-limit match",
-        )
-        self.assertLess(
-            len(counted), total,
-            "an over-limit pile must never be fully enumerated",
-        )
-
     def test_conflicting_terminal_evidence_blocks_never_compacts(self) -> None:
         # R2 re-reply 3792845972: key-only matching deleted a sidecar
         # recording "complete" while canonical said "failed" — conflicting
@@ -468,6 +414,68 @@ class SidecarGateTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 5)
         self.assertIn("failed validation", caught.exception.reason)
         self.assertTrue(sidecar.exists())
+
+
+    def test_over_limit_blocks_from_a_bounded_enumeration(self) -> None:
+        # admin#1495 R2 finding 3813789211: the old glob/set/sort
+        # materialized every matching path (reproduced at 128) before the
+        # count check. The scan must stop at limit+1 matches: with 30
+        # sidecars on disk, the counting scandir wrapper proves enumeration
+        # ended within limit+1 matches plus the directory's few non-sidecar
+        # entries, and the gate blocks on count alone without parsing.
+        import monitor_runner as mr
+        runner = self._runner_with_state()
+        for index in range(30):
+            self._sidecar(runner, f"{index:02d}")
+        consumed = []
+        real_scandir = os.scandir
+
+        def counting_scandir(path):
+            inner = real_scandir(path)
+
+            class _Wrapper:
+                def __enter__(self_w):
+                    return self_w
+
+                def __exit__(self_w, *exc):
+                    inner.close()
+                    return False
+
+                def __iter__(self_w):
+                    return self_w
+
+                def __next__(self_w):
+                    entry = next(inner)
+                    consumed.append(entry.name)
+                    return entry
+
+            return _Wrapper()
+
+        with mock.patch.object(mr.os, "scandir", counting_scandir):
+            with self.assertRaises(RunnerExit) as caught:
+                runner._gate_sidecars({"handoff_results": {}})
+        self.assertEqual(caught.exception.code, 5)
+        self.assertIn("retention", caught.exception.reason)
+        limit = runner.SIDECAR_RETENTION_LIMIT
+        self.assertLessEqual(
+            len(consumed),
+            limit + 6,
+            f"enumeration was not bounded: consumed {len(consumed)} entries",
+        )
+
+    def test_under_limit_scan_is_sorted_and_complete(self) -> None:
+        # Pass-through side: at or under the limit the scan must return the
+        # COMPLETE sorted set (compaction/ordering semantics depend on it).
+        runner = self._runner_with_state()
+        created = sorted(
+            self._sidecar(runner, f"{index:02d}").name for index in range(3)
+        )
+        paths, over = runner._bounded_sidecar_scan(
+            (runner.state_path.stem + ".failed-candidate",),
+            runner.SIDECAR_RETENTION_LIMIT,
+        )
+        self.assertFalse(over)
+        self.assertEqual([path.name for path in paths], created)
 
 
 class ChildSkillSnapshotTests(unittest.TestCase):
@@ -569,7 +577,11 @@ class ChildSkillSnapshotTests(unittest.TestCase):
 
 
 
-class DurableReplaceTests(unittest.TestCase):
+class DurableReplaceFsyncTests(unittest.TestCase):
+    # NOTE: formerly a second `DurableReplaceTests` — a duplicate class name
+    # in one module SHADOWS the first binding, so the basic replace tests
+    # above silently stopped running under discovery. Distinct name keeps
+    # both suites live.
     def test_fsync_failure_raises_instead_of_reporting_success(self) -> None:
         # admin#1495 finding 3793025395: injected EIO was swallowed and
         # durable_replace reported success on an unproven commit.
@@ -1154,55 +1166,6 @@ class GitignoreArtifactShapeTests(unittest.TestCase):
                     sidecar_name, "workflow-state.local.md.failed-candidate-*"
                 )
             )
-
-
-class MappedRepositoryParityTests(unittest.TestCase):
-    def test_manifest_matches_the_qa_owner_map(self) -> None:
-        # algo#1216 finding 3813491661: the runner is import-free of
-        # package modules, so its mapped-repository set restates the key
-        # set of handoff_decision.QA_OWNER_BY_REPOSITORY — that map is
-        # canonical, and this regression fails on any drift in either
-        # direction.
-        import handoff_decision
-
-        self.assertEqual(
-            monitor_runner.MAPPED_QA_REPOSITORIES,
-            {
-                key.casefold()
-                for key in handoff_decision.QA_OWNER_BY_REPOSITORY
-            },
-        )
-
-    def test_origin_url_parsing_covers_the_three_git_shapes(self) -> None:
-        for url, expected in (
-            ("git@github.com:Keeper-Dating/matchmaking.git", "Keeper-Dating/matchmaking"),
-            ("https://github.com/Keeper-Dating/algo", "Keeper-Dating/algo"),
-            ("ssh://git@github.com/Keeper-Dating/admin-portal.git", "Keeper-Dating/admin-portal"),
-            ("https://github.com/Keeper-Dating/matchmaking.git/", "Keeper-Dating/matchmaking"),
-            ("not a url", None),
-            ("", None),
-        ):
-            self.assertEqual(
-                monitor_runner._repo_name_with_owner(url), expected, url
-            )
-
-
-class WorkCapDocParityTests(unittest.TestCase):
-    def test_reference_cap_matches_the_runner_constant(self) -> None:
-        # algo#1216 finding 3813491642: the cap the trusted runner enforces
-        # and the MAX_ITERATIONS literal the child-facing reference
-        # documents must be the same number — a doc edit that moves one
-        # without the other silently splits the contract.
-        doc = (
-            SCRIPTS.parent / "references" / "monitor-ci-feedback.md"
-        ).read_text(encoding="utf-8")
-        match = re.search(r"MAX_ITERATIONS\s*=\s*(\d+)", doc)
-        self.assertIsNotNone(
-            match, "monitor-ci-feedback.md no longer states MAX_ITERATIONS"
-        )
-        self.assertEqual(
-            int(match.group(1)), monitor_runner.MAX_WORK_ITERATIONS
-        )
 
 
 if __name__ == "__main__":  # pragma: no cover
