@@ -6,7 +6,7 @@
 
 Search these sources in priority order (first match wins per variable, but scan ALL sources for `PROTECTED_BRANCHES` and `ISSUE_TRACKER` which union/cross-check):
 
-1. **CLAUDE.md** (project root and workspace-level) — look for "Common Commands", "Quality", "Before Committing", "Development", "Package Manager", etc.
+1. **CLAUDE.md** (project root and workspace-level) — look for "Common Commands", "Quality", "Before Committing", "Development", "Package Manager", etc. **ALSO scan `AGENTS.md` and `.cursor/rules/*.mdc` at the same priority, even when a CLAUDE.md exists** (admin#1495 finding 3822586149): repositories keep binding policy in agent-facing rule files that Claude's own instruction loading never reads — admin-portal's migration prohibition lives ONLY there — and a policy the run never saw is a policy it will misclassify rather than obey.
 2. **Package manifest** (`package.json`, `Makefile`, `Cargo.toml`, `pyproject.toml`, etc.) — `scripts` section for commands
 3. **CI config** (`.github/workflows/*.yml`, `.circleci/config.yml`, etc.) — for quality check steps and protected branches
 4. **Git config** — `git remote show origin` for default branch; branch protection rules if accessible

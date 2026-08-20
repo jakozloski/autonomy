@@ -1515,6 +1515,101 @@ class EntryPointScanTests(unittest.TestCase):
             legacy.unlink()
             self.assertEqual(_validate_entry_points(package), [])
 
+    def test_load_root_symlinks_must_resolve_to_the_package(self) -> None:
+        # admin#1495 finding 3822586140: a retargeted, dangling, or
+        # regular-file load root silently changes (or breaks) what a
+        # client loads — every existing root must resolve to the
+        # validated package, in either repository orientation, and a
+        # symlink root must be covered by the workflow's triggers.
+        from validate_package import _validate_entry_points
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            (repo / ".git").mkdir(parents=True)
+            package = repo / ".agents" / "skills" / "autonomy"
+            package.mkdir(parents=True)
+            (package / "SKILL.md").write_text("# pkg\n", encoding="utf-8")
+            claude_root = repo / ".claude" / "skills"
+            claude_root.mkdir(parents=True)
+            link = claude_root / "autonomy"
+            workflows = repo / ".github" / "workflows"
+            workflows.mkdir(parents=True)
+            wf = workflows / "skill-package-checks.yml"
+
+            def wf_write(*paths):
+                wf.write_text(
+                    "on:\n  pull_request:\n    paths:\n"
+                    + "".join(f'      - "{p}"\n' for p in paths),
+                    encoding="utf-8",
+                )
+
+            wf_write(".agents/skills/**", ".claude/skills/autonomy")
+            # correct symlink + covered trigger: clean
+            link.symlink_to(Path("..") / ".." / ".agents" / "skills" / "autonomy")
+            self.assertEqual(_validate_entry_points(package), [])
+            # glob coverage also satisfies the trigger requirement
+            wf_write(".agents/skills/**", ".claude/skills/**")
+            self.assertEqual(_validate_entry_points(package), [])
+            # missing trigger coverage: error
+            wf_write(".agents/skills/**")
+            errors = _validate_entry_points(package)
+            self.assertTrue(
+                any("symlink-only change" in e for e in errors), errors
+            )
+            wf_write(".agents/skills/**", ".claude/skills/autonomy")
+            # retargeted: error
+            link.unlink()
+            other = repo / "elsewhere"
+            other.mkdir()
+            link.symlink_to(Path("..") / ".." / "elsewhere")
+            errors = _validate_entry_points(package)
+            self.assertTrue(
+                any("does not resolve to the validated package" in e for e in errors),
+                errors,
+            )
+            # dangling: error
+            link.unlink()
+            link.symlink_to(Path("..") / ".." / "missing-target")
+            errors = _validate_entry_points(package)
+            self.assertTrue(
+                any("does not resolve to the validated package" in e for e in errors),
+                errors,
+            )
+            # regular file: error
+            link.unlink()
+            link.write_text("not a link\n", encoding="utf-8")
+            errors = _validate_entry_points(package)
+            self.assertTrue(
+                any("does not resolve to the validated package" in e for e in errors),
+                errors,
+            )
+            link.unlink()
+
+    def test_load_root_mirror_orientation_is_supported(self) -> None:
+        # The algo layout: canonical at .claude, symlink at .agents,
+        # trigger satisfied by the .agents/skills/** glob.
+        from validate_package import _validate_entry_points
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            (repo / ".git").mkdir(parents=True)
+            package = repo / ".claude" / "skills" / "autonomy"
+            package.mkdir(parents=True)
+            (package / "SKILL.md").write_text("# pkg\n", encoding="utf-8")
+            agents_root = repo / ".agents" / "skills"
+            agents_root.mkdir(parents=True)
+            link = agents_root / "autonomy"
+            link.symlink_to(Path("..") / ".." / ".claude" / "skills" / "autonomy")
+            workflows = repo / ".github" / "workflows"
+            workflows.mkdir(parents=True)
+            (workflows / "skill-package-checks.yml").write_text(
+                "on:\n  pull_request:\n    paths:\n"
+                '      - ".claude/skills/**"\n'
+                '      - ".agents/skills/**"\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(_validate_entry_points(package), [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1605,6 +1605,55 @@ def _validate_entry_points(package_dir: Path) -> list[str]:
                             " command-only change would bypass the legacy"
                             " entry-point guard (finding 3816225750)"
                         )
+            # admin#1495 finding 3822586140: the SYMLINK load roots are
+            # entry points too. Whichever of the two known roots is the
+            # real package directory, every OTHER root that exists must be
+            # a link resolving exactly to it — a retargeted, dangling, or
+            # regular-file alias silently changes (or breaks) the package
+            # a client loads, and a symlink-only change must not escape
+            # this guard or its CI triggers.
+            package_real = package_dir.resolve()
+            load_roots = (
+                candidate / ".claude" / "skills" / "autonomy",
+                candidate / ".agents" / "skills" / "autonomy",
+            )
+            workflow = (
+                candidate / ".github" / "workflows" / "skill-package-checks.yml"
+            )
+            try:
+                workflow_text = workflow.read_text(encoding="utf-8")
+            except OSError:
+                workflow_text = ""
+            for root in load_roots:
+                exists_at_all = root.is_symlink() or root.exists()
+                if not exists_at_all:
+                    continue
+                if root.resolve() == package_real:
+                    if root.is_symlink() and workflow_text:
+                        rel = root.relative_to(candidate).as_posix()
+                        parent_glob = (
+                            root.parent.relative_to(candidate).as_posix()
+                            + "/**"
+                        )
+                        if (
+                            rel not in workflow_text
+                            and parent_glob not in workflow_text
+                        ):
+                            errors.append(
+                                "skill-package-checks.yml does not trigger"
+                                f" on {rel} (or {parent_glob}) — a"
+                                " symlink-only change to the load path"
+                                " would bypass this guard"
+                                " (finding 3822586140)"
+                            )
+                    continue
+                errors.append(
+                    f"autonomy load root {root} does not resolve to the"
+                    " validated package"
+                    f" ({package_real}) — a retargeted, dangling, or"
+                    " replaced alias changes what a client loads"
+                    " (finding 3822586140)"
+                )
             break
     return errors
 
