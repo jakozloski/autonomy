@@ -1578,6 +1578,33 @@ def _validate_entry_points(package_dir: Path) -> list[str]:
                             " a thin pointer at the autonomy skill or"
                             " remove it (finding 3813789192)"
                         )
+                # admin#1495 finding 3816225750: the guard above only runs
+                # when CI runs this validator — and a workflow whose path
+                # filters omit the guarded commands never runs it for a
+                # command-only change. When the host repository has BOTH a
+                # skill-package-checks workflow and a .cursor/commands
+                # directory, the workflow must list the commands path in
+                # its triggers, making the guard self-auditing: removing
+                # the trigger fails the runs that package changes still
+                # start.
+                workflow = (
+                    candidate
+                    / ".github"
+                    / "workflows"
+                    / "skill-package-checks.yml"
+                )
+                if workflow.is_file():
+                    try:
+                        workflow_text = workflow.read_text(encoding="utf-8")
+                    except OSError:
+                        workflow_text = ""
+                    if ".cursor/commands/autonomous-*.md" not in workflow_text:
+                        errors.append(
+                            "skill-package-checks.yml does not trigger on"
+                            " .cursor/commands/autonomous-*.md — a"
+                            " command-only change would bypass the legacy"
+                            " entry-point guard (finding 3816225750)"
+                        )
             break
     return errors
 

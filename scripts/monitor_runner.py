@@ -645,8 +645,8 @@ def process_fingerprint(pid: int) -> str | None:
     return value or None
 
 
-def _descendant_snapshot(root_pid: int) -> dict[int, int]:
-    """Best-effort {pid: pgid} of every live descendant of ``root_pid``.
+def _descendant_snapshot(root_pid: int) -> dict[int, dict[str, Any]]:
+    """Best-effort ``{pid: {"pgid", "lstart"}}`` of live descendants.
 
     #3551 finding 3808151914: a descendant that calls ``setsid`` leaves the
     recorded process group, so group inspection alone cannot see it — but
@@ -660,11 +660,17 @@ def _descendant_snapshot(root_pid: int) -> dict[int, int]:
     facts gathered so far (empty on total failure): the snapshot only
     ADDS coverage on top of the fail-closed group gate, so a snapshot
     error must not convert a provable group answer into a block.
+
+    algo#1216 finding 3816160128: every snapshotted pid carries its
+    ``lstart`` start-time fingerprint (the same identity source
+    ``process_fingerprint`` uses for the child), so a long fork-heavy
+    attempt whose pids get RECYCLED can never make liveness or cleanup
+    treat an unrelated same-UID process as the recorded descendant.
     """
 
     try:
         completed = subprocess.run(
-            [_resolve_system_binary("ps"), "-eo", "pid=,ppid=,pgid=,stat="],
+            [_resolve_system_binary("ps"), "-eo", "pid=,ppid=,pgid=,stat=,lstart="],
             capture_output=True,
             text=True,
             timeout=10,
@@ -673,43 +679,47 @@ def _descendant_snapshot(root_pid: int) -> dict[int, int]:
         return {}
     if completed.returncode != 0:
         return {}
-    children: dict[int, list[tuple[int, int, str]]] = {}
+    children: dict[int, list[tuple[int, int, str, str]]] = {}
     for row in completed.stdout.splitlines():
         parts = row.split()
-        if len(parts) < 4:
+        if len(parts) < 5:
             continue
         try:
             pid, ppid, pgid = int(parts[0]), int(parts[1]), int(parts[2])
         except ValueError:
             continue
-        children.setdefault(ppid, []).append((pid, pgid, parts[3]))
-    found: dict[int, int] = {}
+        children.setdefault(ppid, []).append(
+            (pid, pgid, parts[3], " ".join(parts[4:]))
+        )
+    found: dict[int, dict[str, Any]] = {}
     frontier = [root_pid]
     while frontier:
         parent = frontier.pop()
-        for pid, pgid, stat in children.get(parent, []):
+        for pid, pgid, stat, lstart in children.get(parent, []):
             if pid in found:
                 continue
             if not stat.startswith("Z"):
-                found[pid] = pgid
+                found[pid] = {"pgid": pgid, "lstart": lstart}
             frontier.append(pid)
     return found
 
 
-def _live_snapshot_pids(snapshot: dict[int, int]) -> list[int]:
-    """Fail-closed liveness over a recorded descendant snapshot.
+def _snapshot_identities(pids: list[int]) -> dict[int, tuple[str, str]]:
+    """Bounded ``{pid: (stat, lstart)}`` over the given pids — fail-closed.
 
-    Mirrors ``_live_group_members``: an uninspectable table blocks rather
-    than reading as extinction, because these pids were RECORDED live and
-    only a trusted answer may clear them. Zombies do not count.
+    Shared by snapshot liveness and the pre-signal validation (finding
+    3816160128): an uninspectable table raises instead of answering,
+    because a guess in either direction is wrong — reading as extinct
+    launches a writer beside a possibly-live orphan, and signaling
+    without identity can SIGKILL an unrelated recycled pid.
     """
 
-    if not snapshot:
-        return []
-    pid_args = [str(pid) for pid in sorted(snapshot)]
+    if not pids:
+        return {}
+    pid_args = ",".join(str(pid) for pid in sorted(set(pids)))
     try:
         completed = subprocess.run(
-            [_resolve_system_binary("ps"), "-o", "pid=,stat=", "-p", ",".join(pid_args)],
+            [_resolve_system_binary("ps"), "-o", "pid=,stat=,lstart=", "-p", pid_args],
             capture_output=True,
             text=True,
             timeout=10,
@@ -730,17 +740,104 @@ def _live_snapshot_pids(snapshot: dict[int, int]) -> list[int]:
             f" {completed.returncode} — cannot prove recorded descendants"
             " extinct; needs a human",
         )
-    live: list[int] = []
+    identities: dict[int, tuple[str, str]] = {}
     for row in completed.stdout.splitlines():
         parts = row.split()
-        if len(parts) < 2:
+        if len(parts) < 3:
             continue
         try:
             pid = int(parts[0])
         except ValueError:
             continue
-        if not parts[1].startswith("Z"):
-            live.append(pid)
+        identities[pid] = (parts[1], " ".join(parts[2:]))
+    return identities
+
+
+def _snapshot_entry(entry: Any) -> tuple[int | None, str | None]:
+    """(pgid, lstart) from a snapshot value, tolerating the legacy int shape."""
+
+    if isinstance(entry, dict):
+        pgid = entry.get("pgid")
+        lstart = entry.get("lstart")
+        return (
+            pgid if isinstance(pgid, int) else None,
+            lstart if isinstance(lstart, str) and lstart else None,
+        )
+    if isinstance(entry, int):
+        return entry, None
+    return None, None
+
+
+def _validated_kill_targets(
+    snapshot: dict[int, Any],
+    escaped: list[int],
+    identities: dict[int, tuple[str, str]],
+) -> tuple[list[int], list[int]]:
+    """(pgids, pids) safe to signal — identity-validated only.
+
+    algo#1216 finding 3816160128: ``killpg`` fires only after the CURRENT
+    group leader (the process whose pid equals the pgid) matches the
+    fingerprint the snapshot recorded for it; a recycled pgid, or one
+    whose leader was never snapshotted, gets no group signal. A pid is
+    signaled only when its current lstart matches its recorded one. A
+    snapshot entry without a fingerprint (legacy shape, or ps omitted the
+    column) can never validate — it is left to the fail-closed recheck,
+    never guessed at.
+    """
+
+    pgids: list[int] = []
+    pids: list[int] = []
+    for pid in escaped:
+        pgid, recorded_lstart = _snapshot_entry(snapshot.get(pid))
+        current = identities.get(pid)
+        if (
+            current is not None
+            and not current[0].startswith("Z")
+            and recorded_lstart is not None
+            and current[1] == recorded_lstart
+        ):
+            pids.append(pid)
+        if pgid is None or pgid in pgids:
+            continue
+        _, leader_lstart = _snapshot_entry(snapshot.get(pgid))
+        leader_current = identities.get(pgid)
+        if (
+            leader_current is not None
+            and not leader_current[0].startswith("Z")
+            and leader_lstart is not None
+            and leader_current[1] == leader_lstart
+        ):
+            pgids.append(pgid)
+    return pgids, pids
+
+
+def _live_snapshot_pids(snapshot: dict[int, Any]) -> list[int]:
+    """Fail-closed liveness over a recorded descendant snapshot.
+
+    Mirrors ``_live_group_members``: an uninspectable table blocks rather
+    than reading as extinction, because these pids were RECORDED live and
+    only a trusted answer may clear them. Zombies do not count.
+
+    algo#1216 finding 3816160128: a pid that exists but whose ``lstart``
+    differs from the recorded fingerprint is a RECYCLED pid — an
+    unrelated process, not the recorded descendant — so it is neither
+    live evidence nor a kill target. An entry recorded WITHOUT a
+    fingerprint stays fail-closed the other way: it counts as live on
+    bare pid presence, exactly as before the fingerprint existed.
+    """
+
+    if not snapshot:
+        return []
+    identities = _snapshot_identities(list(snapshot))
+    live: list[int] = []
+    for pid in sorted(snapshot):
+        current = identities.get(pid)
+        if current is None or current[0].startswith("Z"):
+            continue
+        _, recorded_lstart = _snapshot_entry(snapshot.get(pid))
+        if recorded_lstart is not None and current[1] != recorded_lstart:
+            continue
+        live.append(pid)
     return live
 
 
@@ -1471,8 +1568,21 @@ class Runner:
                     matches.append(self.state_path.parent / name)
                     if len(matches) > limit:
                         return matches, True
-        except OSError:
-            return [], False
+        except OSError as error:
+            # admin#1495 finding 3816225740: an unenumerable state
+            # directory must BLOCK, not read as "no sidecars" — the
+            # sidecars this gate reconciles are the only durable record of
+            # external mutations a dead child may have fired, and a
+            # degraded filesystem silently bypassing the gate would launch
+            # another write-capable child over them.
+            raise RunnerExit(
+                5,
+                "blocked",
+                "sidecar scan failed"
+                f" ({error.__class__.__name__}) — cannot enumerate the"
+                " state directory, so preserved write-ahead evidence may"
+                " be invisible; fix the filesystem and resume",
+            )
         return matches, False
 
     def recover_in_flight(self, extract: dict[str, Any]) -> None:
@@ -1905,15 +2015,36 @@ class Runner:
             except (ProcessLookupError, PermissionError):
                 pass
             snapshot = drained.get("descendant_snapshot") or {}
-            for pid in escaped:
-                for target in {snapshot.get(pid), None}:
-                    try:
-                        if target is not None:
-                            os.killpg(target, signal.SIGKILL)
-                        else:
-                            os.kill(pid, signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError):
-                        pass
+            # algo#1216 finding 3816160128: identity is re-validated
+            # IMMEDIATELY before signaling — a recycled pid/pgid whose
+            # current lstart no longer matches the snapshot gets no
+            # signal (an unrelated same-UID process must never be
+            # SIGKILLed on a stale number), and killpg fires only after
+            # the current group LEADER matches its recorded fingerprint.
+            # Anything left unvalidated falls to the fail-closed recheck
+            # below, which blocks for a human instead of guessing.
+            kill_pgids, kill_pids = _validated_kill_targets(
+                snapshot, escaped, _snapshot_identities(
+                    sorted(
+                        set(escaped)
+                        | {
+                            _snapshot_entry(snapshot.get(pid))[0]
+                            for pid in escaped
+                            if _snapshot_entry(snapshot.get(pid))[0] is not None
+                        }
+                    )
+                )
+            )
+            for target in kill_pgids:
+                try:
+                    os.killpg(target, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            for pid in kill_pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
             recheck_deadline = time.monotonic() + 15
             while time.monotonic() < recheck_deadline and (
                 _live_group_members(child_pgid)

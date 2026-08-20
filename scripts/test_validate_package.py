@@ -1489,6 +1489,29 @@ class EntryPointScanTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(_validate_entry_points(package), [])
+            # admin#1495 finding 3816225750: with a skill-package-checks
+            # workflow present, its triggers must include the guarded
+            # commands path — otherwise a command-only change bypasses
+            # this very guard.
+            workflows = repo / ".github" / "workflows"
+            workflows.mkdir(parents=True)
+            wf = workflows / "skill-package-checks.yml"
+            wf.write_text(
+                "on:\n  pull_request:\n    paths:\n"
+                '      - ".agents/skills/**"\n',
+                encoding="utf-8",
+            )
+            errors = _validate_entry_points(package)
+            self.assertTrue(
+                any("3816225750" in error for error in errors), errors
+            )
+            wf.write_text(
+                "on:\n  pull_request:\n    paths:\n"
+                '      - ".agents/skills/**"\n'
+                '      - ".cursor/commands/autonomous-*.md"\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(_validate_entry_points(package), [])
             legacy.unlink()
             self.assertEqual(_validate_entry_points(package), [])
 

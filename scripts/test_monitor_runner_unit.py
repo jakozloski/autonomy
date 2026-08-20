@@ -1191,6 +1191,102 @@ class MappedRepositoryParityTests(unittest.TestCase):
             )
 
 
+class DescendantIdentityTests(unittest.TestCase):
+    """algo#1216 finding 3816160128: PID reuse must never make liveness or
+    cleanup treat an unrelated same-UID process as a recorded descendant."""
+
+    RECORDED = "Tue Aug 12 10:00:00 2026"
+    RECYCLED = "Tue Aug 19 09:00:00 2026"
+
+    def _fake_ps(self, tmp: Path, rows: str) -> Path:
+        script = tmp / "ps"
+        script.write_text(
+            "#!/bin/sh\n" f"cat <<'ROWS'\n{rows}\nROWS\n", encoding="utf-8"
+        )
+        script.chmod(0o755)
+        return script
+
+    def test_recycled_pid_is_not_live_and_matching_pid_is(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            fake = self._fake_ps(
+                tmp,
+                f"12345 S {self.RECYCLED}\n67890 S {self.RECORDED}",
+            )
+            snapshot = {
+                12345: {"pgid": 12345, "lstart": self.RECORDED},
+                67890: {"pgid": 12345, "lstart": self.RECORDED},
+            }
+            with mock.patch.dict(
+                os.environ, {"MONITOR_RUNNER_BIN_PS": str(fake)}
+            ):
+                live = monitor_runner._live_snapshot_pids(snapshot)
+        self.assertEqual(
+            live, [67890],
+            "a pid with a different lstart is a recycled pid, not the"
+            " recorded descendant",
+        )
+
+    def test_kill_targets_require_pid_and_leader_identity(self) -> None:
+        snapshot = {
+            # leader 100 recycled: its group must NOT be signaled
+            100: {"pgid": 100, "lstart": self.RECORDED},
+            101: {"pgid": 100, "lstart": self.RECORDED},
+            # leader 200 identity-valid: group signaled; member too
+            200: {"pgid": 200, "lstart": self.RECORDED},
+            201: {"pgid": 200, "lstart": self.RECORDED},
+            # 300: no fingerprint recorded (legacy shape) — never signaled
+            300: 300,
+        }
+        identities = {
+            100: ("S", self.RECYCLED),
+            101: ("S", self.RECORDED),
+            200: ("S", self.RECORDED),
+            201: ("S", self.RECORDED),
+            300: ("S", self.RECORDED),
+        }
+        pgids, pids = monitor_runner._validated_kill_targets(
+            snapshot, [101, 201, 300], identities
+        )
+        self.assertEqual(pgids, [200], "killpg only with a validated leader")
+        self.assertEqual(
+            pids, [101, 201],
+            "identity-matched pids are signaled; the unfingerprinted one"
+            " is left to the fail-closed recheck",
+        )
+
+    def test_scan_failure_blocks_instead_of_bypassing_the_gate(self) -> None:
+        # admin#1495 finding 3816225740: an unenumerable state directory
+        # must block — ([], False) read as "no sidecars" and launched a
+        # write-capable child over possibly-fired operations.
+        tmp = Path(tempfile.mkdtemp(prefix="unit-scan-fail-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        state = tmp / "state.md"
+        state.write_text(
+            "---\nstate_schema_version: 1\n---\n\nbody\n", encoding="utf-8"
+        )
+        args = argparse.Namespace(
+            state_file=str(state),
+            skill_dir=str(SCRIPTS.parent),
+            claude_bin="/opt/homebrew/bin/claude",
+            schema_cli=str(SCRIPTS / "state_schema.py"),
+            slice_budget=100.0,
+            wait_scale=1.0,
+            acknowledge_taint=None,
+        )
+        runner = Runner(args)
+        _HELPER_RUNNERS.append(runner)
+
+        def _boom(_path):
+            raise OSError("EIO")
+
+        with mock.patch.object(monitor_runner.os, "scandir", _boom):
+            with self.assertRaises(RunnerExit) as caught:
+                runner._scan_sidecars(20)
+        self.assertEqual(caught.exception.code, 5)
+        self.assertIn("sidecar scan failed", caught.exception.reason)
+
+
 class WorkCapDocParityTests(unittest.TestCase):
     def test_reference_cap_matches_the_runner_constant(self) -> None:
         # algo#1216 finding 3813491642: the cap the trusted runner enforces
