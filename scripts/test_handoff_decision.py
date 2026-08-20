@@ -329,6 +329,7 @@ class HandoffDecisionTest(unittest.TestCase):
     def test_adm_ticket_moves_to_dev_ready_for_qa(self) -> None:
         request = {
             "scenario": "approved_qa",
+            "existing_assignees": ["jakozloski"],
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
             "issue_tracker": {
@@ -361,6 +362,7 @@ class HandoffDecisionTest(unittest.TestCase):
         # different user is a wrong-target handoff and hard-fails.
         request = {
             "scenario": "approved_qa",
+            "existing_assignees": ["jakozloski"],
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
             "issue_tracker": {
@@ -390,6 +392,7 @@ class HandoffDecisionTest(unittest.TestCase):
         plan = plan_handoff(
             {
                 "scenario": "approved_qa",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "issue_tracker": "linear",
@@ -403,6 +406,7 @@ class HandoffDecisionTest(unittest.TestCase):
         # binding is the guard. A mismatch warns and the plan proceeds.
         request = {
             "scenario": "approved_qa",
+            "existing_assignees": ["jakozloski"],
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
             "issue_tracker": {
@@ -432,6 +436,7 @@ class HandoffDecisionTest(unittest.TestCase):
         plan = plan_handoff(
             {
                 "scenario": "approved_qa",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "issue_tracker": {
@@ -460,6 +465,7 @@ class HandoffDecisionTest(unittest.TestCase):
         plan = plan_handoff(
             {
                 "scenario": "approved_qa",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "issue_tracker": {
@@ -486,6 +492,7 @@ class HandoffDecisionTest(unittest.TestCase):
     def test_unresolved_qa_state_records_nonblocking_local_failure(self) -> None:
         request = {
             "scenario": "approved_qa",
+            "existing_assignees": ["jakozloski"],
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
             "issue_tracker": {
@@ -540,6 +547,7 @@ class HandoffDecisionTest(unittest.TestCase):
         }
         request = {
             "scenario": "approved_qa",
+            "existing_assignees": ["jakozloski"],
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
             "issue_tracker": dict(base_issue_tracker),
@@ -564,6 +572,7 @@ class HandoffDecisionTest(unittest.TestCase):
         supplied_state = plan_handoff(
             {
                 "scenario": "approved_qa",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "issue_tracker": {
@@ -648,9 +657,13 @@ class HandoffDecisionTest(unittest.TestCase):
         replay = retry_plan["call_plan"][0]
         self.assertEqual(replay["action"], "replace_pull_request_assignees")
         self.assertEqual(replay["payload"]["precondition"], persisted)
-        # Legacy fallback: a pre-fix pending record without a persisted
-        # precondition surfaces the spec's fresh observation instead of
-        # nothing.
+        # r13 F4 (Critical): the r19 legacy fallback — surfacing the
+        # spec's fresh observation for a record without a persisted
+        # precondition — is REMOVED. The fresh observation is the
+        # post-crash state, and adopting it as the baseline blesses a
+        # human reassignment made during the crash window as "the
+        # original". A pre-upgrade assignee-mutation record now fails
+        # closed with the manual recovery named.
         legacy_plan = plan_handoff(
             request(
                 {
@@ -662,10 +675,81 @@ class HandoffDecisionTest(unittest.TestCase):
                 }
             )
         )
-        legacy_control = legacy_plan["call_plan"][0]
+        self.assertEqual(legacy_plan["state"], "blocked", legacy_plan)
+        self.assertTrue(
+            any(
+                "carries no precondition" in error
+                and "verify the mutation's postcondition manually" in error
+                for error in legacy_plan["errors"]
+            ),
+            legacy_plan["errors"],
+        )
+
+    def test_reviewer_and_roundtrip_resumes_use_only_persisted_baselines(
+        self,
+    ) -> None:
+        # r13 F4: the crash→human-reassignment pin for the OTHER two
+        # assignee-mutation builders. Each pending record resumes with its
+        # PERSISTED baseline (never the request's fresh observation), and
+        # a record without one fails closed.
+        rr_request = {
+            "scenario": "reviewer_request",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+            "authenticated_actor": "jakozloski",
+            "existing_assignees": ["drifted-human"],
+            "reviewer_requests": {
+                "reviewers": ["alice"],
+                "ball_holder": "alice",
+            },
+        }
+        rr_plan = plan_handoff(rr_request)
+        self.assertEqual(rr_plan["state"], "pending", rr_plan)
+        replace = next(
+            op
+            for op in rr_plan["operations"]
+            if op["action"] == "replace_pull_request_assignees"
+        )
+        persisted = {"assignees": ["original-owner"]}
+        pending = dict(rr_request)
+        pending["operation_results"] = {
+            replace["id"]: {
+                "status": "pending",
+                "attempts": 1,
+                "started_at": "2026-07-14T16:59:00Z",
+                "precondition": dict(persisted),
+            }
+        }
+        # earlier chain ops must be complete for the prefix rule; mark them
+        for op in rr_plan["operations"]:
+            if op["id"] == replace["id"]:
+                break
+            pending["operation_results"][op["id"]] = {
+                "status": "complete",
+                "attempts": 1,
+                "started_at": "2026-07-14T16:58:00Z",
+                "verified_at": "2026-07-14T16:58:30Z",
+                "evidence": {"postcondition": "verified"},
+            }
+        resumed = plan_handoff(pending)
         self.assertEqual(
-            legacy_control["payload"]["precondition"],
-            {"assignees": ["drifted-human"]},
+            resumed["state"], "resume_verification_required", resumed
+        )
+        self.assertEqual(
+            resumed["call_plan"][0]["payload"]["precondition"], persisted
+        )
+        legacy = dict(pending)
+        legacy["operation_results"] = dict(pending["operation_results"])
+        legacy["operation_results"][replace["id"]] = {
+            "status": "pending",
+            "attempts": 1,
+            "started_at": "2026-07-14T16:59:00Z",
+        }
+        blocked = plan_handoff(legacy)
+        self.assertEqual(blocked["state"], "blocked", blocked)
+        self.assertTrue(
+            any("carries no precondition" in e for e in blocked["errors"]),
+            blocked["errors"],
         )
 
     def test_qa_generation_rolls_over_when_reviewers_change(self) -> None:
@@ -980,6 +1064,7 @@ class HandoffDecisionTest(unittest.TestCase):
     ) -> dict[str, object]:
         return {
             "scenario": "approved_qa",
+            "existing_assignees": ["jakozloski"],
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
             "issue_tracker": {
@@ -1146,6 +1231,7 @@ class HandoffDecisionTest(unittest.TestCase):
         plan = plan_handoff(
             {
                 "scenario": "approved_qa",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "session_environment": "managed",
@@ -1176,6 +1262,7 @@ class HandoffDecisionTest(unittest.TestCase):
         plan = plan_handoff(
             {
                 "scenario": "approved_qa",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "session_environment": "managed",
@@ -1202,6 +1289,7 @@ class HandoffDecisionTest(unittest.TestCase):
         plan = plan_handoff(
             {
                 "scenario": "approved_qa",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "session_environment": "local",
@@ -1231,6 +1319,7 @@ class HandoffDecisionTest(unittest.TestCase):
         plan = plan_handoff(
             {
                 "scenario": "approved_qa",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "issue_tracker": {"type": "linera"},
@@ -1246,6 +1335,7 @@ class HandoffDecisionTest(unittest.TestCase):
     def test_no_tracker_write_path_records_nonblocking_local_failure(self) -> None:
         request = {
             "scenario": "approved_qa",
+            "existing_assignees": ["jakozloski"],
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
             "session_environment": "managed",
@@ -1279,7 +1369,10 @@ class HandoffDecisionTest(unittest.TestCase):
                     github_operation(
                         f"qa.github.replace_assignees:g{g}",
                         "replace_pull_request_assignees",
-                        {"assignees": ["tjkeeper"]},
+                        {
+                            "assignees": ["tjkeeper"],
+                            "precondition": {"assignees": ["jakozloski"]},
+                        },
                         "complete",
                     ),
                     github_operation(
@@ -1316,6 +1409,7 @@ class HandoffDecisionTest(unittest.TestCase):
     def test_unavailable_tracker_operation_cannot_be_marked_complete(self) -> None:
         request = {
             "scenario": "approved_qa",
+            "existing_assignees": ["jakozloski"],
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
             "issue_tracker": {
@@ -1348,6 +1442,7 @@ class HandoffDecisionTest(unittest.TestCase):
             plan_handoff(
                 {
                     "scenario": "approved_qa",
+                    "existing_assignees": ["jakozloski"],
                     "repository": {"nameWithOwner": "another-owner/matchmaking"},
                     "pull_request_number": PR_NUMBER,
                 }
@@ -1372,6 +1467,7 @@ class HandoffDecisionTest(unittest.TestCase):
     def test_roundtrip_sorts_deduplicates_and_excludes_actor(self) -> None:
         request = {
             "scenario": "human_review_roundtrip",
+            "existing_assignees": ["jakozloski"],
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
             "authenticated_actor": "jakozloski",
@@ -1414,7 +1510,10 @@ class HandoffDecisionTest(unittest.TestCase):
         replace = github_operation(
             f"roundtrip.github.replace_assignees:g{generation}",
             "replace_pull_request_assignees",
-            {"assignees": ["alice", "zoe"]},
+            {
+                "assignees": ["alice", "zoe"],
+                "precondition": {"assignees": ["jakozloski"]},
+            },
             "waiting",
             [
                 f"roundtrip.github.verify_review_request:alice:g{generation}",
@@ -1458,6 +1557,7 @@ class HandoffDecisionTest(unittest.TestCase):
         plan = plan_handoff(
             {
                 "scenario": "human_review_roundtrip",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "authenticated_actor": " me ",
@@ -1480,6 +1580,7 @@ class HandoffDecisionTest(unittest.TestCase):
         # warning), not treated as unknown IDs.
         first_round = {
             "scenario": "human_review_roundtrip",
+            "existing_assignees": ["jakozloski"],
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
             "authenticated_actor": "jakozloski",
@@ -1493,6 +1594,7 @@ class HandoffDecisionTest(unittest.TestCase):
 
         second_round = {
             "scenario": "human_review_roundtrip",
+            "existing_assignees": ["jakozloski"],
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
             "authenticated_actor": "jakozloski",
@@ -1541,6 +1643,7 @@ class HandoffDecisionTest(unittest.TestCase):
         # must block on shape errors exactly like the QA path.
         first_round = {
             "scenario": "human_review_roundtrip",
+            "existing_assignees": ["jakozloski"],
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
             "authenticated_actor": "jakozloski",
@@ -1553,6 +1656,7 @@ class HandoffDecisionTest(unittest.TestCase):
         malformed = {"status": "complete"}  # no attempts/timestamps/evidence
         second_round = {
             "scenario": "human_review_roundtrip",
+            "existing_assignees": ["jakozloski"],
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
             "authenticated_actor": "jakozloski",
@@ -1605,6 +1709,7 @@ class HandoffDecisionTest(unittest.TestCase):
         # history: pruned with the warning, never in-flight.
         first_round = {
             "scenario": "human_review_roundtrip",
+            "existing_assignees": ["jakozloski"],
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
             "authenticated_actor": "jakozloski",
@@ -1617,6 +1722,7 @@ class HandoffDecisionTest(unittest.TestCase):
 
         second_round = {
             "scenario": "human_review_roundtrip",
+            "existing_assignees": ["jakozloski"],
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
             "authenticated_actor": "jakozloski",
@@ -1666,6 +1772,7 @@ class HandoffDecisionTest(unittest.TestCase):
         # the postcondition, record a terminal result), not just "stop".
         first_round = {
             "scenario": "human_review_roundtrip",
+            "existing_assignees": ["jakozloski"],
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
             "authenticated_actor": "jakozloski",
@@ -1678,6 +1785,7 @@ class HandoffDecisionTest(unittest.TestCase):
 
         second_round = {
             "scenario": "human_review_roundtrip",
+            "existing_assignees": ["jakozloski"],
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
             "authenticated_actor": "jakozloski",
@@ -1713,6 +1821,7 @@ class HandoffDecisionTest(unittest.TestCase):
     ) -> None:
         request = {
             "scenario": "human_review_roundtrip",
+            "existing_assignees": ["jakozloski"],
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
             "authenticated_actor": "jakozloski",
@@ -1758,7 +1867,10 @@ class HandoffDecisionTest(unittest.TestCase):
         replace = github_operation(
             f"roundtrip.github.replace_assignees:g{generation}",
             "replace_pull_request_assignees",
-            {"assignees": ["alice", "zoe"]},
+            {
+                "assignees": ["alice", "zoe"],
+                "precondition": {"assignees": ["jakozloski"]},
+            },
             "waiting",
             [
                 f"roundtrip.github.verify_review_request:alice:g{generation}",
@@ -1820,7 +1932,10 @@ class HandoffDecisionTest(unittest.TestCase):
                 github_operation(
                     f"roundtrip.github.replace_assignees:g{generation}",
                     "replace_pull_request_assignees",
-                    {"assignees": ["alice", "zoe"]},
+                    {
+                        "assignees": ["alice", "zoe"],
+                        "precondition": {"assignees": ["jakozloski"]},
+                    },
                     "pending",
                     [
                         f"roundtrip.github.verify_review_request:alice:g{generation}",
@@ -1833,6 +1948,7 @@ class HandoffDecisionTest(unittest.TestCase):
     def test_in_flight_mutation_requires_verification_before_retry(self) -> None:
         request = {
             "scenario": "approved_qa",
+            "existing_assignees": ["jakozloski"],
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
         }
@@ -1843,6 +1959,9 @@ class HandoffDecisionTest(unittest.TestCase):
                 "attempts": 1,
                 "started_at": TIMESTAMP,
                 "response_id": None,
+                # r13 F4: assignee mutations resume only with their
+                # persisted pre-mutation baseline.
+                "precondition": {"assignees": ["jakozloski"]},
             }
         }
         plan = plan_handoff(request)
@@ -1864,6 +1983,7 @@ class HandoffDecisionTest(unittest.TestCase):
         def request_for(pr_number: int) -> dict[str, object]:
             return {
                 "scenario": "approved_qa",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": pr_number,
                 "issue_tracker": {
@@ -1915,6 +2035,7 @@ class HandoffDecisionTest(unittest.TestCase):
         # block with the recovery named, mirroring the roundtrip contract.
         request = {
             "scenario": "approved_qa",
+            "existing_assignees": ["jakozloski"],
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
         }
@@ -1937,6 +2058,7 @@ class HandoffDecisionTest(unittest.TestCase):
     def test_failed_resume_verification_can_retry_with_write_ahead(self) -> None:
         request = {
             "scenario": "approved_qa",
+            "existing_assignees": ["jakozloski"],
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
         }
@@ -1944,6 +2066,7 @@ class HandoffDecisionTest(unittest.TestCase):
         request["operation_results"] = {
             f"qa.github.replace_assignees:g{g}": {
                 "status": "retryable",
+                "precondition": {"assignees": ["jakozloski"]},
                 "attempts": 1,
                 "started_at": TIMESTAMP,
                 "verified_at": TIMESTAMP,
@@ -1961,6 +2084,7 @@ class HandoffDecisionTest(unittest.TestCase):
         plan = plan_handoff(
             {
                 "scenario": "approved_qa",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "operation_results": {
@@ -1979,6 +2103,7 @@ class HandoffDecisionTest(unittest.TestCase):
         plan = plan_handoff(
             {
                 "scenario": "approved_qa",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "operation_results": {
@@ -2011,6 +2136,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 plan = plan_handoff(
                     {
                         "scenario": "approved_qa",
+                        "existing_assignees": ["jakozloski"],
                         "repository": REPOSITORY,
                         "pull_request_number": PR_NUMBER,
                         "operation_results": {
@@ -2032,6 +2158,7 @@ class HandoffDecisionTest(unittest.TestCase):
         plan = plan_handoff(
             {
                 "scenario": "approved_qa",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "operation_results": {
@@ -2052,6 +2179,7 @@ class HandoffDecisionTest(unittest.TestCase):
         plan = plan_handoff(
             {
                 "scenario": "approved_qa",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "operation_results": {
@@ -2072,6 +2200,7 @@ class HandoffDecisionTest(unittest.TestCase):
     def test_github_success_linear_failure_is_terminal_warning(self) -> None:
         request = {
             "scenario": "approved_qa",
+            "existing_assignees": ["jakozloski"],
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
             "issue_tracker": {
@@ -2136,7 +2265,10 @@ class HandoffDecisionTest(unittest.TestCase):
                     github_operation(
                         f"qa.github.replace_assignees:g{QA_G}",
                         "replace_pull_request_assignees",
-                        {"assignees": ["tjkeeper"]},
+                        {
+                            "assignees": ["tjkeeper"],
+                            "precondition": {"assignees": ["jakozloski"]},
+                        },
                         "complete",
                     ),
                     github_operation(
@@ -2252,6 +2384,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 plan = plan_handoff(
                     {
                         "scenario": "human_review_roundtrip",
+                        "existing_assignees": ["jakozloski"],
                         "repository": REPOSITORY,
                         "pull_request_number": PR_NUMBER,
                         "authenticated_actor": "jakozloski",
@@ -2267,6 +2400,7 @@ class HandoffDecisionTest(unittest.TestCase):
         plan = plan_handoff(
             {
                 "scenario": "human_review_roundtrip",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "authenticated_actor": "jakozloski",
@@ -2298,6 +2432,7 @@ class HandoffDecisionTest(unittest.TestCase):
         plan = plan_handoff(
             {
                 "scenario": "human_review_roundtrip",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "authenticated_actor": "jakozloski",
@@ -2324,6 +2459,7 @@ class HandoffDecisionTest(unittest.TestCase):
         plan = plan_handoff(
             {
                 "scenario": "human_review_roundtrip",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "authenticated_actor": "jakozloski",
@@ -2350,6 +2486,7 @@ class HandoffDecisionTest(unittest.TestCase):
         plan = plan_handoff(
             {
                 "scenario": "human_review_roundtrip",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "authenticated_actor": "jakozloski",
@@ -2376,6 +2513,7 @@ class HandoffDecisionTest(unittest.TestCase):
         plan = plan_handoff(
             {
                 "scenario": "human_review_roundtrip",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "authenticated_actor": "jakozloski",
@@ -2399,6 +2537,7 @@ class HandoffDecisionTest(unittest.TestCase):
         plan = plan_handoff(
             {
                 "scenario": "human_review_roundtrip",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "authenticated_actor": "jakozloski",
@@ -2412,6 +2551,7 @@ class HandoffDecisionTest(unittest.TestCase):
         plan = plan_handoff(
             {
                 "scenario": "human_review_roundtrip",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "authenticated_actor": "jakozloski",
@@ -2427,6 +2567,7 @@ class HandoffDecisionTest(unittest.TestCase):
         plan = plan_handoff(
             {
                 "scenario": "human_review_roundtrip",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "authenticated_actor": "jakozloski",
@@ -2440,6 +2581,7 @@ class HandoffDecisionTest(unittest.TestCase):
         plan = plan_handoff(
             {
                 "scenario": "human_review_roundtrip",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "authenticated_actor": "jakozloski",
@@ -2465,6 +2607,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 plan = plan_handoff(
                     {
                         "scenario": "human_review_roundtrip",
+                        "existing_assignees": ["jakozloski"],
                         "repository": REPOSITORY,
                         "pull_request_number": PR_NUMBER,
                         "authenticated_actor": "jakozloski",
@@ -2481,6 +2624,7 @@ class HandoffDecisionTest(unittest.TestCase):
         plan = plan_handoff(
             {
                 "scenario": "approved_qa",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "issue_tracker": {
@@ -2514,6 +2658,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 plan = plan_handoff(
                     {
                         "scenario": "approved_qa",
+                        "existing_assignees": ["jakozloski"],
                         "repository": REPOSITORY,
                         "pull_request_number": PR_NUMBER,
                         "issue_tracker": incomplete_tracker,
@@ -2551,6 +2696,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 plan = plan_handoff(
                     {
                         "scenario": "approved_qa",
+                        "existing_assignees": ["jakozloski"],
                         "repository": REPOSITORY,
                         "pull_request_number": PR_NUMBER,
                         "issue_tracker": tracker,
@@ -2581,6 +2727,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 plan = plan_handoff(
                     {
                         "scenario": "approved_qa",
+                        "existing_assignees": ["jakozloski"],
                         "repository": REPOSITORY,
                         "pull_request_number": PR_NUMBER,
                         "issue_tracker": tracker,
@@ -2600,6 +2747,7 @@ class HandoffDecisionTest(unittest.TestCase):
         plan = plan_handoff(
             {
                 "scenario": "approved_qa",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "issue_tracker": {
@@ -2627,6 +2775,7 @@ class HandoffDecisionTest(unittest.TestCase):
         plan = plan_handoff(
             {
                 "scenario": "approved_qa",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "issue_tracker": {
@@ -2648,6 +2797,7 @@ class HandoffDecisionTest(unittest.TestCase):
     def test_out_of_order_result_is_rejected(self) -> None:
         request = {
             "scenario": "human_review_roundtrip",
+            "existing_assignees": ["jakozloski"],
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
             "authenticated_actor": "jakozloski",
@@ -2675,6 +2825,7 @@ class HandoffDecisionTest(unittest.TestCase):
         plan = plan_handoff(
             {
                 "scenario": "human_review_roundtrip",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "authenticated_actor": "alice",
@@ -2698,6 +2849,7 @@ class HandoffDecisionTest(unittest.TestCase):
         plan = plan_handoff(
             {
                 "scenario": "human_review_roundtrip",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "authenticated_actor": "alice",
@@ -2787,6 +2939,7 @@ class RetryGuardCoverageTests(unittest.TestCase):
         plan = plan_handoff(
             {
                 "scenario": "approved_qa",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "operation_results": {
@@ -2806,6 +2959,7 @@ class RetryGuardCoverageTests(unittest.TestCase):
         plan = plan_handoff(
             {
                 "scenario": "approved_qa",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "operation_results": {
@@ -2854,6 +3008,7 @@ class MalformedLedgerZeroReviewerTests(unittest.TestCase):
                 plan = plan_handoff(
                     {
                         "scenario": "human_review_roundtrip",
+                        "existing_assignees": ["jakozloski"],
                         "repository": REPOSITORY,
                         "pull_request_number": PR_NUMBER,
                         "authenticated_actor": "alice",
@@ -2879,6 +3034,7 @@ class TicketBindingGateTests(unittest.TestCase):
     ) -> dict[str, object]:
         request: dict[str, object] = {
             "scenario": "approved_qa",
+            "existing_assignees": ["jakozloski"],
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
             "issue_tracker": {
@@ -3031,6 +3187,7 @@ class ReviewerRequestPlanTests(unittest.TestCase):
     ) -> dict[str, object]:
         request: dict[str, object] = {
             "scenario": "reviewer_request",
+            "existing_assignees": ["jakozloski"],
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
             "authenticated_actor": "jakozloski",
@@ -3114,6 +3271,7 @@ class ReviewerRequestPlanTests(unittest.TestCase):
             ),
             "qa": {
                 "scenario": "approved_qa",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "issue_tracker": {
@@ -3135,6 +3293,7 @@ class ReviewerRequestPlanTests(unittest.TestCase):
             # the uncovered third of the "all three sweeps" claim.
             "roundtrip": {
                 "scenario": "human_review_roundtrip",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "authenticated_actor": "jakozloski",
@@ -3166,6 +3325,7 @@ class ReviewerRequestPlanTests(unittest.TestCase):
         def qa_request(reviewers: list[str], results: dict[str, object]) -> dict[str, object]:
             return {
                 "scenario": "approved_qa",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "code_reviewers": reviewers,
@@ -3227,6 +3387,7 @@ class ReviewerRequestPlanTests(unittest.TestCase):
         good_tail = "0" * 12
         qa_request = {
             "scenario": "approved_qa",
+            "existing_assignees": ["jakozloski"],
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
             "issue_tracker": {
@@ -3252,6 +3413,7 @@ class ReviewerRequestPlanTests(unittest.TestCase):
         )
         roundtrip_request = {
             "scenario": "human_review_roundtrip",
+            "existing_assignees": ["jakozloski"],
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
             "authenticated_actor": "jakozloski",
@@ -3288,6 +3450,7 @@ class ReviewerRequestPlanTests(unittest.TestCase):
         cases = {
             "qa_surplus": {
                 "scenario": "approved_qa",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "issue_tracker": {
@@ -3314,6 +3477,7 @@ class ReviewerRequestPlanTests(unittest.TestCase):
             ),
             "roundtrip_surplus": {
                 "scenario": "human_review_roundtrip",
+                "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
                 "authenticated_actor": "jakozloski",
@@ -3373,6 +3537,7 @@ class ReviewerRequestPlanTests(unittest.TestCase):
         # sweeps (qa, reviewer_request, roundtrip).
         qa_request = {
             "scenario": "approved_qa",
+            "existing_assignees": ["jakozloski"],
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
             "issue_tracker": {
@@ -3401,6 +3566,7 @@ class ReviewerRequestPlanTests(unittest.TestCase):
         )
         roundtrip_request = {
             "scenario": "human_review_roundtrip",
+            "existing_assignees": ["jakozloski"],
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
             "authenticated_actor": "jakozloski",
@@ -3487,6 +3653,7 @@ class QaPlanVersionRolloutTests(unittest.TestCase):
     def _request(self, operation_results: dict[str, object]) -> dict[str, object]:
         return {
             "scenario": "approved_qa",
+            "existing_assignees": ["jakozloski"],
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
             "issue_tracker": {

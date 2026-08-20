@@ -1881,6 +1881,54 @@ class BlockingBranchCoverageTests(unittest.TestCase):
         self.assertEqual(result["state"], "blocked")
         self.assertEqual(result["reason_code"], "unknown_invocation_status")
 
+    def test_internal_failure_signature_bound_finite_retry(self) -> None:
+        # r13 F10: internal_failure now takes the finite signature-bound
+        # branch the prose promised — strikes 1-2 retry the exact same
+        # configuration, the third consecutive same-signature strike
+        # blocks, a changed normalized signature resets the streak, and
+        # liveness noise between strikes neither forms nor breaks it.
+        def observe(history=None, signature="proc exit 1: boom"):
+            config = valid_codex(status="internal_failure")
+            config["first_real_invocation"]["failure_signature"] = signature
+            if history is not None:
+                config["post_invocation"] = history
+            return evaluate_model_policy(request(codex=config))["codex"]
+
+        first = observe()
+        self.assertEqual(first["state"], "retry")
+        self.assertEqual(first["reason_code"], "internal_failure")
+        self.assertEqual(first["internal_failure"]["strike"], 1)
+
+        prior = {"status": "internal_failure", "failure_signature": "proc exit 1: boom"}
+        second = observe(history=[dict(prior)])
+        self.assertEqual(second["state"], "retry")
+        self.assertEqual(second["internal_failure"]["strike"], 2)
+
+        third = observe(history=[dict(prior), dict(prior)])
+        self.assertEqual(third["state"], "blocked")
+        self.assertEqual(third["reason_code"], "internal_failure")
+        self.assertIn("three", third["reason"])
+
+        # Whitespace/case differences normalize to the SAME signature.
+        variant = {
+            "status": "internal_failure",
+            "failure_signature": "  PROC   exit 1:   BOOM ",
+        }
+        normalized_third = observe(history=[dict(prior), dict(variant)])
+        self.assertEqual(normalized_third["state"], "blocked")
+
+        # A changed signature resets the streak.
+        other = {"status": "internal_failure", "failure_signature": "segfault"}
+        reset = observe(history=[dict(prior), dict(other)])
+        self.assertEqual(reset["state"], "retry")
+        self.assertEqual(reset["internal_failure"]["strike"], 1)
+
+        # Liveness noise between strikes neither forms nor breaks it.
+        noisy = observe(
+            history=[dict(prior), {"status": "timeout"}, dict(prior)]
+        )
+        self.assertEqual(noisy["state"], "blocked")
+
     def test_waiver_without_named_fallback_blocks(self) -> None:
         for key, _, factory, access_field in LEGS:
             with self.subTest(leg=key):

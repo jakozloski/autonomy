@@ -118,6 +118,110 @@ MAPPED_QA_REPOSITORIES = frozenset(
 )
 
 
+class AttemptContainment:
+    """Per-attempt descendant containment (r13 F8).
+
+    On Linux with a writable cgroup v2 hierarchy (the deployment target —
+    Keeper VMs), the runner creates a per-attempt cgroup and moves the
+    PAUSED wrapper into it BEFORE sending the GO token: the wrapper execs
+    nothing until GO, descendants inherit membership, and a process
+    cannot leave a cgroup by re-sessioning or double-forking. Extinction
+    is proven by reading ``cgroup.procs`` and termination goes through
+    ``cgroup.kill`` — no pid identity involved, so pid/pgid reuse and the
+    between-snapshot setsid escape are structurally impossible inside the
+    boundary. Hosts without delegation (macOS dev) DEGRADE to the
+    snapshot+group proof with the reason recorded in
+    ``in_flight.containment`` — disclosed, never silent.
+    ``MONITOR_RUNNER_CGROUP_ROOT`` is the hermetic test seam (a tmpdir
+    mimicking the cgroup files exercises every branch without root).
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    @property
+    def record(self) -> str:
+        return f"cgroup:{self.path}"
+
+    @staticmethod
+    def create(attempt_id: str) -> "AttemptContainment | None":
+        root = os.environ.get("MONITOR_RUNNER_CGROUP_ROOT", "/sys/fs/cgroup")
+        base = Path(root)
+        if not base.is_dir():
+            return None
+        target = base / f"autonomy-monitor-{os.getpid()}-{attempt_id[:12]}"
+        try:
+            target.mkdir(mode=0o755)
+        except OSError:
+            return None
+        if not (target / "cgroup.procs").exists():
+            # Not a real cgroup2 directory (mkdir on a plain fs creates an
+            # empty dir) — remove and degrade.
+            try:
+                target.rmdir()
+            except OSError:
+                pass
+            return None
+        return AttemptContainment(target)
+
+    def adopt(self, pid: int) -> bool:
+        try:
+            (self.path / "cgroup.procs").write_text(f"{pid}\n")
+        except OSError:
+            return False
+        return True
+
+    def live_pids(self) -> list[int]:
+        """Fail-closed membership read — an unreadable boundary blocks."""
+
+        try:
+            raw = (self.path / "cgroup.procs").read_text()
+        except OSError as error:
+            raise RunnerExit(
+                5,
+                "blocked",
+                "containment boundary unreadable"
+                f" ({error.__class__.__name__}) at {self.path} — cannot"
+                " prove attempt descendants extinct; needs a human",
+            )
+        pids: list[int] = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if line.isdigit():
+                pids.append(int(line))
+        return pids
+
+    def kill(self) -> None:
+        """Kill every member — cgroup.kill when present, else per-pid.
+
+        Membership IS identity here: a pid read from ``cgroup.procs`` is a
+        descendant of this attempt by construction, so the per-pid
+        fallback needs no fingerprint check.
+        """
+
+        kill_file = self.path / "cgroup.kill"
+        if kill_file.exists():
+            try:
+                kill_file.write_text("1\n")
+                return
+            except OSError:
+                pass
+        try:
+            for pid in self.live_pids():
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        except RunnerExit:
+            pass
+
+    def remove(self) -> None:
+        try:
+            self.path.rmdir()
+        except OSError:
+            pass
+
+
 def _repo_name_with_owner(url: str) -> str | None:
     """``owner/name`` from a git origin URL, or None when unrecognized.
 
@@ -414,6 +518,12 @@ def render_monitor_cli_block(block: dict[str, Any]) -> str:
         lines.append("  in_flight: null")
     else:
         lines.append("  in_flight:")
+        # r13 F8: the containment record is optional (pre-upgrade blocks
+        # lack it) — rendered first when present, deterministic either way.
+        if "containment" in in_flight:
+            lines.append(
+                f"    containment: {_render_scalar(in_flight['containment'])}"
+            )
         for key in (
             "attempt_id",
             "tick_ordinal",
@@ -1085,10 +1195,16 @@ def _drain_child(
         if remainder:
             _consume(remainder.decode("utf-8", "replace"), pipe is proc.stdout)
     if outcome != "clean":
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            proc.kill()
+        # r13 F3: only signal while the child is still OUR UNREAPED child —
+        # Popen.returncode is None exactly while the kernel holds the pid
+        # (and thus the group id) for us, so neither can have been
+        # recycled. After a reap the numbers are reusable and a signal
+        # could land on an unrelated same-UID process.
+        if proc.returncode is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
         if not _bounded_reap(proc):
             outcome = "unreaped"
     else:
@@ -1099,10 +1215,14 @@ def _drain_child(
             now = time.monotonic()
             if now >= deadline:
                 outcome = "runaway"
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    proc.kill()
+                # r13 F3: same unreaped-child guard as the non-clean kill
+                # above (poll() just returned None, so this holds by
+                # construction — the guard pins it structurally).
+                if proc.returncode is None:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        proc.kill()
                 if not _bounded_reap(proc):
                     outcome = "unreaped"
                 break
@@ -1321,6 +1441,7 @@ class Runner:
             args, "max_candidate_bytes", MAX_CANDIDATE_BYTES
         )
         self.tick_attempts = 0
+        self.attempt_containment: AttemptContainment | None = None
         self.lock_path = self.state_path.with_suffix(self.state_path.suffix + ".monitor.lock")
         self._lock_handle: IO[bytes] | None = None
         self.ticks_completed = 0
@@ -1892,6 +2013,21 @@ class Runner:
                 )
             self.charge_failure(extract, "monitor-child:spawn_failed")
             return "retry"
+        # r13 F8: containment attaches while the wrapper is PAUSED — the
+        # GO token has not been sent, so nothing has executed and every
+        # future descendant inherits membership. A host without cgroup v2
+        # delegation records the degraded mode instead, never silently.
+        containment = AttemptContainment.create(attempt_id)
+        containment_record = (
+            containment.record
+            if containment is not None
+            else "degraded:no-cgroup-v2-delegation"
+        )
+        if containment is not None and not containment.adopt(proc.pid):
+            containment.remove()
+            containment = None
+            containment_record = "degraded:cgroup-adopt-failed"
+        self.attempt_containment = containment
         # R6-F15: one instant defines both the persisted deadline_at and the
         # enforced monotonic deadline, so the record matches enforcement.
         deadline_monotonic = time.monotonic() + max(0.0, ceiling)
@@ -1899,6 +2035,7 @@ class Runner:
         block = self.current_block(extract)
         block["owner_model"] = self.owner_model
         block["in_flight"] = {
+            "containment": containment_record,
             "attempt_id": attempt_id,
             "tick_ordinal": tick_ordinal,
             "started_at": _utcnow_iso(),
@@ -2008,8 +2145,36 @@ class Runner:
         # that re-sessioned away from the recorded pgid, so the drain's
         # ancestry snapshot extends the extinction proof to every pid that
         # was ever observed as a descendant while the leader lived.
+        # r13 F8: when the attempt ran inside a cgroup boundary, the
+        # containment membership IS the extinction proof and the kill
+        # authority — pid identity never enters into it, and a setsid or
+        # double-fork descendant orphaned between snapshots cannot leave
+        # the boundary. The legacy snapshot+group proof still runs as
+        # defense in depth (it is cheap and covers the degraded mode).
+        containment = self.attempt_containment
+        if containment is not None and containment.live_pids():
+            containment.kill()
+            containment_deadline = time.monotonic() + 15
+            while (
+                time.monotonic() < containment_deadline
+                and containment.live_pids()
+            ):
+                time.sleep(0.3)
+            if containment.live_pids():
+                self._preserve_failed(candidate)
+                raise RunnerExit(
+                    5,
+                    "blocked",
+                    "attempt-containment members survived cgroup kill — a"
+                    " possibly-live writer needs a human",
+                )
         escaped = _live_snapshot_pids(drained.get("descendant_snapshot") or {})
         if _live_group_members(child_pgid) or escaped:
+            # F3: the runner's own tick group — child_pgid equals the
+            # wrapper pid, which stays unreusable while the group has
+            # members (a live group pins its id), so the group signal is
+            # identity-safe here; escaped-pid signals below are
+            # fingerprint-validated per 3816160128.
             try:
                 os.killpg(child_pgid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):

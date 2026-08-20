@@ -1668,6 +1668,61 @@ class MergeReadinessTests(unittest.TestCase):
             result["errors"],
         )
 
+    def test_unavailable_conformance_requires_the_typed_waiver(self) -> None:
+        # r13 F11: the waiver was bound only to unavailable CRITERIA — a
+        # completed gate with captured criteria but ac_conformance
+        # "unavailable" validated with no waiver at all. The waiver now
+        # binds to the conformance outage too (the capture-then-outage
+        # case), and never-captured criteria cannot claim a pass.
+        def completed_gate(conformance: str, with_waiver: bool) -> str:
+            text = self._with_blocks()
+            for old, new in (
+                ('  plan: "in_progress"', '  plan: "complete"'),
+                ('  plan_review: "pending"', '  plan_review: "complete"'),
+                ('  implementation: "pending"', '  implementation: "complete"'),
+                ('  self_review: "pending"', '  self_review: "complete"'),
+                (
+                    '  monitor: "pending"',
+                    '  monitor: "pending"\n  merge_readiness: "complete"',
+                ),
+                ('    verdict: "pending"', '    verdict: "met"'),
+            ):
+                text = _mutate(text, old, new)
+            for check, value in (
+                ("deploy_order", "n_a"),
+                ("dependencies", "n_a"),
+                ("ac_conformance", conformance),
+            ):
+                text = _mutate(
+                    text, f'  {check}: "pending"', f'  {check}: "{value}"'
+                )
+            capture = self._CAPTURE_BLOCK
+            if with_waiver:
+                capture = capture.replace(
+                    "acceptance_criteria_capture:",
+                    "acceptance_criteria_capture:\n"
+                    '  unavailable_waiver: "user waived AC conformance:'
+                    ' tracker outage"',
+                )
+            return _mutate(
+                text,
+                "decision_audit_trail: []",
+                capture + "\ndecision_audit_trail: []",
+            )
+
+        no_waiver = evaluate_state_text(completed_gate("unavailable", False))
+        self.assertTrue(
+            any(
+                "ac_conformance 'unavailable' requires" in error
+                for error in no_waiver["errors"]
+            ),
+            no_waiver["errors"],
+        )
+        with_waiver = evaluate_state_text(completed_gate("unavailable", True))
+        self.assertEqual(with_waiver["errors"], [])
+        passing = evaluate_state_text(completed_gate("pass", False))
+        self.assertEqual(passing["errors"], [])
+
     def test_acceptance_criteria_capture_rejects_bad_shapes(self) -> None:
         base = _mutate(
             self._with_blocks(),
@@ -3092,6 +3147,7 @@ class OperationContractDifferentialTests(unittest.TestCase):
 
         base_request = {
             "scenario": "human_review_roundtrip",
+            "existing_assignees": ["jakozloski"],
             "repository": {"nameWithOwner": "Keeper-Dating/matchmaking"},
             "pull_request_number": 7,
             "authenticated_actor": "jakozloski",
@@ -3886,6 +3942,45 @@ class MonitorCliBlockTests(unittest.TestCase):
         self.assertTrue(
             any("schema_version" in error for error in result2["errors"]),
             result2["errors"],
+        )
+
+    def test_containment_record_contract(self) -> None:
+        # r13 F8: the per-attempt containment mode is an optional in_flight
+        # key — cgroup:<path> or degraded:<reason> only, so a degraded
+        # boundary is always DISCLOSED, never free-form or silent.
+        def with_containment(value: str) -> str:
+            return self.WELL_FORMED.replace(
+                "  in_flight: null",
+                "  in_flight:\n"
+                f'    containment: "{value}"\n'
+                '    attempt_id: "abc123"\n'
+                "    tick_ordinal: 3\n"
+                '    started_at: "2026-08-04T11:00:00+00:00"\n'
+                '    deadline_at: "2026-08-04T11:45:00+00:00"\n'
+                "    child_pid: 4242\n"
+                "    child_pgid: 4242\n"
+                '    child_started_fingerprint: "Wed Aug  6 12:00:00 2026"\n'
+                '    base_workflow_digest: "'
+                + "ab" * 32
+                + '"',
+            )
+
+        for good in (
+            "cgroup:/sys/fs/cgroup/autonomy-monitor-1-abc",
+            "degraded:no-cgroup-v2-delegation",
+        ):
+            with self.subTest(value=good):
+                result = evaluate_state_text(
+                    self._with_block(with_containment(good))
+                )
+                self.assertEqual(result["state"], VALID, result["errors"])
+        bad = evaluate_state_text(self._with_block(with_containment("yolo")))
+        self.assertEqual(bad["state"], SUSPECT)
+        self.assertTrue(
+            any(
+                "in_flight.containment" in error for error in bad["errors"]
+            ),
+            bad["errors"],
         )
 
     def test_populated_in_flight_is_valid_and_pinned(self) -> None:

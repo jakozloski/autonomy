@@ -506,8 +506,12 @@ REDACTION_PATTERNS: tuple[tuple[str, str], ...] = (
     # Pass-4 series codex F1 (PR #3551): quoted branches are escape-aware -
     # a backslash-escaped quote inside the value must not terminate the
     # match early and leak the remainder.
-    ('password_assignment', r"""(?i)[\w-]*password["']?\s*[:=]\s*("(?:\\.|[^"\\\r\n]){4,}"|'(?:\\.|[^'\\\r\n]){4,}'|[^\s"']{8,})"""),
-    ('cookie_header_value', r"""(?i)\b(Set-)?Cookie:[^\r\n]{8,}"""),
+    # r13 F12: EVERY non-empty anchored value redacts — the old
+    # {4,}/{8,} minimums left short passwords publishable. The named
+    # `keep` group preserves the label so operators still see WHICH
+    # assignment was redacted; sanitize_for_publication re-emits it.
+    ('password_assignment', r"""(?i)(?P<keep>[\w-]*password["']?\s*[:=]\s*)("(?:\\.|[^"\\\r\n])+"|'(?:\\.|[^'\\\r\n])+'|[^\s"']+)"""),
+    ('cookie_header_value', r"""(?i)(?P<keep>\b(?:Set-)?Cookie:)[^\r\n]+"""),
     ('stripe_live_key', r"(sk|rk)_live_[A-Za-z0-9]{16,}"),
     ('gcp_api_key', r"AIza[0-9A-Za-z_-]{35}"),
     ('gcp_oauth_access_token', r"ya29\.[A-Za-z0-9_-]{20,}"),
@@ -546,7 +550,14 @@ def sanitize_for_publication(text: str) -> str:
     """
 
     for kind, pattern in REDACTION_PATTERNS:
-        text = re.sub(pattern, f"[REDACTED: {kind}]", text)
+
+        def _swap(match: "re.Match[str]", _kind: str = kind) -> str:
+            # r13 F12: a pattern may name a `keep` group (the label part);
+            # it is re-emitted so redaction removes the VALUE only.
+            keep = match.groupdict().get("keep") or ""
+            return f"{keep}[REDACTED: {_kind}]"
+
+        text = re.sub(pattern, _swap, text)
     return text
 
 
@@ -1747,6 +1758,67 @@ def evaluate_codex(raw: Any) -> dict[str, Any]:
             )
             return decision
         # No reported reset: fall through to the terminal quota block below.
+
+    if status == "internal_failure":
+        # r13 F10: internal_failure joins the FINITE signature-bound retry
+        # policy the prose already promised — strikes 1 and 2 retry the
+        # exact same configuration, the third consecutive same-signature
+        # strike blocks for a human, and a CHANGED normalized signature
+        # resets the streak (a different failure is a different problem,
+        # not progress toward the same block). Liveness noise between
+        # internal failures neither forms nor breaks the streak, matching
+        # the quota-streak rule above.
+
+        def _normalized_signature(value: Any) -> str:
+            if isinstance(value, str) and value.strip():
+                return " ".join(value.split()).casefold()
+            return "internal_failure:unclassified"
+
+        normalized = _normalized_signature(invocation.get("failure_signature"))
+        history = config.get("post_invocation")
+        streak = 1
+        if isinstance(history, list):
+            for record in reversed(history):
+                if not isinstance(record, dict):
+                    break
+                record_status = record.get("status")
+                if record_status in _CODEX_RETRYABLE_FAILURES:
+                    continue
+                if record_status != "internal_failure":
+                    break
+                if (
+                    _normalized_signature(record.get("failure_signature"))
+                    != normalized
+                ):
+                    break
+                streak += 1
+        if streak >= 3:
+            return _block_codex(
+                decision,
+                "internal_failure",
+                f"{decision['model']} invocation failed internally with the"
+                f" same normalized signature {normalized!r} three"
+                " consecutive times — a human must inspect the installation"
+                " or environment",
+                "inspect_codex_installation",
+            )
+        decision.update(
+            {
+                "state": "retry",
+                "reason_code": "internal_failure",
+                "reason": (
+                    f"Codex internal failure (strike {streak} of 3 for"
+                    f" signature {normalized!r}); retry the exact same"
+                    f" {decision['model']}/{CODEX_EFFORT} configuration"
+                ),
+                "next_action": "retry_same_invocation_once",
+                "internal_failure": {
+                    "signature": normalized,
+                    "strike": streak,
+                },
+            }
+        )
+        return decision
 
     if status in _CODEX_RETRYABLE_FAILURES:
         if attempts < CODEX_MAX_ATTEMPTS:

@@ -273,6 +273,11 @@ MONITOR_CLI_IN_FLIGHT_KEYS = frozenset(
         "base_workflow_digest",
     )
 )
+# r13 F8: the per-attempt containment mode is OPTIONAL (pre-upgrade states
+# lack it). "cgroup:<path>" = the strict boundary; "degraded:<reason>" =
+# the disclosed snapshot+group fallback on hosts without cgroup v2
+# delegation — recorded so degradation is never silent.
+MONITOR_CLI_IN_FLIGHT_OPTIONAL_KEYS = frozenset(("containment",))
 MONITOR_CHILD_FAILURE_KEYS = frozenset(("signature", "at"))
 # Same-signature child failures before the runner blocks (mirrors the
 # workflow's 3-strike rule). The runner consumes it through model_policy's
@@ -1513,7 +1518,11 @@ class _Validator:
                         self.error("monitor_cli.in_flight: must be a mapping or null")
                     else:
                         for key in in_flight:
-                            if key not in MONITOR_CLI_IN_FLIGHT_KEYS:
+                            if (
+                                key not in MONITOR_CLI_IN_FLIGHT_KEYS
+                                and key
+                                not in MONITOR_CLI_IN_FLIGHT_OPTIONAL_KEYS
+                            ):
                                 self.error(
                                     "monitor_cli.in_flight: unknown key"
                                     f" {_safe_key(str(key))!r}"
@@ -1521,6 +1530,18 @@ class _Validator:
                         for key in sorted(MONITOR_CLI_IN_FLIGHT_KEYS - set(in_flight)):
                             self.error(
                                 f"monitor_cli.in_flight: required key {key!r} is missing"
+                            )
+                        containment = in_flight.get("containment")
+                        if "containment" in in_flight and (
+                            not isinstance(containment, str)
+                            or not (
+                                containment.startswith("cgroup:")
+                                or containment.startswith("degraded:")
+                            )
+                        ):
+                            self.error(
+                                "monitor_cli.in_flight.containment: must be"
+                                " 'cgroup:<path>' or 'degraded:<reason>'"
                             )
                         for field in ("attempt_id", "child_started_fingerprint", "base_workflow_digest"):
                             value = in_flight.get(field)
@@ -1646,8 +1667,9 @@ class _Validator:
             else:
                 # Completion means every check RAN and landed non-blocked:
                 # absent or still-pending outcomes are the empty-gate bypass.
-                # ("unavailable" stays schema-legal: its mandatory user waiver
-                # lives in the audit trail, which the schema cannot read.)
+                # ("unavailable" is schema-legal ONLY with the typed waiver —
+                # bound below per r13 F11; the old claim that the schema
+                # cannot read the waiver predates the capture block.)
                 for check_key in ("deploy_order", "dependencies", "ac_conformance"):
                     check_value = gate.get(check_key)
                     if check_value in (None, "pending", "blocked"):
@@ -1691,6 +1713,31 @@ class _Validator:
                     "invariant(v): unavailable acceptance criteria require "
                     "acceptance_criteria_capture.unavailable_waiver (the "
                     "typed user waiver)"
+                )
+            # r13 F11: the waiver binds to unavailable CONFORMANCE too — a
+            # completed gate whose ac_conformance is "unavailable" needs
+            # the typed waiver even when criteria were captured earlier
+            # (the capture-then-outage case), and criteria that were never
+            # captured cannot claim a passing conformance.
+            conformance = (
+                gate.get("ac_conformance") if isinstance(gate, dict) else None
+            )
+            if conformance == "unavailable" and not (
+                isinstance(capture, dict)
+                and isinstance(capture.get("unavailable_waiver"), str)
+                and capture.get("unavailable_waiver")
+            ):
+                self.error(
+                    "invariant(v): completed merge_readiness with "
+                    "ac_conformance 'unavailable' requires "
+                    "acceptance_criteria_capture.unavailable_waiver (the "
+                    "typed user waiver covers the conformance outage)"
+                )
+            if criteria == "unavailable" and conformance == "pass":
+                self.error(
+                    "invariant(v): ac_conformance 'pass' is incoherent with "
+                    "unavailable acceptance criteria — conformance cannot "
+                    "pass against criteria that were never captured"
                 )
             if isinstance(criteria, list) and any(
                 isinstance(entry, dict)

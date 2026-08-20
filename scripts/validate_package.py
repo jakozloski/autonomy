@@ -479,38 +479,19 @@ REQUIRED_REDACTION_PATTERNS = {
     # algo#1216 R2 round-3 delivery: password/Cookie redaction was
     # incomplete — both are label/format-anchored to avoid false positives.
     "password_assignment": (
-        # algo#1216 R2 finding 3779532276: the \b-anchored form missed
-        # DB_PASSWORD/MYSQL_PASSWORD-style labels (underscore is a word
-        # character, so no boundary exists before "password").
-        # CR 3787358691: quoted values redact the WHOLE quoted string —
-        # the unquoted branch stops at whitespace, so a multi-word secret
-        # ("correct horse battery staple") previously leaked its suffix.
-        # Pass-3 codex F1: the quoted branches are escape-aware - a
-        # backslash-escaped quote inside the value no longer terminates
-        # the match early and leaks the remainder.
-        r"""(?i)[\w-]*password["']?\s*[:=]\s*("(?:\\.|[^"\\\r\n]){4,}"|'(?:\\.|[^'\\\r\n]){4,}'|[^\s"']{8,})""",
+        r'''(?i)(?P<keep>[\w-]*password["']?\s*[:=]\s*)("(?:\\.|[^"\\\r\n])+"|'(?:\\.|[^'\\\r\n])+'|[^\s"']+)''',
         (
-            "password=" + "SuperSecret99",
-            "PASSWORD: " + "hunter2hunter2",
-            "DB_PASSWORD=" + "prodsecret99",
-            "MYSQL_PASSWORD: " + "hunter2hunter2",
-            'PASSWORD="' + 'correct horse battery staple"',
-            'PASSWORD="' + 'correct \\"horse\\" battery staple"',
+            'password: x',
+            'DB_PASSWORD="a"',
+            "my-password: 'b'",
+            'ADMIN_PASSWORD=supersecretvalue99',
         ),
     ),
     "cookie_header_value": (
-        # CR 3787358691/3779091168 (converging with PR #3551 r2 3774515260
-        # + its pass-2 findings): redact the whole header remainder — the
-        # old per-pair form let a short first pair (theme=x) expose the
-        # session token in a later pair, rejected quoted values, and its
-        # \s* separators crossed line endings. [^\r\n]{8,} handles all
-        # three at once and stays line-confined by construction.
-        r"""(?i)\b(Set-)?Cookie:[^\r\n]{8,}""",
+        r'''(?i)(?P<keep>\b(?:Set-)?Cookie:)[^\r\n]+''',
         (
-            "Cookie: " + "session=abcdef12345678",
-            "Set-Cookie: " + "sid=0123456789abcdef",
-            "Cookie: " + "theme=x; session=abcdef12345678",
-            "Set-Cookie: " + "sid=0123456789abcdef; Path=/; HttpOnly",
+            'Cookie: s=1',
+            'Set-Cookie: session=abc123def456; HttpOnly',
         ),
     ),
     # algo#1216 R2 round-7 finding 3788363460: Keeper's own credential
@@ -1578,33 +1559,31 @@ def _validate_entry_points(package_dir: Path) -> list[str]:
                             " a thin pointer at the autonomy skill or"
                             " remove it (finding 3813789192)"
                         )
-                # admin#1495 finding 3816225750: the guard above only runs
-                # when CI runs this validator — and a workflow whose path
-                # filters omit the guarded commands never runs it for a
-                # command-only change. When the host repository has BOTH a
-                # skill-package-checks workflow and a .cursor/commands
-                # directory, the workflow must list the commands path in
-                # its triggers, making the guard self-auditing: removing
-                # the trigger fails the runs that package changes still
-                # start.
-                workflow = (
-                    candidate
-                    / ".github"
-                    / "workflows"
-                    / "skill-package-checks.yml"
-                )
-                if workflow.is_file():
-                    try:
-                        workflow_text = workflow.read_text(encoding="utf-8")
-                    except OSError:
-                        workflow_text = ""
-                    if ".cursor/commands/autonomous-*.md" not in workflow_text:
-                        errors.append(
-                            "skill-package-checks.yml does not trigger on"
-                            " .cursor/commands/autonomous-*.md — a"
-                            " command-only change would bypass the legacy"
-                            " entry-point guard (finding 3816225750)"
-                        )
+            # admin#1495 finding 3816225750 / algo r13 F5: the trigger
+            # wiring is required UNCONDITIONALLY whenever the workflow
+            # exists — gating it on .cursor/commands presence meant the
+            # FIRST legacy-command addition in a repo without the
+            # directory (algo) never started the run that would reject
+            # it. The absent-directory → first-command transition is
+            # exactly what the trigger must catch.
+            workflow = (
+                candidate
+                / ".github"
+                / "workflows"
+                / "skill-package-checks.yml"
+            )
+            if workflow.is_file():
+                try:
+                    workflow_text = workflow.read_text(encoding="utf-8")
+                except OSError:
+                    workflow_text = ""
+                if ".cursor/commands/autonomous-*.md" not in workflow_text:
+                    errors.append(
+                        "skill-package-checks.yml does not trigger on"
+                        " .cursor/commands/autonomous-*.md — the FIRST"
+                        " legacy-command addition would bypass the"
+                        " entry-point guard (findings 3816225750 / r13 F5)"
+                    )
             # admin#1495 finding 3822586140: the SYMLINK load roots are
             # entry points too. Whichever of the two known roots is the
             # real package directory, every OTHER root that exists must be

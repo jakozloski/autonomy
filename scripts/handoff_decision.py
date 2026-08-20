@@ -270,24 +270,43 @@ def _repository_and_pr(
     return name_with_owner, pull_request_number, errors
 
 
-def _assignee_precondition(request: dict[str, Any]) -> dict[str, Any] | None:
-    """algo#1216 finding 3813491647: the observed pre-mutation assignee set,
-    embedded in every ``replace_pull_request_assignees`` payload so the
-    write-ahead record pins what the mutation replaces. The executor
-    persists it with the pending record; resume's three-way compare
-    (current vs precondition vs desired) turns "differs from both" into a
-    superseded stop instead of a blind replay over a newer human action.
+def _assignee_precondition(
+    request: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """algo#1216 finding 3813491647 / r13 F4: the observed pre-mutation
+    assignee set, REQUIRED in every ``replace_pull_request_assignees``
+    payload so the write-ahead record pins what the mutation replaces.
+    The executor persists it with the pending record; resume's three-way
+    compare (current vs precondition vs desired) turns "differs from
+    both" into a superseded stop instead of a blind replay over a newer
+    human action. r13 F4 (Critical): an OMITTED precondition let resume
+    substitute the fresh post-crash observation as the baseline — which
+    can bless a human reassignment as "the original" — so a malformed or
+    missing observation is now a planner ERROR, never a silent omission.
+    Returns ``(precondition, error)``: exactly one is non-None. The list
+    is complete and case-normalized (casefolded identity dedup, original
+    spelling of the first occurrence kept for operator readability).
     Observational context, deliberately NOT part of the plan digest — a
     drifted observation must never re-mint an in-flight plan."""
 
     raw = request.get("existing_assignees")
     if not isinstance(raw, list):
-        return None
-    observed = sorted(
-        {login for login in raw if isinstance(login, str)},
-        key=str.casefold,
-    )
-    return {"assignees": observed}
+        return None, (
+            "existing_assignees must be a list of the PR's current"
+            " assignee logins (the pre-mutation observation is a required"
+            " plan input — finding r13 F4)"
+        )
+    seen: dict[str, str] = {}
+    for login in raw:
+        if not isinstance(login, str) or GITHUB_LOGIN.fullmatch(login) is None:
+            return None, (
+                "existing_assignees entries must be valid GitHub logins"
+                " (complete, case-normalized pre-mutation observation"
+                " required — finding r13 F4)"
+            )
+        seen.setdefault(login.casefold(), login)
+    observed = [seen[key] for key in sorted(seen)]
+    return {"assignees": observed}, None
 
 
 def _github_operation(
@@ -496,6 +515,9 @@ def _approved_qa_operations(
         )
         reviewer_verification_ids.append(verify_id)
         previous_operation_id = verify_id
+    # r13 F4: the pre-mutation observation is a REQUIRED plan input —
+    # a missing or malformed one is a planner error, never an omitted key.
+    qa_precondition, qa_precondition_error = _assignee_precondition(request)
     operations.append(
         _github_operation(
             f"qa.github.replace_assignees:g{generation}",
@@ -509,8 +531,8 @@ def _approved_qa_operations(
             # precondition instead (finding 3813491647).
             assignees=[github_login],
             **(
-                {"precondition": precondition}
-                if (precondition := _assignee_precondition(request)) is not None
+                {"precondition": qa_precondition}
+                if qa_precondition is not None
                 else {}
             ),
         )
@@ -526,6 +548,8 @@ def _approved_qa_operations(
         )
     )
     errors: list[str] = list(reviewer_errors)
+    if qa_precondition_error is not None:
+        errors.append(qa_precondition_error)
     advisory_warnings: list[str] = []
 
     issue_tracker = request.get("issue_tracker", {})
@@ -1185,6 +1209,8 @@ def _reviewer_request_operations(
         verification_ids.append(verify_id)
         previous_operation_id = verify_id
 
+    # r13 F4: required pre-mutation observation (see _assignee_precondition).
+    rr_precondition, rr_precondition_error = _assignee_precondition(request)
     replace_id = f"reviewer.github.replace_assignees:g{generation}"
     operations.append(
         _github_operation(
@@ -1195,12 +1221,14 @@ def _reviewer_request_operations(
             depends_on=verification_ids,
             assignees=[ball_holder],
             **(
-                {"precondition": precondition}
-                if (precondition := _assignee_precondition(request)) is not None
+                {"precondition": rr_precondition}
+                if rr_precondition is not None
                 else {}
             ),
         )
     )
+    if rr_precondition_error is not None:
+        return targets, operations, [rr_precondition_error]
     operations.append(
         _github_operation(
             f"reviewer.github.verify_assignees:g{generation}",
@@ -1263,6 +1291,8 @@ def _roundtrip_operations(
         reviewer_verification_ids.append(verify_id)
         previous_operation_id = verify_id
 
+    # r13 F4: required pre-mutation observation (see _assignee_precondition).
+    rt_precondition, rt_precondition_error = _assignee_precondition(request)
     replace_id = f"roundtrip.github.replace_assignees:g{generation}"
     operations.append(
         _github_operation(
@@ -1273,12 +1303,14 @@ def _roundtrip_operations(
             depends_on=reviewer_verification_ids,
             assignees=reviewers,
             **(
-                {"precondition": precondition}
-                if (precondition := _assignee_precondition(request)) is not None
+                {"precondition": rt_precondition}
+                if rt_precondition is not None
                 else {}
             ),
         )
     )
+    if rt_precondition_error is not None:
+        return targets, operations, [rt_precondition_error]
     operations.append(
         _github_operation(
             f"roundtrip.github.verify_assignees:g{generation}",
@@ -1581,23 +1613,44 @@ def _apply_operation_state(
                 scenario,
                 f"pending operation {pending_id!r} has no deterministic verification step",
             )
-        # algo#1216 finding 3813491647: surface the pre-mutation
-        # fingerprint with the verification step. The PERSISTED record's
-        # precondition wins — it captured the remote state before attempt
-        # 1 fired; the spec's copy is a fresh observation that may already
-        # include the drift being adjudicated. Three-way rule (documented
-        # in state-and-safety.md): current == desired → complete; current
-        # == precondition → retry; matches neither → superseded, record
-        # failed and reconcile — never replay over a newer human action.
+        # algo#1216 finding 3813491647 / r13 F4: surface the pre-mutation
+        # fingerprint with the verification step. ONLY the PERSISTED
+        # record's precondition is trusted — it captured the remote state
+        # before attempt 1 fired. r13 F4 (Critical) removed the spec
+        # fallback: the spec's copy is rebuilt from the CURRENT request,
+        # i.e. the fresh post-crash observation, and using it as the
+        # baseline blesses a human reassignment made during the crash
+        # window as "the original". A write-ahead record that mutates
+        # assignees but carries no precondition cannot prove what it was
+        # replacing — that resume fails closed with the manual recovery
+        # named. Three-way rule (state-and-safety.md): current == desired
+        # → complete; current == precondition → retry; matches neither →
+        # superseded, record failed and reconcile.
         persisted_precondition = result_records[pending_id].get("precondition")
-        if not isinstance(persisted_precondition, dict):
-            persisted_precondition = next(
-                (
-                    spec.get("payload", {}).get("precondition")
-                    for spec in operation_specs
-                    if spec.get("id") == pending_id
-                ),
-                None,
+        pending_spec = next(
+            (
+                spec
+                for spec in operation_specs
+                if spec.get("id") == pending_id
+            ),
+            None,
+        )
+        pending_action = (
+            pending_spec.get("action") if isinstance(pending_spec, dict) else None
+        )
+        if (
+            pending_action == "replace_pull_request_assignees"
+            and not isinstance(persisted_precondition, dict)
+        ):
+            return _blocked(
+                scenario,
+                f"pending operation {pending_id!r} mutates assignees but its"
+                " write-ahead record carries no precondition — a pre-upgrade"
+                " record cannot prove what it was replacing (r13 F4)."
+                " Recovery: verify the mutation's postcondition manually"
+                " against the current PR, record the terminal result"
+                " (complete or failed) with verified_at and evidence/error,"
+                " then re-plan — never replay it blind",
             )
         call_plan = [
             {
@@ -1623,9 +1676,12 @@ def _apply_operation_state(
         retry_operation["attempt"] = result_records[retryable_id]["attempts"] + 1
         retry_operation["requires_pending_write"] = True
         retry_operation.pop("result", None)
-        # Same record-wins rule for the replay: the persisted precondition
+        # Same record-only rule for the replay: the persisted precondition
         # from attempt 1 rides the retried operation, so the executor's
         # pre-fire check adjudicates against the ORIGINAL observation.
+        # r13 F4: a retryable assignee mutation without one fails closed
+        # exactly like the pending case — the spec's fresh copy is the
+        # post-crash observation and must never become the baseline.
         persisted_precondition = result_records[retryable_id].get(
             "precondition"
         )
@@ -1634,6 +1690,17 @@ def _apply_operation_state(
         ):
             retry_operation["payload"]["precondition"] = copy.deepcopy(
                 persisted_precondition
+            )
+        elif retry_operation.get("action") == "replace_pull_request_assignees":
+            return _blocked(
+                scenario,
+                f"retryable operation {retryable_id!r} mutates assignees but"
+                " its write-ahead record carries no precondition — a"
+                " pre-upgrade record cannot prove what it was replacing"
+                " (r13 F4). Recovery: verify the mutation's postcondition"
+                " manually against the current PR, record the terminal"
+                " result (complete or failed) with verified_at and"
+                " evidence/error, then re-plan — never replay it blind",
             )
         call_plan = [retry_operation]
     else:

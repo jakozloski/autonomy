@@ -1155,7 +1155,14 @@ class ValidatePackageTests(unittest.TestCase):
         cookie = re.compile(REQUIRED_REDACTION_PATTERNS["cookie_header_value"][0])
         self.assertIsNotNone(password.search("Password: " + "S3cretpass!"))
         self.assertIsNotNone(password.search("DB_PASSWORD=" + "prodsecret99"))
-        self.assertIsNone(password.search("password: short"))
+        # r13 F12 reversed the old minimum-length carve-out: EVERY
+        # non-empty anchored value redacts — the probes leaked short
+        # passwords ("password: x") and short quoted forms.
+        self.assertIsNotNone(password.search("password: short"))
+        self.assertIsNotNone(password.search("password: x"))
+        self.assertIsNotNone(password.search('DB_PASSWORD="a"'))
+        # The label anchor still bounds scope: prose without an
+        # assignment operator never matches.
         self.assertIsNone(password.search("the password field is required"))
         # Pass-3 codex F1: an escaped quote inside a quoted value must not
         # terminate the match early - the WHOLE quoted secret redacts.
@@ -1199,7 +1206,10 @@ class ValidatePackageTests(unittest.TestCase):
         self.assertNotIn("notcookie", crossing.group(0))
         self.assertNotIn("\n", crossing.group(0))
         # Sub-threshold remainders stay unredacted.
-        self.assertIsNone(cookie.search("Cookie: a=b"))
+        # r13 F12: every non-empty Cookie value redacts — the short-value
+        # carve-out leaked probe cookies.
+        self.assertIsNotNone(cookie.search("Cookie: a=b"))
+        self.assertIsNone(cookie.search("Cookie:"))
 
     def test_missing_current_redaction_pattern_is_rejected(self) -> None:
         state_path = self.package.root / "references" / "state-and-safety.md"
@@ -1537,8 +1547,11 @@ class EntryPointScanTests(unittest.TestCase):
             wf = workflows / "skill-package-checks.yml"
 
             def wf_write(*paths):
+                # r13 F5: the commands filter is required unconditionally
+                # whenever the workflow exists, so every fixture carries it.
                 wf.write_text(
                     "on:\n  pull_request:\n    paths:\n"
+                    + '      - ".cursor/commands/autonomous-*.md"\n'
                     + "".join(f'      - "{p}"\n' for p in paths),
                     encoding="utf-8",
                 )
@@ -1605,7 +1618,8 @@ class EntryPointScanTests(unittest.TestCase):
             (workflows / "skill-package-checks.yml").write_text(
                 "on:\n  pull_request:\n    paths:\n"
                 '      - ".claude/skills/**"\n'
-                '      - ".agents/skills/**"\n',
+                '      - ".agents/skills/**"\n'
+                '      - ".cursor/commands/autonomous-*.md"\n',
                 encoding="utf-8",
             )
             self.assertEqual(_validate_entry_points(package), [])

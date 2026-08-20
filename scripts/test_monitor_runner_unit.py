@@ -1287,6 +1287,107 @@ class DescendantIdentityTests(unittest.TestCase):
         self.assertIn("sidecar scan failed", caught.exception.reason)
 
 
+class AttemptContainmentTests(unittest.TestCase):
+    """r13 F8: the cgroup containment mechanism, exercised against a fake
+    cgroupfs directory (the MONITOR_RUNNER_CGROUP_ROOT seam covers the
+    create() branches; instance methods are driven directly). The
+    real-cgroupfs create() success line is environment-gated — covered by
+    the delegation-gated integration test below when the host provides
+    cgroup v2 delegation, and disclosed otherwise."""
+
+    def _fake_cgroup(self) -> Path:
+        tmp = Path(tempfile.mkdtemp(prefix="unit-cgroup-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        (tmp / "cgroup.procs").write_text("")
+        return tmp
+
+    def test_create_degrades_without_a_real_cgroupfs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(
+                os.environ, {"MONITOR_RUNNER_CGROUP_ROOT": tmp}
+            ):
+                self.assertIsNone(
+                    monitor_runner.AttemptContainment.create("a" * 32)
+                )
+            # the probe directory is cleaned up after the failed check
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+        with mock.patch.dict(
+            os.environ, {"MONITOR_RUNNER_CGROUP_ROOT": "/nonexistent-root"}
+        ):
+            self.assertIsNone(
+                monitor_runner.AttemptContainment.create("a" * 32)
+            )
+
+    def test_membership_is_the_extinction_proof_and_kill_authority(self) -> None:
+        cg = self._fake_cgroup()
+        containment = monitor_runner.AttemptContainment(cg)
+        self.assertTrue(containment.adopt(4242))
+        (cg / "cgroup.procs").write_text("123\n456\n")
+        self.assertEqual(containment.live_pids(), [123, 456])
+        # cgroup.kill preferred when the host provides it
+        (cg / "cgroup.kill").write_text("")
+        containment.kill()
+        self.assertEqual((cg / "cgroup.kill").read_text(), "1\n")
+        # per-pid fallback goes through membership only — no fingerprints,
+        # because membership IS identity inside the boundary
+        (cg / "cgroup.kill").unlink()
+        killed: list[int] = []
+        with mock.patch.object(
+            monitor_runner.os, "kill", lambda pid, sig: killed.append(pid)
+        ):
+            containment.kill()
+        self.assertEqual(killed, [123, 456])
+        # an unreadable boundary fails closed
+        (cg / "cgroup.procs").unlink()
+        with self.assertRaises(RunnerExit) as caught:
+            containment.live_pids()
+        self.assertEqual(caught.exception.code, 5)
+        self.assertIn("containment boundary unreadable", caught.exception.reason)
+
+    @unittest.skipUnless(
+        Path("/sys/fs/cgroup").is_dir()
+        and os.access("/sys/fs/cgroup", os.W_OK),
+        "requires cgroup v2 delegation",
+    )
+    def test_between_snapshot_escape_cannot_leave_the_boundary(self) -> None:
+        # r13 F8's exact escape: a double-forked, re-sessioned descendant
+        # orphaned between snapshots still appears in cgroup.procs and
+        # dies on kill.
+        containment = monitor_runner.AttemptContainment.create("f" * 32)
+        if containment is None:
+            self.skipTest("cgroup delegation unavailable")
+        self.addCleanup(containment.remove)
+        import subprocess as sp
+
+        proc = sp.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import os,time\n"
+                "if os.fork() == 0:\n"
+                "    os.setsid()\n"
+                "    time.sleep(60)\n"
+                "else:\n"
+                "    time.sleep(60)\n",
+            ],
+            start_new_session=True,
+        )
+        self.addCleanup(lambda: proc.poll() or proc.kill())
+        self.assertTrue(containment.adopt(proc.pid))
+        import time as _time
+
+        _time.sleep(1.0)
+        members = containment.live_pids()
+        self.assertGreaterEqual(
+            len(members), 2, "the re-sessioned orphan must stay a member"
+        )
+        containment.kill()
+        deadline = _time.monotonic() + 10
+        while _time.monotonic() < deadline and containment.live_pids():
+            _time.sleep(0.2)
+        self.assertEqual(containment.live_pids(), [])
+
+
 class WorkCapDocParityTests(unittest.TestCase):
     def test_reference_cap_matches_the_runner_constant(self) -> None:
         # algo#1216 finding 3813491642: the cap the trusted runner enforces
