@@ -637,7 +637,10 @@ class DurableReplaceFsyncTests(unittest.TestCase):
                 mr.durable_replace(source, target)
         self.assertEqual(caught.exception.code, 4)
         self.assertIn("fsync failed", caught.exception.reason)
-        # Best-effort class (ENOTSUP) still succeeds silently.
+        # r11 finding 3825265246 REVERSED the old best-effort pin: an
+        # ENOTSUP/EACCES-class directory fsync is an UNPROVEN commit on
+        # the path holding the only record of possibly-fired external
+        # mutations — it fails closed like any other fsync error.
         source.write_text("y", encoding="utf-8")
 
         def unsupported_fsync(fd: int) -> None:
@@ -645,8 +648,10 @@ class DurableReplaceFsyncTests(unittest.TestCase):
             raise OSError(errno.ENOTSUP, "unsupported")
 
         with mock.patch.object(mr.os, "fsync", unsupported_fsync):
-            mr.durable_replace(source, target)  # no raise
-        self.assertEqual(target.read_text(encoding="utf-8"), "y")
+            with self.assertRaises(RunnerExit) as caught:
+                mr.durable_replace(source, target)
+        self.assertEqual(caught.exception.code, 4)
+        self.assertIn("fsync failed", caught.exception.reason)
 
 
 class SnapshotIntegrityTests(unittest.TestCase):
@@ -1542,6 +1547,61 @@ class RateLimitMatcherTests(unittest.TestCase):
             result_is_error=False,
         )
         self.assertEqual(action, "charge")
+
+
+class MissingCandidateRecoveryTests(unittest.TestCase):
+    """admin#1495 r11 finding 3825265254: an in-flight attempt whose
+    candidate never became durable is an UNKNOWABLE remote outcome —
+    recovery must block for explicit reconciliation, never clear
+    in_flight and hand the next child a blank slate to replay."""
+
+    def _runner(self) -> Runner:
+        tmp = Path(tempfile.mkdtemp(prefix="unit-recover-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        state = tmp / "workflow-state.local.md"
+        state.write_text(
+            "---\nstate_schema_version: 1\n---\n\nbody\n", encoding="utf-8"
+        )
+        args = argparse.Namespace(
+            state_file=str(state),
+            skill_dir=str(SCRIPTS.parent),
+            claude_bin="/opt/homebrew/bin/claude",
+            schema_cli=str(SCRIPTS / "state_schema.py"),
+            slice_budget=100.0,
+            wait_scale=1.0,
+            acknowledge_taint=None,
+        )
+        runner = Runner(args)
+        _HELPER_RUNNERS.append(runner)
+        return runner
+
+    def test_missing_candidate_blocks_for_reconciliation(self) -> None:
+        runner = self._runner()
+        attempt = "ab" * 16
+        extract = {
+            "monitor_cli": {"in_flight": {"attempt_id": attempt}},
+        }
+        with self.assertRaises(RunnerExit) as caught:
+            runner.recover_in_flight(extract)
+        self.assertEqual(caught.exception.code, 5)
+        self.assertIn("NO candidate", caught.exception.reason)
+        self.assertIn(attempt, caught.exception.reason)
+
+    def test_previously_preserved_sidecar_proceeds(self) -> None:
+        runner = self._runner()
+        attempt = "cd" * 16
+        sidecar = runner.state_path.with_suffix(
+            f".failed-candidate-{attempt}.md"
+        )
+        sidecar.write_text("evidence", encoding="utf-8")
+        charged: list[str] = []
+        runner.charge_failure = lambda extract, signature: charged.append(
+            signature
+        )
+        runner.recover_in_flight(
+            {"monitor_cli": {"in_flight": {"attempt_id": attempt}}}
+        )
+        self.assertEqual(charged, ["monitor-child:unknown_outcome"])
 
 
 class WorkCapDocParityTests(unittest.TestCase):

@@ -11,6 +11,7 @@ or on-disk state, never package internals.
 from __future__ import annotations
 
 import json
+import re
 import os
 import shutil
 import signal
@@ -526,6 +527,43 @@ if target.endswith(".snap"):
             open(MARKER, "w", encoding="utf-8").close()
     except OSError:
         pass
+sys.exit(completed.returncode)
+'''
+
+
+# r11 finding 3825265235: a schema-CLI shim that witnesses the STAGE-BEFORE-
+# CHECK ordering. On every canonical-state extract it inspects the candidate
+# file: once the candidate already holds the FINALIZED block (non-null
+# last_completed_attempt_id — only the runner's splice writes that), it
+# touches the witness. Under the fixed order the last canonical re-check runs
+# strictly AFTER staging, so the final canonical extract of a clean tick must
+# observe the staged candidate; under the old check-then-stage order no
+# canonical extract ever sees it and the witness never appears.
+FAKE_SCHEMA_STAGE_WITNESS = '''\
+import os, subprocess, sys
+
+REAL = {real!r}
+STATE = os.environ.get("STAGE_WITNESS_STATE", "")
+CANDIDATE_DIR = os.path.dirname(STATE)
+WITNESS = os.environ.get("STAGE_WITNESS_MARKER", "")
+
+argv = sys.argv[1:]
+target = argv[-1] if argv else ""
+if STATE and WITNESS and os.path.realpath(target) == os.path.realpath(STATE):
+    try:
+        for name in os.listdir(CANDIDATE_DIR):
+            if ".attempt-" in name and name.endswith(".md"):
+                with open(os.path.join(CANDIDATE_DIR, name), encoding="utf-8") as h:
+                    body = h.read()
+                if 'last_completed_attempt_id: "' in body:
+                    open(WITNESS, "w", encoding="utf-8").close()
+    except OSError:
+        pass
+completed = subprocess.run(
+    [sys.executable, REAL, *argv], capture_output=True, text=True
+)
+sys.stdout.write(completed.stdout)
+sys.stderr.write(completed.stderr)
 sys.exit(completed.returncode)
 '''
 
@@ -1555,12 +1593,33 @@ class MonitorRunnerE2ETests(unittest.TestCase):
             ):
                 break
             time.sleep(0.3)
+        # r11 finding 3825265254: this child died before its candidate ever
+        # became durable, so the remote outcome is UNKNOWABLE — recovery now
+        # blocks with the explicit reconciliation instruction instead of
+        # clearing in_flight and letting the next child replay.
+        blocked_again = self._run(budget="365", timeout=60)
+        self.assertEqual(
+            blocked_again.returncode, 5,
+            blocked_again.stdout + blocked_again.stderr,
+        )
+        summary = self._summary(blocked_again)
+        self.assertIn("NO candidate", summary["reason"])
+        self.assertIn(in_flight["attempt_id"], summary["reason"])
+        # The operator performs the named reconciliation (verifies remote
+        # postconditions — none here) and clears in_flight; the next runner
+        # then proceeds to a fresh tick.
+        state_text = self.state.read_text(encoding="utf-8")
+        state_text = re.sub(
+            r"  in_flight:\n(?:    .*\n)+",
+            "  in_flight: null\n",
+            state_text,
+            count=1,
+        )
+        self.state.write_text(state_text, encoding="utf-8")
         completed = self._run(budget="365", timeout=60)
         summary = self._summary(completed)
         self.assertEqual(summary["ticks_completed"], 1, completed.stdout)
         extract = self._extract()
-        signatures = [f["signature"] for f in extract["monitor_cli"]["child_failures"]]
-        self.assertIn("monitor-child:unknown_outcome", signatures)
         self.assertIsNone(extract["monitor_cli"]["in_flight"])
 
     def test_tiny_slice_budget_never_launches(self) -> None:
@@ -1906,6 +1965,25 @@ class MonitorRunnerE2ETests(unittest.TestCase):
             completed.returncode, 0, completed.stdout + completed.stderr
         )
         self.assertEqual(summary["runner_outcome"], "terminal")
+
+    def test_foreign_repo_handoff_is_rejected(self) -> None:
+        # admin#1495 r11 finding 3825265263 (exact repro): a runner bound
+        # to one repository accepted a terminal candidate carrying another
+        # repository's completed handoff. The binding is now COMPARED per
+        # handoff, whatever the status.
+        self._bind_origin("git@github.com:Keeper-Dating/admin-portal.git")
+        self._mutate_state(self._IDLE_QA_HANDOFF, self._FAILED_QA_HANDOFF)
+        completed = self._run(
+            budget="900", timeout=90, wait_scale="0.02", max_ticks="3",
+            env_extra={"FAKE_OUTCOME": "terminal"},
+        )
+        self.assertEqual(completed.returncode, 5, completed.stderr)
+        extract = self._extract()
+        signatures = [
+            f["signature"] for f in extract["monitor_cli"]["child_failures"]
+        ]
+        self.assertIn("monitor-child:handoff_repo_mismatch", signatures)
+        self.assertNotIn("monitor-child:success", signatures)
 
     def test_work_cap_overrun_terminal_is_rejected(self) -> None:
         # algo#1216 finding 3813491642 (exact repro): a candidate advancing
@@ -2514,6 +2592,41 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         self.assertEqual(extract["state"], "valid", extract["errors"])
         self.assertEqual(extract["monitor_status"], "paused")
         self.assertNotIn("GARBAGE", self.state.read_text(encoding="utf-8"))
+
+    def test_finalize_stages_before_the_last_canonical_check(self) -> None:
+        # r11 finding 3825265235: the old order ran the canonical digest +
+        # lock checks FIRST and then rewrote/fsynced the candidate, leaving
+        # that whole I/O window for a concurrent canonical update to be
+        # clobbered with terminal success. The fixed order stages the
+        # finalized bytes first and re-checks canonical immediately before
+        # promotion — so the LAST canonical extract of a clean tick must
+        # observe the already-staged candidate. Reverting the reorder makes
+        # the witness never fire.
+        marker = self.dir / "stage-witness-fired"
+        shim = self.dir / "schema-stage-witness.py"
+        shim.write_text(
+            FAKE_SCHEMA_STAGE_WITNESS.format(real=str(SCHEMA)), encoding="utf-8"
+        )
+        completed = self._run(
+            mode="ok",
+            budget="900",
+            timeout=90,
+            wait_scale="0.02",
+            max_ticks="3",
+            env_extra={
+                "FAKE_OUTCOME": "terminal",
+                "STAGE_WITNESS_STATE": str(self.state),
+                "STAGE_WITNESS_MARKER": str(marker),
+            },
+            extra_args=["--schema-cli", str(shim)],
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertEqual(self._summary(completed)["runner_outcome"], "terminal")
+        self.assertTrue(
+            marker.exists(),
+            "no canonical re-check observed the staged candidate — the"
+            " finalize order regressed to check-then-stage",
+        )
 
     # Built by runtime concatenation so the SOURCE never carries the
     # contiguous injection phrase — the pinned skill scanner (CI-required)

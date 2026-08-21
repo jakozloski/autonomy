@@ -671,21 +671,23 @@ def _fsync_parent(path: Path) -> bool:
     # R6-F14: fsync the parent directory so a rename itself survives a
     # power loss — a data fsync does not make the directory entry durable.
     # admin#1495 finding 3793025395: an fsync I/O failure is a DURABILITY
-    # FAILURE and must surface (injected EIO was silently swallowed while
-    # durable_replace reported success). Only the platform's genuine
-    # inability to open/fsync a directory (ENOTSUP/EINVAL/EACCES-class,
-    # e.g. some non-POSIX filesystems) stays best-effort.
-    import errno
-
-    best_effort = (errno.ENOTSUP, errno.EINVAL, errno.EACCES, errno.EPERM)
+    # FAILURE and must surface. r11 finding 3825265246 CLOSED the errno
+    # carve-out that remained: ENOTSUP/EINVAL/EACCES/EPERM read as
+    # "successful" durability, so an unsupported or permission-limited
+    # filesystem silently dropped the write-ahead guarantee the resume
+    # trust model depends on. The state directory hosts the ONLY durable
+    # record of possibly-fired external mutations — a platform that
+    # cannot prove the rename durable fails closed; a deployment that
+    # genuinely cannot fsync directories must relocate the state file,
+    # not run unproven.
     try:
         dir_fd = os.open(path.parent, os.O_RDONLY)
-    except OSError as error:
-        return error.errno in best_effort
+    except OSError:
+        return False
     try:
         os.fsync(dir_fd)
-    except OSError as error:
-        return error.errno in best_effort
+    except OSError:
+        return False
     finally:
         os.close(dir_fd)
     return True
@@ -1904,9 +1906,42 @@ class Runner:
                         pass
         except OSError:
             pass
+        if not preserved_any:
+            # r11 finding 3825265254: the candidate is the ONLY durable
+            # record of external mutations the dead child may have fired.
+            # Accept its absence only when a PRIOR recovery already
+            # preserved it (the failed-candidate sidecar — including an
+            # F17 quarantine — exists for this attempt); otherwise the
+            # remote outcome is unknowable by construction, and clearing
+            # in_flight would hand the next child a blank slate to REPLAY
+            # reviews/assignments/comments/ticket moves. Block for
+            # explicit remote reconciliation instead.
+            already_preserved = False
+            if isinstance(recorded_attempt, str) and recorded_attempt:
+                sidecar_base = self.state_path.with_suffix(
+                    f".failed-candidate-{recorded_attempt}.md"
+                )
+                already_preserved = sidecar_base.exists() or any(
+                    sidecar_base.parent.glob(sidecar_base.name + ".q*")
+                )
+            if not already_preserved:
+                raise RunnerExit(
+                    5,
+                    "blocked",
+                    "recovery found a recorded in-flight attempt"
+                    f" ({recorded_attempt!r}) with NO candidate and no"
+                    " preserved sidecar — the dead child may have fired"
+                    " external mutations whose only record never became"
+                    " durable. Verify the remote postconditions for every"
+                    " pending handoff operation (GitHub review/assignee/"
+                    "comment state, Linear ticket state) per the Resume"
+                    " trust model, record the observed outcomes in"
+                    " operation_results, then clear monitor_cli.in_flight"
+                    " to resume",
+                )
         _heartbeat(
             "recovery: unknown prior attempt reconciled ("
-            + ("candidate preserved for reconciliation" if preserved_any else "no recorded candidate found")
+            + ("candidate preserved for reconciliation" if preserved_any else "candidate previously preserved; proceeding")
             + ")"
         )
         self.charge_failure(extract, "monitor-child:unknown_outcome")
@@ -3040,6 +3075,35 @@ class Runner:
                 self._preserve_failed(candidate)
                 self.charge_failure(fresh, "monitor-child:handoff_missing")
                 return "retry"
+        # r11 finding 3825265263: the binding must also be COMPARED — a
+        # handoff persisting a DIFFERENT repository than the one this
+        # runner is bound to is a cross-repository mutation record
+        # (mistaken or hostile child output) and must never commit,
+        # whatever its status. Applies to every candidate, not just
+        # terminal ones: a pending foreign-repo handoff is a mutation
+        # plan aimed at another repository.
+        launch_cli_binding = fresh.get("monitor_cli")
+        bound_repo = (
+            launch_cli_binding.get("repository")
+            if isinstance(launch_cli_binding, dict)
+            else None
+        )
+        if not (isinstance(bound_repo, str) and bound_repo):
+            bound_repo = self.repository_hint
+        if isinstance(bound_repo, str) and bound_repo:
+            for kind, handoff_repo in (
+                candidate_extract.get("handoff_bindings") or {}
+            ).items():
+                if (
+                    isinstance(handoff_repo, str)
+                    and handoff_repo
+                    and handoff_repo.casefold() != bound_repo.casefold()
+                ):
+                    self._preserve_failed(candidate)
+                    self.charge_failure(
+                        fresh, "monitor-child:handoff_repo_mismatch"
+                    )
+                    return "retry"
         # F2: the verdict's outcome must agree with the candidate's own
         # monitor lifecycle — a "terminal" claim over a still-in-progress
         # monitor is exactly the false-completion the audit exists to stop.
@@ -3234,17 +3298,21 @@ class Runner:
             self.failures.pop()  # the un-committed success marker
             self.charge_failure(fresh, "monitor-child:finalize_invalid")
             return "retry"
-        # R2 #1328 finding 3767068789: the canonical check at candidate
-        # verification time leaves the extraction/digest/finalize-validation
-        # window unguarded - a writer that ignores the kernel lock could land
-        # between it and this replace and be silently erased. Re-read
-        # canonical NOW, immediately before the atomic replacement; any drift
-        # is an unknown writer and stops the runner as suspect state, never a
-        # clobber (identical semantics to the post-child check above).
+        # R2 #1328 finding 3767068789 + r11 finding 3825265235: the
+        # canonical re-check must sit IMMEDIATELY before the promotion —
+        # the old order checked first and then rewrote/fsynced the
+        # candidate, leaving that whole I/O window for a concurrent
+        # canonical update to land and be clobbered with terminal
+        # success. So: STAGE the finalized bytes into the candidate inode
+        # first, then re-read canonical and verify the lock, then promote
+        # that exact staged inode with nothing but the checks between.
+        # Any drift is an unknown writer and stops the runner as suspect
+        # state, never a clobber. The residual check-to-rename instant is
+        # enforced by the kernel lock; this check is its tripwire.
+        atomic_write(candidate, finalized)
         last_look = self.schema.extract(self.state_path)
         self._require_unmutated_canonical(last_look, candidate)
         self._verify_lock_inode()
-        atomic_write(candidate, finalized)
         # Finding 3791925163: the final namespace update is the commit the
         # runner reports — it must be durable too, not only the candidate's
         # own rename inside atomic_write.

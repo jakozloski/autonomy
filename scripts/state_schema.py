@@ -3240,6 +3240,7 @@ def monitor_extract(text: str) -> dict[str, Any]:
         "monitor_status": None,
         "handoff_statuses": [],
         "handoff_status_by_kind": {},
+        "handoff_bindings": {},
         "handoff_operations": {},
         "handoff_results": {},
         "handoff_result_digests": {},
@@ -3289,6 +3290,22 @@ def monitor_extract(text: str) -> dict[str, Any]:
             status_by_kind[str(kind)] = normalized
     extract["handoff_statuses"] = statuses
     extract["handoff_status_by_kind"] = status_by_kind
+    # admin#1495 r11 finding 3825265263: the runner's terminal gate must
+    # compare every handoff's persisted TARGET repository against the
+    # runner's own binding — a candidate carrying another repository's
+    # handoff must never commit. Operation payloads are not persisted in
+    # state, so the schema-persisted repository_name_with_owner is the
+    # per-handoff binding surface.
+    bindings: dict[str, Any] = {}
+    if isinstance(handoffs, dict):
+        for kind, record in handoffs.items():
+            if not isinstance(record, dict):
+                continue
+            repo_value = record.get("repository_name_with_owner")
+            bindings[str(kind)] = (
+                repo_value if isinstance(repo_value, str) else None
+            )
+    extract["handoff_bindings"] = bindings
     # algo#1216 R2 findings 3787189747/3787189752/3787189757: the runner's
     # terminal/launch decisions need schema-owned views of (a) per-operation
     # handoff results for monotonicity, (b) the direction-aware deploy/
