@@ -80,6 +80,31 @@ from model_policy import (  # noqa: E402
 
 WRAPPER_EXEC_FAILED_MARKER = "MONITOR-WRAPPER-EXEC-FAILED"
 _RESUME_NOT_FOUND_HINTS = ("no conversation found", "session not found", "unknown session")
+
+# r14 F7: ONE contextual rate-limit matcher shared by sticky capture,
+# overflow capture, and final classification. A bare "429" substring let
+# "elapsed 429ms" enter the no-charge liveness ladder; context anchors
+# (HTTP status renderings, the provider's own words) admit the real
+# forms and nothing else. Returns the match offset so excerpts can be
+# anchored on the marker instead of the line head.
+_RATE_LIMIT_CONTEXT = re.compile(
+    r"(?i)("
+    r"\bhttps?/[0-9.]+\s+429\b"
+    r"|\bhttp\s+429\b"
+    r"|\bstatus(?:\s+code)?\s*[:=]?\s*429\b"
+    r"|\berror\s+429\b"
+    r"|\b429\s+too\s+many\s+requests\b"
+    r"|\brate[ _-]?limit(?:ed|s)?\b"
+    r"|\boverloaded\b"
+    r")"
+)
+
+
+def rate_limit_offset(text: str) -> int | None:
+    """Offset of the first contextual rate-limit marker, or None."""
+
+    match = _RATE_LIMIT_CONTEXT.search(text)
+    return match.start() if match is not None else None
 DIAGNOSTIC_LINE_CAP = 50
 PIPE_BUFFER_CAP = 1_048_576
 # R7 codex #11: the child writes the candidate; a bounded read refuses an
@@ -121,9 +146,13 @@ MAPPED_QA_REPOSITORIES = frozenset(
 class AttemptContainment:
     """Per-attempt descendant containment (r13 F8).
 
-    On Linux with a writable cgroup v2 hierarchy (the deployment target —
-    Keeper VMs), the runner creates a per-attempt cgroup and moves the
-    PAUSED wrapper into it BEFORE sending the GO token: the wrapper execs
+    On Linux with a writable cgroup v2 hierarchy, the runner creates a
+    per-attempt cgroup and moves the
+    PAUSED wrapper into it BEFORE sending the GO token (r14 F2: managed
+    Keeper slots run ProtectControlGroups=yes with a read-only cgroup
+    mount, so THOSE runs take the disclosed degraded path — the strict
+    boundary activates only where the host delegates a writable
+    hierarchy): the wrapper execs
     nothing until GO, descendants inherit membership, and a process
     cannot leave a cgroup by re-sessioning or double-forking. Extinction
     is proven by reading ``cgroup.procs`` and termination goes through
@@ -222,22 +251,34 @@ class AttemptContainment:
             pass
 
 
+# r14 F5: only GitHub's own URL shapes may bind a repository — the old
+# suffix match mapped https://evil.example/Keeper-Dating/matchmaking.git
+# and git@gitlab.com:Keeper-Dating/matchmaking.git to the trusted Keeper
+# repository, which would arm the required-handoff manifest (and anything
+# else keyed on the binding) off a foreign host's path.
+_GITHUB_ORIGIN_FORMS = (
+    re.compile(r"^git@github\.com:(?P<repo>[^/:\s]+/[^/:\s]+?)(?:\.git)?/?$", re.IGNORECASE),
+    re.compile(r"^https://(?:[^@/\s]+@)?github\.com/(?P<repo>[^/:\s]+/[^/:\s]+?)(?:\.git)?/?$", re.IGNORECASE),
+    re.compile(r"^ssh://git@github\.com(?::22)?/(?P<repo>[^/:\s]+/[^/:\s]+?)(?:\.git)?/?$", re.IGNORECASE),
+)
+
+
 def _repo_name_with_owner(url: str) -> str | None:
-    """``owner/name`` from a git origin URL, or None when unrecognized.
+    """``owner/name`` from a GITHUB origin URL, or None otherwise.
 
-    Accepts the three shapes git actually emits (scp-like ssh, https,
-    ssh://) and strips a trailing ``.git``/slash. Unrecognized shapes map
-    to None — the workflow is then treated as unmapped, and the sticky
-    persisted binding in the monitor block keeps an already-mapped run
-    mapped regardless (see current_block)."""
+    r14 F5: recognition is an allowlist of GitHub's own three shapes
+    (scp-like ssh, https, ssh://) — any other host or shape maps to None,
+    so a foreign remote can never masquerade as a trusted repository.
+    None means unmapped for a fresh binding; an already-persisted binding
+    disagreeing with a RESOLVABLE live origin fails closed instead
+    (see current_block)."""
 
-    text = url.strip().rstrip("/")
-    if text.endswith(".git"):
-        text = text[:-4]
-    match = re.search(r"[:/]([^/:\s]+/[^/:\s]+)$", text)
-    if match is None:
-        return None
-    return match.group(1)
+    text = url.strip()
+    for form in _GITHUB_ORIGIN_FORMS:
+        match = form.match(text)
+        if match is not None:
+            return match.group("repo")
+    return None
 
 
 def _utcnow_iso() -> str:
@@ -814,6 +855,45 @@ def _descendant_snapshot(root_pid: int) -> dict[int, dict[str, Any]]:
     return found
 
 
+def _group_member_identities(pgid: int) -> dict[int, dict[str, Any]]:
+    """Pre-reap group membership with lstart identities — best effort.
+
+    r14 F21 companion: valid ONLY while the runner's own direct child is
+    unreaped — its (possibly zombie) pid pins the group id against
+    recycling, so every current member genuinely inherited membership
+    from this tick's child. Captured members join the descendant snapshot
+    with their fingerprints, which is what lets the extinction gate use
+    identity-validated per-pid kills instead of a raw post-reap killpg.
+    Failures return empty: this only ADDS coverage on top of the
+    fail-closed gate.
+    """
+
+    try:
+        completed = subprocess.run(
+            [_resolve_system_binary("ps"), "-o", "pid=,stat=,lstart=", "-g", str(pgid)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if completed.returncode not in (0, 1):
+        return {}
+    members: dict[int, dict[str, Any]] = {}
+    for row in completed.stdout.splitlines():
+        parts = row.split()
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        if parts[1].startswith("Z"):
+            continue
+        members[pid] = {"pgid": pgid, "lstart": " ".join(parts[2:])}
+    return members
+
+
 def _snapshot_identities(pids: list[int]) -> dict[int, tuple[str, str]]:
     """Bounded ``{pid: (stat, lstart)}`` over the given pids — fail-closed.
 
@@ -1083,7 +1163,13 @@ def _drain_child(
     import selectors
 
     selector = selectors.DefaultSelector()
-    protocol: dict[str, Any] = {"session_id": None, "served_model": None, "result_text": None}
+    protocol: dict[str, Any] = {
+        "session_id": None,
+        "served_model": None,
+        "result_text": None,
+        "result_subtype": None,
+        "result_is_error": None,
+    }
     recent_lines: list[str] = []
     stderr_tail: list[str] = []
     stderr_sticky: list[str] = []
@@ -1119,6 +1205,22 @@ def _drain_child(
                     protocol["served_model"] = model
             elif event.get("type") == "result" and isinstance(event.get("result"), str):
                 protocol["result_text"] = event["result"]
+                # r14 F12: the stream can deliver a result carrying its
+                # own structured error verdict (subtype=success with
+                # is_error=true was reproduced for an empty-stderr quota
+                # event). Keeping only result_text threw that trusted
+                # metadata away and the failure path classified bare
+                # stderr into a generic charge.
+                protocol["result_subtype"] = (
+                    event.get("subtype")
+                    if isinstance(event.get("subtype"), str)
+                    else None
+                )
+                protocol["result_is_error"] = (
+                    event.get("is_error")
+                    if isinstance(event.get("is_error"), bool)
+                    else None
+                )
         else:
             stderr_tail.append(decoded[:400])
             del stderr_tail[:-20]
@@ -1135,9 +1237,7 @@ def _drain_child(
                 # 20-line tail — a 429 followed by 30 cleanup lines lost
                 # its marker and decayed to a generic retry charge. These
                 # deterministic signatures are sticky like auth/exec ones.
-                or "429" in lowered_line
-                or "rate limit" in lowered_line
-                or "overloaded" in lowered_line
+                or rate_limit_offset(decoded) is not None
                 or "no conversation found" in lowered_line
             ):
                 # R7 codex #12: retain a marker-ANCHORED window, not a fixed
@@ -1165,6 +1265,14 @@ def _drain_child(
             try:
                 chunk = os.read(pipe.fileno(), 65536)
             except BlockingIOError:
+                continue
+            except OSError:
+                # r14 F4: a failed pipe (EIO on pty loss, forced close) is
+                # the END of that stream, not a runner crash — treating it
+                # as fatal escaped _drain_child with the child still
+                # alive. The run_tick lifecycle boundary is the backstop
+                # for anything that still propagates.
+                selector.unregister(pipe)
                 continue
             if not chunk:
                 selector.unregister(pipe)
@@ -1194,6 +1302,17 @@ def _drain_child(
     for pipe, remainder in buffers.items():
         if remainder:
             _consume(remainder.decode("utf-8", "replace"), pipe is proc.stdout)
+    # r14 F21 companion: one FINAL capture before anything can reap the
+    # leader. Ancestry alone misses exit-time stragglers (children
+    # reparent at parent DEATH, before any reap), so this reads GROUP
+    # membership too — trustworthy exactly here, because the unreaped
+    # (possibly zombie) leader still pins the group id against recycling.
+    # Every member enters the snapshot WITH its lstart, so the
+    # identity-validated per-pid kills cover them and the extinction gate
+    # needs no raw post-reap killpg.
+    descendant_snapshot.update(_descendant_snapshot(proc.pid))
+    for member_pid, identity in _group_member_identities(proc.pid).items():
+        descendant_snapshot.setdefault(member_pid, identity)
     if outcome != "clean":
         # r13 F3: only signal while the child is still OUR UNREAPED child —
         # Popen.returncode is None exactly while the kernel holds the pid
@@ -1267,6 +1386,8 @@ def classify_child_failure(
     exit_code: int,
     stderr_tail: list[str],
     resumed: bool,
+    result_text: str | None = None,
+    result_is_error: bool | None = None,
 ) -> tuple[str, str]:
     """Phase-aware classification (F4): ('block'|'ladder'|'charge'|'fresh_session', signature).
 
@@ -1279,6 +1400,14 @@ def classify_child_failure(
     """
 
     joined = "\n".join(stderr_tail)
+    # r14 F12: a structured in-stream error verdict is classified FIRST —
+    # it is trusted protocol metadata, and for providers that report
+    # failures in-band (a quota event with EMPTY stderr was the repro)
+    # the stderr-only path below sees nothing and decays the event into a
+    # generic charge. The result text joins the classification input so
+    # the rate-limit/auth matchers below see the in-band diagnostics.
+    if result_is_error is True and isinstance(result_text, str):
+        joined = joined + "\n" + result_text[:2000]
     lowered = joined.lower()
     if WRAPPER_EXEC_FAILED_MARKER in joined:
         return ("block", "claude CLI binary could not be executed — install or fix PATH")
@@ -1286,7 +1415,7 @@ def classify_child_failure(
         return ("block", "claude CLI authentication failure — re-authenticate the owner route")
     if resumed and any(hint in lowered for hint in _RESUME_NOT_FOUND_HINTS):
         return ("fresh_session", "monitor-child:resume_not_found")
-    if "429" in lowered or "rate limit" in lowered or "overloaded" in lowered:
+    if rate_limit_offset(joined) is not None:
         return ("ladder", "monitor-child:rate_limited")
     return ("charge", f"monitor-child:exit_{exit_code}")
 
@@ -1572,13 +1701,31 @@ class Runner:
             "liveness": None,
         }
         base.setdefault("liveness", None)
-        # algo#1216 finding 3813491661: the repository binding is STICKY
-        # runner-owned state — once a mapped origin is persisted, a later
-        # failed probe (or a child rewiring .git/config between slices)
-        # never downgrades it back to unmapped.
+        # algo#1216 finding 3813491661 + r14 F5: the repository binding is
+        # STICKY runner-owned state — a later FAILED probe (or a child
+        # rewiring .git/config between slices) never downgrades it back to
+        # unmapped. But stickiness covers only probe UNAVAILABILITY: when
+        # the live origin RESOLVES and disagrees with the persisted
+        # binding, that is not drift to paper over — it is either a child
+        # rewrite or an operator re-pointing the checkout, and both need a
+        # human before any further binding-keyed decision.
         persisted_repo = base.get("repository")
         if not (isinstance(persisted_repo, str) and persisted_repo):
             base["repository"] = self.repository_hint
+        elif (
+            self.repository_hint is not None
+            and self.repository_hint.casefold() != persisted_repo.casefold()
+        ):
+            raise RunnerExit(
+                5,
+                "blocked",
+                "persisted repository binding"
+                f" {persisted_repo!r} disagrees with the live origin"
+                f" {self.repository_hint!r} — a rewired remote (or a"
+                " re-pointed checkout) must be reconciled by a human;"
+                " verify .git/config and the monitor_cli.repository"
+                " record, then resume",
+            )
         # The failure ledger is runner-memory truth (bounded diagnostic
         # history in state) — a child that erased it changes nothing.
         base["child_failures"] = list(self.failures[-10:])
@@ -2088,7 +2235,14 @@ class Runner:
             )
         self.launch_block = committed["monitor_cli"]
         self.launch_base_digest = committed["digest"]
-        assert proc.stdin is not None
+        # r14 F10: never `assert` in production paths (vanishes under -O).
+        if proc.stdin is None:
+            raise RunnerExit(
+                4,
+                "suspect_state",
+                "launch wrapper has no stdin pipe — runner defect; the GO"
+                " barrier cannot operate",
+            )
         try:
             proc.stdin.write(b"GO\n")
             proc.stdin.flush()
@@ -2116,196 +2270,237 @@ class Runner:
             self._preserve_failed(candidate)
             self.charge_failure(fresh, "monitor-child:go_write_failed")
             return "retry"
-        drained = _drain_child(
-            proc,
-            idle_timeout=self.child_idle_timeout,
-            deadline=deadline_monotonic,
-        )
-        fresh = self.schema.extract(self.state_path)
-        self._require_unmutated_canonical(fresh, candidate)
-        if drained["outcome"] == "unreaped":
-            self._preserve_failed(candidate)
-            raise RunnerExit(
-                5,
-                "blocked",
-                "killed monitor child could not be reaped within the bounded"
-                " window — a possibly-live writer needs a human",
+        # r14 F4: ONE finally-owned lifecycle boundary for everything
+        # after GO — an exception that escapes supervision (a pipe or
+        # selector failure, a protocol surprise) must never strand a
+        # live write-capable child behind a raw traceback. Structured
+        # RunnerExits own their cleanup story and pass through; any
+        # OTHER escape routes into the backstop, which terminates
+        # through containment/identity, boundedly reaps, preserves
+        # evidence, and refuses to return without extinction proof.
+        try:
+            drained = _drain_child(
+                proc,
+                idle_timeout=self.child_idle_timeout,
+                deadline=deadline_monotonic,
             )
-        # R6-F6, generalized by R2 #1495 findings 3776596760 + 3777668741:
-        # supervision proves only that the LEADER exited — clean OR failed —
-        # and the failure path clears the only survivor record (in_flight)
-        # when it commits. A same-group descendant is a live writer that can
-        # mutate the candidate after validation, so prove the whole process
-        # group extinct for EVERY drained outcome before any state is
-        # cleared or committed. Survivors are killed (this group was spawned
-        # by this runner this tick) and boundedly rechecked; a group that
-        # cannot be proven extinct needs a human, and a clean tick that
-        # needed the kill is charged and retried.
-        # #3551 finding 3808151914: the group gate cannot see a descendant
-        # that re-sessioned away from the recorded pgid, so the drain's
-        # ancestry snapshot extends the extinction proof to every pid that
-        # was ever observed as a descendant while the leader lived.
-        # r13 F8: when the attempt ran inside a cgroup boundary, the
-        # containment membership IS the extinction proof and the kill
-        # authority — pid identity never enters into it, and a setsid or
-        # double-fork descendant orphaned between snapshots cannot leave
-        # the boundary. The legacy snapshot+group proof still runs as
-        # defense in depth (it is cheap and covers the degraded mode).
-        containment = self.attempt_containment
-        if containment is not None and containment.live_pids():
-            containment.kill()
-            containment_deadline = time.monotonic() + 15
-            while (
-                time.monotonic() < containment_deadline
-                and containment.live_pids()
-            ):
-                time.sleep(0.3)
-            if containment.live_pids():
-                self._preserve_failed(candidate)
-                raise RunnerExit(
-                    5,
-                    "blocked",
-                    "attempt-containment members survived cgroup kill — a"
-                    " possibly-live writer needs a human",
-                )
-        escaped = _live_snapshot_pids(drained.get("descendant_snapshot") or {})
-        if _live_group_members(child_pgid) or escaped:
-            # F3: the runner's own tick group — child_pgid equals the
-            # wrapper pid, which stays unreusable while the group has
-            # members (a live group pins its id), so the group signal is
-            # identity-safe here; escaped-pid signals below are
-            # fingerprint-validated per 3816160128.
-            try:
-                os.killpg(child_pgid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-            snapshot = drained.get("descendant_snapshot") or {}
-            # algo#1216 finding 3816160128: identity is re-validated
-            # IMMEDIATELY before signaling — a recycled pid/pgid whose
-            # current lstart no longer matches the snapshot gets no
-            # signal (an unrelated same-UID process must never be
-            # SIGKILLed on a stale number), and killpg fires only after
-            # the current group LEADER matches its recorded fingerprint.
-            # Anything left unvalidated falls to the fail-closed recheck
-            # below, which blocks for a human instead of guessing.
-            kill_pgids, kill_pids = _validated_kill_targets(
-                snapshot, escaped, _snapshot_identities(
-                    sorted(
-                        set(escaped)
-                        | {
-                            _snapshot_entry(snapshot.get(pid))[0]
-                            for pid in escaped
-                            if _snapshot_entry(snapshot.get(pid))[0] is not None
-                        }
-                    )
-                )
-            )
-            for target in kill_pgids:
-                try:
-                    os.killpg(target, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
-            for pid in kill_pids:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
-            recheck_deadline = time.monotonic() + 15
-            while time.monotonic() < recheck_deadline and (
-                _live_group_members(child_pgid)
-                or _live_snapshot_pids(snapshot)
-            ):
-                time.sleep(0.3)
-            if _live_group_members(child_pgid) or _live_snapshot_pids(snapshot):
-                self._preserve_failed(candidate)
-                raise RunnerExit(
-                    5,
-                    "blocked",
-                    "descendants of the monitor child (same-group or"
-                    " re-sessioned) survived SIGKILL — a possibly-live"
-                    " writer needs a human",
-                )
-            # R7 (opus L5), widened to every outcome: the survivor may have
-            # written canonical in the window between the post-drain extract
-            # and the kill. Re-extract and re-prove against the launch
-            # snapshot before ANY charge or clear, so no later step trusts a
-            # mutated base — drift stops as suspect state (discarding the
-            # candidate per the suspect-stop semantics), same as every other
-            # path.
             fresh = self.schema.extract(self.state_path)
             self._require_unmutated_canonical(fresh, candidate)
-            if drained["outcome"] == "clean" and drained["exit_code"] == 0:
+            if drained["outcome"] == "unreaped":
                 self._preserve_failed(candidate)
-                self.charge_failure(fresh, "monitor-child:group_survivors")
-                return "retry"
-        if drained["outcome"] != "clean" or drained["exit_code"] != 0:
-            self._preserve_failed(candidate)
-            # R6-F9: classify the trusted diagnostic stderr BEFORE charging
-            # a non-clean outcome — an auth failure followed by a hang must
-            # take the deterministic block on the first attempt, not be
-            # buried as generic timeout noise (or, with mixed signatures,
-            # never reach the block at all). Model stdout is never scanned
-            # as free text; only the buffered stderr tail is classified.
-            action, detail = classify_child_failure(
-                drained["exit_code"] if isinstance(drained["exit_code"], int) else -1,
-                drained["stderr_tail"],
-                resumed,
-            )
-            if action == "block":
-                self._clear_in_flight(fresh)
-                raise RunnerExit(5, "blocked", detail)
-            if drained["outcome"] != "clean":
-                self.charge_failure(fresh, f"monitor-child:{drained['outcome']}")
-                return "retry"
-            if action == "fresh_session":
-                _heartbeat("resume target gone — clearing session for a fresh owner child")
-                self.child_session_id = None
-                self._clear_in_flight(fresh)
-                return "retry_now"
-            if action == "ladder":
-                self._clear_in_flight(fresh)
-                return "retry"
-            self.charge_failure(fresh, detail)
-            return "retry"
-        protocol = drained["protocol"]
-        verdict = parse_verdict(protocol.get("result_text"))
-        served = protocol.get("served_model")
-        session_id = protocol.get("session_id")
-        # F3: identity and session continuity fail CLOSED.
-        if not isinstance(served, str) or not served:
-            self._preserve_failed(candidate)
-            self.charge_failure(fresh, "monitor-child:identity_unreported")
-            return "retry"
-        if served != self.owner_model:
-            self._preserve_failed(candidate)
-            self._clear_in_flight(fresh)
-            raise RunnerExit(
-                5,
-                "blocked",
-                f"served model {served!r} is not the bound owner"
-                f" {self.owner_model!r} — identity is the contract",
-            )
-        if resumed:
-            if not isinstance(session_id, str) or session_id != self.child_session_id:
-                self._preserve_failed(candidate)
-                self.charge_failure(
-                    fresh,
-                    "monitor-child:session_mismatch"
-                    if session_id
-                    else "monitor-child:session_unreported",
+                raise RunnerExit(
+                    5,
+                    "blocked",
+                    "killed monitor child could not be reaped within the bounded"
+                    " window — a possibly-live writer needs a human",
                 )
+            # R6-F6, generalized by R2 #1495 findings 3776596760 + 3777668741:
+            # supervision proves only that the LEADER exited — clean OR failed —
+            # and the failure path clears the only survivor record (in_flight)
+            # when it commits. A same-group descendant is a live writer that can
+            # mutate the candidate after validation, so prove the whole process
+            # group extinct for EVERY drained outcome before any state is
+            # cleared or committed. Survivors are killed (this group was spawned
+            # by this runner this tick) and boundedly rechecked; a group that
+            # cannot be proven extinct needs a human, and a clean tick that
+            # needed the kill is charged and retried.
+            # #3551 finding 3808151914: the group gate cannot see a descendant
+            # that re-sessioned away from the recorded pgid, so the drain's
+            # ancestry snapshot extends the extinction proof to every pid that
+            # was ever observed as a descendant while the leader lived.
+            # r13 F8: when the attempt ran inside a cgroup boundary, the
+            # containment membership IS the extinction proof and the kill
+            # authority — pid identity never enters into it, and a setsid or
+            # double-fork descendant orphaned between snapshots cannot leave
+            # the boundary. The legacy snapshot+group proof still runs as
+            # defense in depth (it is cheap and covers the degraded mode).
+            containment = self.attempt_containment
+            if containment is not None and containment.live_pids():
+                containment.kill()
+                containment_deadline = time.monotonic() + 15
+                while (
+                    time.monotonic() < containment_deadline
+                    and containment.live_pids()
+                ):
+                    time.sleep(0.3)
+                if containment.live_pids():
+                    self._preserve_failed(candidate)
+                    raise RunnerExit(
+                        5,
+                        "blocked",
+                        "attempt-containment members survived cgroup kill — a"
+                        " possibly-live writer needs a human",
+                    )
+            # r14 F6: the per-attempt cgroup is removed on EVERY exit path
+            # once (and only once) extinction is proven — an unreadable or
+            # still-populated boundary is preserved for the human instead.
+            if containment is not None:
+                try:
+                    if not containment.live_pids():
+                        containment.remove()
+                        self.attempt_containment = None
+                except RunnerExit:
+                    pass
+            escaped = _live_snapshot_pids(drained.get("descendant_snapshot") or {})
+            if _live_group_members(child_pgid) or escaped:
+                # r14 F21 (correcting r21's comment here): after _drain_child
+                # has reaped the leader, the group id is pinned only while
+                # SOME member still holds it — if every member exited, the id
+                # is reusable and ps -g can be showing an UNRELATED new group.
+                # So the raw group signal is gone: killpg fires only when the
+                # CURRENT leader (pid == pgid) still matches the fingerprint
+                # recorded at launch; everything else goes through the
+                # per-pid fingerprint-validated kills below, the containment
+                # boundary, and the fail-closed recheck.
+                leader_now = _snapshot_identities([child_pgid]).get(child_pgid)
+                if (
+                    leader_now is not None
+                    and not leader_now[0].startswith("Z")
+                    and fingerprint is not None
+                    and leader_now[1] == fingerprint
+                ):
+                    try:
+                        os.killpg(child_pgid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                snapshot = drained.get("descendant_snapshot") or {}
+                # algo#1216 finding 3816160128: identity is re-validated
+                # IMMEDIATELY before signaling — a recycled pid/pgid whose
+                # current lstart no longer matches the snapshot gets no
+                # signal (an unrelated same-UID process must never be
+                # SIGKILLed on a stale number), and killpg fires only after
+                # the current group LEADER matches its recorded fingerprint.
+                # Anything left unvalidated falls to the fail-closed recheck
+                # below, which blocks for a human instead of guessing.
+                kill_pgids, kill_pids = _validated_kill_targets(
+                    snapshot, escaped, _snapshot_identities(
+                        sorted(
+                            set(escaped)
+                            | {
+                                _snapshot_entry(snapshot.get(pid))[0]
+                                for pid in escaped
+                                if _snapshot_entry(snapshot.get(pid))[0] is not None
+                            }
+                        )
+                    )
+                )
+                for target in kill_pgids:
+                    try:
+                        os.killpg(target, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                for pid in kill_pids:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                recheck_deadline = time.monotonic() + 15
+                while time.monotonic() < recheck_deadline and (
+                    _live_group_members(child_pgid)
+                    or _live_snapshot_pids(snapshot)
+                ):
+                    time.sleep(0.3)
+                if _live_group_members(child_pgid) or _live_snapshot_pids(snapshot):
+                    self._preserve_failed(candidate)
+                    raise RunnerExit(
+                        5,
+                        "blocked",
+                        "descendants of the monitor child (same-group or"
+                        " re-sessioned) survived SIGKILL — a possibly-live"
+                        " writer needs a human",
+                    )
+                # R7 (opus L5), widened to every outcome: the survivor may have
+                # written canonical in the window between the post-drain extract
+                # and the kill. Re-extract and re-prove against the launch
+                # snapshot before ANY charge or clear, so no later step trusts a
+                # mutated base — drift stops as suspect state (discarding the
+                # candidate per the suspect-stop semantics), same as every other
+                # path.
+                fresh = self.schema.extract(self.state_path)
+                self._require_unmutated_canonical(fresh, candidate)
+                if drained["outcome"] == "clean" and drained["exit_code"] == 0:
+                    self._preserve_failed(candidate)
+                    self.charge_failure(fresh, "monitor-child:group_survivors")
+                    return "retry"
+            if drained["outcome"] != "clean" or drained["exit_code"] != 0:
+                self._preserve_failed(candidate)
+                # R6-F9: classify the trusted diagnostic stderr BEFORE charging
+                # a non-clean outcome — an auth failure followed by a hang must
+                # take the deterministic block on the first attempt, not be
+                # buried as generic timeout noise (or, with mixed signatures,
+                # never reach the block at all). Model stdout is never scanned
+                # as free text; only the buffered stderr tail is classified.
+                action, detail = classify_child_failure(
+                    drained["exit_code"] if isinstance(drained["exit_code"], int) else -1,
+                    drained["stderr_tail"],
+                    resumed,
+                    result_text=drained.get("protocol", {}).get("result_text"),
+                    result_is_error=drained.get("protocol", {}).get(
+                        "result_is_error"
+                    ),
+                )
+                if action == "block":
+                    self._clear_in_flight(fresh)
+                    raise RunnerExit(5, "blocked", detail)
+                if drained["outcome"] != "clean":
+                    self.charge_failure(fresh, f"monitor-child:{drained['outcome']}")
+                    return "retry"
+                if action == "fresh_session":
+                    _heartbeat("resume target gone — clearing session for a fresh owner child")
+                    self.child_session_id = None
+                    self._clear_in_flight(fresh)
+                    return "retry_now"
+                if action == "ladder":
+                    self._clear_in_flight(fresh)
+                    return "retry"
+                self.charge_failure(fresh, detail)
                 return "retry"
-        elif not isinstance(session_id, str) or not session_id:
-            self._preserve_failed(candidate)
-            self.charge_failure(fresh, "monitor-child:no_session_id")
-            return "retry"
-        if verdict is None:
-            self._preserve_failed(candidate)
-            self.charge_failure(fresh, "monitor-child:no_verdict")
-            return "retry"
-        return self._verify_and_commit(
-            fresh, candidate, attempt_id, tick_ordinal, verdict, protocol
-        )
+            protocol = drained["protocol"]
+            verdict = parse_verdict(protocol.get("result_text"))
+            served = protocol.get("served_model")
+            session_id = protocol.get("session_id")
+            # F3: identity and session continuity fail CLOSED.
+            if not isinstance(served, str) or not served:
+                self._preserve_failed(candidate)
+                self.charge_failure(fresh, "monitor-child:identity_unreported")
+                return "retry"
+            if served != self.owner_model:
+                self._preserve_failed(candidate)
+                self._clear_in_flight(fresh)
+                raise RunnerExit(
+                    5,
+                    "blocked",
+                    f"served model {served!r} is not the bound owner"
+                    f" {self.owner_model!r} — identity is the contract",
+                )
+            if resumed:
+                if not isinstance(session_id, str) or session_id != self.child_session_id:
+                    self._preserve_failed(candidate)
+                    self.charge_failure(
+                        fresh,
+                        "monitor-child:session_mismatch"
+                        if session_id
+                        else "monitor-child:session_unreported",
+                    )
+                    return "retry"
+            elif not isinstance(session_id, str) or not session_id:
+                self._preserve_failed(candidate)
+                self.charge_failure(fresh, "monitor-child:no_session_id")
+                return "retry"
+            if verdict is None:
+                self._preserve_failed(candidate)
+                self.charge_failure(fresh, "monitor-child:no_verdict")
+                return "retry"
+            return self._verify_and_commit(
+                fresh, candidate, attempt_id, tick_ordinal, verdict, protocol
+            )
+
+        except RunnerExit:
+            raise
+        except BaseException as error:
+            self._post_go_backstop(proc, child_pgid, fingerprint, candidate, error)
+            raise  # unreachable: the backstop always raises
+
 
     def _gate_taint(self, extract: dict[str, Any]) -> None:
         """R6-F5 + admin-portal#1495 R2 finding 3776596739: fail closed on
@@ -2502,6 +2697,28 @@ class Runner:
             )
         sidecars = sorted(found)
         for sidecar in sidecars:
+            # r14 F17: QUARANTINE before stat/parse. The old flow parsed
+            # via a no-follow descriptor but later unlinked the original
+            # PATHNAME — a child replacing the file between parse and
+            # unlink got its substituted evidence deleted on the strength
+            # of the benign content that was parsed. The atomic rename
+            # binds every later decision to the inode that was actually
+            # read; the quarantine name keeps the sidecar prefix, so the
+            # retention scan, resume's pattern discovery, and a
+            # crash-mid-compaction recovery all still see it. A kept
+            # sidecar simply stays under its quarantine name — renaming
+            # back could clobber a newer file at the original name.
+            quarantined = sidecar.with_name(
+                sidecar.name + f".q{os.getpid()}"
+            )
+            try:
+                os.rename(sidecar, quarantined)
+            except OSError:
+                # Vanished or raced: nothing bound to an inode, nothing
+                # deleted — record and move on, fail-closed.
+                unreadable_sidecars.append(sidecar.name)
+                continue
+            sidecar = quarantined
             try:
                 sidecar_bytes = sidecar.stat().st_size
             except OSError:

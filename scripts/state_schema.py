@@ -1652,7 +1652,8 @@ class _Validator:
         # (v) a complete merge-readiness phase cannot coexist with a blocked
         # check outcome or an unmet acceptance criterion — the workflow blocks
         # the phase in exactly those cases.  (The "unavailable"-with-waiver
-        # nuance stays prose-enforced: the waiver lives in the audit trail.)
+        # nuance is CODE-enforced below (r13 F11 bound the typed waiver
+        # to unavailable conformance; r14 F22 corrected this comment).)
         phases_for_gate = state.get("phases")
         if (
             isinstance(phases_for_gate, dict)

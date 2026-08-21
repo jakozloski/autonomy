@@ -146,7 +146,7 @@ handoffs:
     operations: []
     operation_results: {}
     # Entries are keyed by operation ID; fields are exactly a subset of
-    # { status, attempts, started_at, response_id, verified_at, error, evidence }.
+    # { status, attempts, started_at, response_id, verified_at, error, evidence, precondition? } — precondition (optional mapping) is REQUIRED write-ahead for assignee-replacement mutations only (r13 F4); a pre-upgrade record without it fails closed at resume with the manual recovery named.
     # Canonical contract (state_schema.validate_operation_result_record / _collection):
     # started_at at EVERY status; supplied timestamps parse, verified_at >= started_at;
     # retryable/failed need string error (retryable below the cap); complete needs mapping
@@ -324,11 +324,11 @@ if [ -n "${STASH_REF:-}" ] \
    && [ -z "$(git status --porcelain)" ] \
    && git rev-parse --verify --quiet "refs/heads/$PRE_TAKEOVER_BRANCH" >/dev/null; then
 
-  git checkout "$PRE_TAKEOVER_BRANCH"
-
-  # Use the exact SHA from state, NOT git stash pop (which pops top-of-stack
-  # and would lose the wrong stash if other stashes exist).
-  if git stash apply "$STASH_REF"; then
+  # r14 F15: checkout is GATED — unchecked, apply landed on the current
+  # branch. Any failure RETAINS the stash + persists blocked recovery.
+  if ! git checkout "$PRE_TAKEOVER_BRANCH" || [ "$(git branch --show-current)" != "$PRE_TAKEOVER_BRANCH" ]; then
+    echo "restore blocked: checkout failed — stash $STASH_REF retained" >&2
+  elif git stash apply "$STASH_REF"; then
     # Apply succeeded — safe to drop our stash entry.
     # git stash drop requires stash@{N} format, not raw SHA. Look up the index
     # by exact SHA match via awk — more portable than `grep -F -w`, whose
@@ -359,7 +359,7 @@ Update the state file after each phase transition. This allows resuming if the s
 
 > The prior workflow was blocked on `<reason from attempt_log>`. Reset attempt counters and retry, or continue from current state? **(reset / continue)**
 
-- **`reset`** — set `monitor_iterations` and `monitor_poll_ticks` to 0; clear `attempt_log`, `clean_poll_timestamps`, `next_retry_at`, and phase-specific blocked status fields. Re-fetch each exhausted/unknown/protection source; clear only after deletion, verified resolution/fix, a new edit version, or an explicit user-selected retry. Do not clear durable reply/ack maps merely because of reset.
+- **`reset`** — set `monitor_iterations` and `monitor_poll_ticks` to 0; clear ONLY the retry-scoped `attempt_log` keys (`ci:*`, `monitor-child:*`, `ready:*`, `prompt-trail:stale`), `clean_poll_timestamps`, `next_retry_at`, and phase-specific blocked status fields — unresolved `human:*` entries are verifier-bound blockers and survive reset until their postconditions pass (r14 F16: a blanket clear contradicted the same bullet's re-fetch rule). Re-fetch each exhausted/unknown/protection source; clear only after deletion, verified resolution/fix, a new edit version, or an explicit user-selected retry. Do not clear durable reply/ack maps merely because of reset.
 - **`continue`** — proceed without clearing. The agent will likely BLOCK again immediately if the underlying cause hasn't changed; this option is for cases where the user has fixed the cause externally and just wants the agent to re-verify.
 
 If the agent can't ask interactively (autonomous re-invocation), default to `continue` and log the choice in `attempt_log` as `resume:auto_continue`.

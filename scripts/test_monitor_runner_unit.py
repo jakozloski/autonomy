@@ -238,6 +238,14 @@ class SidecarGateTests(unittest.TestCase):
         _HELPER_RUNNERS.append(runner)
         return runner
 
+    @staticmethod
+    def _survives(sidecar: Path) -> bool:
+        """r14 F17: kept sidecars live on under their quarantine name
+        (original + .q<pid>) — evidence survival is checked across both."""
+        if sidecar.exists():
+            return True
+        return any(sidecar.parent.glob(sidecar.name + ".q*"))
+
     def _sidecar(self, runner: Runner, marker: str) -> Path:
         sidecar = runner.state_path.with_suffix(
             f".failed-candidate-{marker}.md"
@@ -265,7 +273,7 @@ class SidecarGateTests(unittest.TestCase):
         }
         runner._gate_sidecars(canonical)  # no raise
         self.assertFalse(
-            sidecar.exists(), "redundant terminal evidence must compact"
+            self._survives(sidecar), "redundant terminal evidence must compact"
         )
 
     def test_same_status_differing_record_blocks_as_conflict(self) -> None:
@@ -291,7 +299,7 @@ class SidecarGateTests(unittest.TestCase):
             runner._gate_sidecars(canonical)
         self.assertEqual(caught.exception.code, 5)
         self.assertIn("CONFLICTS", caught.exception.reason)
-        self.assertTrue(sidecar.exists())
+        self.assertTrue(self._survives(sidecar))
 
     def test_unmerged_terminal_sidecar_blocks(self) -> None:
         runner = self._runner_with_state()
@@ -309,7 +317,7 @@ class SidecarGateTests(unittest.TestCase):
             runner._gate_sidecars(canonical)
         self.assertEqual(caught.exception.code, 5)
         self.assertIn("TERMINAL operation evidence", caught.exception.reason)
-        self.assertTrue(sidecar.exists(), "never delete unmerged evidence")
+        self.assertTrue(self._survives(sidecar), "never delete unmerged evidence")
 
     def test_no_status_valid_sidecar_is_compacted(self) -> None:
         # admin#1495 finding 3793025403: a valid sidecar with zero operation
@@ -328,13 +336,13 @@ class SidecarGateTests(unittest.TestCase):
         runner._gate_sidecars(
             {"handoff_results": {}}, compact_no_status=True
         )  # no raise
-        self.assertFalse(sidecar.exists())
+        self.assertFalse(self._survives(sidecar))
         stub.queued.append(
             {"state": "valid", "handoff_results": {"qa": {}}}
         )
         survivor = self._sidecar(runner, "gg")
         runner._gate_sidecars({"handoff_results": {}})  # mid-slice default
-        self.assertTrue(survivor.exists())
+        self.assertTrue(self._survives(survivor))
 
     def test_attempt_stray_is_gated_like_a_sidecar(self) -> None:
         # algo#1216 finding 3792942215 (residue): a failed _preserve_failed
@@ -358,7 +366,42 @@ class SidecarGateTests(unittest.TestCase):
             runner._gate_sidecars({"handoff_results": {}})
         self.assertEqual(caught.exception.code, 5)
         self.assertIn("pending external intents", caught.exception.reason)
-        self.assertTrue(stray.exists())
+        self.assertTrue(self._survives(stray))
+
+    def test_replacement_during_parse_survives_compaction(self) -> None:
+        # r14 F17's exact race: a file substituted at the ORIGINAL name
+        # while the gate parses must never be deleted on the strength of
+        # the benign content that was parsed. The quarantine rename binds
+        # the compaction unlink to the parsed inode, so the substitute
+        # survives.
+        runner = self._runner_with_state()
+        stub = self._StubSchema()
+        runner.schema = stub
+        sidecar = self._sidecar(runner, "race")
+        substitute_holder: dict[str, Path] = {}
+
+        original_extract = stub.extract
+
+        def racing_extract(path):
+            # the child strikes between parse and compaction: a NEW file
+            # appears at the original name
+            substitute = sidecar
+            substitute.write_text("substituted evidence", encoding="utf-8")
+            substitute_holder["path"] = substitute
+            return original_extract(path)
+
+        stub.extract = racing_extract
+        stub.queued.append({"state": "valid", "handoff_results": {}})
+        runner._gate_sidecars({"handoff_results": {}}, compact_no_status=True)
+        self.assertTrue(
+            substitute_holder["path"].exists(),
+            "the substituted file at the original name must survive"
+            " compaction of the parsed inode",
+        )
+        self.assertEqual(
+            substitute_holder["path"].read_text(encoding="utf-8"),
+            "substituted evidence",
+        )
 
     def test_retention_limit_blocks_before_any_parse(self) -> None:
         # R2 re-reply 3792845972: the count ceiling is enforced BEFORE any
@@ -451,7 +494,7 @@ class SidecarGateTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 5)
         self.assertIn("CONFLICTS", caught.exception.reason)
         self.assertTrue(
-            sidecar.exists(), "conflicting evidence must never be deleted"
+            self._survives(sidecar), "conflicting evidence must never be deleted"
         )
 
     def test_oversized_sidecar_blocks_without_parsing(self) -> None:
@@ -467,7 +510,7 @@ class SidecarGateTests(unittest.TestCase):
             runner._gate_sidecars({"handoff_results": {}})
         self.assertEqual(caught.exception.code, 5)
         self.assertIn("failed validation", caught.exception.reason)
-        self.assertTrue(sidecar.exists())
+        self.assertTrue(self._survives(sidecar))
 
 
 class ChildSkillSnapshotTests(unittest.TestCase):
@@ -1386,6 +1429,119 @@ class AttemptContainmentTests(unittest.TestCase):
         while _time.monotonic() < deadline and containment.live_pids():
             _time.sleep(0.2)
         self.assertEqual(containment.live_pids(), [])
+
+
+class OriginTrustTests(unittest.TestCase):
+    """r14 F5: only GitHub's own URL shapes bind a repository, and a
+    resolvable live origin disagreeing with the persisted binding fails
+    closed instead of being papered over."""
+
+    def test_parser_is_a_github_allowlist(self) -> None:
+        cases = (
+            ("git@github.com:Keeper-Dating/matchmaking.git", "Keeper-Dating/matchmaking"),
+            ("https://github.com/Keeper-Dating/algo", "Keeper-Dating/algo"),
+            ("ssh://git@github.com/Keeper-Dating/admin-portal.git", "Keeper-Dating/admin-portal"),
+            ("https://github.com/Keeper-Dating/matchmaking.git/", "Keeper-Dating/matchmaking"),
+            ("https://user@github.com/Keeper-Dating/algo", "Keeper-Dating/algo"),
+            ("https://evil.example/Keeper-Dating/matchmaking.git", None),
+            ("git@gitlab.com:Keeper-Dating/matchmaking.git", None),
+            ("https://github.com.evil.example/Keeper-Dating/matchmaking", None),
+            ("not a url", None),
+        )
+        for url, want in cases:
+            with self.subTest(url=url):
+                self.assertEqual(
+                    monitor_runner._repo_name_with_owner(url), want
+                )
+
+    def test_persisted_vs_live_mismatch_fails_closed(self) -> None:
+        class FakeRunner:
+            repository_hint = "keeper-dating/other"
+            owner_model = "claude-opus-5"
+            failures: list = []
+
+        block = {
+            "schema_version": 1,
+            "repository": "Keeper-Dating/matchmaking",
+            "child_session_id": None,
+            "owner_model": "x",
+            "last_completed_attempt_id": None,
+            "in_flight": None,
+            "liveness": None,
+        }
+        with self.assertRaises(RunnerExit) as caught:
+            monitor_runner.Runner.current_block(
+                FakeRunner(), {"monitor_cli": block}
+            )
+        self.assertIn("disagrees with the live origin", caught.exception.reason)
+        # same-repo (case-insensitive) and probe-unavailable stay sticky
+        FakeRunner.repository_hint = "keeper-dating/MATCHMAKING"
+        out = monitor_runner.Runner.current_block(
+            FakeRunner(), {"monitor_cli": dict(block)}
+        )
+        self.assertEqual(out["repository"], "Keeper-Dating/matchmaking")
+        FakeRunner.repository_hint = None
+        out = monitor_runner.Runner.current_block(
+            FakeRunner(), {"monitor_cli": dict(block)}
+        )
+        self.assertEqual(out["repository"], "Keeper-Dating/matchmaking")
+
+
+class RateLimitMatcherTests(unittest.TestCase):
+    """r14 F7: one contextual matcher — incidental numbers never enter
+    the no-charge ladder; real HTTP/status/provider forms do."""
+
+    def test_contextual_forms(self) -> None:
+        for text, hit in (
+            ("elapsed 429ms in setup", False),
+            ("request id 4290 done", False),
+            ("HTTP/1.1 429 Too Many Requests", True),
+            ("status=429", True),
+            ("status code: 429", True),
+            ("error 429 from provider", True),
+            ("You are being rate limited", True),
+            ("rate-limit exceeded", True),
+            ("server overloaded, retry later", True),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    monitor_runner.rate_limit_offset(text) is not None, hit
+                )
+        # the offset anchors excerpts on the marker, not the line head
+        self.assertEqual(
+            monitor_runner.rate_limit_offset("x" * 3000 + " http 429"), 3001
+        )
+
+    def test_classifier_uses_the_contextual_matcher(self) -> None:
+        action, _ = monitor_runner.classify_child_failure(
+            1, ["step took 429ms overall"], False
+        )
+        self.assertEqual(action, "charge")
+        action, _ = monitor_runner.classify_child_failure(
+            1, ["HTTP/2 429 too many requests"], False
+        )
+        self.assertEqual(action, "ladder")
+
+    def test_structured_result_error_joins_classification(self) -> None:
+        # r14 F12: an in-band error verdict with EMPTY stderr classifies
+        # from the result text instead of decaying to a generic charge.
+        action, _ = monitor_runner.classify_child_failure(
+            1,
+            [],
+            False,
+            result_text="Request failed: rate limit reached, retry later",
+            result_is_error=True,
+        )
+        self.assertEqual(action, "ladder")
+        # is_error=false result text is NOT classification input
+        action, _ = monitor_runner.classify_child_failure(
+            1,
+            [],
+            False,
+            result_text="analysis mentions rate limit history",
+            result_is_error=False,
+        )
+        self.assertEqual(action, "charge")
 
 
 class WorkCapDocParityTests(unittest.TestCase):

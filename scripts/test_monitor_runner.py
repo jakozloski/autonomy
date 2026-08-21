@@ -1138,7 +1138,10 @@ class MonitorRunnerE2ETests(unittest.TestCase):
                         self.argv_log.exists(), "child must never launch"
                     )
                 finally:
-                    sidecar.unlink()
+                    # r14 F17: the gate quarantines sidecars to
+                    # <name>.q<pid> — clean whichever name survived.
+                    for leftover in sidecar.parent.glob(sidecar.name + "*"):
+                        leftover.unlink()
 
     def test_extraction_failure_sidecar_fails_closed_before_launch(self) -> None:
         # Same finding, extraction-failure leg: a sidecar path the schema CLI
@@ -1156,7 +1159,9 @@ class MonitorRunnerE2ETests(unittest.TestCase):
                 self.argv_log.exists(), "child must never launch"
             )
         finally:
-            sidecar.rmdir()
+            # r14 F17: the gate may have quarantine-renamed the directory.
+            for leftover in sidecar.parent.glob(sidecar.name + "*"):
+                leftover.rmdir()
 
     def test_valid_idle_sidecar_compacts_at_entry_and_launch_proceeds(
         self,

@@ -1874,6 +1874,26 @@ class MergeReadinessTests(unittest.TestCase):
         )
         self.assertTrue(monitor_extract(text)["merge_readiness_hold"])
 
+    def test_documented_record_field_set_matches_the_schema(self) -> None:
+        # r14 F11: the state-and-safety record-contract line must name
+        # every schema-allowed field — the doc omitted precondition while
+        # the runtime required it for assignee mutations, and an agent
+        # following the doc stranded resumes.
+        import pathlib
+
+        doc = (
+            pathlib.Path(__file__).resolve().parent.parent
+            / "references"
+            / "state-and-safety.md"
+        ).read_text(encoding="utf-8")
+        from state_schema import OPERATION_RESULT_ALLOWED_KEYS
+
+        line = next(
+            l for l in doc.splitlines() if "{ status, attempts," in l
+        )
+        for key in OPERATION_RESULT_ALLOWED_KEYS:
+            self.assertIn(key, line, f"documented field set omits {key}")
+
     def test_stash_intent_contract(self) -> None:
         # admin#1495 finding 3813789199: the write-ahead stash record is a
         # nullable optional key; while present it must pin a non-empty

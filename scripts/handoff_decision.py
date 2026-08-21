@@ -1740,8 +1740,14 @@ def plan_handoff(request: Any) -> dict[str, Any]:
     name_with_owner, pull_request_number, errors = _repository_and_pr(request, scenario)
     if errors:
         return _blocked(scenario, *errors)
-    assert name_with_owner is not None
-    assert pull_request_number is not None
+    # r14 F10: never `assert` in production paths — it vanishes under
+    # optimized Python and the impossible state would sail through.
+    if name_with_owner is None or pull_request_number is None:
+        return _blocked(
+            scenario,
+            "repository/PR resolution returned no errors but also no"
+            " identifiers — planner defect; report it",
+        )
 
     extra_warnings: list[str] = []
     # QA handoff fires at the FIRST clean exit: approved (monitor -> complete)

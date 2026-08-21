@@ -1881,6 +1881,47 @@ class BlockingBranchCoverageTests(unittest.TestCase):
         self.assertEqual(result["state"], "blocked")
         self.assertEqual(result["reason_code"], "unknown_invocation_status")
 
+    def test_401_context_requires_a_token_boundary(self) -> None:
+        # r14 F13: (?!\d) admitted "status=401ms" and "error: 401_foo" as
+        # auth failures — the status token must end at a delimiter or
+        # end-of-string.
+        from model_policy import _HTTP_401_CONTEXT as r
+
+        for text, hit in (
+            ("status=401ms", False),
+            ("error: 401_foo", False),
+            ("took 401ms total", False),
+            ("HTTP/1.1 401", True),
+            ("http 401.", True),
+            ("status: 401", True),
+            ("error=401,retrying", True),
+            ("401 Unauthorized", True),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(r.search(text) is not None, hit)
+
+    def test_internal_failure_requires_history_beyond_first_attempt(
+        self,
+    ) -> None:
+        # r14 F8: a missing/malformed history restarted identical failures
+        # at strike one forever — beyond the first attempt the explicit
+        # list is required, mirroring the quota-streak contract.
+        config = valid_codex(status="internal_failure", attempts=2)
+        config["first_real_invocation"]["failure_signature"] = "boom"
+        missing = evaluate_model_policy(request(codex=config))["codex"]
+        self.assertEqual(missing["state"], "blocked")
+        self.assertEqual(
+            missing["reason_code"], "invalid_internal_failure_observation"
+        )
+        config2 = valid_codex(status="internal_failure", attempts=2)
+        config2["first_real_invocation"]["failure_signature"] = "boom"
+        config2["post_invocation"] = ["not a mapping"]
+        malformed = evaluate_model_policy(request(codex=config2))["codex"]
+        self.assertEqual(malformed["state"], "blocked")
+        self.assertEqual(
+            malformed["reason_code"], "invalid_internal_failure_observation"
+        )
+
     def test_internal_failure_signature_bound_finite_retry(self) -> None:
         # r13 F10: internal_failure now takes the finite signature-bound
         # branch the prose promised — strikes 1-2 retry the exact same

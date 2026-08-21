@@ -325,12 +325,17 @@ _AUTH_SIGNATURE_RE = re.compile(
 # is already caught by the "unauthorized" signature above; these cover bare
 # status renderings ("HTTP/1.1 401", "http 401", "status=401", "status code:
 # 401", "error 401") without matching incidental numbers like "401ms".
+# r14 F13: (?!\d) alone is not a token boundary — "status=401ms" and
+# "error: 401_foo" both classified as auth failures. The status token
+# must END at a delimiter or end-of-string: whitespace, common
+# punctuation, or nothing.
+_401_END = r"(?=$|[\s.,;:!?)\]}\"'/\\-])"
 _HTTP_401_CONTEXT = re.compile(
-    r"\bhttps?/[0-9.]+\s+401(?!\d)"
-    r"|\bhttp\s+401(?!\d)"
-    r"|\bstatus(?:[ _]code)?\s*[=:]?\s*401(?!\d)"
-    r"|\berror\s*[=:]?\s*401(?!\d)"
-    r"|\b401\s+unauthorized\b",
+    r"\bhttps?/[0-9.]+\s+401" + _401_END
+    + r"|\bhttp\s+401" + _401_END
+    + r"|\bstatus(?:[ _]code)?\s*[=:]?\s*401" + _401_END
+    + r"|\berror\s*[=:]?\s*401" + _401_END
+    + r"|\b401\s+unauthorized\b",
     re.IGNORECASE,
 )
 
@@ -1776,22 +1781,46 @@ def evaluate_codex(raw: Any) -> dict[str, Any]:
 
         normalized = _normalized_signature(invocation.get("failure_signature"))
         history = config.get("post_invocation")
+        # r14 F8: the history list is REQUIRED beyond the first
+        # observation, mirroring the quota-streak contract above —
+        # defaulting a missing/malformed history to "streak 1" restarted
+        # identical failures at strike one forever and the terminal block
+        # never fired. Empty is legal only for the first observation.
+        if not isinstance(history, list):
+            if attempts > 1:
+                return _block_codex(
+                    decision,
+                    "invalid_internal_failure_observation",
+                    "internal_failure beyond the first attempt requires the"
+                    " post_invocation history list (empty only on the first"
+                    " observation) so the signature streak is decided here,"
+                    " not in prose",
+                    "correct_observation_input",
+                )
+            history = []
         streak = 1
-        if isinstance(history, list):
-            for record in reversed(history):
-                if not isinstance(record, dict):
-                    break
-                record_status = record.get("status")
-                if record_status in _CODEX_RETRYABLE_FAILURES:
-                    continue
-                if record_status != "internal_failure":
-                    break
-                if (
-                    _normalized_signature(record.get("failure_signature"))
-                    != normalized
-                ):
-                    break
-                streak += 1
+        for record in reversed(history):
+            if not isinstance(record, dict) or not isinstance(
+                record.get("status"), str
+            ):
+                return _block_codex(
+                    decision,
+                    "invalid_internal_failure_observation",
+                    "post_invocation history entries must be mappings with"
+                    " a string status",
+                    "correct_observation_input",
+                )
+            record_status = record.get("status")
+            if record_status in _CODEX_RETRYABLE_FAILURES:
+                continue
+            if record_status != "internal_failure":
+                break
+            if (
+                _normalized_signature(record.get("failure_signature"))
+                != normalized
+            ):
+                break
+            streak += 1
         if streak >= 3:
             return _block_codex(
                 decision,

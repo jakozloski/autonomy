@@ -177,13 +177,12 @@ The pure scenario helper at `scripts/handoff_decision.py` plans these operations
 
 Run, in this order:
 
-1. `python3 scripts/validate_package.py` from this skill directory.
-2. `python3 -m unittest discover -s scripts -p 'test_*.py'` from this skill directory.
-3. The skill-creator `quick_validate.py` check.
-   Steps 1-3 validate the LOADED skill package, not the project. Run them fully at the FIRST Validation Before Push of a workflow, then append `package-validated:<sha256>@<ISO-8601>` to the Decision Audit Trail — the digest covers the loaded package's `SKILL.md`, `references/`, `scripts/`, and `agents/` files plus the resolved `quick_validate.py` and the `python3 --version` string. Before every later push, recompute and compare that digest (sub-second, no model tokens); on ANY mismatch — or when the push diff itself touches this skill package — re-run steps 1-3 fully and append a fresh record.
-4. Every project-resolved quality command.
-5. The mandatory diff-scoped self-review and any required convergence pass.
-6. When `defect_evidence_mode != "none"`: regression and variant evidence must be terminal and bound to the exact HEAD being pushed — `regression_evidence.evaluated_head_sha` and `variant_analysis.analyzed_head_sha` equal the push HEAD (uniform for `complete` and `exempt`), captured across a clean worktree; any later file-changing commit invalidates both until re-evaluated. Persisted evidence argv is audit-only: reruns reconstruct the command from current repository configuration plus validated `test_paths`, and BLOCK if the runner cannot be re-derived. This applies to EVERY push, including monitor-loop pushes.
+1. `python3 scripts/validate_package.py` from this skill directory (in a `uv`-only repository, `uv run --no-project --python 3.12` replaces the bare `python3` — r14 F9).
+2. `python3 -m unittest discover -s scripts -p 'test_*.py'` from this skill directory (same `uv` substitution where the repository requires it).
+   Steps 1-2 validate the LOADED skill package, not the project — `validate_package.py` IS the packaged checker (r14 F3 removed the reference to a `quick_validate.py` that shipped nowhere; a fresh clone can now complete this gate with the package alone). Run them fully at the FIRST Validation Before Push of a workflow, then append `package-validated:<sha256>@<ISO-8601>` to the Decision Audit Trail — the digest covers the loaded package's `SKILL.md`, `references/`, `scripts/`, and `agents/` files plus the `python3 --version` (or `uv run python --version`) string. Before every later push, recompute and compare that digest (sub-second, no model tokens); on ANY mismatch — or when the push diff itself touches this skill package — re-run steps 1-2 fully and append a fresh record.
+3. Every project-resolved quality command.
+4. The mandatory diff-scoped self-review and any required convergence pass.
+5. When `defect_evidence_mode != "none"`: regression and variant evidence must be terminal and bound to the exact HEAD being pushed — `regression_evidence.evaluated_head_sha` and `variant_analysis.analyzed_head_sha` equal the push HEAD (uniform for `complete` and `exempt`), captured across a clean worktree; any later file-changing commit invalidates both until re-evaluated. Persisted evidence argv is audit-only: reruns reconstruct the command from current repository configuration plus validated `test_paths`, and BLOCK if the runner cannot be re-derived. This applies to EVERY push, including monitor-loop pushes.
 
 For a skill-only change, runtime verification is waived with reason `skill_only: no runtime code changed`; forward-test model, identity, transition, state-schema, and resume scenarios instead.
 
