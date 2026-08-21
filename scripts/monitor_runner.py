@@ -2721,6 +2721,80 @@ class Runner:
             " model",
         )
 
+    def _child_capability_probe(self, extract: dict[str, Any]) -> None:
+        """admin#1495 finding 3825265272 (re-eval-named closure path): fail
+        FAST when the child's resolved user-scope capability surface cannot
+        execute the mapped handoffs, instead of stranding after PR
+        creation.
+
+        Deterministic and model-free: (1) the user settings file the
+        ``--setting-sources user`` child resolves must carry a
+        ``permissions`` policy or ``mcpServers``; failing that, (2) the
+        exact-invocation MCP discovery (``claude --setting-sources user
+        mcp list``) must report at least one server. Mapped repositories
+        only — an unmapped dev run uses the developer's own settings.
+        The package still self-provisions NOTHING: this probe only reports
+        what the host supplied.
+        """
+
+        cli = extract.get("monitor_cli")
+        persisted = cli.get("repository") if isinstance(cli, dict) else None
+        bound = (
+            persisted
+            if isinstance(persisted, str) and persisted
+            else self.repository_hint
+        )
+        if not (
+            isinstance(bound, str)
+            and bound.casefold() in MAPPED_QA_REPOSITORIES
+        ):
+            return
+        settings_override = os.environ.get("MONITOR_RUNNER_USER_SETTINGS")
+        settings_path = (
+            Path(settings_override)
+            if settings_override
+            else Path.home() / ".claude" / "settings.json"
+        )
+        try:
+            data = json.loads(
+                _read_regular_file(settings_path, 1_048_576).decode("utf-8")
+            )
+            if isinstance(data, dict) and (
+                data.get("permissions") or data.get("mcpServers")
+            ):
+                return
+        except (OSError, ValueError, RunnerExit):
+            pass
+        try:
+            completed = subprocess.run(
+                [self.claude_bin, "--setting-sources", "user", "mcp", "list"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            listing = (completed.stdout or "").strip()
+            if (
+                completed.returncode == 0
+                and listing
+                and "no mcp servers" not in listing.lower()
+            ):
+                return
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        raise RunnerExit(
+            5,
+            "blocked",
+            "child capability probe failed for a mapped repository"
+            f" ({bound}): the user-scope settings the --setting-sources"
+            " user child resolves carry no permissions policy and no MCP"
+            " configuration, so Phase 6 handoffs would strand after PR"
+            " creation (admin#1495 finding 3825265272). The HOST must"
+            " supply a trusted least-privilege user-scope policy"
+            " (permission mode / tool allowlist / MCP config for the"
+            " GitHub+Linear handoff surface) — the package deliberately"
+            " never self-provisions it",
+        )
+
     def _gate_taint(self, extract: dict[str, Any]) -> None:
         """R6-F5 + admin-portal#1495 R2 finding 3776596739: fail closed on
         taint-flagged state before ANY child launch.
@@ -3716,6 +3790,8 @@ class Runner:
         # tick may start on taint-flagged state without the explicit
         # operator acknowledgment.
         self._gate_taint(extract)
+        # finding 3825265272: capability fail-fast before any child launch.
+        self._child_capability_probe(extract)
         if isinstance(prior_in_flight, dict):
             self._reconcile_recorded_orphan(prior_in_flight)
         if isinstance(prior, dict):

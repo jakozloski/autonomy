@@ -180,6 +180,13 @@ if "--version" in sys.argv:
     print("2.1.220 (fake)")
     sys.exit(0)
 
+if "mcp" in sys.argv and "list" in sys.argv:
+    if os.environ.get("FAKE_MCP_LIST_EMPTY") == "1":
+        print("No MCP servers configured")
+    else:
+        print("some-server: connected")
+    sys.exit(0)
+
 mode = os.environ.get("FAKE_MODE", "ok")
 argv_log = os.environ.get("FAKE_ARGV_LOG")
 if argv_log:
@@ -1973,6 +1980,64 @@ class MonitorRunnerE2ETests(unittest.TestCase):
             completed.returncode, 0, completed.stdout + completed.stderr
         )
         self.assertEqual(summary["runner_outcome"], "terminal")
+
+    def test_bare_vm_capability_probe_blocks_mapped_runs(self) -> None:
+        # admin#1495 finding 3825265272 (re-eval-named closure): a mapped
+        # run whose resolved user-scope settings carry no permissions and
+        # no MCP config fails FAST at monitor entry — never strands after
+        # PR creation. The fake claude answers `mcp list` with nothing.
+        self._bind_origin("git@github.com:Keeper-Dating/matchmaking.git")
+        bare = self.dir / "bare-settings.json"
+        bare.write_text('{"forceLoginMethod": "claudeai"}', encoding="utf-8")
+        completed = self._run(
+            budget="900", timeout=60,
+            env_extra={
+                "MONITOR_RUNNER_USER_SETTINGS": str(bare),
+                "FAKE_MCP_LIST_EMPTY": "1",
+            },
+        )
+        self.assertEqual(completed.returncode, 5, completed.stdout + completed.stderr)
+        summary = self._summary(completed)
+        self.assertIn("3825265272", summary["reason"])
+        # (the probe's own `mcp list` invocation appears in the argv log;
+        # zero ticks + the entry-time block prove no WRITE-capable launch)
+        self.assertEqual(summary["ticks_completed"], 0)
+
+    def test_provisioned_settings_pass_the_capability_probe(self) -> None:
+        self._bind_origin("git@github.com:Keeper-Dating/matchmaking.git")
+        provisioned = self.dir / "provisioned-settings.json"
+        provisioned.write_text(
+            '{"permissions": {"allow": ["Bash(gh *)"]}}', encoding="utf-8"
+        )
+        self._mutate_state(self._IDLE_QA_HANDOFF, self._FAILED_QA_HANDOFF)
+        completed = self._run(
+            budget="900", timeout=90, wait_scale="0.02", max_ticks="2",
+            env_extra={
+                "MONITOR_RUNNER_USER_SETTINGS": str(provisioned),
+                "FAKE_OUTCOME": "terminal",
+            },
+        )
+        self.assertEqual(
+            self._summary(completed)["runner_outcome"],
+            "terminal",
+            completed.stdout + completed.stderr,
+        )
+
+    def test_unmapped_repo_skips_the_capability_probe(self) -> None:
+        bare = self.dir / "bare-settings.json"
+        bare.write_text("{}", encoding="utf-8")
+        completed = self._run(
+            budget="900", timeout=90, wait_scale="0.02", max_ticks="2",
+            env_extra={
+                "MONITOR_RUNNER_USER_SETTINGS": str(bare),
+                "FAKE_OUTCOME": "terminal",
+            },
+        )
+        self.assertEqual(
+            self._summary(completed)["runner_outcome"],
+            "terminal",
+            completed.stdout + completed.stderr,
+        )
 
     def test_foreign_repo_handoff_is_rejected(self) -> None:
         # admin#1495 r11 finding 3825265263 (exact repro): a runner bound
