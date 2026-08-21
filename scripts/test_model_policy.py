@@ -1881,24 +1881,28 @@ class BlockingBranchCoverageTests(unittest.TestCase):
         self.assertEqual(result["state"], "blocked")
         self.assertEqual(result["reason_code"], "unknown_invocation_status")
 
-    def test_401_context_requires_a_token_boundary(self) -> None:
-        # r14 F13: (?!\d) admitted "status=401ms" and "error: 401_foo" as
-        # auth failures — the status token must end at a delimiter or
-        # end-of-string.
-        from model_policy import _HTTP_401_CONTEXT as r
+    def test_401_boundary_through_the_stream_classifier(self) -> None:
+        # r14 F13 re-eval: the boundary cases run through the REAL policy
+        # path (classify_stream_event on diagnostic stderr), not a bare
+        # regex probe — plus Unicode-adjacent forms.
+        from model_policy import SOURCE_STDERR, classify_stream_event
 
-        for text, hit in (
-            ("status=401ms", False),
-            ("error: 401_foo", False),
-            ("took 401ms total", False),
-            ("HTTP/1.1 401", True),
-            ("http 401.", True),
-            ("status: 401", True),
-            ("error=401,retrying", True),
-            ("401 Unauthorized", True),
+        for text, expect_auth in (
+            ("HTTP/1.1 401 Unauthorized", True),
+            ("status 401", True),
+            ("error: 401 unauthorized", True),
+            # context keyword required by design — bare prose stays benign
+            ("api returned 401", False),
+            ("read timeout after 401ms", False),
+            ("error: 401_foo retry queued", False),
+            ("backoff 4011ms", False),
+            ("latency\u00a0401ms", False),
+            ("状态 401 未授权", False),
         ):
-            with self.subTest(text=text):
-                self.assertEqual(r.search(text) is not None, hit)
+            verdict = classify_stream_event(SOURCE_STDERR, text)
+            self.assertEqual(
+                verdict == "auth_error", expect_auth, text
+            )
 
     def test_internal_failure_requires_history_beyond_first_attempt(
         self,
@@ -1920,6 +1924,29 @@ class BlockingBranchCoverageTests(unittest.TestCase):
         self.assertEqual(malformed["state"], "blocked")
         self.assertEqual(
             malformed["reason_code"], "invalid_internal_failure_observation"
+        )
+        # r14 F8 re-evaluation — (the reproduced CLI-level restart): `attempts`
+        # DEFAULTS to 1 when omitted, so the attempts>1 guard alone never
+        # fired for a caller omitting both fields — a defaulted attempts
+        # with no history must block, while an EXPLICIT attempts=1 first
+        # observation stays legal.
+        config3 = valid_codex(status="internal_failure")
+        config3["first_real_invocation"]["failure_signature"] = "boom"
+        config3["first_real_invocation"].pop("attempts", None)
+        config3.pop("post_invocation", None)
+        defaulted = evaluate_model_policy(request(codex=config3))["codex"]
+        self.assertEqual(defaulted["state"], "blocked")
+        self.assertEqual(
+            defaulted["reason_code"], "invalid_internal_failure_observation"
+        )
+        config4 = valid_codex(status="internal_failure", attempts=1)
+        config4["first_real_invocation"]["failure_signature"] = "boom"
+        config4.pop("post_invocation", None)
+        explicit_first = evaluate_model_policy(request(codex=config4))["codex"]
+        self.assertNotEqual(
+            explicit_first.get("reason_code"),
+            "invalid_internal_failure_observation",
+            "an explicit attempts=1 first observation must not block",
         )
 
     def test_internal_failure_signature_bound_finite_retry(self) -> None:

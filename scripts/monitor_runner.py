@@ -1137,6 +1137,13 @@ def _signature_excerpt(line: str) -> str:
     idx = line.find(WRAPPER_EXEC_FAILED_MARKER)
     if idx < 0:
         offset = auth_signature_offset(line)
+        if offset is None:
+            # r14 F7 re-eval: a late rate-limit marker (3000 pad chars
+            # then "HTTP/2 429") was detected on the full line but the
+            # retained excerpt dropped it — anchor on it like the
+            # auth/exec markers so the downstream re-scan re-derives the
+            # same ladder verdict.
+            offset = rate_limit_offset(line)
         idx = offset if offset is not None else 0
     half = STICKY_EXCERPT_BYTES // 2
     start = max(0, idx - half)
@@ -1290,8 +1297,13 @@ def _drain_child(
                 # truncating (stderr only; bounded at cap + one read).
                 if pipe is not proc.stdout and len(stderr_sticky) < 5:
                     overflow = buffers[pipe].decode("utf-8", "replace")
-                    if WRAPPER_EXEC_FAILED_MARKER in overflow or _has_auth_signature(
-                        overflow
+                    if (
+                        WRAPPER_EXEC_FAILED_MARKER in overflow
+                        or _has_auth_signature(overflow)
+                        # r14 F7 re-eval: a newline-free overflow can bury
+                        # a genuine rate-limit marker exactly like an auth
+                        # one — capture it sticky before truncation.
+                        or rate_limit_offset(overflow) is not None
                     ):
                         stderr_sticky.append(_signature_excerpt(overflow))
                 buffers[pipe] = buffers[pipe][-PIPE_BUFFER_CAP:]
@@ -1537,6 +1549,13 @@ class Runner:
         # makes a successful resolution sticky in runner-owned state so a
         # later failed probe (or a child rewiring .git/config between
         # slices) never un-maps an already-mapped run.
+        # r14 F5 re-eval: the probe result is TRI-STATE — a SUCCESSFUL
+        # get-url whose origin is foreign (unparseable/other host) is a
+        # trusted answer that the checkout points somewhere untrusted,
+        # which must BLOCK against a persisted binding; only an actually
+        # unavailable probe (nonzero exit, timeout, exec failure) leaves
+        # the sticky binding standing.
+        self.repository_probe: str = "unavailable"
         self.repository_hint: str | None = None
         if probe_ok:
             try:
@@ -1548,7 +1567,11 @@ class Runner:
                     self.repository_hint = _repo_name_with_owner(
                         origin_probe.stdout
                     )
+                    self.repository_probe = (
+                        "resolved" if self.repository_hint else "foreign"
+                    )
             except (OSError, subprocess.TimeoutExpired):
+                self.repository_probe = "unavailable"
                 self.repository_hint = None
         self.slice_deadline = time.monotonic() + args.slice_budget
         # Testability seam (same class as --claude-bin): scales ladder and
@@ -1714,6 +1737,20 @@ class Runner:
         persisted_repo = base.get("repository")
         if not (isinstance(persisted_repo, str) and persisted_repo):
             base["repository"] = self.repository_hint
+        elif self.repository_probe == "foreign":
+            # r14 F5 re-eval: the probe SUCCEEDED and the origin is not a
+            # trusted GitHub shape — that is a rewired checkout, not an
+            # unavailable answer, and stickiness must not paper over it.
+            raise RunnerExit(
+                5,
+                "blocked",
+                "persisted repository binding"
+                f" {persisted_repo!r} but the live origin resolves to an"
+                " untrusted remote — a rewired .git/config (or re-pointed"
+                " checkout) must be reconciled by a human; verify the"
+                " origin URL and the monitor_cli.repository record, then"
+                " resume",
+            )
         elif (
             self.repository_hint is not None
             and self.repository_hint.casefold() != persisted_repo.casefold()
@@ -2262,6 +2299,7 @@ class Runner:
                     "aborted launch wrapper could not be reaped — a"
                     " possibly-live process needs a human",
                 )
+            self._containment_cleanup_if_empty()
             raise RunnerExit(
                 4,
                 "suspect_state",
@@ -2270,8 +2308,18 @@ class Runner:
             )
         self.launch_block = committed["monitor_cli"]
         self.launch_base_digest = committed["digest"]
-        # r14 F10: never `assert` in production paths (vanishes under -O).
+        # r14 F10: never `assert` in production paths (vanishes under -O),
+        # and (re-eval) this branch is cleanup-aware: the paused wrapper is
+        # killed and reaped and an empty containment removed before the
+        # structured stop — it executes nothing without GO, so the kill is
+        # safe by construction.
         if proc.stdin is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            _bounded_reap(proc)
+            self._containment_cleanup_if_empty()
             raise RunnerExit(
                 4,
                 "suspect_state",
@@ -2300,6 +2348,7 @@ class Runner:
                     "monitor child could not be reaped after a failed GO"
                     " write — a possibly-live writer needs a human",
                 )
+            self._containment_cleanup_if_empty()
             fresh = self.schema.extract(self.state_path)
             self._require_unmutated_canonical(fresh, candidate)
             self._preserve_failed(candidate)
@@ -2457,6 +2506,42 @@ class Runner:
                     self._preserve_failed(candidate)
                     self.charge_failure(fresh, "monitor-child:group_survivors")
                     return "retry"
+            # r14 F12 re-eval: a structured error can ride a CLEAN exit 0
+            # (type=result, subtype=success, is_error=true) — gating on
+            # the metadata only inside the non-clean branch let that shape
+            # fall through to verdict parsing and become a generic
+            # no_verdict charge. Classify the structured error FIRST,
+            # before the outcome/verdict split, whatever the exit code.
+            protocol_meta = drained.get("protocol") or {}
+            if (
+                protocol_meta.get("result_is_error") is True
+                and drained["outcome"] == "clean"
+                and drained["exit_code"] == 0
+            ):
+                self._preserve_failed(candidate)
+                action, detail = classify_child_failure(
+                    0,
+                    drained["stderr_tail"],
+                    resumed,
+                    result_text=protocol_meta.get("result_text"),
+                    result_is_error=True,
+                )
+                if action == "block":
+                    self._clear_in_flight(fresh)
+                    raise RunnerExit(5, "blocked", detail)
+                if action == "fresh_session":
+                    _heartbeat(
+                        "resume target gone — clearing session for a fresh"
+                        " owner child"
+                    )
+                    self.child_session_id = None
+                    self._clear_in_flight(fresh)
+                    return "retry_now"
+                if action == "ladder":
+                    self._clear_in_flight(fresh)
+                    return "retry"
+                self.charge_failure(fresh, detail)
+                return "retry"
             if drained["outcome"] != "clean" or drained["exit_code"] != 0:
                 self._preserve_failed(candidate)
                 # R6-F9: classify the trusted diagnostic stderr BEFORE charging
@@ -2531,11 +2616,110 @@ class Runner:
             )
 
         except RunnerExit:
+            # Structured exits own their child handling; the shared
+            # boundary still sweeps a provably-empty containment (F6
+            # re-eval: every exit path).
+            self._containment_cleanup_if_empty()
             raise
         except BaseException as error:
             self._post_go_backstop(proc, child_pgid, fingerprint, candidate, error)
             raise  # unreachable: the backstop always raises
 
+
+    def _containment_cleanup_if_empty(self) -> None:
+        """r14 F6 (re-eval): every exit path removes a provably-empty
+        per-attempt cgroup — structured exits included. Never kills (each
+        raise site owns its child handling); never removes an unreadable
+        or still-populated boundary."""
+
+        containment = self.attempt_containment
+        if containment is None:
+            return
+        try:
+            if not containment.live_pids():
+                containment.remove()
+                self.attempt_containment = None
+        except RunnerExit:
+            pass
+
+    def _post_go_backstop(
+        self,
+        proc: subprocess.Popen,
+        child_pgid: int | None,
+        fingerprint: str | None,
+        candidate: Path,
+        error: BaseException,
+    ) -> None:
+        """r14 F4 (re-eval restored this — the r22 head CALLED it without
+        defining it, lost reimplementing after a /tmp purge; the
+        source-shape regression now pins call-and-definition together).
+
+        Terminal cleanup for a non-RunnerExit escape after GO: terminate
+        through the containment boundary and identity-bound signals only,
+        boundedly reap the direct child, preserve the write-ahead
+        candidate, and raise a structured RunnerExit — extinction proven,
+        or blocking because it could not be. Never returns.
+        """
+
+        containment = self.attempt_containment
+        if containment is not None:
+            try:
+                containment.kill()
+            except RunnerExit:
+                pass
+        if proc.returncode is None:
+            # Our own unreaped child: pid/pgid pinned by the kernel.
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+        elif child_pgid is not None and fingerprint is not None:
+            leader_now = _snapshot_identities([child_pgid]).get(child_pgid)
+            if (
+                leader_now is not None
+                and not leader_now[0].startswith("Z")
+                and leader_now[1] == fingerprint
+            ):
+                try:
+                    os.killpg(child_pgid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        reaped = _bounded_reap(proc)
+        try:
+            self._preserve_failed(candidate)
+        except (OSError, RunnerExit):
+            pass
+        survivors = False
+        if containment is not None:
+            try:
+                if containment.live_pids():
+                    survivors = True
+            except RunnerExit:
+                survivors = True
+        if child_pgid is not None and _live_group_members(child_pgid):
+            survivors = True
+        if survivors or not reaped:
+            raise RunnerExit(
+                5,
+                "blocked",
+                "post-GO supervision failed"
+                f" ({error.__class__.__name__}: {error}) and extinction"
+                " could not be proven — a possibly-live writer needs a"
+                " human; the write-ahead candidate is preserved",
+            )
+        self._containment_cleanup_if_empty()
+        raise RunnerExit(
+            5,
+            "blocked",
+            "post-GO supervision failed"
+            f" ({error.__class__.__name__}: {error}) — the child was"
+            " terminated and proven extinct; the write-ahead candidate is"
+            " preserved for resume reconciliation per the Resume trust"
+            " model",
+        )
 
     def _gate_taint(self, extract: dict[str, Any]) -> None:
         """R6-F5 + admin-portal#1495 R2 finding 3776596739: fail closed on
@@ -2743,14 +2927,37 @@ class Runner:
             # crash-mid-compaction recovery all still see it. A kept
             # sidecar simply stays under its quarantine name — renaming
             # back could clobber a newer file at the original name.
-            quarantined = sidecar.with_name(
-                sidecar.name + f".q{os.getpid()}"
-            )
-            try:
-                os.rename(sidecar, quarantined)
-            except OSError:
-                # Vanished or raced: nothing bound to an inode, nothing
-                # deleted — record and move on, fail-closed.
+            # r14 F17 re-eval: the move must be NO-CLOBBER — a plain
+            # rename REPLACES an existing target on Linux, so a recycled
+            # pid colliding with older quarantined evidence would destroy
+            # it. os.link fails EEXIST instead; on collision the name
+            # gains a counter until it links. A crash between link and
+            # unlink leaves both names pointing at ONE inode — the
+            # retention scan counts both and the parse decisions are
+            # idempotent over identical content, so the leftover is
+            # noise, never loss.
+            quarantined = None
+            for attempt in range(20):
+                suffix = f".q{os.getpid()}" + (
+                    f"-{attempt}" if attempt else ""
+                )
+                target = sidecar.with_name(sidecar.name + suffix)
+                try:
+                    os.link(sidecar, target)
+                except FileExistsError:
+                    continue
+                except OSError:
+                    break
+                try:
+                    os.unlink(sidecar)
+                except OSError:
+                    pass
+                quarantined = target
+                break
+            if quarantined is None:
+                # Vanished, raced, or unlinkable: nothing bound to an
+                # inode, nothing deleted — record and move on,
+                # fail-closed.
                 unreadable_sidecars.append(sidecar.name)
                 continue
             sidecar = quarantined

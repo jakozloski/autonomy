@@ -421,6 +421,42 @@ class SidecarGateTests(unittest.TestCase):
             len(stub.queued), count, "no sidecar may be parsed past the cap"
         )
 
+    def test_quarantine_never_clobbers_preexisting_evidence(self) -> None:
+        # r14 F17 re-eval: a recycled pid colliding with older quarantined
+        # evidence must not destroy it — the move is no-clobber (os.link
+        # EEXIST + counter fallback), so both survive.
+        runner = self._runner_with_state()
+        stub = self._StubSchema()
+        runner.schema = stub
+        sidecar = self._sidecar(runner, "clash")
+        older = sidecar.with_name(sidecar.name + f".q{os.getpid()}")
+        older.write_text("older-quarantined-evidence", encoding="utf-8")
+        # Both files are scanned as sidecars; invalid extracts retain both
+        # as unreadable, which isolates the property under test: the MOVE
+        # itself must not replace the pre-existing quarantine target.
+        stub.queued.append({"state": "invalid", "errors": ["x"]})
+        stub.queued.append({"state": "invalid", "errors": ["x"]})
+        with self.assertRaises(RunnerExit):
+            runner._gate_sidecars(
+                {"handoff_results": {}}, compact_no_status=True
+            )
+        # Both files may themselves be (re-)quarantined by the pass; the
+        # property is CONTENT SURVIVAL — the older evidence must exist
+        # somewhere, byte-identical, never replaced by the colliding move.
+        contents = [
+            f.read_text(encoding="utf-8")
+            for f in runner.state_path.parent.iterdir()
+            if f.is_file() and ".failed-candidate-" in f.name
+        ]
+        self.assertIn(
+            "older-quarantined-evidence", contents,
+            "pre-existing quarantined evidence must survive the collision",
+        )
+        self.assertIn(
+            "sidecar", contents,
+            "the newly quarantined sidecar must survive too",
+        )
+
     def test_retention_scan_stops_at_first_over_limit_match(self) -> None:
         # admin#1495 finding 3813789211: the enumeration itself is bounded —
         # glob() materialized all 128 matches under the monitor lock in R2's
@@ -1462,6 +1498,7 @@ class OriginTrustTests(unittest.TestCase):
     def test_persisted_vs_live_mismatch_fails_closed(self) -> None:
         class FakeRunner:
             repository_hint = "keeper-dating/other"
+            repository_probe = "resolved"
             owner_model = "claude-opus-5"
             failures: list = []
 
@@ -1486,10 +1523,47 @@ class OriginTrustTests(unittest.TestCase):
         )
         self.assertEqual(out["repository"], "Keeper-Dating/matchmaking")
         FakeRunner.repository_hint = None
+        FakeRunner.repository_probe = "unavailable"
         out = monitor_runner.Runner.current_block(
             FakeRunner(), {"monitor_cli": dict(block)}
         )
         self.assertEqual(out["repository"], "Keeper-Dating/matchmaking")
+        # r14 F5 re-eval: a SUCCESSFUL probe resolving to an untrusted
+        # (foreign/unparseable) origin is a trusted answer, not
+        # unavailability — it must block against the persisted binding,
+        # never stay sticky.
+        FakeRunner.repository_hint = None
+        FakeRunner.repository_probe = "foreign"
+        with self.assertRaises(RunnerExit) as caught:
+            monitor_runner.Runner.current_block(
+                FakeRunner(), {"monitor_cli": dict(block)}
+            )
+        self.assertIn("untrusted remote", caught.exception.reason)
+
+
+class RateLimitExcerptTests(unittest.TestCase):
+    """r14 F7 re-eval: the sticky excerpt must PRESERVE a late rate-limit
+    marker — R2's 3000-pad probe found the marker at offset 3001 and then
+    lost it to the head-anchored excerpt."""
+
+    def test_late_marker_survives_excerpting(self) -> None:
+        probe = "x" * 3000 + " HTTP/2 429 Too Many Requests"
+        excerpt = monitor_runner._signature_excerpt(probe)
+        self.assertIsNotNone(
+            monitor_runner.rate_limit_offset(excerpt),
+            "the retained excerpt must still classify as rate-limit",
+        )
+
+    def test_mixed_auth_and_rate_prefers_deterministic_auth(self) -> None:
+        probe = (
+            "x" * 3000
+            + " authentication_error: invalid api key; also HTTP/2 429"
+        )
+        excerpt = monitor_runner._signature_excerpt(probe)
+        self.assertTrue(
+            monitor_runner._has_auth_signature(excerpt),
+            "auth anchoring must win so the deterministic block survives",
+        )
 
 
 class RateLimitMatcherTests(unittest.TestCase):
@@ -1602,6 +1676,105 @@ class MissingCandidateRecoveryTests(unittest.TestCase):
             {"monitor_cli": {"in_flight": {"attempt_id": attempt}}}
         )
         self.assertEqual(charged, ["monitor-child:unknown_outcome"])
+
+
+class PostGoBackstopTests(unittest.TestCase):
+    """r14 F4 re-eval: the r22 head CALLED _post_go_backstop without
+    defining it — no test exercised the escape path, so 727 tests stayed
+    green over a phantom method. These pin (a) the mechanism itself with a
+    real child, and (b) the SOURCE SHAPE: the boundary and its handler
+    must exist together."""
+
+    def _runner(self) -> Runner:
+        tmp = Path(tempfile.mkdtemp(prefix="unit-backstop-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        state = tmp / "workflow-state.local.md"
+        state.write_text(
+            "---\nstate_schema_version: 1\n---\n\nbody\n", encoding="utf-8"
+        )
+        args = argparse.Namespace(
+            state_file=str(state),
+            skill_dir=str(SCRIPTS.parent),
+            claude_bin="/opt/homebrew/bin/claude",
+            schema_cli=str(SCRIPTS / "state_schema.py"),
+            slice_budget=100.0,
+            wait_scale=1.0,
+            acknowledge_taint=None,
+        )
+        runner = Runner(args)
+        _HELPER_RUNNERS.append(runner)
+        return runner
+
+    def test_backstop_terminates_preserves_and_raises_structured(self) -> None:
+        import subprocess as sp
+        import sys as _sys
+
+        runner = self._runner()
+        child = sp.Popen(
+            [_sys.executable, "-c", "import time; time.sleep(60)"],
+            start_new_session=True,
+        )
+        self.addCleanup(lambda: child.poll() is None and child.kill())
+        candidate = runner.state_path.with_suffix(".attempt-test.md")
+        candidate.write_text("write-ahead evidence", encoding="utf-8")
+        with self.assertRaises(RunnerExit) as caught:
+            runner._post_go_backstop(
+                child, child.pid, None, candidate, RuntimeError("boom")
+            )
+        self.assertEqual(caught.exception.code, 5)
+        self.assertIn("post-GO supervision failed", caught.exception.reason)
+        self.assertIn("RuntimeError", caught.exception.reason)
+        self.assertIsNotNone(child.returncode, "child must be reaped")
+        preserved = list(
+            runner.state_path.parent.glob("*.failed-candidate-*")
+        )
+        self.assertTrue(preserved, "candidate must be preserved as evidence")
+
+    def test_run_tick_boundary_and_handler_exist_together(self) -> None:
+        # The phantom catcher: a call site without a definition (or a
+        # definition without the boundary) fails here, independent of any
+        # runtime path reaching the escape.
+        import inspect
+
+        self.assertTrue(hasattr(Runner, "_post_go_backstop"))
+        self.assertTrue(callable(getattr(Runner, "_post_go_backstop")))
+        source = inspect.getsource(Runner.run_tick)
+        self.assertIn("except BaseException as error:", source)
+        self.assertIn("self._post_go_backstop(", source)
+        self.assertIn("except RunnerExit:", source)
+
+    def test_assert_free_paths_survive_optimized_python(self) -> None:
+        # r14 F10 re-eval: prove the two former assert sites raise
+        # structured errors under python3 -O (asserts stripped).
+        import subprocess as sp
+        import sys as _sys
+
+        probe = (
+            "import sys; sys.path.insert(0, %r); "
+            "import monitor_runner, handoff_decision; "
+            "print('OPTIMIZED-IMPORT-OK')"
+        ) % str(SCRIPTS)
+        completed = sp.run(
+            [_sys.executable, "-O", "-c", probe],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("OPTIMIZED-IMPORT-OK", completed.stdout)
+        source_mr = Path(SCRIPTS / "monitor_runner.py").read_text(
+            encoding="utf-8"
+        )
+        source_hd = Path(SCRIPTS / "handoff_decision.py").read_text(
+            encoding="utf-8"
+        )
+        for src, name in ((source_mr, "monitor_runner"), (source_hd, "handoff_decision")):
+            for line in src.splitlines():
+                stripped = line.strip()
+                self.assertFalse(
+                    stripped.startswith("assert ") and "# nosec" not in stripped,
+                    f"bare assert in {name}: {stripped[:80]}",
+                )
 
 
 class WorkCapDocParityTests(unittest.TestCase):

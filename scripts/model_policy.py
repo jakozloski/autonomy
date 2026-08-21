@@ -1787,14 +1787,22 @@ def evaluate_codex(raw: Any) -> dict[str, Any]:
         # identical failures at strike one forever and the terminal block
         # never fired. Empty is legal only for the first observation.
         if not isinstance(history, list):
-            if attempts > 1:
+            # r14 F8 re-eval: the attempts>1 guard was toothless because
+            # `attempts` itself DEFAULTS to 1 for every non-`not_run`
+            # invocation — a CLI-level caller omitting both fields
+            # restarted identical failures at strike one forever. The
+            # history list is therefore REQUIRED whenever `attempts` was
+            # defaulted rather than explicitly supplied: an explicit
+            # attempts=1 with no history is a legitimate first
+            # observation; a defaulted one is an unauditable restart.
+            if attempts > 1 or "attempts" not in invocation:
                 return _block_codex(
                     decision,
                     "invalid_internal_failure_observation",
-                    "internal_failure beyond the first attempt requires the"
-                    " post_invocation history list (empty only on the first"
-                    " observation) so the signature streak is decided here,"
-                    " not in prose",
+                    "internal_failure requires the post_invocation history"
+                    " list (empty only on an explicit first observation"
+                    " with attempts=1) so the signature streak is decided"
+                    " here, not in prose",
                     "correct_observation_input",
                 )
             history = []

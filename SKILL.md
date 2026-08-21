@@ -177,8 +177,8 @@ The pure scenario helper at `scripts/handoff_decision.py` plans these operations
 
 Run, in this order:
 
-1. `python3 scripts/validate_package.py` from this skill directory (in a `uv`-only repository, `uv run --no-project --python 3.12` replaces the bare `python3` — r14 F9).
-2. `python3 -m unittest discover -s scripts -p 'test_*.py'` from this skill directory (same `uv` substitution where the repository requires it).
+1. `uv run --no-project --python 3.12 --with python-frontmatter==1.1.0 --with PyYAML==6.0.2 scripts/validate_package.py` from this skill directory — the dependency-complete canonical gate (r14 F9 re-eval: without the `--with` pins the scanner-parity tests SKIP while the command still exits 0, a green that proves less than it reads). Where `uv` is unavailable, bare `python3` is the DEGRADED fallback: it must be paired with `pip show python-frontmatter PyYAML` proving the deps, or the run is recorded as partial.
+2. `uv run --no-project --python 3.12 --with python-frontmatter==1.1.0 --with PyYAML==6.0.2 -m unittest discover -s scripts -p 'test_*.py'` from this skill directory (same fallback rule).
    Steps 1-2 validate the LOADED skill package, not the project — `validate_package.py` IS the packaged checker (r14 F3 removed the reference to a `quick_validate.py` that shipped nowhere; a fresh clone can now complete this gate with the package alone). Run them fully at the FIRST Validation Before Push of a workflow, then append `package-validated:<sha256>@<ISO-8601>` to the Decision Audit Trail — the digest covers the loaded package's `SKILL.md`, `references/`, `scripts/`, and `agents/` files plus the `python3 --version` (or `uv run python --version`) string. Before every later push, recompute and compare that digest (sub-second, no model tokens); on ANY mismatch — or when the push diff itself touches this skill package — re-run steps 1-2 fully and append a fresh record.
 3. Every project-resolved quality command.
 4. The mandatory diff-scoped self-review and any required convergence pass.

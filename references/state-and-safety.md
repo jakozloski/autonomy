@@ -324,21 +324,21 @@ if [ -n "${STASH_REF:-}" ] \
    && [ -z "$(git status --porcelain)" ] \
    && git rev-parse --verify --quiet "refs/heads/$PRE_TAKEOVER_BRANCH" >/dev/null; then
 
-  # r14 F15: checkout is GATED — unchecked, apply landed on the current
-  # branch. Any failure RETAINS the stash + persists blocked recovery.
+  # r14 F15 (re-eval): checkout GATED; EVERY failure arm persists the durable
+  # blocked record (attempt_log "human:stash-restore" + $STASH_REF in state —
+  # a printed warning alone evaporates with the session) BEFORE surfacing;
+  # the stash drops ONLY after restoration verifies on the target branch.
   if ! git checkout "$PRE_TAKEOVER_BRANCH" || [ "$(git branch --show-current)" != "$PRE_TAKEOVER_BRANCH" ]; then
-    echo "restore blocked: checkout failed — stash $STASH_REF retained" >&2
+    echo "restore blocked: checkout failed — stash $STASH_REF retained" >&2  # + persist blocked record
   elif git stash apply "$STASH_REF"; then
-    # Apply succeeded — safe to drop our stash entry.
-    # git stash drop requires stash@{N} format, not raw SHA. Look up the index
-    # by exact SHA match via awk — more portable than `grep -F -w`, whose
-    # word-boundary semantics differ between GNU and BSD grep on macOS.
-    STASH_INDEX=$(git stash list --format='%gd %H' | awk -v sha="$STASH_REF" '$2 == sha { print $1; exit }')
-    if [ -n "$STASH_INDEX" ]; then
-      git stash drop "$STASH_INDEX"
+    if [ "$(git branch --show-current)" != "$PRE_TAKEOVER_BRANCH" ]; then  # postcondition BEFORE drop
+      echo "restore blocked: branch drifted mid-apply — stash retained" >&2  # + persist blocked record
+    else
+      STASH_INDEX=$(git stash list --format='%gd %H' | awk -v sha="$STASH_REF" '$2 == sha { print $1; exit }')  # stash@{N} lookup by exact SHA (portable vs grep -w)
+      if [ -n "$STASH_INDEX" ]; then git stash drop "$STASH_INDEX"; fi
     fi
   else
-    echo "WARNING: stash apply failed — keeping stash intact at $STASH_REF" >&2
+    echo "WARNING: stash apply failed — keeping stash intact at $STASH_REF" >&2  # + persist blocked record
   fi
 else
   # Don't auto-restore if working tree is dirty, branch is missing, or stash_ref empty.
@@ -359,7 +359,7 @@ Update the state file after each phase transition. This allows resuming if the s
 
 > The prior workflow was blocked on `<reason from attempt_log>`. Reset attempt counters and retry, or continue from current state? **(reset / continue)**
 
-- **`reset`** — set `monitor_iterations` and `monitor_poll_ticks` to 0; clear ONLY the retry-scoped `attempt_log` keys (`ci:*`, `monitor-child:*`, `ready:*`, `prompt-trail:stale`), `clean_poll_timestamps`, `next_retry_at`, and phase-specific blocked status fields — unresolved `human:*` entries are verifier-bound blockers and survive reset until their postconditions pass (r14 F16: a blanket clear contradicted the same bullet's re-fetch rule). Re-fetch each exhausted/unknown/protection source; clear only after deletion, verified resolution/fix, a new edit version, or an explicit user-selected retry. Do not clear durable reply/ack maps merely because of reset.
+- **`reset`** — set `monitor_iterations` and `monitor_poll_ticks` to 0; clear ONLY the retry-scoped `attempt_log` keys (`ci:*`, `monitor-child:*`, `ready:*`), `clean_poll_timestamps`, `next_retry_at`, and phase-specific blocked status fields — unresolved `human:*` entries AND `prompt-trail:stale` are verifier-bound blockers and survive reset until their own postconditions pass (`prompt-trail:stale` clears only when the trail-currency check re-verifies; r14 F16 re-eval: it must never be presence-cleared by reset while the trail is still stale). Re-fetch each exhausted/unknown/protection source; clear only after deletion, verified resolution/fix, a new edit version, or an explicit user-selected retry. Do not clear durable reply/ack maps merely because of reset.
 - **`continue`** — proceed without clearing. The agent will likely BLOCK again immediately if the underlying cause hasn't changed; this option is for cases where the user has fixed the cause externally and just wants the agent to re-verify.
 
 If the agent can't ask interactively (autonomous re-invocation), default to `continue` and log the choice in `attempt_log` as `resume:auto_continue`.

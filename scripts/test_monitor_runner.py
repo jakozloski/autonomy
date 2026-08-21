@@ -488,6 +488,14 @@ if mode == "bad_utf8_candidate":
         h.write(b"\xff\xfe not valid utf-8 \x80\x81\n")
 if mode == "no_verdict":
     print(json.dumps({"type": "result", "result": "not json"}), flush=True)
+elif mode == "quota_clean_exit":
+    # r14 F12 re-eval: a structured in-band error on a CLEAN exit 0 with
+    # EMPTY stderr — the provider quota shape that used to decay into a
+    # generic no_verdict charge.
+    print(json.dumps({
+        "type": "result", "subtype": "success", "is_error": True,
+        "result": "Rate limit reached for the model. Please retry later.",
+    }), flush=True)
 else:
     print(json.dumps({"type": "result", "result": json.dumps(verdict)}), flush=True)
 sys.exit(7 if mode == "die_late" else 0)
@@ -1984,6 +1992,22 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         ]
         self.assertIn("monitor-child:handoff_repo_mismatch", signatures)
         self.assertNotIn("monitor-child:success", signatures)
+
+    def test_clean_exit_structured_error_takes_the_ladder(self) -> None:
+        # r14 F12 re-evaluation — (exact repro): type=result, subtype=success,
+        # is_error=true on exit 0 with EMPTY stderr must classify as a
+        # rate-limit ladder wait — never fall through verdict parsing into
+        # a no_verdict/exit_0 charge.
+        completed = self._run(
+            mode="quota_clean_exit", budget="900", timeout=90,
+            wait_scale="0.02", max_ticks="2",
+        )
+        extract = self._extract()
+        signatures = [
+            f["signature"] for f in extract["monitor_cli"]["child_failures"]
+        ]
+        self.assertNotIn("monitor-child:no_verdict", signatures)
+        self.assertNotIn("monitor-child:exit_0", signatures)
 
     def test_work_cap_overrun_terminal_is_rejected(self) -> None:
         # algo#1216 finding 3813491642 (exact repro): a candidate advancing

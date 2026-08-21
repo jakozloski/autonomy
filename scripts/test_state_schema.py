@@ -1891,8 +1891,23 @@ class MergeReadinessTests(unittest.TestCase):
         line = next(
             l for l in doc.splitlines() if "{ status, attempts," in l
         )
-        for key in OPERATION_RESULT_ALLOWED_KEYS:
-            self.assertIn(key, line, f"documented field set omits {key}")
+        # r14 F11 re-eval: substring presence lets the documented set
+        # DRIFT (extra/renamed fields pass). Parse the braced list and
+        # compare the SETS exactly — optional markers (?) stripped.
+        import re as _re
+
+        braced = _re.search(r"\{([^}]*)\}", line)
+        self.assertIsNotNone(braced, line)
+        documented = {
+            field.strip().rstrip("?")
+            for field in braced.group(1).split(",")
+            if field.strip()
+        }
+        self.assertEqual(
+            documented,
+            set(OPERATION_RESULT_ALLOWED_KEYS),
+            "documented field set must equal the schema constant exactly",
+        )
 
     def test_stash_intent_contract(self) -> None:
         # admin#1495 finding 3813789199: the write-ahead stash record is a
