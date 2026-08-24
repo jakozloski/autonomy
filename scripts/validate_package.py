@@ -1711,6 +1711,23 @@ def _strip_html_comments(text: str) -> str:
     return "\n".join(operative_lines)
 
 
+def _delegates_to_autonomy(text: str) -> bool:
+    """True when ``text``'s operative Markdown (HTML comments stripped)
+    visibly points at the canonical autonomy package. Two link forms count,
+    and BOTH must, or a real delegation false-rejects: the path-style
+    ``skills/autonomy`` the `.cursor` command pointers and the
+    `.claude`/`.agents` skill dirs carry, and the sibling-relative
+    ``autonomy/SKILL.md`` a superseded autonomous-workflow root uses to
+    reach its neighbor package (``../autonomy/SKILL.md`` — never contains
+    ``skills/autonomy``). Anchoring only on the first token rejected the
+    correct root stub (admin#1495 r13 F10); the HTML-comment stripping
+    still holds so a commented-out mention never counts (finding
+    3813789192)."""
+
+    operative = _strip_html_comments(text)
+    return "skills/autonomy" in operative or "autonomy/SKILL.md" in operative
+
+
 def _validate_entry_points(package_dir: Path) -> list[str]:
     """Reject non-delegating legacy autonomy entry points in the host repo.
 
@@ -1744,8 +1761,9 @@ def _validate_entry_points(package_dir: Path) -> list[str]:
                         continue
                     # admin#1495 r12 F20: delegation must be OPERATIVE text
                     # — a mention inside an HTML comment reads as compliant
-                    # to a substring check while delegating nothing.
-                    if "skills/autonomy" not in _strip_html_comments(content):
+                    # to a substring check while delegating nothing. Either
+                    # canonical link form counts (r13 F10).
+                    if not _delegates_to_autonomy(content):
                         errors.append(
                             "legacy autonomy entry point does not delegate"
                             f" to the canonical package: {entry} — make it"
@@ -1826,7 +1844,7 @@ def _validate_entry_points(package_dir: Path) -> list[str]:
                         f"unreadable legacy skill root: {legacy_skill}"
                     )
                     continue
-                if "skills/autonomy" not in _strip_html_comments(legacy_text):
+                if not _delegates_to_autonomy(legacy_text):
                     errors.append(
                         "legacy autonomous-workflow root does not delegate"
                         f" to the canonical package: {legacy_skill}"

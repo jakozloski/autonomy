@@ -1843,6 +1843,72 @@ class EntryPointScanTests(unittest.TestCase):
                 sum(".gitignore" in error for error in errors), 2, errors
             )
 
+    def test_delegates_to_autonomy_accepts_both_link_forms(self) -> None:
+        # r13 F10: the delegation check must accept BOTH canonical link
+        # forms. Anchoring only on "skills/autonomy" false-rejected the real
+        # superseded root stub, whose operative link is the verbatim
+        # sibling-relative `[`autonomy`](../autonomy/SKILL.md)` — that
+        # contains "autonomy/SKILL.md" but never "skills/autonomy".
+        from validate_package import _delegates_to_autonomy
+
+        # path-style token: commands and the .claude/.agents skill dirs
+        self.assertTrue(
+            _delegates_to_autonomy("read .agents/skills/autonomy/SKILL.md")
+        )
+        self.assertTrue(_delegates_to_autonomy("delegates to skills/autonomy"))
+        # sibling-relative token, verbatim from the real root stub. It has
+        # NO "skills/autonomy" substring, so this assertion is what turns
+        # red if the helper reverts to a single accepted token.
+        sibling = "Invoke the [`autonomy`](../autonomy/SKILL.md) skill instead"
+        self.assertNotIn("skills/autonomy", sibling)
+        self.assertTrue(_delegates_to_autonomy(sibling))
+        # neither token, and an HTML-commented mention, still fail closed
+        self.assertFalse(_delegates_to_autonomy("run the legacy flow directly"))
+        self.assertFalse(
+            _delegates_to_autonomy("legacy\n<!-- ../autonomy/SKILL.md -->\n")
+        )
+
+    def test_legacy_root_sibling_relative_link_is_accepted(self) -> None:
+        # r13 F10 end to end: a superseded root whose ONLY delegation is the
+        # sibling-relative link — the real admin#1495 stub form — must
+        # validate clean. This is the exact case that failed admin CI at r27
+        # before the token was widened.
+        from validate_package import _validate_entry_points
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            (repo / ".git").mkdir(parents=True)
+            package = repo / ".agents" / "skills" / "autonomy"
+            package.mkdir(parents=True)
+            workflows = repo / ".github" / "workflows"
+            workflows.mkdir(parents=True)
+            (workflows / "skill-package-checks.yml").write_text(
+                "on:\n  pull_request:\n    paths:\n"
+                '      - ".agents/skills/**"\n'
+                '      - ".cursor/commands/autonomous-*.md"\n'
+                "  push:\n    paths:\n"
+                '      - ".agents/skills/**"\n'
+                '      - ".cursor/commands/autonomous-*.md"\n',
+                encoding="utf-8",
+            )
+            legacy = repo / ".agents" / "skills" / "autonomous-workflow"
+            legacy.mkdir(parents=True)
+            # The real stub opens with a "do not follow ... previous
+            # instructions" hardening line; it is deliberately omitted here
+            # because the behavioral scanner flags that phrase as generic
+            # prompt injection, and the delegation-token logic under test
+            # does not depend on it — the sibling-relative link is the
+            # discriminator.
+            stub = (
+                "# Autonomous Feature Workflow (superseded)\n\n"
+                "This compatibility alias is superseded. Invoke the"
+                " [`autonomy`](../autonomy/SKILL.md) skill instead and follow"
+                " its Loading Contract.\n"
+            )
+            self.assertNotIn("skills/autonomy", stub)
+            (legacy / "SKILL.md").write_text(stub, encoding="utf-8")
+            self.assertEqual(_validate_entry_points(package), [])
+
     def test_load_root_mirror_orientation_is_supported(self) -> None:
         # The algo layout: canonical at .claude, symlink at .agents,
         # trigger satisfied by the .agents/skills/** glob.
