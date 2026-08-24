@@ -151,6 +151,7 @@ import json
 import re
 import selectors
 import shlex
+import signal
 import sys
 import time
 from datetime import timedelta
@@ -705,6 +706,7 @@ def supervise_stream(
     kill_callback: Callable[[], None],
     child_wait: Callable[[], int | None] | None = None,
     *,
+    child_pgid: int | None = None,
     read_size: int = 65536,
     idle_timeout_seconds: float | None = None,
     max_runtime_seconds: float | None = None,
@@ -746,6 +748,18 @@ def supervise_stream(
     ``idle_timeout_seconds`` bounds SILENCE, not total runtime: the clock
     resets on every byte received, so a slow-but-alive stream is never killed
     for being slow — a max-effort review legitimately runs for many minutes.
+    ``child_pgid`` (admin#1495 r13 F9) is the process group captured by
+    the caller AT SPAWN — before any wait can reap the leader (a reaped
+    pid makes ``os.getpgid`` raise, which turned lazy group kills into
+    silent no-ops while same-group descendants survived).  When supplied,
+    EVERY non-clean result — the failure outcomes, the runaway/incapable
+    waits, a raising wait, and clean streams followed by a nonzero exit —
+    routes through guarded GROUP termination plus the bounded reap.  On
+    supervisor-initiated kills the leader is still unreaped, which pins
+    the id against reuse; on the one path where the wait reaped first, an
+    existence probe skips a dead group, and the residual (a full PID-space
+    wrap re-allocating this exact id between probe and kill) is
+    documented, not defended.
     ``max_runtime_seconds`` is the orthogonal runaway backstop (Timeout
     Heuristics ``PER_ATTEMPT_CEILING``, canonically
     ``PER_ATTEMPT_CEILING_SECONDS``): it bounds TOTAL runtime, because a
@@ -774,6 +788,32 @@ def supervise_stream(
         except Exception:
             return False
         return True
+
+    def _guarded_group_kill() -> bool:
+        """admin#1495 r13 F9: guarded GROUP termination for every
+        non-clean result. The pgid was captured at spawn; a zombie
+        (unreaped) leader pins the id against reuse on supervisor-
+        initiated paths, and the existence probe covers the post-reap
+        path. The leader-targeted ``kill_callback`` still runs for
+        callers that supplied no pgid."""
+        ok = True
+        if child_pgid is not None:
+            try:
+                os.killpg(child_pgid, 0)
+            except ProcessLookupError:
+                pass  # no members left — nothing to kill
+            except Exception:
+                ok = False
+            else:
+                try:
+                    os.killpg(child_pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    ok = False
+        if not _guarded_kill():
+            ok = False
+        return ok
 
     def _reap_after_kill(deadline_seconds: float = 30.0) -> bool:
         """R6-F4: bounded reap after every kill — without it each killed gate
@@ -899,7 +939,9 @@ def supervise_stream(
         # other cleanup failure becomes the structured internal_failure.
         # R6-F4: the kill is then followed by a bounded reap — a SIGKILLed
         # child left unwaited is a zombie in the long-lived session.
-        if not _guarded_kill():
+        # admin#1495 r13 F9: the kill is the GROUP kill — the leader may
+        # already be dead while same-group descendants hold credentials.
+        if not _guarded_group_kill():
             outcome = "internal_failure"
         if not _reap_after_kill():
             outcome = "internal_failure"
@@ -930,7 +972,7 @@ def supervise_stream(
             )
             if remaining is not None and remaining <= 0:
                 outcome = "runaway"
-                if not _guarded_kill():
+                if not _guarded_group_kill():
                     outcome = "internal_failure"
                 if not _reap_after_kill():
                     outcome = "internal_failure"
@@ -947,7 +989,7 @@ def supervise_stream(
                 # bounded (R7 codex #9): fail structurally — kill and reap —
                 # rather than hang past the advertised ceiling.
                 outcome = "internal_failure"
-                _guarded_kill()
+                _guarded_group_kill()
                 _reap_after_kill()
                 break
             # "timeout": the bounded chunk expired with the child alive —
@@ -961,14 +1003,19 @@ def supervise_stream(
             # non-clean outcome; ProcessLookupError is the kill's goal state,
             # and any other cleanup failure adds nothing beyond the
             # internal_failure already recorded.
-            try:
-                kill_callback()
-            except ProcessLookupError:
-                pass
-            except Exception:
-                pass
+            _guarded_group_kill()
+            _reap_after_kill()
         if outcome == "clean" and child_returncode not in (0, None):
+            # admin#1495 r13 F9: clean streams plus a nonzero exit is a
+            # NON-CLEAN result, and the leader's own exit says nothing
+            # about group descendants — which previously survived this
+            # branch with zero kill calls. Route through the same guarded
+            # group termination and bounded reap as every other failure
+            # (the reap returns immediately: the wait above already
+            # collected the leader).
             outcome = "internal_failure"
+            _guarded_group_kill()
+            _reap_after_kill()
 
     exit_code = {
         "clean": CLASSIFY_EXIT_CLEAN,

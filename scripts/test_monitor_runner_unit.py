@@ -1331,6 +1331,36 @@ class MappedRepositoryParityTests(unittest.TestCase):
             )
 
 
+class TerminalPlannedQaTests(unittest.TestCase):
+    def test_terminal_missing_planned_qa_flags_only_mapped_idle(self) -> None:
+        # algo#1216 finding 3813491661, pinned at the predicate the manifest
+        # rule calls. The r17 F9 containment gate now preempts that branch end
+        # to end on a non-delegating host (a mapped launch blocks BEFORE any
+        # child produces a terminal candidate), so the rule is verified here
+        # directly rather than through the now-gated e2e path. A mapped
+        # repository whose QA aggregate is idle or absent is a missing-handoff
+        # terminal; every other combination stays valid.
+        mapped = "keeper-dating/matchmaking"
+        self.assertIn(mapped, monitor_runner.MAPPED_QA_REPOSITORIES)
+        for bound_repo, qa_status, expected in (
+            (mapped, "idle", True),
+            (mapped, None, True),
+            ("Keeper-Dating/Matchmaking", "idle", True),  # case-insensitive
+            (mapped, "failed", False),
+            (mapped, "complete", False),
+            ("someone/unmapped-repo", "idle", False),
+            ("someone/unmapped-repo", None, False),
+            (None, "idle", False),  # a non-str bound repo is never mapped
+        ):
+            self.assertIs(
+                monitor_runner._terminal_missing_planned_qa(
+                    bound_repo, qa_status
+                ),
+                expected,
+                (bound_repo, qa_status),
+            )
+
+
 class CapabilityFamilyResolutionTests(unittest.TestCase):
     # admin#1495 finding 3825265272 / algo#1216 F3: the narrowed probe accepts
     # a mapped run only when the resolved user-scope surface grants BOTH the
@@ -2097,6 +2127,57 @@ class AtomicWriteCleanupTests(unittest.TestCase):
                     monitor_runner.atomic_write(target, "new")
             self.assertEqual(target.read_text(encoding="utf-8"), "new")
             self.assertEqual(list(Path(tmp).glob("*.tmp-*")), [])
+
+
+class ResultVariantClassificationTests(unittest.TestCase):
+    """algo#1216 r17 F7: error-union results carry diagnostics in
+    errors[] with no result text — auth blocks, rate limits ladder, and
+    the generic case charges the SUBTYPE signature, for both exits."""
+
+    def test_error_variant_matrix(self) -> None:
+        cases = (
+            (0, ["execution died"], "charge",
+             "monitor-child:result_error_during_execution"),
+            (1, ["execution died"], "charge",
+             "monitor-child:result_error_during_execution"),
+            (0, ["authentication_error: token has expired"], "block", None),
+            (1, ["authentication_error: token has expired"], "block", None),
+            (0, ["Rate limit reached for the model. Please retry later."],
+             "ladder", "monitor-child:rate_limited"),
+            (1, ["Rate limit reached for the model. Please retry later."],
+             "ladder", "monitor-child:rate_limited"),
+        )
+        for exit_code, errors, want_action, want_signature in cases:
+            with self.subTest(exit_code=exit_code, action=want_action):
+                action, detail = monitor_runner.classify_child_failure(
+                    exit_code,
+                    [],
+                    False,
+                    result_is_error=True,
+                    result_subtype="error_during_execution",
+                    result_errors=errors,
+                )
+                self.assertEqual(action, want_action, detail)
+                if want_signature is not None:
+                    self.assertEqual(detail, want_signature)
+
+
+class WrapperStageWriteTests(unittest.TestCase):
+    """algo#1216 r17 F1 (sibling site): a short os.write on the wrapper
+    restage would exec a PREFIX of the trusted wrapper source."""
+
+    def test_wrapper_restage_survives_short_writes(self) -> None:
+        runner = _runner("claude-opus-5", "max")
+        real_write = os.write
+        with mock.patch.object(
+            monitor_runner.os,
+            "write",
+            side_effect=lambda fd, data: real_write(fd, bytes(data)[:1]),
+        ):
+            runner._restage_wrapper()
+        self.assertEqual(
+            runner.wrapper_stage_path.read_bytes(), runner.wrapper_source
+        )
 
 
 class ConstructionGuardTests(unittest.TestCase):

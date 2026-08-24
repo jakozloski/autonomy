@@ -1596,6 +1596,8 @@ class EntryPointScanTests(unittest.TestCase):
             wf = workflows / "skill-package-checks.yml"
             wf.write_text(
                 "on:\n  pull_request:\n    paths:\n"
+                '      - ".agents/skills/**"\n'
+                "  push:\n    paths:\n"
                 '      - ".agents/skills/**"\n',
                 encoding="utf-8",
             )
@@ -1605,6 +1607,9 @@ class EntryPointScanTests(unittest.TestCase):
             )
             wf.write_text(
                 "on:\n  pull_request:\n    paths:\n"
+                '      - ".agents/skills/**"\n'
+                '      - ".cursor/commands/autonomous-*.md"\n'
+                "  push:\n    paths:\n"
                 '      - ".agents/skills/**"\n'
                 '      - ".cursor/commands/autonomous-*.md"\n',
                 encoding="utf-8",
@@ -1663,7 +1668,9 @@ class EntryPointScanTests(unittest.TestCase):
             wf.write_text(
                 "on:\n  pull_request:\n    paths:\n"
                 '      - ".agents/skills/**"\n'
-                "      - .cursor/commands/autonomous-*.md # the guard\n",
+                "      - .cursor/commands/autonomous-*.md # the guard\n"
+                "  push:\n    paths:\n"
+                "      - .cursor/commands/autonomous-*.md\n",
                 encoding="utf-8",
             )
             self.assertEqual(_validate_entry_points(package), [])
@@ -1703,11 +1710,15 @@ class EntryPointScanTests(unittest.TestCase):
 
             def wf_write(*paths):
                 # r13 F5: the commands filter is required unconditionally
-                # whenever the workflow exists, so every fixture carries it.
+                # whenever the workflow exists, so every fixture
+                # carries it — mirrored onto BOTH events per r13 F13.
+                block = (
+                    '      - ".cursor/commands/autonomous-*.md"\n'
+                    + "".join(f'      - "{p}"\n' for p in paths)
+                )
                 wf.write_text(
-                    "on:\n  pull_request:\n    paths:\n"
-                    + '      - ".cursor/commands/autonomous-*.md"\n'
-                    + "".join(f'      - "{p}"\n' for p in paths),
+                    "on:\n  pull_request:\n    paths:\n" + block
+                    + "  push:\n    paths:\n" + block,
                     encoding="utf-8",
                 )
 
@@ -1753,6 +1764,85 @@ class EntryPointScanTests(unittest.TestCase):
             )
             link.unlink()
 
+    def test_legacy_workflow_roots_and_event_filters(self) -> None:
+        # admin#1495 r13 F10 + r13 F13: existing autonomous-workflow roots
+        # must visibly delegate (HTML comments do not count) and be covered
+        # by BOTH event filters; a workflow that consumes .gitignore (the
+        # check-ignore pin) must trigger on it on both events too.
+        from validate_package import _validate_entry_points
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            (repo / ".git").mkdir(parents=True)
+            package = repo / ".agents" / "skills" / "autonomy"
+            package.mkdir(parents=True)
+            workflows = repo / ".github" / "workflows"
+            workflows.mkdir(parents=True)
+            wf = workflows / "skill-package-checks.yml"
+            push_block = (
+                "  push:\n    paths:\n"
+                '      - ".agents/skills/**"\n'
+                '      - ".cursor/commands/autonomous-*.md"\n'
+                '      - ".claude/skills/autonomous-workflow/**"\n'
+            )
+            both = (
+                "on:\n  pull_request:\n    paths:\n"
+                '      - ".agents/skills/**"\n'
+                '      - ".cursor/commands/autonomous-*.md"\n'
+                '      - ".claude/skills/autonomous-workflow/**"\n'
+                + push_block
+            )
+            wf.write_text(both, encoding="utf-8")
+            legacy = repo / ".claude" / "skills" / "autonomous-workflow"
+            legacy.mkdir(parents=True)
+            (legacy / "SKILL.md").write_text(
+                "Superseded: read .agents/skills/autonomy/SKILL.md.\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(_validate_entry_points(package), [])
+            # comment-only delegation is rejected
+            (legacy / "SKILL.md").write_text(
+                "Run the legacy flow.\n<!-- skills/autonomy -->\n",
+                encoding="utf-8",
+            )
+            errors = _validate_entry_points(package)
+            self.assertTrue(
+                any("r13 F10" in error for error in errors), errors
+            )
+            (legacy / "SKILL.md").write_text(
+                "Delegates to .agents/skills/autonomy.\n", encoding="utf-8"
+            )
+            # a push filter missing the legacy root fails structurally
+            wf.write_text(
+                both.replace(
+                    push_block,
+                    "  push:\n    paths:\n"
+                    '      - ".agents/skills/**"\n'
+                    '      - ".cursor/commands/autonomous-*.md"\n',
+                ),
+                encoding="utf-8",
+            )
+            errors = _validate_entry_points(package)
+            self.assertTrue(
+                any(
+                    "push paths do not cover"
+                    " .claude/skills/autonomous-workflow" in error
+                    for error in errors
+                ),
+                errors,
+            )
+            # a workflow consuming .gitignore must trigger on it, both events
+            wf.write_text(
+                both
+                + "jobs:\n  x:\n    steps:\n"
+                "      - run: git check-ignore -q probe\n",
+                encoding="utf-8",
+            )
+            errors = _validate_entry_points(package)
+            self.assertEqual(
+                sum(".gitignore" in error for error in errors), 2, errors
+            )
+
     def test_load_root_mirror_orientation_is_supported(self) -> None:
         # The algo layout: canonical at .claude, symlink at .agents,
         # trigger satisfied by the .agents/skills/** glob.
@@ -1772,6 +1862,10 @@ class EntryPointScanTests(unittest.TestCase):
             workflows.mkdir(parents=True)
             (workflows / "skill-package-checks.yml").write_text(
                 "on:\n  pull_request:\n    paths:\n"
+                '      - ".claude/skills/**"\n'
+                '      - ".agents/skills/**"\n'
+                '      - ".cursor/commands/autonomous-*.md"\n'
+                "  push:\n    paths:\n"
                 '      - ".claude/skills/**"\n'
                 '      - ".agents/skills/**"\n'
                 '      - ".cursor/commands/autonomous-*.md"\n',

@@ -346,6 +346,12 @@ REQUIRED_PY_BINDINGS = {
         "REVIEWER_REQUEST_FAMILIES = state_schema.REVIEWER_REQUEST_FAMILIES",
         "ROUNDTRIP_FAMILIES = state_schema.ROUNDTRIP_FAMILIES",
         "parsed_generation_family = state_schema.parsed_generation_family",
+        # algo#1216 r17 F5: the Git object-ID grammar derives from the
+        # schema-owned fragment on both sides.
+        "GIT_OBJECT_ID = state_schema.GIT_OBJECT_ID",
+    ),
+    "scripts/state_schema.py": (
+        'PR_ARTIFACT_ID = re.compile("(?:ci-evidence|qa-rehearsal|deferred-work):" + GIT_OBJECT_ID_HEX + r"\\Z")',
     ),
     "scripts/model_policy.py": (
         "MAX_QUOTA_WAIT_SECONDS = state_schema.MAX_QUOTA_WAIT_SECONDS",
@@ -1608,13 +1614,14 @@ def _validate_size_boundary_parity(package_dir: Path) -> list[str]:
     return errors
 
 
-def _workflow_pull_request_paths(text: str) -> list[str]:
-    """Narrow std-lib structural read of a workflow's ``on.pull_request.paths``
-    entries (admin#1495 r12 F20). Deliberately NARROW: a top-level ``on:``
-    mapping, a block-form ``pull_request:`` child, a block-form ``paths:``
-    child, and ``- item`` entries — comment lines and inline `` #`` comments
-    stripped, quotes unwrapped. Flow-form or otherwise unrecognized shapes
-    yield no entries and fail closed at the caller (use block form)."""
+def _workflow_event_paths(text: str, event: str) -> list[str]:
+    """Narrow std-lib structural read of a workflow's ``on.<event>.paths``
+    entries (admin#1495 r12 F20, generalized to both events by r13 F13).
+    Deliberately NARROW: a top-level ``on:`` mapping, a block-form
+    ``<event>:`` child, a block-form ``paths:`` child, and ``- item``
+    entries — comment lines and inline `` #`` comments stripped, quotes
+    unwrapped. Flow-form or otherwise unrecognized shapes yield no
+    entries and fail closed at the caller (use block form)."""
 
     def _operative(raw: str) -> str:
         if raw.lstrip().startswith("#"):
@@ -1647,7 +1654,7 @@ def _workflow_pull_request_paths(text: str) -> list[str]:
         if on_child_indent is None:
             on_child_indent = indent
         if indent == on_child_indent:
-            in_pull_request = stripped == "pull_request:"
+            in_pull_request = stripped == event + ":"
             pr_child_indent = None
             in_paths = False
             continue
@@ -1661,6 +1668,18 @@ def _workflow_pull_request_paths(text: str) -> list[str]:
         if in_paths and indent > pr_child_indent and stripped.startswith("- "):
             paths.append(stripped[2:].strip().strip("'\""))
     return paths
+
+
+def _covers_path(entries: list[str], target: str) -> bool:
+    """True when a structural paths list covers ``target`` — exactly, as
+    ``target/**``, or through a ``prefix/**`` glob ancestor."""
+
+    for entry in entries:
+        if entry == target or entry == target + "/**":
+            return True
+        if entry.endswith("/**") and target.startswith(entry[:-3] + "/"):
+            return True
+    return False
 
 
 def _strip_html_comments(text: str) -> str:
@@ -1752,18 +1771,78 @@ def _validate_entry_points(package_dir: Path) -> list[str]:
                     workflow_text = workflow.read_text(encoding="utf-8")
                 except OSError:
                     workflow_text = ""
-                if ".cursor/commands/autonomous-*.md" not in (
-                    _workflow_pull_request_paths(workflow_text)
-                ):
+                event_paths = {
+                    event: _workflow_event_paths(workflow_text, event)
+                    for event in ("pull_request", "push")
+                }
+                # admin#1495 r13 F13: BOTH event filters carry the guarded
+                # paths, and a workflow that CONSUMES .gitignore (the
+                # check-ignore visibility pin) must also trigger on it —
+                # a gitignore-only regression otherwise never runs the pin.
+                required_paths = [".cursor/commands/autonomous-*.md"]
+                if "check-ignore" in workflow_text:
+                    required_paths.append(".gitignore")
+                for event, paths in event_paths.items():
+                    for needed in required_paths:
+                        if not _covers_path(paths, needed) and needed not in paths:
+                            errors.append(
+                                f"skill-package-checks.yml {event} paths do"
+                                f" not include {needed} under structural"
+                                f" on.{event}.paths — a YAML comment, a"
+                                " wrong key, or a wrong indent does not"
+                                " count (findings 3816225750 / r13 F5;"
+                                " admin#1495 r12 F20 / r13 F13)"
+                            )
+            else:
+                workflow_text = ""
+                event_paths = {"pull_request": [], "push": []}
+            # admin#1495 r13 F10: the superseded autonomous-workflow skill
+            # roots are entry points too — a non-delegating or retargeted
+            # copy at either root validated cleanly. Each EXISTING root
+            # must visibly delegate to the canonical autonomy package
+            # (operative text, HTML comments stripped), and when any root
+            # exists the CI filters must cover it on both events.
+            legacy_workflow_roots = tuple(
+                root
+                for root in (
+                    candidate / ".claude" / "skills" / "autonomous-workflow",
+                    candidate / ".agents" / "skills" / "autonomous-workflow",
+                )
+                if root.is_symlink() or root.exists()
+            )
+            for legacy_root in legacy_workflow_roots:
+                legacy_skill = legacy_root / "SKILL.md"
+                if not legacy_skill.is_file():
                     errors.append(
-                        "skill-package-checks.yml does not trigger on"
-                        " .cursor/commands/autonomous-*.md under structural"
-                        " on.pull_request.paths — the FIRST legacy-command"
-                        " addition would bypass the entry-point guard, and"
-                        " a YAML comment, push-only trigger, or wrong"
-                        " key/indent does not count (findings 3816225750 /"
-                        " r13 F5; admin#1495 r12 F20)"
+                        f"legacy autonomous-workflow root {legacy_root} has"
+                        " no readable SKILL.md — a dangling or emptied"
+                        " alias still discovers (admin#1495 r13 F10)"
                     )
+                    continue
+                try:
+                    legacy_text = legacy_skill.read_text(encoding="utf-8")
+                except OSError:
+                    errors.append(
+                        f"unreadable legacy skill root: {legacy_skill}"
+                    )
+                    continue
+                if "skills/autonomy" not in _strip_html_comments(legacy_text):
+                    errors.append(
+                        "legacy autonomous-workflow root does not delegate"
+                        f" to the canonical package: {legacy_skill}"
+                        " (admin#1495 r13 F10; HTML comments do not count)"
+                    )
+            if legacy_workflow_roots and workflow.is_file():
+                for event, paths in event_paths.items():
+                    for legacy_root in legacy_workflow_roots:
+                        rel_root = legacy_root.relative_to(candidate).as_posix()
+                        if not _covers_path(paths, rel_root):
+                            errors.append(
+                                f"skill-package-checks.yml {event} paths do"
+                                f" not cover {rel_root} — a root-only"
+                                " change bypasses the delegation guard"
+                                " (admin#1495 r13 F10)"
+                            )
             # admin#1495 finding 3822586140: the SYMLINK load roots are
             # entry points too. Whichever of the two known roots is the
             # real package directory, every OTHER root that exists must be
@@ -1790,21 +1869,23 @@ def _validate_entry_points(package_dir: Path) -> list[str]:
                 if root.resolve() == package_real:
                     if root.is_symlink() and workflow_text:
                         rel = root.relative_to(candidate).as_posix()
-                        parent_glob = (
-                            root.parent.relative_to(candidate).as_posix()
-                            + "/**"
-                        )
-                        if (
-                            rel not in workflow_text
-                            and parent_glob not in workflow_text
-                        ):
-                            errors.append(
-                                "skill-package-checks.yml does not trigger"
-                                f" on {rel} (or {parent_glob}) — a"
-                                " symlink-only change to the load path"
-                                " would bypass this guard"
-                                " (finding 3822586140)"
+                        # admin#1495 r13 F13: the trigger check is
+                        # STRUCTURAL on both events — a raw substring
+                        # accepted a comment-only mention.
+                        for event in ("pull_request", "push"):
+                            structural = _workflow_event_paths(
+                                workflow_text, event
                             )
+                            if not _covers_path(structural, rel):
+                                errors.append(
+                                    f"skill-package-checks.yml {event}"
+                                    f" paths do not cover {rel} under"
+                                    f" structural on.{event}.paths — a"
+                                    " symlink-only change to the load path"
+                                    " would bypass this guard, and a"
+                                    " comment-only mention does not count"
+                                    " (findings 3822586140 / r13 F13)"
+                                )
                     continue
                 errors.append(
                     f"autonomy load root {root} does not resolve to the"

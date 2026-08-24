@@ -11,6 +11,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from state_schema import (
     HANDOFF_KIND_GENERATION_VOCABULARY,
@@ -631,6 +632,133 @@ class HandoffKindGrammarBoundaryTests(unittest.TestCase):
         ):
             with self.subTest(op=op):
                 self.assertTrue(handoff_operation_id_valid("pr_artifacts", op))
+
+    def test_mandatory_kinds_enum_uniqueness_and_evidence(self) -> None:
+        # admin#1495 r13 F6: an arbitrary mandatory_kinds value silently
+        # disabled required runtime verification. The enum is closed, the
+        # entries unique, and every mandated kind carries its repository
+        # rule/source in the evidence mapping.
+        def with_policy(policy_yaml: str) -> str:
+            return _mutate(
+                FULL_STATE,
+                "  quality_check_steps: []",
+                "  quality_check_steps: []\n"
+                "  runtime_verification_policy:\n" + policy_yaml,
+            )
+
+        valid = with_policy(
+            '    mandatory_kinds: ["ui", "api"]\n'
+            "    evidence:\n"
+            '      ui: "AGENTS.md UI verification rule"\n'
+            '      api: "AGENTS.md API smoke rule"\n'
+            '      performance: "optional extra source"'
+        )
+        self.assertEqual(evaluate_state_text(valid)["errors"], [])
+        cases = (
+            ("bogus-kind", '    mandatory_kinds: ["e2e"]', "one of"),
+            (
+                "duplicate",
+                '    mandatory_kinds: ["ui", "ui"]\n'
+                "    evidence:\n"
+                '      ui: "rule"',
+                "unique",
+            ),
+            (
+                "non-list",
+                '    mandatory_kinds: "ui"',
+                "must be a list",
+            ),
+            (
+                "mandated-without-evidence",
+                '    mandatory_kinds: ["performance"]\n'
+                "    evidence: {}",
+                "requires its",
+            ),
+            (
+                "unknown-evidence-kind",
+                "    mandatory_kinds: []\n"
+                "    evidence:\n"
+                '      smoke: "rule"',
+                "unknown kind",
+            ),
+        )
+        for label, policy_yaml, needle in cases:
+            with self.subTest(case=label):
+                result = evaluate_state_text(with_policy(policy_yaml))
+                self.assertEqual(result["state"], SUSPECT, result["errors"])
+                self.assertTrue(
+                    any(
+                        "runtime_verification_policy" in error
+                        and needle in error
+                        for error in result["errors"]
+                    ),
+                    result["errors"],
+                )
+
+    def test_reviewer_request_operations_require_binding(self) -> None:
+        # admin#1495 r13 F5: an operation-bearing reviewer_request record
+        # must persist its repository binding (the runner's terminal gate
+        # compares only PRESENT bindings); the rejection names the
+        # explicit monitor_cli.repository derivation for legacy records,
+        # and an idle record keeps a null binding.
+        op = "reviewer.github.request_review:alice:g0123456789ab"
+        record = (
+            "  reviewer_request:\n"
+            "    scenario: null\n"
+            '    status: "pending"\n'
+            "    targets:\n"
+            '      reviewers: ["alice"]\n'
+            "      github_assignees: []\n"
+            f'    operations: ["{op}"]\n'
+            "    operation_results:\n"
+            f'      "{op}":\n'
+            '        status: "pending"\n'
+            "        attempts: 1\n"
+            '        started_at: "2026-08-08T00:00:00Z"'
+        )
+        base_anchor = (
+            "    operations: []\n"
+            "    operation_results: {}\n"
+            'last_check_status: "pending"'
+        )
+        missing = _mutate(
+            FULL_STATE,
+            base_anchor,
+            "    operations: []\n    operation_results: {}\n"
+            + record
+            + '\nlast_check_status: "pending"',
+        )
+        result = evaluate_state_text(missing)
+        self.assertEqual(result["state"], SUSPECT, result["errors"])
+        self.assertTrue(
+            any(
+                "reviewer_request.repository_name_with_owner" in error
+                and "monitor_cli.repository" in error
+                for error in result["errors"]
+            ),
+            result["errors"],
+        )
+        bound = missing.replace(
+            '    status: "pending"\n    targets:\n      reviewers: ["alice"]',
+            '    status: "pending"\n'
+            '    repository_name_with_owner: "Keeper-Dating/matchmaking"\n'
+            "    targets:\n"
+            '      reviewers: ["alice"]',
+        )
+        self.assertNotEqual(bound, missing)
+        self.assertEqual(evaluate_state_text(bound)["errors"], [])
+
+    def test_git_object_id_fragment_boundaries(self) -> None:
+        # algo#1216 r17 F5: the schema-owned shared grammar pins its own
+        # 6/7/64/65 boundaries; PR_ARTIFACT_ID and the planner's
+        # GIT_OBJECT_ID both derive from this fragment.
+        from state_schema import GIT_OBJECT_ID
+
+        for length, ok in ((6, False), (7, True), (64, True), (65, False)):
+            with self.subTest(length=length):
+                self.assertEqual(
+                    GIT_OBJECT_ID.fullmatch("a" * length) is not None, ok
+                )
 
     def test_pr_artifact_head_length_bounds(self) -> None:
         # Head-bound ids carry a 7..64 hex git object id (literal boundary).
@@ -1347,6 +1475,162 @@ class ValueContractTests(unittest.TestCase):
                     ),
                     result["errors"],
                 )
+
+    _RV_PENDING = (
+        "  runtime_verification:\n"
+        '    status: "pending"\n'
+        "    reason: null"
+    )
+    _RV_PROOF = (
+        "  runtime_verification:\n"
+        '    status: "complete"\n'
+        "    reason: null\n"
+        '    target_head_sha: "' + "a" * 40 + '"\n'
+        '    touched_diff_fingerprint: "' + "b" * 64 + '"\n'
+        '    started_at: "2026-08-24T10:00:00Z"\n'
+        '    verified_at: "2026-08-24T10:05:00Z"\n'
+        "    evidence:\n"
+        '      smoke: "run-123"'
+    )
+
+    _PHASES_PREFIX_OLD = (
+        'phases:\n  plan: "in_progress"\n  plan_review: "pending"\n'
+        '  implementation: "pending"\n  self_review: "pending"\n'
+    )
+    _PHASES_PREFIX_DONE = (
+        'phases:\n  plan: "complete"\n  plan_review: "complete"\n'
+        '  implementation: "complete"\n  self_review: "complete"\n'
+    )
+
+    def _rv_base(self) -> str:
+        # The resume-to-Phase-5 shape: predecessors complete, pr
+        # IN_PROGRESS (still pre-Phase-5 for the proof gate, and the
+        # chain accepts it only with runtime_verification terminal).
+        return (
+            FULL_STATE.replace(
+                self._PHASES_PREFIX_OLD, self._PHASES_PREFIX_DONE
+            )
+            .replace('current_phase: "plan"', 'current_phase: "pr"')
+            .replace('  pr: "pending"', '  pr: "in_progress"')
+            .replace(
+                '  status: "pending"\n  root_cause',
+                '  status: "not_applicable"\n  root_cause',
+            )
+            .replace(
+                'variant_analysis:\n  status: "pending"',
+                'variant_analysis:\n  status: "skipped"',
+            )
+            .replace(
+                "  skipped_reason: null",
+                '  skipped_reason: "change_type feature: no defect"',
+            )
+        )
+
+    def test_runtime_verification_complete_requires_proof(self) -> None:
+        # algo#1216 r17 F6: before Phase 5 has passed, a complete record
+        # must carry its proof — exact-head SHA, 64-hex fingerprint,
+        # ordered timestamps, nonempty evidence, no unknown keys — and
+        # every rejection names the reset-to-re-verification migration.
+        valid = _mutate(self._rv_base(), self._RV_PENDING, self._RV_PROOF)
+        self.assertEqual(evaluate_state_text(valid)["errors"], [])
+        cases = (
+            ("no-head", self._RV_PROOF.replace('"' + "a" * 40 + '"', "null")),
+            ("short-fingerprint", self._RV_PROOF.replace("b" * 64, "b" * 63)),
+            (
+                "unordered",
+                self._RV_PROOF.replace("T10:05:00Z", "T09:00:00Z"),
+            ),
+            (
+                "no-evidence",
+                self._RV_PROOF.replace(
+                    '    evidence:\n      smoke: "run-123"',
+                    "    evidence: {}",
+                ),
+            ),
+        )
+        for label, block in cases:
+            with self.subTest(case=label):
+                result = evaluate_state_text(
+                    _mutate(FULL_STATE, self._RV_PENDING, block)
+                )
+                self.assertEqual(result["state"], SUSPECT, result["errors"])
+                self.assertTrue(
+                    any(
+                        "legacy-v1 migration" in error
+                        or "verified_at" in error
+                        for error in result["errors"]
+                    ),
+                    result["errors"],
+                )
+        unknown = _mutate(
+            FULL_STATE, self._RV_PENDING, self._RV_PROOF + '\n    extra: "x"'
+        )
+        self.assertTrue(
+            any(
+                "runtime_verification: unknown key" in error
+                for error in evaluate_state_text(unknown)["errors"]
+            )
+        )
+
+    def test_runtime_verification_legacy_complete_past_phase5_tolerated(
+        self,
+    ) -> None:
+        # The migration boundary: once Phase 5 consumed the record
+        # (phases.pr complete), a proofless legacy complete is history —
+        # resetting it would break the successful-predecessor chain
+        # retroactively.
+        past = (
+            FULL_STATE.replace(
+                'current_phase: "plan"', 'current_phase: "monitor"'
+            )
+            .replace("pr_number: null", "pr_number: 77")
+            .replace('  status: "pending"\n  root_cause', '  status: "not_applicable"\n  root_cause')
+            .replace(
+                'variant_analysis:\n  status: "pending"',
+                'variant_analysis:\n  status: "skipped"',
+            )
+            .replace(
+                "  skipped_reason: null",
+                '  skipped_reason: "change_type feature: no defect"',
+            )
+            .replace(
+                "human_roundtrip:\n  reviewers: {}",
+                "human_roundtrip:\n  reviewers: {}\n"
+                "acceptance_criteria:\n"
+                '  - id: "AC-1"\n'
+                '    text: "package validates and tests pass"\n'
+                '    source: "description"\n'
+                '    verdict: "met"\n'
+                '    evidence: "validator green; suite green"\n'
+                "acceptance_criteria_capture:\n"
+                '  captured_at: "2026-08-16T12:00:00Z"\n'
+                '  requester: "jakozloski"\n'
+                '  source_revision: "2026-08-15T09:00:00Z"\n'
+                '  digest: "3c0963cca3a4999a"\n'
+                "merge_readiness:\n"
+                '  deploy_order: "n_a"\n'
+                "  applied_state: {}\n"
+                '  dependencies: "n_a"\n'
+                '  ac_conformance: "pass"\n'
+                "  claims_audit:\n"
+                "    audited: 1\n"
+                "    rewritten: 0",
+            )
+        )
+        past = _mutate(
+            past,
+            self._PHASES_PREFIX_OLD
+            + self._RV_PENDING
+            + '\n  pr: "pending"\n  monitor: "pending"',
+            self._PHASES_PREFIX_DONE
+            + "  runtime_verification:\n"
+            '    status: "complete"\n'
+            "    reason: null\n"
+            '  merge_readiness: "complete"\n'
+            '  pr: "complete"\n  monitor: "in_progress"',
+        )
+        result = evaluate_state_text(past)
+        self.assertEqual(result["errors"], [], result["errors"])
 
     def test_max_iterations_is_immutable(self) -> None:
         # admin#1495 r12 F8: the template advertised max_iterations as an
@@ -4562,6 +4846,149 @@ class AppendAttemptTests(unittest.TestCase):
                 self.assertEqual(
                     _append_attempt_cli(path, "human:stash-restore"), 0
                 )
+            with open(path, encoding="utf-8") as handle:
+                self.assertIn('"human:stash-restore": 1', handle.read())
+
+    def test_cli_refuses_symlink_and_fifo_lock_paths(self) -> None:
+        # algo#1216 r17 F1 / admin#1495 r13 F2: the lock path is a
+        # predictable sibling of a child-writable state file — a planted
+        # symlink is refused by O_NOFOLLOW and a FIFO by the regular-file
+        # check (O_NONBLOCK keeps the open from hanging on it).
+        silenced = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.md")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(FULL_STATE)
+            os.symlink(path, path + ".monitor.lock")
+            with contextlib.redirect_stdout(silenced):
+                self.assertEqual(
+                    _append_attempt_cli(path, "human:stash-restore"), 1
+                )
+            with open(path, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), FULL_STATE)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.md")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(FULL_STATE)
+            os.mkfifo(path + ".monitor.lock")
+            with contextlib.redirect_stdout(silenced):
+                self.assertEqual(
+                    _append_attempt_cli(path, "human:stash-restore"), 1
+                )
+            with open(path, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), FULL_STATE)
+
+    def test_cli_refuses_lock_identity_churn(self) -> None:
+        # A lock whose PATH no longer names the flocked inode was swapped
+        # between open and flock; persistent churn refuses rather than
+        # trusting either inode.
+        real_stat = os.stat
+
+        def churned(target, *args, **kwargs):
+            result = real_stat(target, *args, **kwargs)
+            if str(target).endswith(".monitor.lock"):
+                fake = mock.Mock()
+                fake.st_ino = result.st_ino + 1
+                fake.st_dev = result.st_dev
+                fake.st_mode = result.st_mode
+                return fake
+            return result
+
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.md")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(FULL_STATE)
+            with mock.patch("os.stat", side_effect=churned):
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(
+                        _append_attempt_cli(path, "human:stash-restore"), 1
+                    )
+            self.assertIn("changing identity", out.getvalue())
+            with open(path, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), FULL_STATE)
+
+    def test_cli_preplanted_temp_symlink_refused_and_preserved(self) -> None:
+        # Unpredictable temp names close the pre-plant window; even with
+        # the name known (uuid pinned), O_EXCL|O_NOFOLLOW refuses the
+        # planted symlink, its TARGET is never written, and ownership-safe
+        # cleanup leaves the attacker's link in place.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.md")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(FULL_STATE)
+            victim = os.path.join(tmp, "victim.txt")
+            with open(victim, "w", encoding="utf-8") as handle:
+                handle.write("precious")
+            fixed = mock.Mock()
+            fixed.hex = "deadbeefcafe"
+            planted = f"{path}.append-attempt.deadbeefcafe.tmp"
+            os.symlink(victim, planted)
+            with mock.patch("uuid.uuid4", return_value=fixed):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(
+                        _append_attempt_cli(path, "human:stash-restore"), 1
+                    )
+            self.assertTrue(os.path.islink(planted))
+            with open(victim, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "precious")
+            with open(path, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), FULL_STATE)
+
+    def test_cli_short_writes_complete(self) -> None:
+        # os.write may write short; the loop must land the full payload.
+        real_write = os.write
+
+        def one_byte(fd, data):
+            return real_write(fd, bytes(data)[:1])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.md")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(FULL_STATE)
+            with mock.patch("os.write", side_effect=one_byte):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(
+                        _append_attempt_cli(path, "human:stash-restore"), 0
+                    )
+            with open(path, encoding="utf-8") as handle:
+                text = handle.read()
+            self.assertIn('"human:stash-restore": 1', text)
+            self.assertEqual(len(text), len(text.rstrip("\x00")))
+
+    def test_cli_replace_and_dir_fsync_failures_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.md")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(FULL_STATE)
+            with mock.patch("os.replace", side_effect=OSError("boom")):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(
+                        _append_attempt_cli(path, "human:stash-restore"), 1
+                    )
+            with open(path, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), FULL_STATE)
+            self.assertEqual(
+                [n for n in os.listdir(tmp) if ".append-attempt." in n], []
+            )
+            # Directory-fsync failure AFTER a successful replace: honest
+            # refusal naming unproven durability, new content retained.
+            fsync_calls = {"count": 0}
+            real_fsync = os.fsync
+
+            def second_fails(fd):
+                fsync_calls["count"] += 1
+                if fsync_calls["count"] == 2:
+                    raise OSError("dir fsync")
+                return real_fsync(fd)
+
+            out = io.StringIO()
+            with mock.patch("os.fsync", side_effect=second_fails):
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(
+                        _append_attempt_cli(path, "human:stash-restore"), 1
+                    )
+            self.assertIn("durability", out.getvalue())
             with open(path, encoding="utf-8") as handle:
                 self.assertIn('"human:stash-restore": 1', handle.read())
 

@@ -12,6 +12,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 import unittest
@@ -96,6 +97,73 @@ class SuperviseStreamLiveProcessTests(unittest.TestCase):
             for pipe in (process.stdout, process.stderr):
                 if pipe is not None:
                     pipe.close()
+
+    def test_nonzero_exit_after_clean_streams_kills_group_descendants(
+        self,
+    ) -> None:
+        # admin#1495 r13 F9 (the repro): clean streams, leader exits
+        # nonzero, and a same-process-group descendant previously
+        # survived with ZERO kill calls — the lazy getpgid-at-kill-time
+        # group resolution raised on the reaped leader. The pgid captured
+        # at spawn now routes this branch through guarded group
+        # termination plus the bounded reap.
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = os.path.join(tmp, "descendant.pid")
+            script = textwrap.dedent(
+                f"""
+                import subprocess, sys
+                # The descendant must NOT inherit the leader's pipes —
+                # holding the write ends would postpone supervision's EOF
+                # until the sleep ends (the "clean streams" premise needs
+                # the pipes to close at leader exit).
+                child = subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(120)"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                with open({pid_file!r}, "w") as handle:
+                    handle.write(str(child.pid))
+                sys.exit(3)
+                """
+            )
+            process = subprocess.Popen(
+                [sys.executable, "-c", script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            pgid = os.getpgid(process.pid)
+            try:
+                result = supervise_stream(
+                    process.stdout,
+                    process.stderr,
+                    lambda: os.killpg(pgid, signal.SIGKILL),
+                    child_wait=process.wait,
+                    child_pgid=pgid,
+                )
+                self.assertEqual(result["outcome"], "internal_failure")
+                with open(pid_file, encoding="utf-8") as handle:
+                    descendant = int(handle.read().strip())
+                deadline = time.monotonic() + 10
+                dead = False
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(descendant, 0)
+                    except ProcessLookupError:
+                        dead = True
+                        break
+                    time.sleep(0.1)
+                self.assertTrue(
+                    dead, "same-group descendant must be group-killed"
+                )
+            finally:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                for pipe in (process.stdout, process.stderr):
+                    if pipe is not None:
+                        pipe.close()
 
     def test_dead_child_kill_race_returns_structured_result(self) -> None:
         # R2 round-2 finding 3737466443, second leg: a CLI that prints its

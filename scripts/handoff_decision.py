@@ -59,9 +59,9 @@ QA_OPERATION_FAMILIES = state_schema.QA_OPERATION_FAMILIES
 REVIEWER_REQUEST_FAMILIES = state_schema.REVIEWER_REQUEST_FAMILIES
 ROUNDTRIP_FAMILIES = state_schema.ROUNDTRIP_FAMILIES
 parsed_generation_family = state_schema.parsed_generation_family
-# Git accepts unambiguous abbreviated object IDs. Require at least seven hex
-# characters while allowing full SHA-1 and SHA-256 object IDs.
-GIT_OBJECT_ID = re.compile(r"[0-9a-fA-F]{7,64}")
+# algo#1216 r17 F5: the Git object-ID grammar is schema-owned — one shared
+# fragment, both consumers bound to it (validate_package pins this line).
+GIT_OBJECT_ID = state_schema.GIT_OBJECT_ID
 LINEAR_WRITE_PATHS = {"environment_tool", "local_api", "none"}
 ISSUE_TRACKER_TYPES = {"linear", "jira", "github", "none"}
 # Single source of truth: the attempt cap lives in state_schema (dependency

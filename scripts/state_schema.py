@@ -232,16 +232,37 @@ ROUNDTRIP_FAMILIES = {
 # pr_artifacts is the DISTINCT artifact contract (references/state-and-safety.md):
 # generic PR-anchored lifecycle mutations that are HEAD-bound, never generation-
 # scoped, and never planned by handoff_decision.py. Its ids are
+# algo#1216 r17 F5: the abbreviated-or-full Git object-ID grammar is ONE
+# shared fact (Git accepts unambiguous abbreviations of at least 7 hex
+# characters, up to a full SHA-256). Both consumers DERIVE from this
+# fragment — PR_ARTIFACT_ID below and handoff_decision.GIT_OBJECT_ID —
+# and validate_package pins each derivation as an operative source line,
+# so the range can never drift between them. Full-match anchoring stays
+# at the consumers (fullmatch / trailing \Z).
+GIT_OBJECT_ID_HEX = r"[0-9a-fA-F]{7,64}"
+GIT_OBJECT_ID = re.compile(GIT_OBJECT_ID_HEX)
+# admin#1495 r13 F6: the closed set of runtime-verification kinds a
+# repository may mandate.
+RUNTIME_VERIFICATION_KINDS = frozenset(("ui", "api", "performance"))
+# algo#1216 r17 F6: the closed runtime_verification record shape.
+RUNTIME_VERIFICATION_KEYS = frozenset(
+    (
+        "status",
+        "reason",
+        "target_head_sha",
+        "touched_diff_fingerprint",
+        "started_at",
+        "verified_at",
+        "evidence",
+    )
+)
 # `ci-evidence:<head_sha>` / `qa-rehearsal:<head_sha>` / `deferred-work:<head_sha>`
 # (the last added by algo#1216 r16 F11 for the anchored deferred-work body
-# record the terminal gate requires); the sha is an
-# abbreviated-or-full git object id (7-64 hex, matching handoff_decision's
-# GIT_OBJECT_ID range). The generation-family grammar would wrongly reject these,
+# record the terminal gate requires); the sha is the shared Git object-ID
+# grammar above. The generation-family grammar would wrongly reject these,
 # so this kind carries its own grammar - preserving that contract is an explicit
 # requirement of algo#1216 r16 F6.
-PR_ARTIFACT_ID = re.compile(
-    r"(?:ci-evidence|qa-rehearsal|deferred-work):[0-9a-fA-F]{7,64}\Z"
-)
+PR_ARTIFACT_ID = re.compile("(?:ci-evidence|qa-rehearsal|deferred-work):" + GIT_OBJECT_ID_HEX + r"\Z")
 
 
 def parsed_generation_family(
@@ -296,7 +317,11 @@ ALLOWED_HANDOFF_KINDS = frozenset(
 # monitor_cli.repository (algo#1216 r16 F1) - a hard requirement here would
 # fail-closed every legacy ledger at resume instead of deriving. pr_artifacts
 # is repo-agnostic.
-HANDOFF_KINDS_REQUIRING_REPOSITORY = frozenset(("qa",))
+# admin#1495 r13 F5: reviewer_request joined qa — an operation-bearing
+# reviewer_request record without a binding slips the runner's cross-repo
+# terminal compare (it skips absent bindings), so new records must
+# persist it; the rejection message names the explicit legacy derivation.
+HANDOFF_KINDS_REQUIRING_REPOSITORY = frozenset(("qa", "reviewer_request"))
 
 
 def handoff_operation_id_valid(kind: str, operation_id: str) -> bool:
@@ -2014,6 +2039,15 @@ class _Validator:
                 if not isinstance(value, dict):
                     self.error("phases.runtime_verification: must be a mapping with a status")
                     return None
+                # algo#1216 r17 F6: the mapping is a closed shape — an
+                # unknown key on a record Phase 5 trusts is exactly the
+                # laundering surface the proof fields close.
+                for key in value:
+                    if key not in RUNTIME_VERIFICATION_KEYS:
+                        self.error(
+                            "phases.runtime_verification: unknown key "
+                            f"{_safe_key(str(key))!r}"
+                        )
                 status = value.get("status")
                 if not self.check_enum(status, RUNTIME_VERIFICATION_ENUM, "phases.runtime_verification.status"):
                     return None
@@ -2021,6 +2055,69 @@ class _Validator:
                     self.error(
                         "phases.runtime_verification: waived requires a non-empty reason"
                     )
+                if status == "complete":
+                    # algo#1216 r17 F6: a terminal record is trusted by
+                    # Phase 5, so BEFORE Phase 5 has passed (phases.pr
+                    # pending/in_progress/absent) `complete` must carry
+                    # its proof: exact-head SHA, the touched-diff
+                    # fingerprint, ordered timestamps, and nonempty
+                    # evidence. A proofless complete under a COMPLETED pr
+                    # phase is tolerated as pre-upgrade history — Phase 5
+                    # already consumed it, and resetting it would break
+                    # the successful-predecessor chain retroactively.
+                    pr_status = phases.get("pr")
+                    pre_phase5 = pr_status in (None, "pending", "in_progress")
+                    if pre_phase5:
+                        migration = (
+                            " — legacy-v1 migration: set status to"
+                            ' "in_progress" (and phases.pr back to'
+                            ' "pending" if it was "in_progress"),'
+                            " re-verify at the current head, fill the"
+                            " proof fields, then restore complete"
+                        )
+                        if not _is_full_hex(value.get("target_head_sha")):
+                            self.error(
+                                "phases.runtime_verification: complete"
+                                " requires a full-length hex"
+                                " target_head_sha" + migration
+                            )
+                        fingerprint = value.get("touched_diff_fingerprint")
+                        if not (
+                            isinstance(fingerprint, str)
+                            and len(fingerprint) == 64
+                            and all(
+                                c in "0123456789abcdefABCDEF"
+                                for c in fingerprint
+                            )
+                        ):
+                            self.error(
+                                "phases.runtime_verification: complete"
+                                " requires a 64-hex"
+                                " touched_diff_fingerprint" + migration
+                            )
+                        started = normalize_iso_timestamp(
+                            value.get("started_at")
+                        )
+                        verified = normalize_iso_timestamp(
+                            value.get("verified_at")
+                        )
+                        if started is None or verified is None:
+                            self.error(
+                                "phases.runtime_verification: complete"
+                                " requires ISO started_at and verified_at"
+                                + migration
+                            )
+                        elif verified < started:
+                            self.error(
+                                "phases.runtime_verification: verified_at"
+                                " must not precede started_at" + migration
+                            )
+                        evidence = value.get("evidence")
+                        if not (isinstance(evidence, dict) and evidence):
+                            self.error(
+                                "phases.runtime_verification: complete"
+                                " requires nonempty evidence" + migration
+                            )
                 return status
             enum = MONITOR_ENUM if name == "monitor" else SIMPLE_PHASE_ENUM
             if not self.check_enum(value, enum, f"phases.{name}"):
@@ -2387,7 +2484,11 @@ class _Validator:
                 if not isinstance(binding, str) or not binding:
                     self.error(
                         f"handoffs.{safe_kind}.repository_name_with_owner: required "
-                        "(non-empty) when the handoff carries operations"
+                        "(non-empty) when the handoff carries operations — a"
+                        " pre-upgrade record derives it from"
+                        " monitor_cli.repository (the runner's"
+                        " live-origin-agreed binding): persist that value"
+                        " and resume"
                     )
                     continue
             if not isinstance(results, dict):
@@ -2621,6 +2722,71 @@ class _Validator:
                     " argv list of strings (null allowed; a legacy plain"
                     " string is tolerated as an always-cache-miss value)"
                 )
+        # admin#1495 r13 F6: mandatory_kinds is the closed ui|api|performance
+        # set and each mandated kind needs its repository-rule evidence -
+        # an arbitrary value silently disabled required runtime
+        # verification (nothing downstream matched it), and an unsourced
+        # mandate is unauditable.
+        policy = conventions.get("runtime_verification_policy")
+        if policy is not None and not isinstance(policy, dict):
+            self.error(
+                "resolved_conventions.runtime_verification_policy: must be"
+                " a mapping"
+            )
+        elif isinstance(policy, dict):
+            kinds = policy.get("mandatory_kinds")
+            declared_kinds: list[str] = []
+            if kinds is not None:
+                if not isinstance(kinds, list):
+                    self.error(
+                        "resolved_conventions.runtime_verification_policy"
+                        ".mandatory_kinds: must be a list"
+                    )
+                else:
+                    for kind in kinds:
+                        if (
+                            not isinstance(kind, str)
+                            or kind not in RUNTIME_VERIFICATION_KINDS
+                        ):
+                            self.error(
+                                "resolved_conventions"
+                                ".runtime_verification_policy"
+                                ".mandatory_kinds: entries must be one of"
+                                " ui, api, performance"
+                            )
+                        else:
+                            declared_kinds.append(kind)
+                    if len(set(declared_kinds)) != len(declared_kinds):
+                        self.error(
+                            "resolved_conventions"
+                            ".runtime_verification_policy.mandatory_kinds:"
+                            " entries must be unique"
+                        )
+            policy_evidence = policy.get("evidence")
+            if policy_evidence is not None and not isinstance(
+                policy_evidence, dict
+            ):
+                self.error(
+                    "resolved_conventions.runtime_verification_policy"
+                    ".evidence: must be a mapping"
+                )
+            evidence_map = (
+                policy_evidence if isinstance(policy_evidence, dict) else {}
+            )
+            for key in evidence_map:
+                if key not in RUNTIME_VERIFICATION_KINDS:
+                    self.error(
+                        "resolved_conventions.runtime_verification_policy"
+                        f".evidence: unknown kind {_safe_key(str(key))!r}"
+                    )
+            for kind in sorted(set(declared_kinds)):
+                value = evidence_map.get(kind)
+                if not isinstance(value, str) or not value:
+                    self.error(
+                        "resolved_conventions.runtime_verification_policy"
+                        f".evidence[{kind}]: a mandated kind requires its"
+                        " exact repository rule/source"
+                    )
         branches = conventions.get("protected_branches")
         if branches is not None and (
             not isinstance(branches, list)
@@ -3794,20 +3960,63 @@ def _append_attempt_cli(path: str, key: str) -> int:
     if not key.startswith("human:") or len(key) <= len("human:"):
         return _refuse(["--append-attempt accepts only human:* keys"])
     import fcntl as _fcntl
+    import stat as _stat
+    import uuid as _uuid
 
+    # algo#1216 r17 F1 / admin#1495 r13 F2: the lock and temp paths are
+    # attacker-predictable siblings of a child-writable state file, so
+    # every open here is no-follow, the lock must be a REGULAR file whose
+    # PATH still names the locked inode after acquisition (a swap between
+    # open and flock re-acquires; persistent churn refuses), and the temp
+    # below is an unpredictable same-directory O_EXCL 0600 file written
+    # with a complete-write loop and fsynced before the atomic replace,
+    # with the parent directory fsynced after it. Cleanup unlinks only
+    # the temp THIS call created - an O_EXCL collision is someone else's
+    # file and stays untouched.
     lock_path = path + ".monitor.lock"
-    try:
-        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
-    except OSError:
-        return _refuse(["append-attempt could not open the runner lock"])
-    try:
+    lock_fd = None
+    for _ in range(5):
         try:
-            _fcntl.flock(lock_fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            candidate_fd = os.open(
+                lock_path,
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                0o600,
+            )
         except OSError:
+            return _refuse(
+                ["append-attempt could not open the runner lock as a"
+                 " no-follow regular file"]
+            )
+        fd_stat = os.fstat(candidate_fd)
+        if not _stat.S_ISREG(fd_stat.st_mode):
+            os.close(candidate_fd)
+            return _refuse(["runner lock path is not a regular file"])
+        try:
+            _fcntl.flock(candidate_fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        except OSError:
+            os.close(candidate_fd)
             return _refuse(
                 ["a monitor runner is active — persist the record after"
                  " it exits (lock held)"]
             )
+        try:
+            path_stat = os.stat(lock_path, follow_symlinks=False)
+        except OSError:
+            os.close(candidate_fd)
+            continue
+        if (path_stat.st_ino, path_stat.st_dev) == (
+            fd_stat.st_ino,
+            fd_stat.st_dev,
+        ):
+            lock_fd = candidate_fd
+            break
+        os.close(candidate_fd)
+    if lock_fd is None:
+        return _refuse(
+            ["the runner lock kept changing identity under acquisition —"
+             " refusing to trust it"]
+        )
+    try:
         try:
             text = _read_state_file(path)
         except (OSError, UnicodeDecodeError):
@@ -3823,22 +4032,47 @@ def _append_attempt_cli(path: str, key: str) -> int:
                 ["append would leave the state invalid; file untouched:"]
                 + list(result["errors"])
             )
-        tmp_path = path + ".append-attempt.tmp"
+        tmp_path = f"{path}.append-attempt.{_uuid.uuid4().hex}.tmp"
         try:
             tmp_fd = os.open(
-                tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644
+                tmp_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
             )
+        except OSError:
+            # O_EXCL collision or a planted symlink: not our file — refuse
+            # without unlinking anything (ownership-safe cleanup).
+            return _refuse(
+                ["temp creation failed (collision or symlink refused);"
+                 " original untouched, nothing cleaned"]
+            )
+        replaced = False
+        try:
+            payload = memoryview(updated.encode("utf-8"))
             try:
-                os.write(tmp_fd, updated.encode("utf-8"))
+                while payload:
+                    payload = payload[os.write(tmp_fd, payload):]
                 os.fsync(tmp_fd)
             finally:
                 os.close(tmp_fd)
             os.replace(tmp_path, path)
+            replaced = True
+            dir_fd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
         except OSError:
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
+            if replaced:
+                return _refuse(
+                    ["state WAS replaced but the parent-directory fsync"
+                     " failed — durability is unproven; re-verify the"
+                     " record after the filesystem syncs"]
+                )
             return _refuse(["atomic replace failed; original untouched"])
         print(
             json.dumps(

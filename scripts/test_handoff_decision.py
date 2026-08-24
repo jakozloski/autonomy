@@ -823,6 +823,25 @@ class HandoffDecisionTest(unittest.TestCase):
             blocked["errors"],
         )
 
+    def test_git_object_id_grammar_is_schema_owned(self) -> None:
+        # algo#1216 r17 F5: one shared grammar — this consumer binds the
+        # schema-owned compiled pattern itself (assertIs is meaningful for
+        # compiled regex objects, unlike interned small ints), so a
+        # re-declared local range can never drift. The 6/7/64/65
+        # boundaries hold through the shared fragment with full-match
+        # anchoring preserved.
+        import state_schema
+
+        from handoff_decision import GIT_OBJECT_ID
+
+        self.assertIs(GIT_OBJECT_ID, state_schema.GIT_OBJECT_ID)
+        for length, ok in ((6, False), (7, True), (64, True), (65, False)):
+            with self.subTest(length=length):
+                self.assertEqual(
+                    GIT_OBJECT_ID.fullmatch("a" * length) is not None, ok
+                )
+        self.assertIsNone(GIT_OBJECT_ID.fullmatch("g" * 7))
+
     def test_qa_generation_rolls_over_when_reviewers_change(self) -> None:
         # admin#1495 R2 finding 3791925153 (executed repro): the reviewer set
         # shapes operation IDs, so it is a target fact — omitting it from the

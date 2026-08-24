@@ -79,6 +79,7 @@ from model_policy import (  # noqa: E402
     monitor_child_arguments,
     monitor_child_prompt,
     monitor_orchestrator_binding,
+    sanitize_for_publication,
 )
 
 WRAPPER_EXEC_FAILED_MARKER = "MONITOR-WRAPPER-EXEC-FAILED"
@@ -144,6 +145,26 @@ MAPPED_QA_REPOSITORIES = frozenset(
         "keeper-dating/keeper-lead-generator",
     }
 )
+
+
+def _terminal_missing_planned_qa(bound_repo: object, qa_status: object) -> bool:
+    """algo#1216 finding 3813491661: a terminal candidate for a Keeper-mapped
+    repository must show the clean-exit QA handoff actually planned — an idle
+    or absent QA aggregate means completion was reported without assigning QA,
+    moving the ticket, or recording any handoff artifact. Idle stays valid for
+    unmapped repositories.
+
+    Extracted so the manifest rule keeps a reachable pin: the r17 F9
+    containment gate now preempts this branch end to end on a non-delegating
+    host (a mapped launch blocks BEFORE any child produces a candidate), so the
+    predicate is verified directly here rather than through the now-gated e2e
+    path."""
+
+    mapped = (
+        isinstance(bound_repo, str)
+        and bound_repo.casefold() in MAPPED_QA_REPOSITORIES
+    )
+    return mapped and qa_status in (None, "idle")
 
 # admin#1495 finding 3825265272 / algo#1216 F3: narrow the capability probe
 # to the exact surface the mapped Phase-6 handoffs exercise. The planner
@@ -239,8 +260,13 @@ class AttemptContainment:
     boundary. Hosts without delegation (macOS dev) DEGRADE to the
     snapshot+group proof with the reason recorded in
     ``in_flight.containment`` — disclosed, never silent.
-    ``MONITOR_RUNNER_CGROUP_ROOT`` is the hermetic test seam (a tmpdir
-    mimicking the cgroup files exercises every branch without root).
+    ``MONITOR_RUNNER_CGROUP_ROOT`` is the hermetic test seam: a plain tmpdir
+    reaches the DEGRADE branches (missing root, un-creatable target, a
+    directory the kernel never populated with ``cgroup.procs``) without root.
+    The success branch needs a real delegated cgroup2 hierarchy — the kernel
+    auto-creates ``cgroup.procs`` inside a freshly ``mkdir``-ed cgroup, which a
+    plain filesystem cannot fake — so it is exercised only on a delegating
+    host, never in the tmpdir seam.
     """
 
     def __init__(self, path: Path) -> None:
@@ -1411,6 +1437,7 @@ def _drain_child(
         "result_text": None,
         "result_subtype": None,
         "result_is_error": None,
+        "result_errors": [],
     }
     recent_lines: list[str] = []
     stderr_tail: list[str] = []
@@ -1445,14 +1472,15 @@ def _drain_child(
                     protocol["session_id"] = sid
                 if isinstance(model, str) and model:
                     protocol["served_model"] = model
-            elif event.get("type") == "result" and isinstance(event.get("result"), str):
-                protocol["result_text"] = event["result"]
-                # r14 F12: the stream can deliver a result carrying its
-                # own structured error verdict (subtype=success with
-                # is_error=true was reproduced for an empty-stderr quota
-                # event). Keeping only result_text threw that trusted
-                # metadata away and the failure path classified bare
-                # stderr into a generic charge.
+            elif event.get("type") == "result":
+                # algo#1216 r17 F7 (supersedes r14 F12's shape): the
+                # official result union exposes the `result` string ONLY
+                # on subtype=success — error variants carry the subtype
+                # and errors[] WITHOUT it. Parse the discriminator FIRST
+                # so an error result classifies as itself instead of
+                # falling through to a generic no_verdict; the text stays
+                # optional, and errors[] is retained byte-bounded and
+                # publication-sanitized.
                 protocol["result_subtype"] = (
                     event.get("subtype")
                     if isinstance(event.get("subtype"), str)
@@ -1463,6 +1491,14 @@ def _drain_child(
                     if isinstance(event.get("is_error"), bool)
                     else None
                 )
+                if isinstance(event.get("result"), str):
+                    protocol["result_text"] = event["result"]
+                raw_errors = event.get("errors")
+                if isinstance(raw_errors, list):
+                    protocol["result_errors"] = [
+                        sanitize_for_publication(str(item))[:400]
+                        for item in raw_errors[:5]
+                    ]
         else:
             stderr_tail.append(decoded[:400])
             del stderr_tail[:-20]
@@ -1635,6 +1671,8 @@ def classify_child_failure(
     resumed: bool,
     result_text: str | None = None,
     result_is_error: bool | None = None,
+    result_subtype: str | None = None,
+    result_errors: list[str] | None = None,
 ) -> tuple[str, str]:
     """Phase-aware classification (F4): ('block'|'ladder'|'charge'|'fresh_session', signature).
 
@@ -1655,6 +1693,14 @@ def classify_child_failure(
     # the rate-limit/auth matchers below see the in-band diagnostics.
     if result_is_error is True and isinstance(result_text, str):
         joined = joined + "\n" + result_text[:2000]
+    # algo#1216 r17 F7: error variants carry their diagnostics in
+    # errors[] with NO result text at all — join the bounded sanitized
+    # entries so the auth/rate-limit matchers see the in-band
+    # diagnostics for zero AND nonzero exits.
+    if result_errors:
+        joined = joined + "\n" + "\n".join(
+            entry for entry in result_errors if isinstance(entry, str)
+        )
     lowered = joined.lower()
     if WRAPPER_EXEC_FAILED_MARKER in joined:
         return ("block", "claude CLI binary could not be executed — install or fix PATH")
@@ -1664,6 +1710,10 @@ def classify_child_failure(
         return ("fresh_session", "monitor-child:resume_not_found")
     if rate_limit_offset(joined) is not None:
         return ("ladder", "monitor-child:rate_limited")
+    # A structured error variant that matches no deterministic signature
+    # is a classified execution failure, never a bare exit-code charge.
+    if isinstance(result_subtype, str) and result_subtype.startswith("error"):
+        return ("charge", f"monitor-child:result_{result_subtype}"[:80])
     return ("charge", f"monitor-child:exit_{exit_code}")
 
 
@@ -2487,7 +2537,9 @@ class Runner:
         # r13 F8: containment attaches while the wrapper is PAUSED — the
         # GO token has not been sent, so nothing has executed and every
         # future descendant inherits membership. A host without cgroup v2
-        # delegation records the degraded mode instead, never silently.
+        # delegation records the degraded mode instead, never silently —
+        # for UNMAPPED repositories only; a mapped repository fails closed
+        # below before GO (r17 F9 / r13 F3).
         containment = AttemptContainment.create(attempt_id)
         containment_record = (
             containment.record
@@ -2498,6 +2550,39 @@ class Runner:
             containment.remove()
             containment = None
             containment_record = "degraded:cgroup-adopt-failed"
+        # algo#1216 r17 F9 / admin#1495 r13 F3 (package half): a MAPPED
+        # repository's monitor child is a write-capable managed run, and
+        # the snapshot fallback's between-snapshot double-fork/setsid
+        # escape is not enforceable containment. Degraded containment
+        # therefore fails CLOSED here — before the GO token, while the
+        # paused wrapper has executed nothing: close stdin (no GO), reap
+        # the wrapper, and block naming the host obligation. Unmapped
+        # repositories retain the documented degraded operation; the
+        # host-delegated-cgroup provisioning itself stays a host contract.
+        if containment is None and self._bound_mapped_repository(extract):
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+            if not _bounded_reap(proc):
+                raise RunnerExit(
+                    5,
+                    "blocked",
+                    "paused launch wrapper could not be reaped while"
+                    " refusing an uncontained mapped launch — a"
+                    " possibly-live process needs a human",
+                )
+            raise RunnerExit(
+                5,
+                "blocked",
+                f"cgroup v2 delegation is unavailable ({containment_record})"
+                " and this repository is Keeper-mapped — a write-capable"
+                " managed launch requires enforceable per-attempt"
+                " containment (the snapshot fallback admits a"
+                " between-snapshot setsid escape); provision delegated"
+                " cgroups (MONITOR_RUNNER_CGROUP_ROOT) or run this"
+                " workflow on a delegating host",
+            )
         self.attempt_containment = containment
         # R6-F15: one instant defines both the persisted deadline_at and the
         # enforced monotonic deadline, so the record matches enforcement.
@@ -2706,8 +2791,15 @@ class Runner:
             # no_verdict charge. Classify the structured error FIRST,
             # before the outcome/verdict split, whatever the exit code.
             protocol_meta = drained.get("protocol") or {}
+            # algo#1216 r17 F7: an error VARIANT (subtype error_*) is a
+            # structured error even when is_error is absent and no result
+            # text exists — the union exposes `result` only for success.
+            structured_error = protocol_meta.get("result_is_error") is True or (
+                isinstance(protocol_meta.get("result_subtype"), str)
+                and protocol_meta["result_subtype"].startswith("error")
+            )
             if (
-                protocol_meta.get("result_is_error") is True
+                structured_error
                 and drained["outcome"] == "clean"
                 and drained["exit_code"] == 0
             ):
@@ -2718,6 +2810,8 @@ class Runner:
                     resumed,
                     result_text=protocol_meta.get("result_text"),
                     result_is_error=True,
+                    result_subtype=protocol_meta.get("result_subtype"),
+                    result_errors=protocol_meta.get("result_errors"),
                 )
                 if action == "block":
                     self._clear_in_flight(fresh)
@@ -2750,6 +2844,12 @@ class Runner:
                     result_text=drained.get("protocol", {}).get("result_text"),
                     result_is_error=drained.get("protocol", {}).get(
                         "result_is_error"
+                    ),
+                    result_subtype=drained.get("protocol", {}).get(
+                        "result_subtype"
+                    ),
+                    result_errors=drained.get("protocol", {}).get(
+                        "result_errors"
                     ),
                 )
                 if action == "block":
@@ -3065,13 +3165,7 @@ class Runner:
         contract.
         """
 
-        cli = extract.get("monitor_cli")
-        persisted = cli.get("repository") if isinstance(cli, dict) else None
-        bound = (
-            persisted
-            if isinstance(persisted, str) and persisted
-            else self.repository_hint
-        )
+        bound = self._bound_repository(extract)
         if not (
             isinstance(bound, str)
             and bound.casefold() in MAPPED_QA_REPOSITORIES
@@ -3509,6 +3603,30 @@ class Runner:
                     " each parse under the byte ceiling)",
                 )
 
+    def _bound_repository(self, extract: dict[str, Any]) -> str | None:
+        """The bound repository: persisted ``monitor_cli.repository``, else
+        the live origin hint."""
+
+        cli = extract.get("monitor_cli")
+        persisted = cli.get("repository") if isinstance(cli, dict) else None
+        return (
+            persisted
+            if isinstance(persisted, str) and persisted
+            else self.repository_hint
+        )
+
+    def _bound_mapped_repository(self, extract: dict[str, Any]) -> bool:
+        """The bound repository is one of the Keeper-mapped QA
+        repositories — the shared write-capable-managed-run predicate
+        consumed by the capability probe and the r17 F9 containment
+        gate."""
+
+        bound = self._bound_repository(extract)
+        return (
+            isinstance(bound, str)
+            and bound.casefold() in MAPPED_QA_REPOSITORIES
+        )
+
     def _verify_skill_snapshot(self) -> None:
         """Re-verify the staged instruction surface against the __init__
         manifest immediately before a launch (finding 3722356278): the
@@ -3681,14 +3799,10 @@ class Runner:
                 if isinstance(persisted_repo, str) and persisted_repo
                 else self.repository_hint
             )
-            mapped = (
-                isinstance(bound_repo, str)
-                and bound_repo.casefold() in MAPPED_QA_REPOSITORIES
-            )
             qa_status = (
                 candidate_extract.get("handoff_status_by_kind") or {}
             ).get("qa")
-            if mapped and qa_status in (None, "idle"):
+            if _terminal_missing_planned_qa(bound_repo, qa_status):
                 self._preserve_failed(candidate)
                 self.charge_failure(fresh, "monitor-child:handoff_missing")
                 return "retry"
@@ -4020,7 +4134,12 @@ class Runner:
             0o600,
         )
         try:
-            os.write(stage_fd, self.wrapper_source)
+            # algo#1216 r17 F1 (sibling site): os.write may write SHORT —
+            # a truncated wrapper would exec a prefix of the trusted
+            # source. Loop to completion.
+            view = memoryview(self.wrapper_source)
+            while view:
+                view = view[os.write(stage_fd, view):]
         finally:
             os.close(stage_fd)
 
