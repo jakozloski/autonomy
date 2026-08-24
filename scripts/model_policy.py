@@ -150,6 +150,7 @@ import inspect
 import json
 import re
 import selectors
+import shlex
 import sys
 import time
 from datetime import timedelta
@@ -1988,6 +1989,18 @@ def monitor_child_prompt(
     the runner-owned ``monitor_cli`` block, and the strict verdict schema.
     """
 
+    # admin#1495 r12 F17: the digest command is a copy-runnable shell line —
+    # raw path interpolation broke on spaces and let quotes/dollars/
+    # semicolons/newlines inject shell syntax. shlex.join quotes each argv
+    # element; the prose path mentions stay raw (they are read, not run).
+    digest_command = shlex.join(
+        [
+            "python3",
+            f"{skill_dir}/scripts/state_schema.py",
+            "--monitor-digest",
+            candidate_path,
+        ]
+    )
     return (
         f"You are the Phase 6 monitor orchestrator for the autonomy workflow"
         f" whose skill package is at {skill_dir}. First follow that package's"
@@ -1999,8 +2012,7 @@ def monitor_child_prompt(
         f" Persist the FULL updated state to {candidate_path} and NEVER"
         f" write {state_path} itself; carry the monitor_cli block over"
         f" value-identical (it is runner-owned). Compute the candidate"
-        f" digest with: python3 {skill_dir}/scripts/state_schema.py"
-        f" --monitor-digest {candidate_path} . Your final message must be"
+        f" digest with: {digest_command} . Your final message must be"
         f" ONLY this JSON object and nothing else:"
         f' {{"schema_version": 1, "attempt_id": "{attempt_id}",'
         f' "tick_ordinal": {tick_ordinal},'
@@ -2732,14 +2744,37 @@ def monitor_orchestrator_binding(
         and base_leg.get("host_agent_selection_verified") is True
     )
 
+    # admin#1495 r12 F1: the OpenAI entry's Phase 6 controller is a live
+    # session on the CODEX leg's selection — a recorded, gate-ready leg,
+    # not an unrecorded model. Recompute its landed-ready model the same
+    # untrusted-state way as the Claude legs (floor recheck via the shared
+    # slug predicate; a hand-edited below-floor or excluded-variant record
+    # never continues).
+    codex_leg = model_runtime.get("codex")
+    codex_model: str | None = None
+    if isinstance(codex_leg, dict) and codex_leg.get("gate_status") == "ready":
+        codex_candidate = codex_leg.get("model")
+        if (
+            isinstance(codex_candidate, str)
+            and codex_candidate
+            and _slug_meets_floor_policy(codex_candidate)
+        ):
+            codex_model = codex_candidate
+
     def _bound(
         lineage: str, model: str, reason_code: str, reason: str, pending: str | None
     ) -> dict[str, Any]:
+        if lineage == "reviewer":
+            effort = REVIEWER_EFFORT
+        elif lineage == "codex":
+            effort = CODEX_EFFORT
+        else:
+            effort = BASE_EFFORT
         return {
             "state": "bound",
             "lineage": lineage,
             "model": model,
-            "effort": REVIEWER_EFFORT if lineage == "reviewer" else BASE_EFFORT,
+            "effort": effort,
             "reason_code": reason_code,
             "reason": reason,
             "pending_owner": pending,
@@ -2815,6 +2850,30 @@ def monitor_orchestrator_binding(
         # capability set, mirroring the nominal no-write-path demotion; the
         # nominal owner still takes over at the next session boundary.
         live_lineage, live_model = "base", reviewer_model
+    elif codex_model is not None and session_model == codex_model:
+        # admin#1495 r12 F1: the OpenAI entry's controller continues
+        # monitoring on the codex lineage — orchestrate-only, with Claude
+        # child ownership retained (the nominal Claude owner rides in
+        # pending_owner, the exact target the runner's session_model-free
+        # recompute cross-checks, so every pinned child stays on the
+        # frozen Claude selection). Like reviewer ownership it needs the
+        # host-verified write-capable base worker path; unlike a live
+        # Opus session, a Codex session cannot truthfully demote to the
+        # base lineage's inline role, so without that path there is no
+        # compliant write actor and the binding fails closed.
+        if not base_write_verified:
+            return {
+                "state": "invalid",
+                "errors": [
+                    "a codex-leg controller dispatches every substantive"
+                    " work item to base workers, and the base leg's write"
+                    " path is not host-verified"
+                    " (host_agent_selection_verified is not true) — no"
+                    " compliant write actor exists; verify the base worker"
+                    " path or run the monitor from a Claude-leg session"
+                ],
+            }
+        live_lineage, live_model = "codex", codex_model
     else:
         return {
             "state": "invalid",

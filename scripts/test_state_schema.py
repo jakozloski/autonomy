@@ -3,14 +3,23 @@
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
+import io
 import json
+import os
+import tempfile
 import unittest
 
 from state_schema import (
+    HANDOFF_KIND_GENERATION_VOCABULARY,
     SUSPECT,
     VALID,
+    _append_attempt_cli,
+    append_attempt_key,
     evaluate_state_text,
+    handoff_operation_id_valid,
     roundtrip_generation,
     validate_operation_collection,
     validate_operation_result_record,
@@ -198,10 +207,13 @@ def _terminal_monitor_state() -> str:
 
 def _qa_handoff(operations: str, results: str, status: str) -> str:
     text = _terminal_monitor_state()
+    # A qa handoff that carries operations must persist a non-empty
+    # repository_name_with_owner (algo#1216 r16 F6); every fixture here injects
+    # operations, so bind the QA-owner repository the operations act on.
     text = _mutate(
         text,
         '    status: "idle"\n    repository_name_with_owner: null',
-        f'    status: "{status}"\n    repository_name_with_owner: null',
+        f'    status: "{status}"\n    repository_name_with_owner: "Keeper-Dating/matchmaking"',
     )
     text = _mutate(text, "    operations: []\n    operation_results: {}", f"{operations}\n{results}")
     return text
@@ -416,13 +428,13 @@ class PhaseInvariantTests(unittest.TestCase):
 
 
 class HandoffInvariantTests(unittest.TestCase):
-    OPS_TWO = '    operations: ["github_assignees", "tracker_assign"]'
+    OPS_TWO = '    operations: ["qa.github.replace_assignees:g0123456789ab", "qa.linear.assign_ticket:g0123456789ab"]'
     # Every record carries attempts: the write-ahead contract persists
     # "status pending, incremented attempts, started_at" before any call.
     RESULT_FIRST_PENDING = "\n".join(
         (
             "    operation_results:",
-            '      "github_assignees":',
+            '      "qa.github.replace_assignees:g0123456789ab":',
             '        status: "pending"',
             "        attempts: 1",
             '        started_at: "2026-07-14T17:00:00Z"',
@@ -431,14 +443,14 @@ class HandoffInvariantTests(unittest.TestCase):
     RESULTS_BOTH_COMPLETE = "\n".join(
         (
             "    operation_results:",
-            '      "github_assignees":',
+            '      "qa.github.replace_assignees:g0123456789ab":',
             '        status: "complete"',
             "        attempts: 1",
             '        started_at: "2026-07-14T16:58:00Z"',
             '        verified_at: "2026-07-14T17:00:00Z"',
             "        evidence:",
             '          verified: "assignee array verified"',
-            '      "tracker_assign":',
+            '      "qa.linear.assign_ticket:g0123456789ab":',
             '        status: "complete"',
             "        attempts: 1",
             '        started_at: "2026-07-14T16:59:00Z"',
@@ -524,9 +536,250 @@ class HandoffInvariantTests(unittest.TestCase):
         self.assertEqual(evaluate_state_text(text)["state"], SUSPECT)
 
     def test_duplicate_operation_ids_are_suspect(self) -> None:
-        ops = '    operations: ["github_assignees", "github_assignees"]'
+        ops = '    operations: ["qa.github.replace_assignees:g0123456789ab", "qa.github.replace_assignees:g0123456789ab"]'
         text = self._nonterminal(_qa_handoff(ops, self.RESULT_FIRST_PENDING, "pending"))
         self.assertEqual(evaluate_state_text(text)["state"], SUSPECT)
+
+
+class HandoffKindGrammarBoundaryTests(unittest.TestCase):
+    """algo#1216 r16 F6: the persisted-state validator allowlists handoff
+    kinds, enforces a per-kind operation grammar, requires the qa repository
+    binding when the handoff carries operations, and preserves the distinct
+    (head-bound) pr_artifacts artifact contract. Kinds/families are named as
+    literals so a vocabulary rename cannot silently green these assertions."""
+
+    # --- pure-function grammar: canonical families accepted ---
+
+    def test_canonical_generation_families_are_accepted(self) -> None:
+        # One identity-free and one per-reviewer family for each generation
+        # kind, at a valid 12-hex generation stamp.
+        for kind, op in (
+            ("qa", "qa.github.replace_assignees:g0123456789ab"),
+            ("qa", "qa.github.request_review:alice:g0123456789ab"),
+            ("qa", "qa.linear.assign_ticket:g0123456789ab"),
+            ("review_roundtrip", "roundtrip.github.replace_assignees:g0123456789ab"),
+            ("review_roundtrip", "roundtrip.github.request_review:alice:g0123456789ab"),
+            ("reviewer_request", "reviewer.github.replace_assignees:g0123456789ab"),
+            ("reviewer_request", "reviewer.github.request_review:alice:g0123456789ab"),
+        ):
+            with self.subTest(kind=kind, op=op):
+                self.assertTrue(handoff_operation_id_valid(kind, op))
+
+    def test_every_declared_family_parses_under_its_vocabulary(self) -> None:
+        # Completeness: the vocabulary (data) and GENERATION_SCOPED_ID (regex)
+        # are independent mechanisms; a family carrying an illegal character
+        # would sit in the dict yet be rejected by the grammar. Sweep both.
+        for kind, vocab in HANDOFF_KIND_GENERATION_VOCABULARY.items():
+            for family, requires_identity in vocab.items():
+                op = (
+                    f"{family}:alice:g0123456789ab"
+                    if requires_identity
+                    else f"{family}:g0123456789ab"
+                )
+                with self.subTest(kind=kind, family=family):
+                    self.assertTrue(handoff_operation_id_valid(kind, op))
+
+    def test_generation_rollover_new_stamp_is_accepted(self) -> None:
+        # Same family, a fresh distinct 12-hex generation: rollover stays valid.
+        self.assertTrue(
+            handoff_operation_id_valid("qa", "qa.github.replace_assignees:g0123456789ab")
+        )
+        self.assertTrue(
+            handoff_operation_id_valid("qa", "qa.github.replace_assignees:gba9876543210")
+        )
+
+    # --- pure-function grammar: fabricated / malformed rejected ---
+
+    def test_fabricated_operation_family_is_rejected(self) -> None:
+        # The finding's exact adversarial input: a mapped runner accepted a
+        # terminal "bogus.qa.done" as a valid qa operation.
+        self.assertFalse(handoff_operation_id_valid("qa", "bogus.qa.done"))
+
+    def test_generation_family_requires_the_generation_stamp(self) -> None:
+        # A bare family with no ":g<12-hex>" tail is not a generation id, and a
+        # short / non-hex stamp does not satisfy the 12-hex digest.
+        self.assertFalse(
+            handoff_operation_id_valid("qa", "qa.github.replace_assignees")
+        )
+        self.assertFalse(
+            handoff_operation_id_valid("qa", "qa.github.replace_assignees:gtest")
+        )
+        self.assertFalse(
+            handoff_operation_id_valid("qa", "qa.github.replace_assignees:g0123456789")
+        )
+
+    def test_generation_identity_arity_is_enforced(self) -> None:
+        # replace_assignees is identity-free: a surplus identity is rejected.
+        self.assertFalse(
+            handoff_operation_id_valid(
+                "qa", "qa.github.replace_assignees:alice:g0123456789ab"
+            )
+        )
+        # request_review is per-reviewer: a missing identity is rejected.
+        self.assertFalse(
+            handoff_operation_id_valid("qa", "qa.github.request_review:g0123456789ab")
+        )
+
+    def test_distinct_artifact_contract_is_accepted(self) -> None:
+        # The distinct artifact contract (F6): pr_artifacts ids are head-bound,
+        # NOT generation-scoped. 7-hex and 64-hex heads bracket the range.
+        for op in (
+            "ci-evidence:abcdef0",
+            "qa-rehearsal:abcdef0",
+            "deferred-work:abcdef0",
+            "ci-evidence:" + "a" * 64,
+        ):
+            with self.subTest(op=op):
+                self.assertTrue(handoff_operation_id_valid("pr_artifacts", op))
+
+    def test_pr_artifact_head_length_bounds(self) -> None:
+        # Head-bound ids carry a 7..64 hex git object id (literal boundary).
+        self.assertFalse(
+            handoff_operation_id_valid("pr_artifacts", "ci-evidence:abcdef")
+        )  # 6 hex
+        self.assertTrue(
+            handoff_operation_id_valid("pr_artifacts", "ci-evidence:abcdef0")
+        )  # 7 hex
+        self.assertTrue(
+            handoff_operation_id_valid("pr_artifacts", "ci-evidence:" + "a" * 64)
+        )
+        self.assertFalse(
+            handoff_operation_id_valid("pr_artifacts", "ci-evidence:" + "a" * 65)
+        )
+
+    def test_distinct_artifact_contract_is_cross_kind_isolated(self) -> None:
+        # pr_artifacts does NOT accept a generation-scoped id ...
+        self.assertFalse(
+            handoff_operation_id_valid(
+                "pr_artifacts", "qa.github.replace_assignees:g0123456789ab"
+            )
+        )
+        # ... and a generation kind does NOT accept a head-bound artifact id.
+        self.assertFalse(
+            handoff_operation_id_valid("qa", "ci-evidence:abcdef0")
+        )
+        self.assertFalse(
+            handoff_operation_id_valid("qa", "deferred-work:abcdef0")
+        )
+        # A family is valid only under the kind that mints it.
+        self.assertFalse(
+            handoff_operation_id_valid(
+                "review_roundtrip", "qa.github.replace_assignees:g0123456789ab"
+            )
+        )
+        self.assertFalse(
+            handoff_operation_id_valid(
+                "reviewer_request", "roundtrip.github.replace_assignees:g0123456789ab"
+            )
+        )
+
+    # --- integration through evaluate_state_text: allowlist + wiring ---
+
+    def test_fabricated_handoff_kind_is_rejected(self) -> None:
+        text = _mutate(
+            FULL_STATE,
+            "    operations: []\n    operation_results: {}\nlast_check_status:",
+            "    operations: []\n    operation_results: {}\n"
+            "  bogus_kind:\n"
+            "    scenario: null\n"
+            '    status: "idle"\n'
+            "    operations: []\n    operation_results: {}\n"
+            "last_check_status:",
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(any("unknown handoff kind" in e for e in result["errors"]))
+
+    def test_fabricated_qa_operation_is_rejected_end_to_end(self) -> None:
+        # The finding's adversarial terminal id, through the full validator.
+        text = _qa_handoff(
+            '    operations: ["bogus.qa.done"]',
+            "    operation_results: {}",
+            "pending",
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("malformed operation ID" in e for e in result["errors"])
+        )
+
+    def test_review_roundtrip_routes_to_its_own_vocabulary(self) -> None:
+        # A qa family id planted in review_roundtrip is malformed there:
+        # validate_handoffs routes by the ACTUAL kind, not a shared vocabulary.
+        text = _mutate(
+            FULL_STATE,
+            "    operations: []\n    operation_results: {}\nlast_check_status:",
+            '    operations: ["qa.github.replace_assignees:g0123456789ab"]\n'
+            "    operation_results: {}\nlast_check_status:",
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any(
+                "malformed operation ID" in e and "review_roundtrip" in e
+                for e in result["errors"]
+            )
+        )
+
+    def test_reviewer_request_kind_is_allowlisted(self) -> None:
+        # reviewer_request is dynamically persisted for non-Keeper repos; an
+        # idle reviewer_request handoff must validate (the kind is allowlisted).
+        text = _mutate(
+            FULL_STATE,
+            "    operations: []\n    operation_results: {}\nlast_check_status:",
+            "    operations: []\n    operation_results: {}\n"
+            "  reviewer_request:\n"
+            "    scenario: null\n"
+            '    status: "idle"\n'
+            "    operations: []\n    operation_results: {}\n"
+            "last_check_status:",
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["state"], VALID)
+
+    def test_pr_artifacts_kind_is_allowlisted(self) -> None:
+        text = _mutate(
+            FULL_STATE,
+            "    operations: []\n    operation_results: {}\nlast_check_status:",
+            "    operations: []\n    operation_results: {}\n"
+            "  pr_artifacts:\n"
+            "    scenario: null\n"
+            '    status: "idle"\n'
+            "    operations: []\n    operation_results: {}\n"
+            "last_check_status:",
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["state"], VALID)
+
+    # --- integration: qa repository binding requirement (operations-gated) ---
+
+    def test_qa_operations_require_repository_binding(self) -> None:
+        text = _qa_handoff(
+            '    operations: ["qa.github.replace_assignees:g0123456789ab"]',
+            "    operation_results: {}",
+            "pending",
+        )
+        text = _mutate(
+            text,
+            '    repository_name_with_owner: "Keeper-Dating/matchmaking"',
+            "    repository_name_with_owner: null",
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("repository_name_with_owner" in e for e in result["errors"])
+        )
+
+    def test_idle_qa_handoff_keeps_null_binding(self) -> None:
+        # The binding requirement is operations-gated: an idle qa handoff
+        # (operations: []) keeps the template's null default and stays valid.
+        result = evaluate_state_text(_terminal_monitor_state())
+        self.assertEqual(result["state"], VALID)
+        self.assertFalse(
+            any("repository_name_with_owner" in e for e in result["errors"])
+        )
 
 
 class EvidenceTests(unittest.TestCase):
@@ -858,12 +1111,12 @@ class ValueContractTests(unittest.TestCase):
     COMPLETE_NO_EVIDENCE = "\n".join(
         (
             "    operation_results:",
-            '      "github_assignees":',
+            '      "qa.github.replace_assignees:g0123456789ab":',
             '        status: "complete"',
             "        attempts: 1",
             '        started_at: "2026-07-16T10:59:00Z"',
             '        verified_at: "2026-07-16T11:00:00Z"',
-            '      "tracker_assign":',
+            '      "qa.linear.assign_ticket:g0123456789ab":',
             '        status: "complete"',
             "        attempts: 1",
             '        started_at: "2026-07-16T10:59:30Z"',
@@ -893,12 +1146,12 @@ class ValueContractTests(unittest.TestCase):
                 results = "\n".join(
                     (
                         "    operation_results:",
-                        '      "github_assignees":',
+                        '      "qa.github.replace_assignees:g0123456789ab":',
                         f'        status: "{status}"',
                         "        attempts: 1" if status == "failed" else "        attempts: 2",
                         '        started_at: "2026-07-16T10:59:00Z"',
                         '        verified_at: "2026-07-16T11:00:00Z"',
-                        '      "tracker_assign":',
+                        '      "qa.linear.assign_ticket:g0123456789ab":',
                         '        status: "failed"',
                         "        attempts: 1",
                         '        started_at: "2026-07-16T10:59:30Z"',
@@ -919,14 +1172,14 @@ class ValueContractTests(unittest.TestCase):
         bad_verified = "\n".join(
             (
                 "    operation_results:",
-                '      "github_assignees":',
+                '      "qa.github.replace_assignees:g0123456789ab":',
                 '        status: "complete"',
                 "        attempts: 1",
                 '        started_at: "2026-07-16T10:59:00Z"',
                 '        verified_at: "yesterday"',
                 "        evidence:",
                 '          verified: "ok"',
-                '      "tracker_assign":',
+                '      "qa.linear.assign_ticket:g0123456789ab":',
                 '        status: "complete"',
                 "        attempts: 1",
                 '        started_at: "2026-07-16T10:59:30Z"',
@@ -940,7 +1193,7 @@ class ValueContractTests(unittest.TestCase):
             ("started_at", "\n".join(
                 (
                     "    operation_results:",
-                    '      "github_assignees":',
+                    '      "qa.github.replace_assignees:g0123456789ab":',
                     '        status: "pending"',
                     "        attempts: 1",
                     '        started_at: "not-a-time"',
@@ -954,8 +1207,8 @@ class ValueContractTests(unittest.TestCase):
                     text = _mutate(text, '  monitor: "paused"', '  monitor: "in_progress"')
                     text = _mutate(
                         text,
-                        '    operations: ["github_assignees", "tracker_assign"]',
-                        '    operations: ["github_assignees"]',
+                        '    operations: ["qa.github.replace_assignees:g0123456789ab", "qa.linear.assign_ticket:g0123456789ab"]',
+                        '    operations: ["qa.github.replace_assignees:g0123456789ab"]',
                     )
                 result = evaluate_state_text(text)
                 self.assertTrue(
@@ -1057,6 +1310,75 @@ class ValueContractTests(unittest.TestCase):
             '  quality_check_steps:\n    - ["yarn", "lint:fix"]',
         )
         self.assertEqual(evaluate_state_text(good_step)["errors"], [])
+
+    def test_dev_server_commands_validate_as_argv_cache(self) -> None:
+        # algo#1216 r16 F14: dev-server commands are the same executable-
+        # cache class as quality_check_steps — argv vectors, never shell
+        # strings. A legacy plain string still validates (pre-upgrade
+        # states must resume) but is BY CONTRACT always a cache miss.
+        ok = _mutate(
+            FULL_STATE,
+            "  quality_check_steps: []",
+            "  quality_check_steps: []\n"
+            '  dev_server_frontend: ["yarn", "dev:admin"]\n'
+            "  dev_server_backend: null",
+        )
+        self.assertEqual(evaluate_state_text(ok)["errors"], [])
+        legacy = _mutate(
+            FULL_STATE,
+            "  quality_check_steps: []",
+            '  quality_check_steps: []\n  dev_server_frontend: "yarn dev:admin"',
+        )
+        self.assertEqual(evaluate_state_text(legacy)["errors"], [])
+        for bad in ("[]", '[""]', '["yarn", 3]', '""', "7"):
+            with self.subTest(value=bad):
+                text = _mutate(
+                    FULL_STATE,
+                    "  quality_check_steps: []",
+                    "  quality_check_steps: []\n"
+                    f"  dev_server_backend: {bad}",
+                )
+                result = evaluate_state_text(text)
+                self.assertEqual(result["state"], SUSPECT, result["errors"])
+                self.assertTrue(
+                    any(
+                        "dev_server_backend" in error
+                        for error in result["errors"]
+                    ),
+                    result["errors"],
+                )
+
+    def test_max_iterations_is_immutable(self) -> None:
+        # admin#1495 r12 F8: the template advertised max_iterations as an
+        # overridable default while the schema ignored it and the runner
+        # enforced 50 regardless. Absent (FULL_STATE), null, and the
+        # legacy literal 50 are equivalent; any other declaration is
+        # suspect state rather than a silently ignored knob.
+        def with_cap(value: str) -> str:
+            return _mutate(
+                FULL_STATE,
+                "  quality_check_steps: []",
+                "  quality_check_steps: []\n"
+                "  monitor_constants:\n"
+                f"    max_iterations: {value}",
+            )
+
+        for legal in ("50", "null"):
+            with self.subTest(value=legal):
+                self.assertEqual(
+                    evaluate_state_text(with_cap(legal))["errors"], []
+                )
+        for illegal in ("49", "51", '"50"', "true"):
+            with self.subTest(value=illegal):
+                result = evaluate_state_text(with_cap(illegal))
+                self.assertEqual(result["state"], SUSPECT, result["errors"])
+                self.assertTrue(
+                    any(
+                        "max_iterations" in error and "immutable" in error
+                        for error in result["errors"]
+                    ),
+                    result["errors"],
+                )
 
     def test_conventions_enum_and_list_contracts(self) -> None:
         cases = (
@@ -2403,15 +2725,17 @@ class ResumeValueContractCoverageTests(unittest.TestCase):
     def test_operation_attempts_above_cap_are_rejected(self) -> None:
         text = _mutate(
             FULL_STATE,
-            '  qa:\n    scenario: null\n    status: "idle"',
-            '  qa:\n    scenario: "approved_qa"\n    status: "pending"',
+            '  qa:\n    scenario: null\n    status: "idle"\n'
+            "    repository_name_with_owner: null",
+            '  qa:\n    scenario: "approved_qa"\n    status: "pending"\n'
+            '    repository_name_with_owner: "Keeper-Dating/matchmaking"',
         )
         text = _mutate(
             text,
             "    operations: []\n    operation_results: {}\n  review_roundtrip:",
-            '    operations:\n      - "qa.github.replace_assignees"\n'
+            '    operations:\n      - "qa.github.replace_assignees:g0123456789ab"\n'
             "    operation_results:\n"
-            '      "qa.github.replace_assignees":\n'
+            '      "qa.github.replace_assignees:g0123456789ab":\n'
             '        status: "pending"\n'
             "        attempts: 7\n"
             '        started_at: "2026-07-30T19:30:00Z"\n'
@@ -2807,7 +3131,7 @@ class SkippedDependencyRecordTests(unittest.TestCase):
     failed answer must validate under a terminal monitor (before this
     contract existed, no monitor state could persist that answer)."""
 
-    OPS_TWO = '    operations: ["github_assignees", "tracker_assign"]'
+    OPS_TWO = '    operations: ["qa.github.replace_assignees:g0123456789ab", "qa.linear.assign_ticket:g0123456789ab"]'
 
     FAILED_OK = "\n".join(
         (
@@ -2822,7 +3146,7 @@ class SkippedDependencyRecordTests(unittest.TestCase):
         (
             '        status: "skipped_dependency"',
             "        attempts: 0",
-            '        error: "dependency failed: github_assignees"',
+            '        error: "dependency failed: qa.github.replace_assignees:g0123456789ab"',
         )
     )
 
@@ -2830,9 +3154,9 @@ class SkippedDependencyRecordTests(unittest.TestCase):
         return "\n".join(
             (
                 "    operation_results:",
-                '      "github_assignees":',
+                '      "qa.github.replace_assignees:g0123456789ab":',
                 first,
-                '      "tracker_assign":',
+                '      "qa.linear.assign_ticket:g0123456789ab":',
                 second,
             )
         )
@@ -2904,15 +3228,17 @@ class OperationResultContractRedTests(unittest.TestCase):
     mask them — these tests must be able to fail against the exact rule they
     pin, not pass via an unrelated rejection."""
 
-    OPS_TWO = '    operations: ["github_assignees", "tracker_assign"]'
+    OPS_TWO = '    operations: ["qa.github.replace_assignees:g0123456789ab", "qa.linear.assign_ticket:g0123456789ab"]'
 
     @staticmethod
     def _qa_handoff_live(operations: str, results: str, status: str) -> str:
         text = _in_progress_monitor_state()
+        # Same binding requirement as _qa_handoff: operations-bearing qa handoff
+        # persists a non-empty repository_name_with_owner (algo#1216 r16 F6).
         text = _mutate(
             text,
             '    status: "idle"\n    repository_name_with_owner: null',
-            f'    status: "{status}"\n    repository_name_with_owner: null',
+            f'    status: "{status}"\n    repository_name_with_owner: "Keeper-Dating/matchmaking"',
         )
         text = _mutate(
             text, "    operations: []\n    operation_results: {}", f"{operations}\n{results}"
@@ -2923,9 +3249,9 @@ class OperationResultContractRedTests(unittest.TestCase):
         return "\n".join(
             (
                 "    operation_results:",
-                '      "github_assignees":',
+                '      "qa.github.replace_assignees:g0123456789ab":',
                 first,
-                '      "tracker_assign":',
+                '      "qa.linear.assign_ticket:g0123456789ab":',
                 second,
             )
         )
@@ -3043,7 +3369,7 @@ class OperationResultContractRedTests(unittest.TestCase):
         second_only = "\n".join(
             (
                 "    operation_results:",
-                '      "tracker_assign":',
+                '      "qa.linear.assign_ticket:g0123456789ab":',
                 self.COMPLETE_OK,
             )
         )
@@ -3707,13 +4033,29 @@ class MonitorOwnershipTests(unittest.TestCase):
         )
 
     def test_illegal_lineage_is_rejected(self) -> None:
-        block = self.WELL_FORMED.replace('"reviewer"', '"codex"')
+        # "codex" moved into the legal enum (admin#1495 r12 F1), so the
+        # illegal example is a model name that is not a lineage.
+        block = self.WELL_FORMED.replace('"reviewer"', '"opus"')
         result = evaluate_state_text(self._with_block(block))
         self.assertEqual(result["state"], SUSPECT)
         self.assertTrue(
             any("monitor_ownership.lineage" in error for error in result["errors"]),
             result["errors"],
         )
+
+    def test_codex_continuity_lineage_is_valid(self) -> None:
+        # admin#1495 r12 F1: the OpenAI entry's Phase 6 controller records
+        # itself truthfully under lineage codex, carrying the nominal
+        # Claude owner in pending_owner (continuity bindings require it).
+        block = (
+            '  lineage: "codex"\n'
+            '  model: "gpt-5.6-sol"\n'
+            '  bound_at: "2026-08-04T11:55:00+00:00"\n'
+            '  reason_code: "orchestrator_continuity"\n'
+            '  pending_owner: "claude-opus-5"'
+        )
+        result = evaluate_state_text(self._with_block(block))
+        self.assertEqual(result["state"], VALID, result["errors"])
 
     def test_empty_model_is_rejected(self) -> None:
         block = self.WELL_FORMED.replace('"claude-opus-5"', '""')
@@ -4116,8 +4458,15 @@ class MonitorCliBlockTests(unittest.TestCase):
         # reviewer evidence (this fixture's human_roundtrip.reviewers is
         # empty). A forged/stale generation must NOT read as evidence - the
         # trailing assertion pins that side end-to-end through the extract.
+        #
+        # algo#1216 r16 F1: production ledgers are minted with the request's
+        # REAL nameWithOwner, so this fixture persists the binding and mints
+        # the generation with the same repo — a null-repo digest on both
+        # sides would mask the recompute never resolving the repository.
         base = self._with_block(self.WELL_FORMED)
-        current_gen = roundtrip_generation([], ["alice"])
+        current_gen = roundtrip_generation(
+            [], ["alice"], "Keeper-Dating/matchmaking", None
+        )
         idle_block = (
             "  review_roundtrip:\n"
             "    scenario: null\n"
@@ -4135,6 +4484,7 @@ class MonitorCliBlockTests(unittest.TestCase):
                 "  review_roundtrip:\n"
                 '    scenario: "human_review_roundtrip"\n'
                 '    status: "failed"\n'
+                '    repository_name_with_owner: "Keeper-Dating/matchmaking"\n'
                 "    targets:\n"
                 '      reviewers: ["alice"]\n'
                 '      github_assignees: ["alice"]\n'
@@ -4154,6 +4504,82 @@ class MonitorCliBlockTests(unittest.TestCase):
         forged = base.replace(idle_block, _engaged_block("deadbeef0123"))
         self.assertNotEqual(forged, base)
         self.assertFalse(monitor_extract(forged)["blocked_evidence_present"])
+
+
+class AppendAttemptTests(unittest.TestCase):
+    """algo#1216 r16 F13: the stash-restore persist call — surgical
+    attempt_log append, validate-before-replace, runner-lock respect."""
+
+    def test_append_to_empty_attempt_log_is_valid_blocked_evidence(
+        self,
+    ) -> None:
+        updated = append_attempt_key(FULL_STATE, "human:stash-restore")
+        self.assertIsNotNone(updated)
+        result = evaluate_state_text(updated)
+        self.assertEqual(result["state"], VALID, result["errors"])
+        extract = monitor_extract(updated)
+        self.assertTrue(extract["blocked_evidence_present"])
+
+    def test_append_increments_and_leaves_siblings_untouched(self) -> None:
+        first = append_attempt_key(FULL_STATE, "human:stash-restore")
+        second = append_attempt_key(first, "human:stash-restore")
+        self.assertIn('  "human:stash-restore": 2', second)
+        third = append_attempt_key(second, "human:other")
+        self.assertIn('  "human:stash-restore": 2', third)
+        self.assertIn('  "human:other": 1', third)
+        self.assertEqual(evaluate_state_text(third)["state"], VALID)
+
+    def test_append_without_attempt_log_anchor_returns_none(self) -> None:
+        self.assertIsNone(append_attempt_key("phases: {}", "human:x"))
+
+    def test_cli_lock_key_and_atomicity_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.md")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(FULL_STATE)
+            silenced = io.StringIO()
+            # Non-human keys are refused: this is a narrow persist helper
+            # for presence-fired blocker records, not a state mutator.
+            with contextlib.redirect_stdout(silenced):
+                self.assertEqual(_append_attempt_cli(path, "ci:nope"), 1)
+            with open(path, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), FULL_STATE)
+            # A live monitor runner (its kernel lock held) refuses the
+            # write instead of racing the canonical-commit protocol.
+            lock = open(path + ".monitor.lock", "w", encoding="utf-8")
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                with contextlib.redirect_stdout(silenced):
+                    self.assertEqual(
+                        _append_attempt_cli(path, "human:stash-restore"), 1
+                    )
+                with open(path, encoding="utf-8") as handle:
+                    self.assertEqual(handle.read(), FULL_STATE)
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                lock.close()
+            with contextlib.redirect_stdout(silenced):
+                self.assertEqual(
+                    _append_attempt_cli(path, "human:stash-restore"), 0
+                )
+            with open(path, encoding="utf-8") as handle:
+                self.assertIn('"human:stash-restore": 1', handle.read())
+
+    def test_cli_refuses_when_result_would_be_invalid(self) -> None:
+        broken = FULL_STATE.replace(
+            'current_phase: "plan"', 'current_phase: "bogus"'
+        )
+        self.assertNotEqual(broken, FULL_STATE)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.md")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(broken)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    _append_attempt_cli(path, "human:stash-restore"), 1
+                )
+            with open(path, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), broken)
 
 
 class MonitorBlockedEvidenceTests(unittest.TestCase):
@@ -4470,6 +4896,149 @@ class MonitorBlockedEvidenceTests(unittest.TestCase):
         # Idle status is never evidence, even with a current-generation op.
         self.assertFalse(
             monitor_blocked_evidence_present(_ledger("idle", [current_op]))
+        )
+
+    def test_roundtrip_ledger_with_persisted_binding_is_evidence(self) -> None:
+        # algo#1216 r16 F1 (positive): a new ledger persists the plan's
+        # repository binding, and the recompute rebinds the generation with
+        # it — a production-shaped digest (repo + PR + reviewer evidence)
+        # matches with no monitor_cli fallback in the state at all.
+        gen = roundtrip_generation([], ["alice"], "o/r", 77)
+        state = self._state(
+            pr_number=77,
+            handoffs={
+                "review_roundtrip": {
+                    "status": "complete",
+                    "repository_name_with_owner": "o/r",
+                    "targets": {"reviewers": ["alice"]},
+                    "operations": [
+                        f"roundtrip.github.request_review:alice:g{gen}"
+                    ],
+                }
+            },
+        )
+        self.assertTrue(monitor_blocked_evidence_present(state))
+
+    def test_roundtrip_ledger_pre_upgrade_derives_repo_from_monitor_cli(
+        self,
+    ) -> None:
+        # algo#1216 r16 F1 (the bug): pre-F1 ledgers never persisted the
+        # binding, but their operation IDs were minted with the request's
+        # REAL nameWithOwner — recomputing with the missing value hashed
+        # null and permanently mismatched, so a successful handback could
+        # never prove durable evidence post-reassignment. A pre-upgrade
+        # ledger derives the repo from monitor_cli.repository, which the
+        # runner live-origin-agrees before this predicate ever runs.
+        gen = roundtrip_generation([], ["alice"], "o/r", 77)
+        state = self._state(
+            pr_number=77,
+            monitor_cli={"repository": "o/r"},
+            handoffs={
+                "review_roundtrip": {
+                    "status": "complete",
+                    "targets": {"reviewers": ["alice"]},
+                    "operations": [
+                        f"roundtrip.github.request_review:alice:g{gen}"
+                    ],
+                }
+            },
+        )
+        self.assertTrue(monitor_blocked_evidence_present(state))
+
+    def test_roundtrip_ledger_persisted_binding_preferred_over_monitor_cli(
+        self,
+    ) -> None:
+        # Precedence: the ledger's own binding wins — a monitor_cli value
+        # that has since moved (retarget, takeover) must not reinterpret a
+        # ledger recorded against the repository it was minted for.
+        gen = roundtrip_generation([], ["alice"], "o/r", 77)
+        state = self._state(
+            pr_number=77,
+            monitor_cli={"repository": "o/other"},
+            handoffs={
+                "review_roundtrip": {
+                    "status": "complete",
+                    "repository_name_with_owner": "o/r",
+                    "targets": {"reviewers": ["alice"]},
+                    "operations": [
+                        f"roundtrip.github.request_review:alice:g{gen}"
+                    ],
+                }
+            },
+        )
+        self.assertTrue(monitor_blocked_evidence_present(state))
+
+    def test_roundtrip_ledger_repo_drift_is_not_evidence(self) -> None:
+        # Fail-closed: operations minted for one repository never read as
+        # evidence under a ledger bound to another — even when monitor_cli
+        # still points at the minting repository, the persisted binding is
+        # authoritative once present.
+        gen = roundtrip_generation([], ["alice"], "o/r", 77)
+        state = self._state(
+            pr_number=77,
+            monitor_cli={"repository": "o/r"},
+            handoffs={
+                "review_roundtrip": {
+                    "status": "complete",
+                    "repository_name_with_owner": "o/other",
+                    "targets": {"reviewers": ["alice"]},
+                    "operations": [
+                        f"roundtrip.github.request_review:alice:g{gen}"
+                    ],
+                }
+            },
+        )
+        self.assertFalse(monitor_blocked_evidence_present(state))
+
+    def test_monitor_extract_exposes_deferred_work_evidence(self) -> None:
+        # algo#1216 r16 F11: the runner's terminal deferred-work gate needs
+        # the ledgered evidence payload and the observed head from ONE
+        # extract — COMPLETE deferred-work records only, keyed by head sha;
+        # other artifact families and in-flight records stay out.
+        head = "c3" * 20
+        text = _mutate(
+            FULL_STATE,
+            "last_observed_head_sha: null",
+            f'last_observed_head_sha: "{head}"',
+        )
+        text = _mutate(
+            text,
+            "    operations: []\n"
+            "    operation_results: {}\n"
+            'last_check_status: "pending"',
+            "    operations: []\n"
+            "    operation_results: {}\n"
+            "  pr_artifacts:\n"
+            "    scenario: null\n"
+            '    status: "pending"\n'
+            f'    operations: ["deferred-work:{head}", "ci-evidence:{head}",'
+            ' "deferred-work:abcdef0"]\n'
+            "    operation_results:\n"
+            f'      "deferred-work:{head}":\n'
+            '        status: "complete"\n'
+            "        attempts: 1\n"
+            '        started_at: "2026-08-08T00:00:00Z"\n'
+            '        verified_at: "2026-08-08T00:00:01Z"\n'
+            "        evidence:\n"
+            '          deferred: ["prod:m_drop_col"]\n'
+            f'      "ci-evidence:{head}":\n'
+            '        status: "complete"\n'
+            "        attempts: 1\n"
+            '        started_at: "2026-08-08T00:00:00Z"\n'
+            '        verified_at: "2026-08-08T00:00:01Z"\n'
+            "        evidence:\n"
+            '          runs: ["https://example.invalid/run/1"]\n'
+            '      "deferred-work:abcdef0":\n'
+            '        status: "pending"\n'
+            "        attempts: 1\n"
+            '        started_at: "2026-08-08T00:00:00Z"\n'
+            'last_check_status: "pending"',
+        )
+        extract = monitor_extract(text)
+        self.assertEqual(extract["state"], "valid", extract["errors"])
+        self.assertEqual(extract["last_observed_head_sha"], head)
+        self.assertEqual(
+            extract["deferred_work_evidence"], {head: ["prod:m_drop_col"]}
         )
 
     def test_monitor_extract_carries_the_predicate(self) -> None:

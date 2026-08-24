@@ -45,80 +45,20 @@ SCENARIOS = {
     REVIEWER_REQUEST,
 }
 GITHUB_LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?")
-# Post-merge codex F3 + pass-3 codex F4: a prunable prior-generation id
-# must match the COMPLETE grammar `family(:identity)?:g<12-hex>` - not
-# merely end in the digest tail. A tail-only check let an extra-segment id
-# like `qa.linear.assign_ticket:gBAD:g<hex>` prune as history while the
-# real mutation re-queued. \Z, not $: a stray trailing newline would
-# satisfy $ and launder a CURRENT completed id as history (replay).
-GENERATION_SCOPED_ID = re.compile(
-    r"(?P<family>[a-z_]+(?:\.[a-z_]+)+)"
-    r"(?::(?P<identity>[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?))?"
-    r":g[0-9a-f]{12}\Z"
-)
-
-
-# Static per-scenario family vocabularies for the prior-generation sweeps.
-# CR 3760683938 requires that prunable history name a family the scenario
-# MINTS - deriving that set from the current plan's ids broke down once
-# reviewer turnover could legitimately empty a family (a prior round's
-# request_review records must still prune when the new round routes no
-# reviewer), so the vocabulary is the scenario's static mint surface.
-# Maps family -> whether the id carries a per-reviewer identity segment.
-# Pass-4 codex F1: identity must be ARITY-CHECKED per family, not globally
-# optional - `qa.github.replace_assignees:bogus:g<current>` parsed as a
-# well-formed id under the optional grammar and pruned as history while
-# the real operation re-queued.
-QA_OPERATION_FAMILIES = {
-    "qa.github.replace_assignees": False,
-    "qa.github.verify_assignees": False,
-    "qa.github.request_review": True,
-    "qa.github.verify_review_request": True,
-    "qa.linear.verify_ticket_binding": False,
-    "qa.linear.assign_ticket": False,
-    "qa.linear.verify_ticket_assignee": False,
-    "qa.linear.set_ticket_state": False,
-    "qa.linear.verify_ticket_state": False,
-    "qa.linear.record_unavailable": False,
-    "qa.linear.record_state_unavailable": False,
-}
-REVIEWER_REQUEST_FAMILIES = {
-    "reviewer.github.request_review": True,
-    "reviewer.github.verify_review_request": True,
-    "reviewer.github.replace_assignees": False,
-    "reviewer.github.verify_assignees": False,
-}
-ROUNDTRIP_FAMILIES = {
-    "roundtrip.github.request_review": True,
-    "roundtrip.github.verify_review_request": True,
-    "roundtrip.github.replace_assignees": False,
-    "roundtrip.github.verify_assignees": False,
-}
-
-
-def parsed_generation_family(
-    operation_id: str, vocabulary: dict[str, bool]
-) -> str | None:
-    """Family of a well-formed generation-scoped id, else ``None``.
-
-    The sweeps prune a record as prior-generation history ONLY when this
-    returns a family the scenario mints AND the id's identity segment
-    matches that family's arity (pass-4 codex F1): a surplus identity on
-    an identity-free family, a missing identity on a per-reviewer family,
-    a wrong digest shape, extra segments, uppercase identity, or a
-    trailing newline all stay unknown-ID errors downstream.
-    """
-
-    match = GENERATION_SCOPED_ID.fullmatch(operation_id)
-    if match is None:
-        return None
-    family = match.group("family")
-    requires_identity = vocabulary.get(family)
-    if requires_identity is None:
-        return None
-    if (match.group("identity") is not None) != requires_identity:
-        return None
-    return family
+# Generation-scoped operation-ID grammar + per-scenario family vocabularies and
+# the parser that classifies IDs against them. The SCHEMA (dependency root) owns
+# these so its persisted-state validator and these planner sweeps decide "is
+# this a well-formed operation ID" against ONE grammar (algo#1216 r16 F6: the
+# validator previously accepted arbitrary IDs, so a mapped runner treated a
+# fabricated `bogus.qa.done` as valid). REBIND, never re-declare - the rationale
+# (complete-match \Z over the digest tail, per-family identity arity, why the
+# vocabulary is the scenario's static mint surface) lives at the definitions in
+# state_schema.py; validate_package.py pins these operative lines so a
+# re-declared literal cannot silently diverge from the schema's copy.
+QA_OPERATION_FAMILIES = state_schema.QA_OPERATION_FAMILIES
+REVIEWER_REQUEST_FAMILIES = state_schema.REVIEWER_REQUEST_FAMILIES
+ROUNDTRIP_FAMILIES = state_schema.ROUNDTRIP_FAMILIES
+parsed_generation_family = state_schema.parsed_generation_family
 # Git accepts unambiguous abbreviated object IDs. Require at least seven hex
 # characters while allowing full SHA-1 and SHA-256 object IDs.
 GIT_OBJECT_ID = re.compile(r"[0-9a-fA-F]{7,64}")
@@ -374,6 +314,16 @@ def qa_generation(request: dict[str, Any]) -> str:
         if isinstance(name_with_owner, str)
         else None
     )
+    # algo#1216 r16 F2: the digest's github_login slot is the HANDBACK
+    # target — the mapped QA owner, else the request's validated
+    # ball_holder (the universal handback's assignee). Mapped digests stay
+    # byte-identical to pre-F2; unmapped plans key on their ball holder.
+    # Mirrors _approved_qa_operations' resolution exactly.
+    handback_login = owner["github_login"] if owner else None
+    if handback_login is None:
+        raw_holder = request.get("ball_holder")
+        if isinstance(raw_holder, str) and GITHUB_LOGIN.fullmatch(raw_holder):
+            handback_login = raw_holder
     tracker = request.get("issue_tracker")
     tracker = tracker if isinstance(tracker, dict) else {}
     qa_assignee = tracker.get("qa_assignee")
@@ -409,7 +359,7 @@ def qa_generation(request: dict[str, Any]) -> str:
         "plan_version": 2,
         "nameWithOwner": name_with_owner,
         "pull_request_number": pull_request_number,
-        "github_login": owner["github_login"] if owner else None,
+        "github_login": handback_login,
         "ticket_identifier": tracker.get("ticket_identifier"),
         "ticket_provider_id": tracker.get("ticket_provider_id"),
         "write_path": tracker.get("write_path"),
@@ -433,10 +383,69 @@ def _approved_qa_operations(
     request: dict[str, Any],
     name_with_owner: str,
     pull_request_number: int,
-    owner: dict[str, str],
+    owner: dict[str, str] | None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[str], list[str]]:
-    github_login = owner["github_login"]
-    linear_name = owner["linear_name"]
+    # algo#1216 r16 F2: the reviewer/ball-holder handback is UNIVERSAL —
+    # review routing exists for every repository — while the Keeper
+    # QA-owner assignee target and the tracker legs are OPTIONAL,
+    # exact-map gated. An unmapped repository hands ownership to the
+    # request's validated ball_holder; when none resolves, reviewer
+    # requests still plan and the ownership transfer is skipped with a
+    # warning. The resolved login fills qa_generation's github_login slot
+    # (mirrored there), so mapped digests are byte-identical to pre-F2.
+    github_login: str | None
+    if owner is not None:
+        github_login = owner["github_login"]
+        linear_name = owner["linear_name"]
+    else:
+        linear_name = None
+        raw_holder = request.get("ball_holder")
+        if raw_holder is None:
+            github_login = None
+        elif isinstance(raw_holder, str) and GITHUB_LOGIN.fullmatch(
+            raw_holder
+        ):
+            github_login = raw_holder
+        else:
+            return (
+                {"assignees": [], "reviewers": [], "linear_assignee": None},
+                [],
+                ["ball_holder must be a valid GitHub login when supplied"],
+                [],
+            )
+    # algo#1216 r16 F10: the self-review filter below and its digest mirror
+    # in qa_generation are IDENTITY-KEYED - with a missing or malformed
+    # authenticated_actor both silently no-op, and the actor's own login
+    # can mint a request/verify pair GitHub 422s into a permanent ledger
+    # failure. Whenever the plan routes any code reviewer, a valid actor
+    # is therefore a REQUIRED input, rejected BEFORE the filter and the
+    # generation digest run - never a silently unfiltered plan. An empty
+    # code_reviewers list mints no reviewer operations, so the actor stays
+    # optional there and the actor-less clean exits keep planning.
+    raw_code_reviewers = request.get("code_reviewers", [])
+    actor = request.get("authenticated_actor")
+    if (
+        isinstance(raw_code_reviewers, list)
+        and raw_code_reviewers
+        and (
+            not isinstance(actor, str)
+            or GITHUB_LOGIN.fullmatch(actor) is None
+        )
+    ):
+        return (
+            {
+                "assignees": [github_login] if github_login else [],
+                "reviewers": [],
+                "linear_assignee": None,
+            },
+            [],
+            [
+                "authenticated_actor must be a valid GitHub login when"
+                " code_reviewers is non-empty (the self-review filter and"
+                " its generation-digest mirror are identity-keyed)"
+            ],
+            [],
+        )
     generation = qa_generation(request)
     # R2 #3551 finding 3737466462: the post-flip reviewer request needed the
     # same write-ahead/replay coverage as the roundtrip scenario — a crash
@@ -445,15 +454,16 @@ def _approved_qa_operations(
     # the routed code reviewers (judgment stays with the workflow's routing
     # rules); each mints request+verify operations ahead of the assignee
     # replacement, mirroring roundtrip's shapes.
-    raw_code_reviewers = request.get("code_reviewers", [])
     code_reviewers: list[str] = []
     reviewer_errors: list[str] = []
     # Post-merge pass-3 opus F3: mirror _reviewer_request_operations' actor
     # guard - GitHub 422s a self-request into a permanent ledger failure.
     # The QA handoff must still transfer ownership, so the actor is
     # FILTERED (not blocked) and the drop is surfaced as a plan warning by
-    # the caller-visible targets delta.
-    actor = request.get("authenticated_actor")
+    # the caller-visible targets delta. (With reviewers routed, the r16 F10
+    # gate above has already proven the actor valid; the None arm below is
+    # reachable only on the reviewer-less path, where nothing needs
+    # filtering.)
     actor_identity = actor.casefold() if isinstance(actor, str) else None
     if not isinstance(raw_code_reviewers, list):
         reviewer_errors.append("code_reviewers must be a list of logins")
@@ -476,10 +486,11 @@ def _approved_qa_operations(
     # use the digest's own canonical order, so order is never load-bearing.
     code_reviewers = sorted(code_reviewers, key=str.casefold)
     targets = {
-        "assignees": [github_login],
+        "assignees": [github_login] if github_login else [],
         "reviewers": list(code_reviewers),
         "linear_assignee": None,
     }
+    advisory_warnings: list[str] = []
     operations = []
     reviewer_verification_ids: list[str] = []
     previous_operation_id: str | None = None
@@ -515,42 +526,58 @@ def _approved_qa_operations(
         )
         reviewer_verification_ids.append(verify_id)
         previous_operation_id = verify_id
-    # r13 F4: the pre-mutation observation is a REQUIRED plan input —
-    # a missing or malformed one is a planner error, never an omitted key.
-    qa_precondition, qa_precondition_error = _assignee_precondition(request)
-    operations.append(
-        _github_operation(
-            f"qa.github.replace_assignees:g{generation}",
-            "replace_pull_request_assignees",
-            name_with_owner,
-            pull_request_number,
-            depends_on=list(reviewer_verification_ids),
-            # This is the complete desired set, not an additive update.  Stale
-            # assignees supplied by GitHub are intentionally absent from the
-            # TARGET; the observed set rides along as the write-ahead
-            # precondition instead (finding 3813491647).
-            assignees=[github_login],
-            **(
-                {"precondition": qa_precondition}
-                if qa_precondition is not None
-                else {}
-            ),
+    qa_precondition_error: str | None = None
+    if github_login is not None:
+        # r13 F4: the pre-mutation observation is a REQUIRED plan input —
+        # a missing or malformed one is a planner error, never an omitted
+        # key.
+        qa_precondition, qa_precondition_error = _assignee_precondition(
+            request
         )
-    )
-    operations.append(
-        _github_operation(
-            f"qa.github.verify_assignees:g{generation}",
-            "verify_pull_request_assignees",
-            name_with_owner,
-            pull_request_number,
-            depends_on=[f"qa.github.replace_assignees:g{generation}"],
-            expected_assignees=[github_login],
+        operations.append(
+            _github_operation(
+                f"qa.github.replace_assignees:g{generation}",
+                "replace_pull_request_assignees",
+                name_with_owner,
+                pull_request_number,
+                depends_on=list(reviewer_verification_ids),
+                # This is the complete desired set, not an additive update.
+                # Stale assignees supplied by GitHub are intentionally absent
+                # from the TARGET; the observed set rides along as the
+                # write-ahead precondition instead (finding 3813491647).
+                assignees=[github_login],
+                **(
+                    {"precondition": qa_precondition}
+                    if qa_precondition is not None
+                    else {}
+                ),
+            )
         )
-    )
+        operations.append(
+            _github_operation(
+                f"qa.github.verify_assignees:g{generation}",
+                "verify_pull_request_assignees",
+                name_with_owner,
+                pull_request_number,
+                depends_on=[f"qa.github.replace_assignees:g{generation}"],
+                expected_assignees=[github_login],
+            )
+        )
+    elif operations:
+        # algo#1216 r16 F2: reviewer requests planned without an ownership
+        # transfer — surfaced, never silent.
+        advisory_warnings.append(
+            "no ball holder resolved for this unmapped repository —"
+            " reviewer requests planned without an assignee transfer"
+        )
     errors: list[str] = list(reviewer_errors)
     if qa_precondition_error is not None:
         errors.append(qa_precondition_error)
-    advisory_warnings: list[str] = []
+    if owner is None:
+        # algo#1216 r16 F2: the tracker legs are Keeper-mapped OPTIONAL
+        # routing — an unmapped repository plans no Linear operations and
+        # skips tracker validation entirely.
+        return targets, operations, errors, advisory_warnings
 
     issue_tracker = request.get("issue_tracker", {})
     if not isinstance(issue_tracker, dict):
@@ -777,14 +804,27 @@ def _approved_qa_operations(
             return targets, operations, errors, advisory_warnings
         if not isinstance(qa_state, dict):
             errors.append(
-                "issue_tracker.qa_state must contain the resolved Linear "
-                "workflow-state provider ID"
+                "issue_tracker.qa_state must be an object carrying the exact"
+                f" {expected_state_name!r} state name (provider_id optional:"
+                " the broker resolves the name server-side)"
             )
             return targets, operations, errors, advisory_warnings
+        # admin#1495 r12 F7: the managed (environment_tool) child cannot
+        # LIST Linear workflow states, so a REQUIRED pre-resolved provider
+        # ID forced every managed run into the manual fallback. The broker
+        # accepts the canonical state NAME and resolves it server-side, so
+        # the plan mutates BY NAME; the id is verification material -
+        # optional at plan time, pinned in the verify payload when
+        # supplied, and otherwise persisted from the verify step's
+        # post-mutation refetch (the observed id lands in that operation's
+        # recorded evidence).
         state_provider_id = qa_state.get("provider_id")
-        if not _is_stripped_nonempty_string(state_provider_id):
+        if state_provider_id is not None and not _is_stripped_nonempty_string(
+            state_provider_id
+        ):
             errors.append(
-                "issue_tracker.qa_state.provider_id must be stripped and non-empty"
+                "issue_tracker.qa_state.provider_id must be stripped and"
+                " non-empty when supplied (omit it to mutate by name)"
             )
             return targets, operations, errors, advisory_warnings
         if qa_state.get("name") != expected_state_name:
@@ -794,6 +834,13 @@ def _approved_qa_operations(
             )
             return targets, operations, errors, advisory_warnings
 
+        set_state_payload: dict[str, Any] = {
+            "ticket_identifier": ticket_identifier,
+            "state_name": expected_state_name,
+            "write_path": write_path,
+        }
+        if state_provider_id is not None:
+            set_state_payload["state_id"] = state_provider_id
         operations.append(
             {
                 "id": f"qa.linear.set_ticket_state:g{generation}",
@@ -802,27 +849,24 @@ def _approved_qa_operations(
                 "depends_on": [f"qa.linear.verify_ticket_assignee:g{generation}"],
                 # Finding 3792942223: mutation keyed by identifier only —
                 # see qa.linear.assign_ticket's comment.
-                "payload": {
-                    "ticket_identifier": ticket_identifier,
-                    "state_id": state_provider_id,
-                    "state_name": expected_state_name,
-                    "write_path": write_path,
-                },
+                "payload": set_state_payload,
             }
         )
+        verify_state_payload: dict[str, Any] = {
+            "ticket_identifier": ticket_identifier,
+            "expected_ticket_provider_id": ticket_provider_id,
+            "expected_state_name": expected_state_name,
+            "write_path": write_path,
+        }
+        if state_provider_id is not None:
+            verify_state_payload["expected_state_id"] = state_provider_id
         operations.append(
             {
                 "id": f"qa.linear.verify_ticket_state:g{generation}",
                 "service": "linear",
                 "action": "verify_ticket_state",
                 "depends_on": [f"qa.linear.set_ticket_state:g{generation}"],
-                "payload": {
-                    "ticket_identifier": ticket_identifier,
-                    "expected_ticket_provider_id": ticket_provider_id,
-                    "expected_state_id": state_provider_id,
-                    "expected_state_name": expected_state_name,
-                    "write_path": write_path,
-                },
+                "payload": verify_state_payload,
             }
         )
 
@@ -1756,26 +1800,32 @@ def plan_handoff(request: Any) -> dict[str, Any]:
     # paused exit still never writes `complete` and never merges.
     if scenario in (APPROVED_QA, CLEAN_UNAPPROVED):
         owner = QA_OWNER_BY_REPOSITORY.get(name_with_owner)
-        if owner is None:
-            results, result_errors = _operation_results(request)
-            state_errors = list(result_errors)
-            if results:
-                state_errors.append(
-                    "unmapped repositories have no operations to resume"
-                )
-            if state_errors:
-                return _blocked(scenario, *state_errors)
-            return _idle(
-                scenario,
-                "repository.nameWithOwner is not in the exact QA-owner map",
-            )
-
+        # algo#1216 r16 F2: an unmapped repository still plans the
+        # UNIVERSAL reviewer/ball-holder handback (the builder gates only
+        # the QA-owner assignee target and the tracker legs on the map
+        # entry); the idle clean exit survives only for a repository with
+        # NO handback targets at all, keeping the old no-op resume guard.
         targets, operations, errors, qa_advisory_warnings = (
             _approved_qa_operations(
                 request, name_with_owner, pull_request_number, owner
             )
         )
         extra_warnings.extend(qa_advisory_warnings)
+        if owner is None and not operations and not errors:
+            results, result_errors = _operation_results(request)
+            state_errors = list(result_errors)
+            if results:
+                state_errors.append(
+                    "unmapped repositories with no handback targets have"
+                    " no operations to resume"
+                )
+            if state_errors:
+                return _blocked(scenario, *state_errors)
+            return _idle(
+                scenario,
+                "no handback targets resolved and repository.nameWithOwner"
+                " is not in the exact QA-owner map",
+            )
         if not errors and operations:
             # Target-digest-bound IDs make a ledger persisted for different
             # targets (another PR, a re-keyed ticket, a changed owner map or

@@ -432,6 +432,77 @@ class HandoffDecisionTest(unittest.TestCase):
         )
         self.assertEqual(assign["payload"]["assignee_email"], "tj@keeper.ai")
 
+    def test_name_only_qa_state_plans_mutation_by_name(self) -> None:
+        # admin#1495 r12 F7: a managed (environment_tool) child cannot
+        # list Linear workflow states, so the provider id is optional -
+        # the broker resolves the canonical NAME server-side. A name-only
+        # qa_state plans the mutation by name and a verify step keyed on
+        # the expected name (the observed id lands in verify evidence);
+        # a supplied id still pins both payloads exactly as before.
+        for team, ticket, state in (
+            ("WEB", "WEB-8877", {"name": "Vercel Preview QA"}),
+            ("ADM", "ADM-953", {"name": "Dev - Ready for QA"}),
+        ):
+            with self.subTest(team=team):
+                request = {
+                    "scenario": "approved_qa",
+                    "repository": REPOSITORY,
+                    "pull_request_number": PR_NUMBER,
+                    "existing_assignees": ["jakozloski"],
+                    "issue_tracker": {
+                        "type": "linear",
+                        "qa_assignee": LINEAR_QA_ASSIGNEE,
+                        "qa_state": state,
+                        "ticket_identifier": ticket,
+                        "ticket_provider_id": f"linear-ticket-{ticket}",
+                        "ticket_validated": True,
+                        "write_path": "environment_tool",
+                    },
+                }
+                plan = plan_handoff(request)
+                self.assertEqual(plan["state"], "pending", plan.get("errors"))
+                by_action = {
+                    operation["action"]: operation
+                    for operation in plan["operations"]
+                }
+                set_payload = by_action["set_ticket_state"]["payload"]
+                self.assertEqual(
+                    set_payload["state_name"], state["name"]
+                )
+                self.assertNotIn("state_id", set_payload)
+                verify_payload = by_action["verify_ticket_state"]["payload"]
+                self.assertEqual(
+                    verify_payload["expected_state_name"], state["name"]
+                )
+                self.assertNotIn("expected_state_id", verify_payload)
+
+    def test_blank_supplied_qa_state_provider_id_is_rejected(self) -> None:
+        # Supplied-but-blank is neither a name-only plan nor an id plan.
+        request = {
+            "scenario": "approved_qa",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+            "existing_assignees": ["jakozloski"],
+            "issue_tracker": {
+                "type": "linear",
+                "qa_assignee": LINEAR_QA_ASSIGNEE,
+                "qa_state": {"provider_id": " ", "name": "Vercel Preview QA"},
+                "ticket_identifier": "WEB-8877",
+                "ticket_provider_id": "linear-ticket-web-8877",
+                "ticket_validated": True,
+                "write_path": "environment_tool",
+            },
+        }
+        plan = plan_handoff(request)
+        self.assertEqual(plan["state"], "blocked", plan)
+        self.assertTrue(
+            any(
+                "provider_id must be stripped and non-empty" in error
+                for error in plan["errors"]
+            ),
+            plan["errors"],
+        )
+
     def test_qa_state_name_must_match_ticket_team(self) -> None:
         plan = plan_handoff(
             {
@@ -835,6 +906,148 @@ class HandoffDecisionTest(unittest.TestCase):
             "the actor filter matches the builder's casefolded skip",
         )
 
+    def test_qa_missing_or_malformed_actor_with_code_reviewers_blocks(
+        self,
+    ) -> None:
+        # algo#1216 r16 F10: the self-review filter (and its digest mirror)
+        # is identity-keyed, so a missing or malformed authenticated_actor
+        # silently disabled filtering and could mint a self-review request
+        # GitHub 422s into a permanent ledger failure. With code reviewers
+        # routed, a valid actor is a required input, rejected before the
+        # filter and generation digest run.
+        def request(**overrides):
+            payload = {
+                "scenario": "approved_qa",
+                "repository": REPOSITORY,
+                "pull_request_number": PR_NUMBER,
+                "existing_assignees": ["jakozloski"],
+                "code_reviewers": ["alice", "jakozloski"],
+                "issue_tracker": {
+                    "type": "linear",
+                    "qa_assignee": LINEAR_QA_ASSIGNEE,
+                    "qa_state": LINEAR_QA_STATE_WEB,
+                    "ticket_identifier": "WEB-8877",
+                    "ticket_provider_id": "linear-ticket-web-8877",
+                    "ticket_validated": True,
+                    "write_path": "environment_tool",
+                },
+            }
+            payload.update(overrides)
+            return payload
+
+        for label, overrides in (
+            ("absent", {}),
+            ("non-string", {"authenticated_actor": 42}),
+            ("malformed", {"authenticated_actor": " me "}),
+            (
+                "clean-unapproved-absent",
+                {"scenario": "clean_unapproved"},
+            ),
+        ):
+            with self.subTest(actor=label):
+                plan = plan_handoff(request(**overrides))
+                self.assertEqual(plan["state"], "blocked", plan)
+                self.assertTrue(
+                    any(
+                        "authenticated_actor must be a valid GitHub login"
+                        in error
+                        for error in plan["errors"]
+                    ),
+                    plan["errors"],
+                )
+        # algo#1216 r16 F2 updated this side: an unmapped repository now
+        # plans the universal handback, so with code reviewers routed the
+        # actor gate applies there too — the actor-less clean exit
+        # survives only when no handback target resolves at all.
+        unmapped = plan_handoff(
+            request(repository={"nameWithOwner": "Keeper-Dating/unmapped"})
+        )
+        self.assertEqual(unmapped["state"], "blocked", unmapped)
+        # The valid-actor plan proceeds, and the actor's own login is
+        # filtered out of the minted reviewer operations (casefold match).
+        plan = plan_handoff(request(authenticated_actor="Jakozloski"))
+        self.assertEqual(plan["state"], "pending", plan.get("errors"))
+        ids = [operation["id"] for operation in plan["operations"]]
+        self.assertTrue(any(":alice:" in op_id for op_id in ids), ids)
+        self.assertFalse(
+            any(":jakozloski:" in op_id for op_id in ids), ids
+        )
+
+    def test_qa_actor_optional_without_code_reviewers(self) -> None:
+        # The other side of the r16 F10 gate: with no routed code reviewers
+        # the plan mints no reviewer operations, so the actor-less QA plan
+        # (the historical shape) keeps planning - the requirement is scoped
+        # to exactly the input that makes self-review filtering load-bearing.
+        for label, reviewers in (("absent", None), ("empty", [])):
+            with self.subTest(code_reviewers=label):
+                payload = {
+                    "scenario": "approved_qa",
+                    "repository": REPOSITORY,
+                    "pull_request_number": PR_NUMBER,
+                    "existing_assignees": ["jakozloski"],
+                    "issue_tracker": {
+                        "type": "linear",
+                        "qa_assignee": LINEAR_QA_ASSIGNEE,
+                        "qa_state": LINEAR_QA_STATE_WEB,
+                        "ticket_identifier": "WEB-8877",
+                        "ticket_provider_id": "linear-ticket-web-8877",
+                        "ticket_validated": True,
+                        "write_path": "environment_tool",
+                    },
+                }
+                if reviewers is not None:
+                    payload["code_reviewers"] = reviewers
+                plan = plan_handoff(payload)
+                self.assertEqual(plan["state"], "pending", plan.get("errors"))
+                self.assertFalse(
+                    [
+                        operation
+                        for operation in plan["operations"]
+                        if ".request_review:" in operation["id"]
+                    ]
+                )
+
+    def test_qa_actor_era_rollover_prunes_unfiltered_generation_records(
+        self,
+    ) -> None:
+        # algo#1216 r16 F10 upgrade path: ledgers minted BEFORE the actor
+        # gate hashed the UNFILTERED reviewer set (no actor supplied). Once
+        # the actor arrives the generation rolls, and the old era's
+        # terminal records prune as prior-target history instead of
+        # stranding the resume on unknown-ID errors.
+        base = {
+            "scenario": "approved_qa",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+            "existing_assignees": ["jakozloski"],
+            "code_reviewers": ["alice", "bob"],
+            "issue_tracker": {
+                "type": "linear",
+                "qa_assignee": LINEAR_QA_ASSIGNEE,
+                "qa_state": LINEAR_QA_STATE_WEB,
+                "ticket_identifier": "WEB-8877",
+                "ticket_provider_id": "linear-ticket-web-8877",
+                "ticket_validated": True,
+                "write_path": "environment_tool",
+            },
+        }
+        unfiltered_gen = qa_generation(base)
+        old_id = f"qa.github.request_review:bob:g{unfiltered_gen}"
+        plan = plan_handoff(
+            {
+                **base,
+                "authenticated_actor": "bob",
+                "operation_results": {old_id: operation_result("complete")},
+            }
+        )
+        self.assertEqual(plan["state"], "pending", plan.get("errors"))
+        self.assertTrue(
+            any("prior-target" in warning for warning in plan["warnings"]),
+            plan["warnings"],
+        )
+        ids = [operation["id"] for operation in plan["operations"]]
+        self.assertFalse(any(":bob:" in op_id for op_id in ids), ids)
+
     def test_reviewer_removal_prunes_terminal_request_ops(self) -> None:
         # admin#1495 finding 3806647937: after removing bob from a completed
         # alice,bob handoff, bob's terminal request/verify records must
@@ -845,6 +1058,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 "scenario": "approved_qa",
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
+                "authenticated_actor": "jakozloski",
                 "existing_assignees": ["jakozloski"],
                 "code_reviewers": reviewers,
                 "issue_tracker": {
@@ -884,6 +1098,7 @@ class HandoffDecisionTest(unittest.TestCase):
                 "scenario": "approved_qa",
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,
+                "authenticated_actor": "jakozloski",
                 "existing_assignees": ["jakozloski"],
                 "code_reviewers": reviewers,
                 "issue_tracker": {
@@ -917,6 +1132,7 @@ class HandoffDecisionTest(unittest.TestCase):
             "scenario": "approved_qa",
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
+            "authenticated_actor": "jakozloski",
             "existing_assignees": ["jakozloski"],
             # Uppercase FIRST (pass-3 opus F6): dedup keeps the first-seen
             # raw spelling, so this ordering is the one that can fail if
@@ -988,6 +1204,7 @@ class HandoffDecisionTest(unittest.TestCase):
             "scenario": "approved_qa",
             "repository": REPOSITORY,
             "pull_request_number": PR_NUMBER,
+            "authenticated_actor": "jakozloski",
             "existing_assignees": ["jakozloski"],
             "code_reviewers": ["not a login!"],
             "issue_tracker": {
@@ -1046,7 +1263,8 @@ class HandoffDecisionTest(unittest.TestCase):
                 "version": 1,
                 "scenario": "clean_unapproved",
                 "state": "idle",
-                "reason": "repository.nameWithOwner is not in the exact QA-owner map",
+                "reason": "no handback targets resolved and"
+                " repository.nameWithOwner is not in the exact QA-owner map",
                 "targets": {
                     "assignees": [],
                     "reviewers": [],
@@ -1451,7 +1669,8 @@ class HandoffDecisionTest(unittest.TestCase):
                 "version": 1,
                 "scenario": "approved_qa",
                 "state": "idle",
-                "reason": "repository.nameWithOwner is not in the exact QA-owner map",
+                "reason": "no handback targets resolved and"
+                " repository.nameWithOwner is not in the exact QA-owner map",
                 "targets": {
                     "assignees": [],
                     "reviewers": [],
@@ -1462,6 +1681,91 @@ class HandoffDecisionTest(unittest.TestCase):
                 "warnings": [],
                 "errors": [],
             },
+        )
+
+    def test_unmapped_repository_plans_universal_handback(self) -> None:
+        # algo#1216 r16 F2: reviewer/ball-holder handback is UNIVERSAL —
+        # both clean-exit scenarios on an unmapped repository (the algo
+        # lane itself) plan reviewer request/verify plus the assignee
+        # transfer to the validated ball_holder, with NO Linear leg and no
+        # Keeper QA-owner assignment.
+        for scenario in ("approved_qa", "clean_unapproved"):
+            with self.subTest(scenario=scenario):
+                plan = plan_handoff(
+                    {
+                        "scenario": scenario,
+                        "repository": {"nameWithOwner": "Keeper-Dating/algo"},
+                        "pull_request_number": PR_NUMBER,
+                        "authenticated_actor": "jakozloski",
+                        "existing_assignees": ["jakozloski"],
+                        "code_reviewers": ["michal-janicki"],
+                        "ball_holder": "michal-janicki",
+                    }
+                )
+                self.assertEqual(plan["state"], "pending", plan.get("errors"))
+                actions = [op["action"] for op in plan["operations"]]
+                self.assertIn("request_pull_request_review", actions)
+                self.assertIn("replace_pull_request_assignees", actions)
+                self.assertFalse(
+                    [
+                        op
+                        for op in plan["operations"]
+                        if op["service"] == "linear"
+                    ]
+                )
+                replace = next(
+                    op
+                    for op in plan["operations"]
+                    if op["action"] == "replace_pull_request_assignees"
+                )
+                self.assertEqual(
+                    replace["payload"]["assignees"], ["michal-janicki"]
+                )
+
+    def test_unmapped_handback_without_ball_holder_warns(self) -> None:
+        # No resolvable ball holder: reviewer requests still plan, the
+        # ownership transfer is skipped, and the drop is surfaced.
+        plan = plan_handoff(
+            {
+                "scenario": "approved_qa",
+                "repository": {"nameWithOwner": "Keeper-Dating/algo"},
+                "pull_request_number": PR_NUMBER,
+                "authenticated_actor": "jakozloski",
+                "existing_assignees": ["jakozloski"],
+                "code_reviewers": ["michal-janicki"],
+            }
+        )
+        self.assertEqual(plan["state"], "pending", plan.get("errors"))
+        actions = [op["action"] for op in plan["operations"]]
+        self.assertIn("request_pull_request_review", actions)
+        self.assertNotIn("replace_pull_request_assignees", actions)
+        self.assertTrue(
+            any(
+                "without an assignee transfer" in warning
+                for warning in plan["warnings"]
+            ),
+            plan["warnings"],
+        )
+
+    def test_unmapped_invalid_ball_holder_blocks(self) -> None:
+        plan = plan_handoff(
+            {
+                "scenario": "approved_qa",
+                "repository": {"nameWithOwner": "Keeper-Dating/algo"},
+                "pull_request_number": PR_NUMBER,
+                "authenticated_actor": "jakozloski",
+                "existing_assignees": ["jakozloski"],
+                "code_reviewers": ["michal-janicki"],
+                "ball_holder": "not a login!",
+            }
+        )
+        self.assertEqual(plan["state"], "blocked", plan)
+        self.assertTrue(
+            any(
+                "ball_holder must be a valid GitHub login" in error
+                for error in plan["errors"]
+            ),
+            plan["errors"],
         )
 
     def test_roundtrip_sorts_deduplicates_and_excludes_actor(self) -> None:
@@ -3325,6 +3629,7 @@ class ReviewerRequestPlanTests(unittest.TestCase):
         def qa_request(reviewers: list[str], results: dict[str, object]) -> dict[str, object]:
             return {
                 "scenario": "approved_qa",
+                "authenticated_actor": "jakozloski",
                 "existing_assignees": ["jakozloski"],
                 "repository": REPOSITORY,
                 "pull_request_number": PR_NUMBER,

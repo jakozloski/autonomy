@@ -2388,6 +2388,38 @@ class MonitorChildInvocationTests(unittest.TestCase):
         ):
             self.assertIn(clause, prompt)
 
+    def test_child_prompt_digest_command_survives_hostile_paths(self) -> None:
+        # admin#1495 r12 F17: the digest command interpolated raw local
+        # paths — a space split the argv, and quotes/dollars/semicolons/
+        # newlines injected shell syntax. The shlex-joined command must
+        # round-trip to the exact argv for every hostile shape.
+        import shlex as _shlex
+
+        for hostile in (
+            "/tmp/dir with space",
+            '/tmp/dir"quote',
+            "/tmp/dir$dollar",
+            "/tmp/dir;semi",
+            "/tmp/dir\nnewline",
+        ):
+            with self.subTest(path=hostile):
+                candidate = hostile + "/state.md.attempt-x.md"
+                prompt = monitor_child_prompt(
+                    hostile, hostile + "/state.md", candidate, "abc", 1
+                )
+                start = prompt.index("digest with: ") + len("digest with: ")
+                end = prompt.index(" . Your final message")
+                argv = _shlex.split(prompt[start:end])
+                self.assertEqual(
+                    argv,
+                    [
+                        "python3",
+                        f"{hostile}/scripts/state_schema.py",
+                        "--monitor-digest",
+                        candidate,
+                    ],
+                )
+
     def test_slice_constants_fit_inside_the_attempt_ceiling(self) -> None:
         # Literal boundary pins: the slice must return before a parent's own
         # 2700s attempt ceiling with margin to spare.
@@ -2577,6 +2609,64 @@ class MonitorOrchestratorBindingTests(unittest.TestCase):
             self._runtime(reviewer_status="blocked", base_status="blocked")
         )
         self.assertEqual(binding["state"], "invalid")
+
+    def test_ready_codex_leg_session_continues_monitoring(self) -> None:
+        # admin#1495 r12 F1: the OpenAI entry's Phase 6 controller runs on
+        # the CODEX leg's recorded selection — a gate-ready leg, not an
+        # unrecorded model. It continues as orchestrator (never re-model a
+        # live session) while Claude child ownership is retained: the
+        # nominal Claude owner rides in pending_owner, exactly the target
+        # the runner's recompute cross-checks.
+        binding = monitor_orchestrator_binding(
+            self._runtime(), session_model="gpt-5.6-sol"
+        )
+        self.assertEqual(binding["state"], "bound")
+        self.assertEqual(binding["lineage"], "codex")
+        self.assertEqual(binding["model"], "gpt-5.6-sol")
+        self.assertEqual(binding["effort"], "max")
+        self.assertEqual(binding["reason_code"], "orchestrator_continuity")
+        self.assertEqual(binding["pending_owner"], "claude-opus-5")
+
+    def test_unready_codex_leg_session_stays_unrecorded(self) -> None:
+        runtime = self._runtime()
+        runtime["codex"]["gate_status"] = "blocked"
+        binding = monitor_orchestrator_binding(
+            runtime, session_model="gpt-5.6-sol"
+        )
+        self.assertEqual(binding["state"], "invalid")
+
+    def test_codex_session_model_mismatch_fails_closed(self) -> None:
+        # Only the EXACT recorded selection continues — a different GPT
+        # slug (newer, older, variant) matches no landed leg.
+        binding = monitor_orchestrator_binding(
+            self._runtime(), session_model="gpt-5.7-sol"
+        )
+        self.assertEqual(binding["state"], "invalid")
+
+    def test_below_floor_codex_record_never_continues(self) -> None:
+        # State is untrusted: a hand-edited codex leg naming an excluded
+        # down-tier variant must not continue even at gate_status ready.
+        runtime = self._runtime()
+        runtime["codex"]["model"] = "gpt-5.6-sol-mini"
+        binding = monitor_orchestrator_binding(
+            runtime, session_model="gpt-5.6-sol-mini"
+        )
+        self.assertEqual(binding["state"], "invalid")
+
+    def test_codex_controller_requires_verified_base_write_path(self) -> None:
+        # Unlike a live Opus session (which truthfully demotes to inline
+        # base-lineage work), a Codex session cannot take the Claude base
+        # role — without a host-verified base worker path there is no
+        # compliant write actor, so the binding fails closed.
+        binding = monitor_orchestrator_binding(
+            self._runtime(base_write_verified=False),
+            session_model="gpt-5.6-sol",
+        )
+        self.assertEqual(binding["state"], "invalid")
+        self.assertTrue(
+            any("write" in error for error in binding["errors"]),
+            binding["errors"],
+        )
         self.assertTrue(binding["errors"])
 
     def test_malformed_runtime_fails_closed(self) -> None:

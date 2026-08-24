@@ -34,6 +34,7 @@ def _valid_skill_text() -> str:
             *BUILTIN_EXPECTED_HEADINGS["SKILL.md"],
             "",
             f"Use `codex exec {EXEC_MODEL_FLAGS}` for Codex execution.",
+            f"Use `codex exec {EXEC_MODEL_FLAGS} resume <session-id>` to resume.",
             f"Use `codex review {REVIEW_MODEL_FLAGS}` for Codex review.",
             f"The codex floor model is {CODEX_FLOOR_MODEL}; newer eligible models auto-forward.",
             "Conductor owns orchestration; do not substitute the separate ultracode mode.",
@@ -118,6 +119,17 @@ class PackageFixture:
             # module to define a collectable test* method — the fixture must
             # satisfy the invariant it exists to defend, like the marker and
             # binding loops above.
+            # _validate_size_boundary_parity (algo#1216 r16 F5 + admin#1495
+            # r12 F8) reads the paired assignments textually — bake matching
+            # literals so the fixture satisfies the invariants it defends.
+            if relative_path == "scripts/monitor_runner.py":
+                script_lines.append("MAX_CANDIDATE_BYTES = 8 * 1_048_576")
+                script_lines.append("MAX_WORK_ITERATIONS = 50")
+            if relative_path == "scripts/state_schema.py":
+                script_lines.append(
+                    "STATE_READ_CEILING_BYTES = 8 * 1_048_576"
+                )
+                script_lines.append("MAX_WORK_ITERATIONS = 50")
             name = relative_path.rsplit("/", 1)[-1]
             if name.startswith("test_") and name.endswith(".py"):
                 script_lines.extend(
@@ -147,6 +159,82 @@ class ValidatePackageTests(unittest.TestCase):
 
     def test_valid_package_passes(self) -> None:
         self.assertEqual(validate_package(self.package.root), [])
+
+    def test_size_boundary_parity_detects_drift(self) -> None:
+        # algo#1216 r16 F5: the runner's candidate cap and the schema
+        # CLI's read ceiling are independent literals with a mirror
+        # comment but no guard — a drifted pair must fail validation.
+        runner = self.package.root / "scripts" / "monitor_runner.py"
+        runner.write_text(
+            runner.read_text(encoding="utf-8").replace(
+                "MAX_CANDIDATE_BYTES = 8 * 1_048_576",
+                "MAX_CANDIDATE_BYTES = 9 * 1_048_576",
+            ),
+            encoding="utf-8",
+        )
+        errors = validate_package(self.package.root)
+        self.assertTrue(
+            any("size-boundary parity" in error for error in errors), errors
+        )
+
+    def test_claims_audit_anchor_rejects_fenced_decoy(self) -> None:
+        # algo#1216 r16 F12: the operative Check 4 claims-audit instruction
+        # is anchored — relocating it into a fenced block turns it into
+        # display content, and the anchored-marker machinery must fail
+        # validation instead of counting the decoy.
+        path = self.package.root / "references" / "merge-readiness.md"
+        text = path.read_text(encoding="utf-8")
+        anchor_line = next(
+            line
+            for line in text.splitlines()
+            if "2. For each claim, verify against the actual code path"
+            in line
+        )
+        path.write_text(
+            text.replace(
+                anchor_line, "```text\n" + anchor_line + "\n```"
+            ),
+            encoding="utf-8",
+        )
+        errors = validate_package(self.package.root)
+        self.assertTrue(
+            any(
+                "expected exactly one operative line" in error
+                and "For each claim" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_missing_exec_resume_shape_is_reported(self) -> None:
+        # admin#1495 r12 F10: the ordered resume shape (flags BEFORE the
+        # resume subcommand) is pinned — a package documenting only
+        # trailing flags would let a delegated resume drop the sandbox pin.
+        (self.package.root / "SKILL.md").write_text(
+            _valid_skill_text().replace(
+                f"codex exec {EXEC_MODEL_FLAGS} resume", "codex exec resume"
+            ),
+            encoding="utf-8",
+        )
+        errors = validate_package(self.package.root)
+        self.assertTrue(
+            any("exec-resume shape" in error for error in errors), errors
+        )
+
+    def test_work_cap_parity_detects_drift(self) -> None:
+        # admin#1495 r12 F8: the immutable work cap is restated in the
+        # schema for the validator's own check — a drifted pair must fail.
+        schema = self.package.root / "scripts" / "state_schema.py"
+        schema.write_text(
+            schema.read_text(encoding="utf-8").replace(
+                "MAX_WORK_ITERATIONS = 50", "MAX_WORK_ITERATIONS = 49"
+            ),
+            encoding="utf-8",
+        )
+        errors = validate_package(self.package.root)
+        self.assertTrue(
+            any("work-cap parity" in error for error in errors), errors
+        )
 
     def test_required_test_module_with_zero_tests_is_rejected(self) -> None:
         # CR 3761135481: unittest discover exits 0 after collecting zero
@@ -1524,6 +1612,73 @@ class EntryPointScanTests(unittest.TestCase):
             self.assertEqual(_validate_entry_points(package), [])
             legacy.unlink()
             self.assertEqual(_validate_entry_points(package), [])
+
+    def test_trigger_and_delegation_checks_are_structural(self) -> None:
+        # admin#1495 r12 F20: raw substring checks accepted a YAML comment,
+        # a push-only trigger, a wrong key, or a wrong indent as the
+        # required pull_request paths trigger — and an HTML comment as
+        # delegation. The narrow structural parser rejects each while the
+        # current valid shape (block form, quoted or bare, with an inline
+        # comment) still passes.
+        from validate_package import _validate_entry_points
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            (repo / ".git").mkdir(parents=True)
+            package = repo / ".agents" / "skills" / "autonomy"
+            package.mkdir(parents=True)
+            workflows = repo / ".github" / "workflows"
+            workflows.mkdir(parents=True)
+            wf = workflows / "skill-package-checks.yml"
+            bypasses = {
+                "comment-only": (
+                    "on:\n  pull_request:\n    paths:\n"
+                    '      - ".agents/skills/**"\n'
+                    '      # - ".cursor/commands/autonomous-*.md"\n'
+                ),
+                "push-only": (
+                    "on:\n  push:\n    paths:\n"
+                    '      - ".cursor/commands/autonomous-*.md"\n'
+                    "  pull_request:\n    paths:\n"
+                    '      - ".agents/skills/**"\n'
+                ),
+                "wrong-key": (
+                    "on:\n  pull_request:\n    paths-ignore:\n"
+                    '      - ".cursor/commands/autonomous-*.md"\n'
+                ),
+                "wrong-indent": (
+                    "on:\n  pull_request:\n    branches:\n      - main\n"
+                    "  paths:\n"
+                    '    - ".cursor/commands/autonomous-*.md"\n'
+                ),
+            }
+            for label, workflow_text in bypasses.items():
+                with self.subTest(shape=label):
+                    wf.write_text(workflow_text, encoding="utf-8")
+                    errors = _validate_entry_points(package)
+                    self.assertTrue(
+                        any("pull_request.paths" in e for e in errors),
+                        (label, errors),
+                    )
+            wf.write_text(
+                "on:\n  pull_request:\n    paths:\n"
+                '      - ".agents/skills/**"\n'
+                "      - .cursor/commands/autonomous-*.md # the guard\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(_validate_entry_points(package), [])
+            # Delegation must be operative text, not an HTML comment.
+            commands = repo / ".cursor" / "commands"
+            commands.mkdir(parents=True)
+            legacy = commands / "autonomous-feature.md"
+            legacy.write_text(
+                "Run the legacy flow directly.\n<!-- skills/autonomy -->\n",
+                encoding="utf-8",
+            )
+            errors = _validate_entry_points(package)
+            self.assertTrue(
+                any("3813789192" in error for error in errors), errors
+            )
 
     def test_load_root_symlinks_must_resolve_to_the_package(self) -> None:
         # admin#1495 finding 3822586140: a retargeted, dangling, or

@@ -93,7 +93,7 @@ Entitlement denial, authentication failure, missing CLI, old CLI, or missing liv
 
 2. **Direct Codex review** (when `/autoplan` is not selected):
    - Read the `codex-review` skill file from the discovered path above and follow its steps directly (do NOT invoke it as a slash command from inside this skill)
-   - Invoke Codex with `-m <selected-codex-model> -c 'model_reasoning_effort="max"' -s read-only` using the policy-selected model from state (floor `gpt-5.6-sol`; the codex-review skill uses `codex exec`, which accepts `-m`; the sandbox pin keeps a review voice from inheriting an ambient write-capable sandbox) — if its defaults ever differ, Model Configuration wins
+   - Invoke Codex with `-m <selected-codex-model> -c 'model_reasoning_effort="max"' -s read-only` using the policy-selected model from state (floor `gpt-5.6-sol`; the codex-review skill uses `codex exec`, which accepts `-m`; on any `codex exec resume` place every flag BEFORE the `resume` subcommand — the CLI accepts none after it, so a trailing-flags resume silently drops the sandbox pin (admin#1495 r12 F10); the sandbox pin keeps a review voice from inheriting an ambient write-capable sandbox) — if its defaults ever differ, Model Configuration wins
    - Codex and Claude iterate until Codex approves — no fixed working budget; this round policy overrides any round cap in the delegated codex-review skill. Log each round's open findings in the Decision Audit Trail
    - If Codex raises valid concerns, revise the plan
    - If Codex suggests something contradicting explicit user requirements or repo rules, skip with logged note
@@ -388,7 +388,7 @@ When `change_type == "skill_only"`: set `phases.runtime_verification.status: "wa
 If frontend verification is user-requested OR mandatory for the actual diff, and `change_type != "skill_only"`:
 
 1. Set `phases.runtime_verification.status: "in_progress"` in state
-2. Start the frontend dev server using `DEV_SERVER_FRONTEND` (and `DEV_SERVER_BACKEND` if full-stack). **Timeout: 60 seconds.** If startup fails or times out: BLOCK when mandatory; otherwise waive with the exact reason.
+2. Start the frontend dev server using `DEV_SERVER_FRONTEND` (and `DEV_SERVER_BACKEND` if full-stack) — the re-resolved argv form only, never a command string recovered from state (state-and-safety rule 4; a legacy string value is always a cache miss). **Timeout: 60 seconds.** If startup fails or times out: BLOCK when mandatory; otherwise waive with the exact reason.
 3. Run the `/qa` adapter in diff-aware mode, Quick tier (critical + high only):
    - Navigate to each affected page using the browse binary
    - Test critical flows only (no exhaustive exploration)

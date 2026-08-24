@@ -403,9 +403,14 @@ class SidecarGateTests(unittest.TestCase):
             "substituted evidence",
         )
 
-    def test_retention_limit_blocks_before_any_parse(self) -> None:
-        # R2 re-reply 3792845972: the count ceiling is enforced BEFORE any
-        # sidecar is schema-extracted — the untouched stub queue proves it.
+    def test_retention_limit_blocks_after_bounded_batch(self) -> None:
+        # R2 re-reply 3792845972, amended by admin#1495 r12 F16: over-limit
+        # no longer blocks before compaction — the BOUNDED batch (limit + 1
+        # entries, never the full pile) classifies first so compactable
+        # sidecars can shed; a mid-slice gate (compact_no_status=False)
+        # leaves no-intent sidecars in place, so the rescan still exceeds
+        # and the block fires with the batch-compaction message. Startup
+        # work stays bounded: exactly the enumerated batch is parsed.
         runner = self._runner_with_state()
         stub = self._StubSchema()
         runner.schema = stub
@@ -416,10 +421,54 @@ class SidecarGateTests(unittest.TestCase):
         with self.assertRaises(RunnerExit) as caught:
             runner._gate_sidecars({"handoff_results": {}})
         self.assertEqual(caught.exception.code, 5)
-        self.assertIn("retention limit", caught.exception.reason)
+        self.assertIn("bounded batch compaction", caught.exception.reason)
         self.assertEqual(
-            len(stub.queued), count, "no sidecar may be parsed past the cap"
+            len(stub.queued), 0, "exactly the bounded batch is parsed"
         )
+
+    def _remaining_sidecars(self, runner: Runner) -> list[str]:
+        return sorted(
+            f.name
+            for f in runner.state_path.parent.iterdir()
+            if f.is_file() and ".failed-candidate-" in f.name
+        )
+
+    def test_over_limit_no_intent_sidecars_compact_at_entry(self) -> None:
+        # admin#1495 r12 F16 (the fix): at ENTRY (compact_no_status=True)
+        # the same over-limit pile of valid no-intent sidecars compacts
+        # inside the bounded batch and the gate proceeds without a block.
+        runner = self._runner_with_state()
+        stub = self._StubSchema()
+        runner.schema = stub
+        count = runner.SIDECAR_RETENTION_LIMIT + 1
+        for index in range(count):
+            self._sidecar(runner, f"{index:02d}")
+            stub.queued.append({"state": "valid", "handoff_results": {}})
+        runner._gate_sidecars({"handoff_results": {}}, compact_no_status=True)
+        self.assertEqual(self._remaining_sidecars(runner), [])
+
+    def test_over_limit_batches_persist_progress_across_gates(self) -> None:
+        # 45 no-intent sidecars: the first gate compacts one bounded batch
+        # (21), rescans, and blocks on the 24 that remain; the second gate
+        # compacts 21 more and proceeds with 3 under the limit — each
+        # deletion is durable progress across invocations.
+        runner = self._runner_with_state()
+        stub = self._StubSchema()
+        runner.schema = stub
+        for index in range(45):
+            self._sidecar(runner, f"{index:03d}")
+        for _ in range(runner.SIDECAR_RETENTION_LIMIT + 1):
+            stub.queued.append({"state": "valid", "handoff_results": {}})
+        with self.assertRaises(RunnerExit) as caught:
+            runner._gate_sidecars(
+                {"handoff_results": {}}, compact_no_status=True
+            )
+        self.assertIn("bounded batch compaction", caught.exception.reason)
+        self.assertEqual(len(self._remaining_sidecars(runner)), 24)
+        for _ in range(runner.SIDECAR_RETENTION_LIMIT + 1):
+            stub.queued.append({"state": "valid", "handoff_results": {}})
+        runner._gate_sidecars({"handoff_results": {}}, compact_no_status=True)
+        self.assertEqual(len(self._remaining_sidecars(runner)), 3)
 
     def test_quarantine_never_clobbers_preexisting_evidence(self) -> None:
         # r14 F17 re-eval: a recycled pid colliding with older quarantined
@@ -469,6 +518,12 @@ class SidecarGateTests(unittest.TestCase):
         total = limit + 50
         for index in range(total):
             self._sidecar(runner, f"{index:03d}")
+        # admin#1495 r12 F16: the bounded batch is parsed before the block
+        # now, so the stub queue holds exactly one batch; the mid-slice
+        # gate keeps the no-intent sidecars, and the rescan (a second
+        # bounded scan) still exceeds.
+        for _ in range(limit + 1):
+            stub.queued.append({"state": "valid", "handoff_results": {}})
         real_scandir = os.scandir
         counted: list[str] = []
 
@@ -502,8 +557,9 @@ class SidecarGateTests(unittest.TestCase):
             if ".failed-candidate" in name or ".attempt-" in name
         )
         self.assertEqual(
-            matching, limit + 1,
-            "the scan must stop at the first over-limit match",
+            matching, 2 * (limit + 1),
+            "each scan (batch + rescan) must stop at the first over-limit"
+            " match",
         )
         self.assertLess(
             len(counted), total,
@@ -1275,6 +1331,227 @@ class MappedRepositoryParityTests(unittest.TestCase):
             )
 
 
+class CapabilityFamilyResolutionTests(unittest.TestCase):
+    # admin#1495 finding 3825265272 / algo#1216 F3: the narrowed probe accepts
+    # a mapped run only when the resolved user-scope surface grants BOTH the
+    # github and linear handoff families. These pin the deterministic core the
+    # e2e probe tests exercise end-to-end — token matching and deny precedence.
+
+    def test_family_of_maps_each_token_shape(self) -> None:
+        cases = {
+            "mcp__linear__create_issue": "linear",
+            "Linear": "linear",
+            "mcp__github__create_pull_request": "github",
+            "Bash(gh pr create)": "github",
+            "bash(gh ": "github",
+            "GitHub": "github",
+            "Bash(git push)": None,
+            "mcp__sentry__event": None,
+            "": None,
+        }
+        for token, expected in cases.items():
+            self.assertEqual(
+                monitor_runner._capability_family_of(token), expected, token
+            )
+
+    def test_linear_wins_when_a_token_names_both(self) -> None:
+        # linear is tested first so a single token resolves to exactly one
+        # family — a server literally named "linear-github" counts as linear,
+        # never silently as github.
+        self.assertEqual(
+            monitor_runner._capability_family_of("linear-github-bridge"),
+            "linear",
+        )
+
+    def test_allow_list_unions_both_families(self) -> None:
+        self.assertEqual(
+            monitor_runner._resolved_capability_families(
+                {"permissions": {"allow": ["Bash(gh *)", "mcp__linear__*"]}},
+                None,
+            ),
+            {"github", "linear"},
+        )
+
+    def test_github_only_allow_is_incomplete(self) -> None:
+        resolved = monitor_runner._resolved_capability_families(
+            {"permissions": {"allow": ["Bash(gh *)"]}}, None
+        )
+        self.assertEqual(resolved, {"github"})
+        self.assertFalse(monitor_runner.REQUIRED_CHILD_CAPABILITIES <= resolved)
+
+    def test_catch_all_deny_removes_every_family(self) -> None:
+        self.assertEqual(
+            monitor_runner._resolved_capability_families(
+                {
+                    "permissions": {
+                        "allow": ["mcp__github__*", "mcp__linear__*"],
+                        "deny": ["*"],
+                    }
+                },
+                None,
+            ),
+            set(),
+        )
+
+    def test_explicit_family_deny_beats_its_own_allow(self) -> None:
+        # deny precedence mirrors Claude Code: an allow + a same-family deny
+        # nets to denied, so a run granting github but denying linear is not
+        # complete even though both appear.
+        self.assertEqual(
+            monitor_runner._resolved_capability_families(
+                {
+                    "permissions": {
+                        "allow": ["Bash(gh *)", "mcp__linear__*"],
+                        "deny": ["mcp__linear__*"],
+                    }
+                },
+                None,
+            ),
+            {"github"},
+        )
+
+    def test_mcp_servers_keys_grant_families(self) -> None:
+        self.assertEqual(
+            monitor_runner._resolved_capability_families(
+                {"mcpServers": {"linear": {}, "github": {}, "filesystem": {}}},
+                None,
+            ),
+            {"github", "linear"},
+        )
+
+    def test_listing_text_completes_a_partial_surface(self) -> None:
+        # settings grant github; the exact-invocation `mcp list` supplies the
+        # linear half — the union is complete.
+        self.assertEqual(
+            monitor_runner._resolved_capability_families(
+                {"permissions": {"allow": ["Bash(gh *)"]}},
+                "linear: connected\nfilesystem: connected",
+            ),
+            {"github", "linear"},
+        )
+
+    def test_non_dict_settings_falls_back_to_listing_only(self) -> None:
+        # a missing/unparseable settings file (None) contributes nothing; the
+        # listing alone must still resolve families.
+        self.assertEqual(
+            monitor_runner._resolved_capability_families(
+                None, "github: connected\nlinear: connected"
+            ),
+            {"github", "linear"},
+        )
+
+    def test_malformed_tokens_are_ignored_not_crashing(self) -> None:
+        # non-string entries in allow/deny and a non-list allow must be
+        # skipped, never raise — hostile or hand-edited settings stay safe.
+        self.assertEqual(
+            monitor_runner._resolved_capability_families(
+                {
+                    "permissions": {
+                        "allow": ["mcp__linear__*", 7, None, {"x": 1}],
+                        "deny": "not-a-list",
+                    }
+                },
+                None,
+            ),
+            {"linear"},
+        )
+
+
+class SidecarQuarantineRenameTests(unittest.TestCase):
+    # admin#1495 F5: quarantine must be ONE atomic no-replace move, never
+    # link+unlink. These pin the properties that close the same-UID
+    # source-replacement race the old link+unlink left open.
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+
+    def _sidecar(self, name: str, body: str = "x") -> Path:
+        path = self.dir / name
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    def test_move_is_atomic_source_and_target_never_coexist(self) -> None:
+        # link+unlink left BOTH names bound to one inode mid-operation; the
+        # atomic rename never does — after it, exactly one name exists.
+        src = self._sidecar("state.md.sidecar-1234", "EVIDENCE")
+        quarantined = monitor_runner._quarantine_sidecar(src)
+        self.assertIsNotNone(quarantined)
+        self.assertFalse(src.exists())
+        self.assertTrue(quarantined.exists())
+        self.assertEqual(quarantined.read_text(encoding="utf-8"), "EVIDENCE")
+
+    def test_no_replace_preserves_an_existing_target(self) -> None:
+        # RENAME_NOREPLACE / RENAME_EXCL: colliding onto an existing name
+        # raises FileExistsError and leaves BOTH files intact — a plain
+        # rename would have destroyed the older quarantined evidence.
+        src = self._sidecar("s", "new")
+        dst = self._sidecar("t", "older-quarantined")
+        with self.assertRaises(FileExistsError):
+            monitor_runner._rename_noreplace(src, dst)
+        self.assertEqual(src.read_text(encoding="utf-8"), "new")
+        self.assertEqual(dst.read_text(encoding="utf-8"), "older-quarantined")
+
+    def test_collision_advances_the_counter_suffix(self) -> None:
+        src = self._sidecar("state.md.sidecar-5678", "B")
+        collide = self.dir / f"state.md.sidecar-5678.q{os.getpid()}"
+        collide.write_text("OLD", encoding="utf-8")
+        quarantined = monitor_runner._quarantine_sidecar(src)
+        self.assertIsNotNone(quarantined)
+        self.assertTrue(quarantined.name.endswith(f".q{os.getpid()}-1"))
+        self.assertEqual(collide.read_text(encoding="utf-8"), "OLD")
+        self.assertFalse(src.exists())
+
+    def test_quarantine_name_keeps_the_sidecar_prefix(self) -> None:
+        # crash-after-rename recovery: the retention scan and resume
+        # discovery must still find the parked file, so its name must retain
+        # the original sidecar name as a prefix.
+        for name in ("state.md.sidecar-9", "state.md.attempt-9"):
+            src = self._sidecar(name)
+            quarantined = monitor_runner._quarantine_sidecar(src)
+            self.assertIsNotNone(quarantined, name)
+            self.assertTrue(quarantined.name.startswith(name), quarantined.name)
+
+    def test_unsupported_platform_fails_closed_source_untouched(self) -> None:
+        # No atomic primitive: return None (caller records unreadable) and
+        # leave the source EXACTLY as found — never degrade to link+unlink.
+        src = self._sidecar("state.md.sidecar-3", "C")
+        with mock.patch.object(monitor_runner.sys, "platform", "sunos5"):
+            self.assertIsNone(monitor_runner._quarantine_sidecar(src))
+        self.assertEqual(src.read_text(encoding="utf-8"), "C")
+
+    def test_rename_syscall_failure_fails_closed(self) -> None:
+        # A hard OSError from the primitive (not EEXIST/unsupported) leaves
+        # the source and returns None — nothing bound, nothing deleted.
+        src = self._sidecar("state.md.sidecar-4", "D")
+        with mock.patch.object(
+            monitor_runner,
+            "_rename_noreplace",
+            side_effect=OSError(monitor_runner.errno.EIO, "io"),
+        ):
+            self.assertIsNone(monitor_runner._quarantine_sidecar(src))
+        self.assertEqual(src.read_text(encoding="utf-8"), "D")
+
+    def test_parent_fsync_failure_still_quarantines(self) -> None:
+        # Unlike the canonical commit, a quarantine an fsync-failure crash
+        # reverts is safe (re-scan is idempotent), so the move still lands.
+        src = self._sidecar("state.md.sidecar-7", "E")
+        with mock.patch.object(
+            monitor_runner, "_fsync_parent", return_value=False
+        ):
+            quarantined = monitor_runner._quarantine_sidecar(src)
+        self.assertIsNotNone(quarantined)
+        self.assertFalse(src.exists())
+        self.assertEqual(quarantined.read_text(encoding="utf-8"), "E")
+
+    def test_darwin_excl_flag_is_not_the_linux_bit(self) -> None:
+        # Regression on the verified constant: Darwin RENAME_EXCL is 0x4;
+        # 0x2 is RENAME_SWAP (needs both names -> ENOENT). A silent revert to
+        # the Linux 0x1 would make every quarantine ENOENT-fail on macOS.
+        self.assertEqual(monitor_runner._DARWIN_RENAME_EXCL, 0x4)
+        self.assertEqual(monitor_runner._RENAME_NOREPLACE, 1)
+
+
 class DescendantIdentityTests(unittest.TestCase):
     """algo#1216 finding 3816160128: PID reuse must never make liveness or
     cleanup treat an unrelated same-UID process as a recorded descendant."""
@@ -1741,7 +2018,19 @@ class PostGoBackstopTests(unittest.TestCase):
         source = inspect.getsource(Runner.run_tick)
         self.assertIn("except BaseException as error:", source)
         self.assertIn("self._post_go_backstop(", source)
-        self.assertIn("except RunnerExit:", source)
+        # admin#1495 F4: the structured-exit arm binds the exception (it
+        # rethrows the ORIGINAL) and runs the SAME identity-safe descendant
+        # extinction the normal path and the backstop use — a bare
+        # `except RunnerExit:` that only swept an empty containment was the
+        # bug. Pin both the binding and the extinction call so a regression
+        # to the sweep-only shape fails here.
+        self.assertIn("except RunnerExit as exc:", source)
+        self.assertIn("self._extinguish_child_descendants(", source)
+        self.assertTrue(
+            hasattr(Runner, "_extinguish_containment")
+            and hasattr(Runner, "_extinguish_child_descendants"),
+            "the shared extinction helpers must exist",
+        )
 
     def test_assert_free_paths_survive_optimized_python(self) -> None:
         # r14 F10 re-eval: prove the two former assert sites raise
@@ -1775,6 +2064,108 @@ class PostGoBackstopTests(unittest.TestCase):
                     stripped.startswith("assert ") and "# nosec" not in stripped,
                     f"bare assert in {name}: {stripped[:80]}",
                 )
+
+
+class AtomicWriteCleanupTests(unittest.TestCase):
+    """admin#1495 r12 F19: temp cleanup is phase-aware — a pre-rename
+    replace failure removes the temp this call created; a post-rename
+    fsync failure has no temp left and must never touch the committed
+    target."""
+
+    def test_pre_rename_replace_failure_removes_the_temp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "state.md"
+            target.write_text("old", encoding="utf-8")
+            with mock.patch.object(
+                monitor_runner.os, "replace", side_effect=OSError("boom")
+            ):
+                with self.assertRaises(OSError):
+                    monitor_runner.atomic_write(target, "new")
+            self.assertEqual(list(Path(tmp).glob("*.tmp-*")), [])
+            self.assertEqual(target.read_text(encoding="utf-8"), "old")
+
+    def test_post_rename_fsync_failure_keeps_the_committed_bytes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "state.md"
+            target.write_text("old", encoding="utf-8")
+            with mock.patch.object(
+                monitor_runner, "_fsync_parent", return_value=False
+            ):
+                with self.assertRaises(monitor_runner.RunnerExit):
+                    monitor_runner.atomic_write(target, "new")
+            self.assertEqual(target.read_text(encoding="utf-8"), "new")
+            self.assertEqual(list(Path(tmp).glob("*.tmp-*")), [])
+
+
+class ConstructionGuardTests(unittest.TestCase):
+    """admin#1495 r12 F18: __init__ creates the wrapper stage and the
+    skill snapshot before main() ever holds the instance — a constructor
+    failure after either resource exists must remove exactly this
+    construction's resources (never a sibling runner's), through the same
+    cleanup main()'s finally uses."""
+
+    def _args(self, tmp: Path, skill_dir: Path) -> argparse.Namespace:
+        return argparse.Namespace(
+            state_file=str(tmp / "state.md"),
+            skill_dir=str(skill_dir),
+            claude_bin="/opt/homebrew/bin/claude",
+            schema_cli=str(SCRIPTS / "state_schema.py"),
+            slice_budget=100.0,
+            wait_scale=1.0,
+            acknowledge_taint=None,
+        )
+
+    def test_snapshot_read_failure_removes_both_resources(self) -> None:
+        # The snapshot loop fails (no SKILL.md in the skill dir) AFTER the
+        # wrapper stage and snapshot dir both exist.
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            fake_tmproot = tmp / "tmproot"
+            fake_tmproot.mkdir()
+            empty_skill = tmp / "skill"
+            empty_skill.mkdir()
+            with mock.patch.object(tempfile, "tempdir", str(fake_tmproot)):
+                with self.assertRaises(FileNotFoundError):
+                    Runner(self._args(tmp, empty_skill))
+            self.assertEqual(list(fake_tmproot.iterdir()), [])
+
+    def test_git_resolution_failure_removes_both_resources(self) -> None:
+        # _resolve_system_binary fails closed (missing git host) AFTER the
+        # full snapshot succeeded.
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            fake_tmproot = tmp / "tmproot"
+            fake_tmproot.mkdir()
+            with mock.patch.object(
+                monitor_runner,
+                "_resolve_system_binary",
+                side_effect=monitor_runner.RunnerExit(5, "blocked", "no git"),
+            ):
+                with mock.patch.object(
+                    tempfile, "tempdir", str(fake_tmproot)
+                ):
+                    with self.assertRaises(monitor_runner.RunnerExit):
+                        Runner(self._args(tmp, SCRIPTS.parent))
+            self.assertEqual(list(fake_tmproot.iterdir()), [])
+
+    def test_snapshot_dir_creation_failure_removes_the_stage(self) -> None:
+        # mkdtemp itself fails: only the wrapper stage exists — the guard
+        # must tolerate the partially constructed instance.
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            fake_tmproot = tmp / "tmproot"
+            fake_tmproot.mkdir()
+            with mock.patch.object(
+                tempfile, "mkdtemp", side_effect=OSError("boom")
+            ):
+                with mock.patch.object(
+                    tempfile, "tempdir", str(fake_tmproot)
+                ):
+                    with self.assertRaises(OSError):
+                        Runner(self._args(tmp, SCRIPTS.parent))
+            self.assertEqual(list(fake_tmproot.iterdir()), [])
 
 
 class WorkCapDocParityTests(unittest.TestCase):

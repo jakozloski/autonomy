@@ -40,10 +40,13 @@ Write protocol (plan-gate converged):
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import fcntl
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import signal
@@ -141,6 +144,81 @@ MAPPED_QA_REPOSITORIES = frozenset(
         "keeper-dating/keeper-lead-generator",
     }
 )
+
+# admin#1495 finding 3825265272 / algo#1216 F3: narrow the capability probe
+# to the exact surface the mapped Phase-6 handoffs exercise. The planner
+# emits ``*.github.*`` (request-review / replace-assignees) and
+# ``*.linear.*`` (assign-ticket / set-ticket-state) operations, and a mapped
+# repository is DEFINED by a QA_OWNER_BY_REPOSITORY Linear binding — so it
+# will attempt BOTH families. The r25 probe accepted any truthy
+# ``permissions`` object or any MCP server, so a deny-all policy or an
+# unrelated server passed while granting neither of these. Linear's
+# ``record_unavailable`` fallback covers a RUNTIME outage, not a provisioning
+# gap: a mapped host that never grants linear is a misconfiguration this
+# fails fast on.
+REQUIRED_CHILD_CAPABILITIES = frozenset({"github", "linear"})
+
+
+def _capability_family_of(token: str) -> str | None:
+    """Map a single permission pattern, MCP server name, or ``mcp list``
+    line to the handoff capability family it names, or ``None``.
+    Case-insensitive. ``linear`` is tested first so a token can only ever
+    resolve to one family."""
+
+    lowered = token.lower()
+    if "linear" in lowered:
+        return "linear"
+    if "github" in lowered or "bash(gh" in lowered:
+        return "github"
+    return None
+
+
+def _resolved_capability_families(
+    settings_data: object, listing_text: str | None
+) -> set[str]:
+    """The handoff capability families the resolved user-scope surface
+    GRANTS minus those it DENIES, unioned across the settings
+    ``permissions.allow`` list, the ``mcpServers`` keys, and the
+    exact-invocation ``mcp list`` output. Deny precedence mirrors Claude
+    Code: an explicit family deny (or a catch-all ``*``) removes the family
+    even when an allow entry or a configured server would otherwise grant
+    it."""
+
+    granted: set[str] = set()
+    denied: set[str] = set()
+    if isinstance(settings_data, dict):
+        perms = settings_data.get("permissions")
+        if isinstance(perms, dict):
+            allow = perms.get("allow")
+            if isinstance(allow, list):
+                for token in allow:
+                    if isinstance(token, str):
+                        family = _capability_family_of(token)
+                        if family:
+                            granted.add(family)
+            deny = perms.get("deny")
+            if isinstance(deny, list):
+                for token in deny:
+                    if isinstance(token, str):
+                        if token.strip() == "*":
+                            denied |= set(REQUIRED_CHILD_CAPABILITIES)
+                        else:
+                            family = _capability_family_of(token)
+                            if family:
+                                denied.add(family)
+        servers = settings_data.get("mcpServers")
+        if isinstance(servers, dict):
+            for name in servers:
+                if isinstance(name, str):
+                    family = _capability_family_of(name)
+                    if family:
+                        granted.add(family)
+    if listing_text:
+        for line in listing_text.splitlines():
+            family = _capability_family_of(line)
+            if family:
+                granted.add(family)
+    return granted - denied
 
 
 class AttemptContainment:
@@ -664,7 +742,19 @@ def atomic_write(path: Path, text: str) -> None:
         except OSError:
             pass
         raise
-    durable_replace(tmp, path)
+    # admin#1495 r12 F19: a PRE-rename os.replace failure leaves the temp
+    # this call created — remove it, but only if it still exists: after a
+    # successful rename the temp path no longer names anything (a
+    # post-rename directory-fsync failure has nothing to unlink, and the
+    # committed target must never be touched by cleanup).
+    try:
+        durable_replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def _fsync_parent(path: Path) -> bool:
@@ -710,6 +800,149 @@ def durable_replace(source: Path, target: Path) -> None:
             " rename may not be durable on disk; treat the commit as"
             " unproven and reconcile per the Resume trust model",
         )
+
+
+class _NoReplaceRenameUnsupported(RuntimeError):
+    """The host exposes no atomic no-replace rename primitive, so the caller
+    must fail closed rather than degrade to a lossy link+unlink."""
+
+
+# admin#1495 finding F5: quarantining a sidecar must be ONE atomic no-replace
+# move, never link-then-unlink. os.link + os.unlink leaves a window in which a
+# same-UID writer replaces the SOURCE pathname between the two calls, so the
+# unlink deletes the writer's newer evidence instead of the inode we linked. An
+# atomic rename moves whichever inode the source names and drops the source
+# name in the same syscall — a racing writer either loses to the rename (we
+# quarantine its newer inode) or creates a fresh source name preserved for the
+# next scan; either way no evidence is destroyed.
+#
+# UAPI/ABI constants for the primitives differ by platform and were verified
+# against the live syscall: Linux renameat2 takes RENAME_NOREPLACE (0x1,
+# linux/fs.h) with AT_FDCWD == -100; Darwin renamex_np takes RENAME_EXCL —
+# 0x4 in sys/stdio.h, NOT the Linux 0x1 (0x2 there is RENAME_SWAP, which needs
+# BOTH names to exist and returns ENOENT otherwise). renamex_np is fd-less, so
+# Darwin never needs an AT_FDCWD value.
+_RENAME_NOREPLACE = 1
+_DARWIN_RENAME_EXCL = 0x4
+_LINUX_AT_FDCWD = -100
+# renameat2 syscall numbers by machine, used only when glibc predates the
+# renameat2 wrapper (2.28); a modern GKE base image resolves the wrapper.
+_LINUX_RENAMEAT2_NR = {
+    "x86_64": 316,
+    "aarch64": 276,
+    "armv7l": 382,
+    "armv8l": 382,
+    "i386": 353,
+    "i686": 353,
+    "ppc64le": 357,
+    "s390x": 347,
+}
+
+
+def _linux_renameat2(libc: ctypes.CDLL, src_b: bytes, dst_b: bytes) -> int:
+    """Invoke Linux ``renameat2(RENAME_NOREPLACE)`` via the glibc wrapper when
+    present, else the raw syscall for the running machine. Returns the raw
+    return code (0 or -1 with errno set)."""
+
+    wrapper = getattr(libc, "renameat2", None)
+    if wrapper is not None:
+        wrapper.restype = ctypes.c_int
+        wrapper.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        ctypes.set_errno(0)
+        return wrapper(
+            _LINUX_AT_FDCWD, src_b, _LINUX_AT_FDCWD, dst_b, _RENAME_NOREPLACE
+        )
+    number = _LINUX_RENAMEAT2_NR.get(platform.machine())
+    if number is None:
+        raise _NoReplaceRenameUnsupported(
+            f"renameat2 syscall number unknown for {platform.machine()}"
+        )
+    syscall = libc.syscall
+    syscall.restype = ctypes.c_long
+    ctypes.set_errno(0)
+    # Variadic: pass ctypes-typed args so pointers are not truncated to int.
+    return syscall(
+        ctypes.c_long(number),
+        ctypes.c_int(_LINUX_AT_FDCWD),
+        ctypes.c_char_p(src_b),
+        ctypes.c_int(_LINUX_AT_FDCWD),
+        ctypes.c_char_p(dst_b),
+        ctypes.c_uint(_RENAME_NOREPLACE),
+    )
+
+
+def _rename_noreplace(src: Path, dst: Path) -> None:
+    """Atomically rename ``src`` onto ``dst``, refusing to REPLACE an existing
+    ``dst`` (raising ``FileExistsError``). Raises ``_NoReplaceRenameUnsupported``
+    where the host has no such primitive (or the fs/kernel rejects the flag) so
+    the caller fails closed instead of degrading to a lossy link+unlink."""
+
+    src_b = os.fsencode(src)
+    dst_b = os.fsencode(dst)
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        fn = getattr(libc, "renamex_np", None)
+        if fn is None:
+            raise _NoReplaceRenameUnsupported("renamex_np unavailable")
+        fn.restype = ctypes.c_int
+        fn.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        ctypes.set_errno(0)
+        rc = fn(src_b, dst_b, _DARWIN_RENAME_EXCL)
+    elif sys.platform.startswith("linux"):
+        rc = _linux_renameat2(libc, src_b, dst_b)
+    else:
+        raise _NoReplaceRenameUnsupported(sys.platform)
+    if rc == 0:
+        return
+    err = ctypes.get_errno()
+    if err == errno.EEXIST:
+        raise FileExistsError(err, os.strerror(err), str(dst))
+    if err in (errno.ENOSYS, errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP):
+        # Kernel too old for renameat2, or the flag is unsupported by this
+        # filesystem — fail closed, never fall back to the racy link+unlink.
+        raise _NoReplaceRenameUnsupported(os.strerror(err))
+    raise OSError(err, os.strerror(err), str(src))
+
+
+def _quarantine_sidecar(sidecar: Path) -> Path | None:
+    """Move ``sidecar`` aside under a no-clobber quarantine name (keeping the
+    sidecar prefix so the retention scan and resume discovery still see it) and
+    return the new path, or ``None`` when no atomic no-replace primitive is
+    available, the source raced away, or the move failed. In EVERY ``None`` case
+    the source is left exactly as found (an atomic rename either moves it wholly
+    or does nothing), so no evidence is destroyed and the next scan retries. A
+    counter suffix advances on a name collision with older quarantined
+    evidence. Never falls back to link+unlink — that is the exact same-UID
+    replacement race admin#1495 F5 closes."""
+
+    for attempt in range(20):
+        suffix = f".q{os.getpid()}" + (f"-{attempt}" if attempt else "")
+        target = sidecar.with_name(sidecar.name + suffix)
+        try:
+            _rename_noreplace(sidecar, target)
+        except FileExistsError:
+            continue  # collided with older quarantined evidence — advance
+        except _NoReplaceRenameUnsupported:
+            return None  # no atomic primitive — fail closed, source untouched
+        except OSError:
+            return None  # vanished, raced, or unrenamable — source untouched
+        # Best-effort durability. Unlike the canonical-state commit, a
+        # quarantine that a crash reverts is safe: the sidecar reappears under
+        # its ORIGINAL name and the next scan re-quarantines and re-parses it
+        # idempotently, so an fsync failure here does not fail the run.
+        if not _fsync_parent(target):
+            _heartbeat(
+                "sidecar quarantine parent fsync failed (move committed;"
+                f" re-scan is idempotent): {target.name}"
+            )
+        return target
+    return None
 
 
 def _read_regular_file(path: Path, ceiling: int) -> bytes:
@@ -1493,6 +1726,19 @@ class Runner:
         )
         os.close(wrapper_fd)
         self.wrapper_stage_path = Path(wrapper_stage_name)
+        # admin#1495 r12 F18: from the first created temp resource onward a
+        # constructor failure never reaches main()'s finally (main holds no
+        # instance yet) — guard locally, removing exactly THIS
+        # construction's resources through the same cleanup main uses,
+        # then re-raise. Never glob for siblings: other runners' temp
+        # files are theirs.
+        try:
+            self._finish_construction(args)
+        except BaseException:
+            self.cleanup_wrapper_stage()
+            raise
+
+    def _finish_construction(self, args: argparse.Namespace) -> None:
         # admin#1495 R2 finding 3722356278 (follow-up 3777166503): the
         # write-capable monitor child is ordered to re-read this package's
         # SKILL.md/references and run its scripts, and the live skill_dir
@@ -1596,6 +1842,11 @@ class Runner:
         )
         self.tick_attempts = 0
         self.attempt_containment: AttemptContainment | None = None
+        # admin#1495 F4: the drain's descendant snapshot, stashed per tick so
+        # the structured-exit boundary and the backstop can run identity-safe
+        # extinction even for an exit raised BEFORE the normal post-drain
+        # block reached it (the early _require_unmutated_canonical gate).
+        self._descendant_snapshot: dict[int, Any] = {}
         self.lock_path = self.state_path.with_suffix(self.state_path.suffix + ".monitor.lock")
         self._lock_handle: IO[bytes] | None = None
         self.ticks_completed = 0
@@ -1896,7 +2147,8 @@ class Runner:
         """State-writing half of recovery: discard candidates and charge the
         unknown-outcome budget. Runs only on a VALID state (writes go through
         the same splice/commit path as everything else); the no-signal
-        extinction check already ran before the validity gate."""
+        extinction check already ran immediately after the validity gate,
+        before the taint and capability gates (admin#1495 r12 F6)."""
 
         block = extract.get("monitor_cli")
         if not isinstance(block, dict):
@@ -2354,20 +2606,29 @@ class Runner:
             self._preserve_failed(candidate)
             self.charge_failure(fresh, "monitor-child:go_write_failed")
             return "retry"
-        # r14 F4: ONE finally-owned lifecycle boundary for everything
-        # after GO — an exception that escapes supervision (a pipe or
-        # selector failure, a protocol surprise) must never strand a
-        # live write-capable child behind a raw traceback. Structured
-        # RunnerExits own their cleanup story and pass through; any
-        # OTHER escape routes into the backstop, which terminates
-        # through containment/identity, boundedly reaps, preserves
-        # evidence, and refuses to return without extinction proof.
+        # r14 F4: ONE lifecycle boundary for everything after GO — an
+        # exception that escapes supervision (a pipe or selector failure, a
+        # protocol surprise) must never strand a live write-capable child
+        # behind a raw traceback. admin#1495 F4: a structured RunnerExit is
+        # NOT self-sufficient here — one can be raised BEFORE the normal
+        # extinction block ran (the early _require_unmutated_canonical gate),
+        # so BOTH except arms now run the common containment/descendant
+        # extinction before releasing: the structured arm re-raises the
+        # ORIGINAL error once extinction is proven, and any OTHER escape
+        # routes into the backstop, which additionally boundedly reaps,
+        # preserves evidence, and refuses to return without extinction proof.
+        self._descendant_snapshot = {}
         try:
             drained = _drain_child(
                 proc,
                 idle_timeout=self.child_idle_timeout,
                 deadline=deadline_monotonic,
             )
+            # Stash the ancestry snapshot the moment it exists, so a structured
+            # exit raised anywhere below (the early _require_unmutated_canonical
+            # gate included) routes through identity-safe extinction with the
+            # full re-sessioned-escapee set, not just the live process group.
+            self._descendant_snapshot = drained.get("descendant_snapshot") or {}
             fresh = self.schema.extract(self.state_path)
             self._require_unmutated_canonical(fresh, candidate)
             if drained["outcome"] == "unreaped":
@@ -2398,93 +2659,25 @@ class Runner:
             # double-fork descendant orphaned between snapshots cannot leave
             # the boundary. The legacy snapshot+group proof still runs as
             # defense in depth (it is cheap and covers the degraded mode).
-            containment = self.attempt_containment
-            if containment is not None and containment.live_pids():
-                containment.kill()
-                containment_deadline = time.monotonic() + 15
-                while (
-                    time.monotonic() < containment_deadline
-                    and containment.live_pids()
-                ):
-                    time.sleep(0.3)
-                if containment.live_pids():
-                    self._preserve_failed(candidate)
-                    raise RunnerExit(
-                        5,
-                        "blocked",
-                        "attempt-containment members survived cgroup kill — a"
-                        " possibly-live writer needs a human",
-                    )
-            # r14 F6: the per-attempt cgroup is removed on EVERY exit path
-            # once (and only once) extinction is proven — an unreadable or
-            # still-populated boundary is preserved for the human instead.
-            if containment is not None:
-                try:
-                    if not containment.live_pids():
-                        containment.remove()
-                        self.attempt_containment = None
-                except RunnerExit:
-                    pass
-            escaped = _live_snapshot_pids(drained.get("descendant_snapshot") or {})
-            if _live_group_members(child_pgid) or escaped:
-                # r14 F21 (correcting r21's comment here): after _drain_child
-                # has reaped the leader, the group id is pinned only while
-                # SOME member still holds it — if every member exited, the id
-                # is reusable and ps -g can be showing an UNRELATED new group.
-                # So the raw group signal is gone: killpg fires only when the
-                # CURRENT leader (pid == pgid) still matches the fingerprint
-                # recorded at launch; everything else goes through the
-                # per-pid fingerprint-validated kills below, the containment
-                # boundary, and the fail-closed recheck.
-                leader_now = _snapshot_identities([child_pgid]).get(child_pgid)
-                if (
-                    leader_now is not None
-                    and not leader_now[0].startswith("Z")
-                    and fingerprint is not None
-                    and leader_now[1] == fingerprint
-                ):
-                    try:
-                        os.killpg(child_pgid, signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError):
-                        pass
-                snapshot = drained.get("descendant_snapshot") or {}
-                # algo#1216 finding 3816160128: identity is re-validated
-                # IMMEDIATELY before signaling — a recycled pid/pgid whose
-                # current lstart no longer matches the snapshot gets no
-                # signal (an unrelated same-UID process must never be
-                # SIGKILLed on a stale number), and killpg fires only after
-                # the current group LEADER matches its recorded fingerprint.
-                # Anything left unvalidated falls to the fail-closed recheck
-                # below, which blocks for a human instead of guessing.
-                kill_pgids, kill_pids = _validated_kill_targets(
-                    snapshot, escaped, _snapshot_identities(
-                        sorted(
-                            set(escaped)
-                            | {
-                                _snapshot_entry(snapshot.get(pid))[0]
-                                for pid in escaped
-                                if _snapshot_entry(snapshot.get(pid))[0] is not None
-                            }
-                        )
-                    )
+            # The containment boundary and the identity-safe descendant sweep
+            # are the COMMON extinction — extracted to _extinguish_containment
+            # and _extinguish_child_descendants so the structured-exit boundary
+            # (admin#1495 F4) and the non-RunnerExit backstop run the exact same
+            # proof instead of a weaker or absent one. Those methods carry the
+            # r14 F21 / algo#1216 3816160128 / r13 F8 mechanics they replaced.
+            if not self._extinguish_containment():
+                self._preserve_failed(candidate)
+                raise RunnerExit(
+                    5,
+                    "blocked",
+                    "attempt-containment members survived cgroup kill — a"
+                    " possibly-live writer needs a human",
                 )
-                for target in kill_pgids:
-                    try:
-                        os.killpg(target, signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError):
-                        pass
-                for pid in kill_pids:
-                    try:
-                        os.kill(pid, signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError):
-                        pass
-                recheck_deadline = time.monotonic() + 15
-                while time.monotonic() < recheck_deadline and (
-                    _live_group_members(child_pgid)
-                    or _live_snapshot_pids(snapshot)
+            snapshot = drained.get("descendant_snapshot") or {}
+            if _live_group_members(child_pgid) or _live_snapshot_pids(snapshot):
+                if not self._extinguish_child_descendants(
+                    child_pgid, fingerprint, snapshot
                 ):
-                    time.sleep(0.3)
-                if _live_group_members(child_pgid) or _live_snapshot_pids(snapshot):
                     self._preserve_failed(candidate)
                     raise RunnerExit(
                         5,
@@ -2615,22 +2808,162 @@ class Runner:
                 fresh, candidate, attempt_id, tick_ordinal, verdict, protocol
             )
 
-        except RunnerExit:
-            # Structured exits own their child handling; the shared
-            # boundary still sweeps a provably-empty containment (F6
-            # re-eval: every exit path).
-            self._containment_cleanup_if_empty()
+        except RunnerExit as exc:
+            # admin#1495 F4: a structured post-GO exit is NOT proof the child
+            # was handled — one can be raised BEFORE the normal extinction
+            # block reached it (the early _require_unmutated_canonical gate is
+            # the reproduced path), and the prior handler only swept an
+            # already-empty containment, releasing the monitor with a
+            # credentialed same-group or re-sessioned descendant still alive.
+            # Run the SAME identity-safe extinction the normal path uses
+            # (idempotent when it already ran: a removed containment and a dead
+            # group are both no-ops), then rethrow the ORIGINAL error so its
+            # outcome and candidate semantics are preserved (a suspect_state
+            # exit still discards its candidate — this arm never preserves).
+            # If a containment member or descendant cannot be proven extinct, a
+            # possibly-live writer supersedes the original exit.
+            containment_extinct = self._extinguish_containment()
+            descendants_extinct = self._extinguish_child_descendants(
+                child_pgid, fingerprint, self._descendant_snapshot
+            )
+            if not (containment_extinct and descendants_extinct):
+                raise RunnerExit(
+                    5,
+                    "blocked",
+                    "a monitor-child descendant or containment member could not"
+                    " be proven extinct after a structured post-GO exit"
+                    f" ({exc.reason}) — a possibly-live writer needs a human",
+                ) from exc
             raise
         except BaseException as error:
             self._post_go_backstop(proc, child_pgid, fingerprint, candidate, error)
             raise  # unreachable: the backstop always raises
 
 
+    def _extinguish_containment(self) -> bool:
+        """Kill any live member of the per-attempt cgroup boundary, prove it
+        empty, and remove it. Returns True when the boundary is provably
+        empty (removed on the way out, ``attempt_containment`` cleared), or
+        was never established; False when members outlived the bounded kill.
+
+        r13 F8 mechanics, extracted (admin#1495 F4) so the normal post-drain
+        path, the structured-exit boundary, and the non-RunnerExit backstop
+        run the SAME containment proof instead of three divergent copies.
+        When a cgroup boundary was used its membership IS the extinction proof
+        and the kill authority — pid identity never enters into it, and a
+        setsid or double-fork descendant orphaned between snapshots cannot
+        leave it. Callers own preservation and the block message; an
+        unreadable boundary raises from ``live_pids()`` and propagates (never
+        read as extinction), and is left in place for the human.
+        """
+
+        containment = self.attempt_containment
+        if containment is None:
+            return True
+        if containment.live_pids():
+            containment.kill()
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline and containment.live_pids():
+                time.sleep(0.3)
+            if containment.live_pids():
+                return False
+        # r14 F6: remove the boundary once (and only once) extinction is
+        # proven; a boundary that turns unreadable here raises from
+        # live_pids() and is preserved rather than removed.
+        try:
+            if not containment.live_pids():
+                containment.remove()
+                self.attempt_containment = None
+        except RunnerExit:
+            pass
+        return True
+
+    def _extinguish_child_descendants(
+        self,
+        child_pgid: int | None,
+        fingerprint: str | None,
+        snapshot: dict[int, Any],
+    ) -> bool:
+        """Identity-safe extinction of surviving descendants — same-group
+        members AND re-sessioned escapees the group id can no longer see.
+        Returns True when neither cohort is live (nothing to do, or the kill
+        proved them gone), False when a survivor outlived the bounded recheck.
+
+        r14 F21 / algo#1216 3816160128 / #3551 3808151914 mechanics, extracted
+        (admin#1495 F4) so the structured-exit boundary and the backstop reuse
+        the SAME proof the normal path uses instead of a weaker or absent one.
+        After ``_drain_child`` reaped the leader the group id is pinned only
+        while a member still holds it, so a raw killpg is unsafe: a pgid or
+        pid is signaled ONLY when its CURRENT identity still matches the
+        launch snapshot, so a recycled same-UID number is never SIGKILLed.
+        Uninspectable process tables fail closed (the ps helpers raise),
+        never reading as extinction. Callers own preservation and the block
+        message.
+        """
+
+        escaped = _live_snapshot_pids(snapshot)
+        group_live = (
+            _live_group_members(child_pgid) if child_pgid is not None else []
+        )
+        if not (group_live or escaped):
+            return True
+        if child_pgid is not None:
+            leader_now = _snapshot_identities([child_pgid]).get(child_pgid)
+            if (
+                leader_now is not None
+                and not leader_now[0].startswith("Z")
+                and fingerprint is not None
+                and leader_now[1] == fingerprint
+            ):
+                try:
+                    os.killpg(child_pgid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        kill_pgids, kill_pids = _validated_kill_targets(
+            snapshot,
+            escaped,
+            _snapshot_identities(
+                sorted(
+                    set(escaped)
+                    | {
+                        _snapshot_entry(snapshot.get(pid))[0]
+                        for pid in escaped
+                        if _snapshot_entry(snapshot.get(pid))[0] is not None
+                    }
+                )
+            ),
+        )
+        for target in kill_pgids:
+            try:
+                os.killpg(target, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        for pid in kill_pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        recheck_deadline = time.monotonic() + 15
+        while time.monotonic() < recheck_deadline and (
+            (child_pgid is not None and _live_group_members(child_pgid))
+            or _live_snapshot_pids(snapshot)
+        ):
+            time.sleep(0.3)
+        remaining_group = (
+            _live_group_members(child_pgid) if child_pgid is not None else []
+        )
+        return not (remaining_group or _live_snapshot_pids(snapshot))
+
     def _containment_cleanup_if_empty(self) -> None:
-        """r14 F6 (re-eval): every exit path removes a provably-empty
-        per-attempt cgroup — structured exits included. Never kills (each
-        raise site owns its child handling); never removes an unreadable
-        or still-populated boundary."""
+        """r14 F6 (re-eval; admin#1495 F4 narrowed the claim): the pre-GO and
+        GO-boundary abort paths remove a provably-empty per-attempt cgroup
+        after the caller has already killed and reaped the paused wrapper —
+        which executed nothing without GO, so the boundary is empty by
+        construction. Post-GO paths do NOT route through here: both the
+        structured-exit boundary and the backstop run _extinguish_containment,
+        which kills surviving members first. Never kills (each caller owns its
+        child handling); never removes an unreadable or still-populated
+        boundary."""
 
         containment = self.attempt_containment
         if containment is None:
@@ -2659,14 +2992,19 @@ class Runner:
         boundedly reap the direct child, preserve the write-ahead
         candidate, and raise a structured RunnerExit — extinction proven,
         or blocking because it could not be. Never returns.
+
+        admin#1495 F4: runs the SAME _extinguish_containment /
+        _extinguish_child_descendants proof the normal path and the
+        structured-exit boundary use, so a non-RunnerExit escape now also
+        extinguishes re-sessioned escapees the raw group id can no longer
+        see — the prior inline sweep signaled only the live process group.
+        The pinned kill of our own still-held child stays first and separate:
+        while we hold the Popen the kernel pins its pid, so killpg(proc.pid)
+        is authorized without the fingerprint dance the reaped-leader case
+        needs.
         """
 
-        containment = self.attempt_containment
-        if containment is not None:
-            try:
-                containment.kill()
-            except RunnerExit:
-                pass
+        snapshot = getattr(self, "_descendant_snapshot", {}) or {}
         if proc.returncode is None:
             # Our own unreaped child: pid/pgid pinned by the kernel.
             try:
@@ -2676,32 +3014,16 @@ class Runner:
                     proc.kill()
                 except OSError:
                     pass
-        elif child_pgid is not None and fingerprint is not None:
-            leader_now = _snapshot_identities([child_pgid]).get(child_pgid)
-            if (
-                leader_now is not None
-                and not leader_now[0].startswith("Z")
-                and leader_now[1] == fingerprint
-            ):
-                try:
-                    os.killpg(child_pgid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
+        containment_extinct = self._extinguish_containment()
+        descendants_extinct = self._extinguish_child_descendants(
+            child_pgid, fingerprint, snapshot
+        )
         reaped = _bounded_reap(proc)
         try:
             self._preserve_failed(candidate)
         except (OSError, RunnerExit):
             pass
-        survivors = False
-        if containment is not None:
-            try:
-                if containment.live_pids():
-                    survivors = True
-            except RunnerExit:
-                survivors = True
-        if child_pgid is not None and _live_group_members(child_pgid):
-            survivors = True
-        if survivors or not reaped:
+        if not (containment_extinct and descendants_extinct) or not reaped:
             raise RunnerExit(
                 5,
                 "blocked",
@@ -2710,7 +3032,6 @@ class Runner:
                 " could not be proven — a possibly-live writer needs a"
                 " human; the write-ahead candidate is preserved",
             )
-        self._containment_cleanup_if_empty()
         raise RunnerExit(
             5,
             "blocked",
@@ -2722,19 +3043,26 @@ class Runner:
         )
 
     def _child_capability_probe(self, extract: dict[str, Any]) -> None:
-        """admin#1495 finding 3825265272 (re-eval-named closure path): fail
-        FAST when the child's resolved user-scope capability surface cannot
-        execute the mapped handoffs, instead of stranding after PR
-        creation.
+        """admin#1495 finding 3825265272 + algo#1216 F3: fail FAST when the
+        child's resolved user-scope capability surface cannot execute the
+        mapped handoffs, instead of stranding after PR creation.
 
-        Deterministic and model-free: (1) the user settings file the
-        ``--setting-sources user`` child resolves must carry a
-        ``permissions`` policy or ``mcpServers``; failing that, (2) the
-        exact-invocation MCP discovery (``claude --setting-sources user
-        mcp list``) must report at least one server. Mapped repositories
-        only — an unmapped dev run uses the developer's own settings.
-        The package still self-provisions NOTHING: this probe only reports
-        what the host supplied.
+        Deterministic and model-free. The mapped Phase-6 handoffs emit
+        ``*.github.*`` and ``*.linear.*`` operations, so a mapped run needs
+        BOTH families in ``REQUIRED_CHILD_CAPABILITIES``. This extracts the
+        families the resolved surface actually GRANTS (minus denials) from
+        the user settings (``permissions.allow`` + ``mcpServers``) and, only
+        when that is insufficient, completes the surface with the
+        exact-invocation ``claude --setting-sources user mcp list`` the child
+        itself would resolve — then blocks naming the MISSING families. The
+        r25 probe passed on any truthy ``permissions`` object or any MCP
+        server; a deny-all policy or an unrelated server slipped through.
+        Mapped repositories only — an unmapped dev run uses the developer's
+        own settings, and a genuinely read-only scheduled run never reaches
+        this mutation path, so scheduled-readonly behavior is preserved. The
+        package self-provisions NOTHING: this only reports what the host
+        supplied, and the immutable per-profile descriptor remains a host
+        contract.
         """
 
         cli = extract.get("monitor_cli")
@@ -2755,16 +3083,20 @@ class Runner:
             if settings_override
             else Path.home() / ".claude" / "settings.json"
         )
+        settings_data: object = None
         try:
-            data = json.loads(
+            settings_data = json.loads(
                 _read_regular_file(settings_path, 1_048_576).decode("utf-8")
             )
-            if isinstance(data, dict) and (
-                data.get("permissions") or data.get("mcpServers")
-            ):
-                return
         except (OSError, ValueError, RunnerExit):
-            pass
+            settings_data = None
+        if REQUIRED_CHILD_CAPABILITIES <= _resolved_capability_families(
+            settings_data, None
+        ):
+            return
+        # Insufficient from settings alone — complete the surface with the
+        # exact-invocation MCP discovery the child itself resolves.
+        listing: str | None = None
         try:
             completed = subprocess.run(
                 [self.claude_bin, "--setting-sources", "user", "mcp", "list"],
@@ -2772,27 +3104,26 @@ class Runner:
                 text=True,
                 timeout=30,
             )
-            listing = (completed.stdout or "").strip()
-            if (
-                completed.returncode == 0
-                and listing
-                and "no mcp servers" not in listing.lower()
-            ):
-                return
+            if completed.returncode == 0:
+                listing = completed.stdout or ""
         except (OSError, subprocess.TimeoutExpired):
-            pass
+            listing = None
+        resolved = _resolved_capability_families(settings_data, listing)
+        if REQUIRED_CHILD_CAPABILITIES <= resolved:
+            return
+        missing = ", ".join(sorted(REQUIRED_CHILD_CAPABILITIES - resolved))
         raise RunnerExit(
             5,
             "blocked",
             "child capability probe failed for a mapped repository"
-            f" ({bound}): the user-scope settings the --setting-sources"
-            " user child resolves carry no permissions policy and no MCP"
-            " configuration, so Phase 6 handoffs would strand after PR"
-            " creation (admin#1495 finding 3825265272). The HOST must"
-            " supply a trusted least-privilege user-scope policy"
-            " (permission mode / tool allowlist / MCP config for the"
-            " GitHub+Linear handoff surface) — the package deliberately"
-            " never self-provisions it",
+            f" ({bound}): the user-scope surface the --setting-sources user"
+            f" child resolves grants no {missing} capability, so Phase 6"
+            " handoffs would strand after PR creation (admin#1495 finding"
+            " 3825265272 / algo#1216 F3). The HOST must supply a trusted"
+            " least-privilege user-scope policy naming the GitHub+Linear"
+            " handoff surface (permission allowlist and/or MCP config) — the"
+            " package deliberately never self-provisions it, and the"
+            " immutable per-profile descriptor remains a host contract",
         )
 
     def _gate_taint(self, extract: dict[str, Any]) -> None:
@@ -2977,61 +3308,43 @@ class Runner:
         # scan streams os.scandir entries and stops at limit + 1: the gate
         # only needs "over the cap", never the full census.
         found, exceeded = self._scan_sidecars(self.SIDECAR_RETENTION_LIMIT)
-        if exceeded:
-            raise RunnerExit(
-                5,
-                "blocked",
-                f"more than {self.SIDECAR_RETENTION_LIMIT} preserved"
-                " sidecars exceed the retention limit — reconcile and"
-                " delete them per state-and-safety.md before resuming;"
-                " unbounded sidecar accumulation makes startup work"
-                " unbounded (bound enforced before any sidecar is parsed,"
-                " and enumeration stops at the first over-limit match)",
-            )
+        # admin#1495 r12 F16: over-limit is NOT an immediate block — the
+        # 21st sidecar used to block BEFORE valid no-intent records could
+        # compact, stranding runs whose accumulation was exactly the
+        # compactable kind. The bounded batch already enumerated (limit + 1
+        # entries, each parse capped by the byte ceiling, so startup work
+        # stays bounded per invocation) runs through the classification
+        # below FIRST, letting no-intent and redundant terminal-only
+        # sidecars compact; each deletion is durable progress. The recheck
+        # after the loop rescans and blocks only when the directory is
+        # STILL over the limit — re-running the gate then continues
+        # compaction from where this batch left off.
         sidecars = sorted(found)
         for sidecar in sidecars:
             # r14 F17: QUARANTINE before stat/parse. The old flow parsed
             # via a no-follow descriptor but later unlinked the original
             # PATHNAME — a child replacing the file between parse and
             # unlink got its substituted evidence deleted on the strength
-            # of the benign content that was parsed. The atomic rename
-            # binds every later decision to the inode that was actually
+            # of the benign content that was parsed. The atomic no-replace
+            # move binds every later decision to the inode that was actually
             # read; the quarantine name keeps the sidecar prefix, so the
             # retention scan, resume's pattern discovery, and a
             # crash-mid-compaction recovery all still see it. A kept
             # sidecar simply stays under its quarantine name — renaming
             # back could clobber a newer file at the original name.
-            # r14 F17 re-eval: the move must be NO-CLOBBER — a plain
-            # rename REPLACES an existing target on Linux, so a recycled
-            # pid colliding with older quarantined evidence would destroy
-            # it. os.link fails EEXIST instead; on collision the name
-            # gains a counter until it links. A crash between link and
-            # unlink leaves both names pointing at ONE inode — the
-            # retention scan counts both and the parse decisions are
-            # idempotent over identical content, so the leftover is
-            # noise, never loss.
-            quarantined = None
-            for attempt in range(20):
-                suffix = f".q{os.getpid()}" + (
-                    f"-{attempt}" if attempt else ""
-                )
-                target = sidecar.with_name(sidecar.name + suffix)
-                try:
-                    os.link(sidecar, target)
-                except FileExistsError:
-                    continue
-                except OSError:
-                    break
-                try:
-                    os.unlink(sidecar)
-                except OSError:
-                    pass
-                quarantined = target
-                break
+            # admin#1495 F5: the move is ONE atomic rename (renameat2 /
+            # renamex_np), never link+unlink — link+unlink left a window in
+            # which a same-UID writer replaced the source pathname between
+            # the two calls and had its newer evidence unlinked. The atomic
+            # rename has no such intermediate state (never both names on one
+            # inode), is NO-CLOBBER via RENAME_NOREPLACE/RENAME_EXCL, and on
+            # a host with no such primitive fails closed (None) rather than
+            # degrading to the racy fallback. See _quarantine_sidecar.
+            quarantined = _quarantine_sidecar(sidecar)
             if quarantined is None:
-                # Vanished, raced, or unlinkable: nothing bound to an
-                # inode, nothing deleted — record and move on,
-                # fail-closed.
+                # Vanished, raced, unrenamable, or no atomic primitive: the
+                # source is untouched, nothing was deleted — record and move
+                # on, fail-closed.
                 unreadable_sidecars.append(sidecar.name)
                 continue
             sidecar = quarantined
@@ -3179,6 +3492,22 @@ class Runner:
                 " runner never merges history unsupervised), then delete the"
                 " sidecar(s) and resume",
             )
+        if exceeded:
+            _, still_exceeded = self._scan_sidecars(
+                self.SIDECAR_RETENTION_LIMIT
+            )
+            if still_exceeded:
+                raise RunnerExit(
+                    5,
+                    "blocked",
+                    f"more than {self.SIDECAR_RETENTION_LIMIT} preserved"
+                    " sidecars remain after bounded batch compaction —"
+                    " compacted deletions are durable progress, so"
+                    " re-running the gate continues from here; reconcile"
+                    " and delete the remainder per state-and-safety.md"
+                    " (bound enforced per batch: limit + 1 enumerated,"
+                    " each parse under the byte ceiling)",
+                )
 
     def _verify_skill_snapshot(self) -> None:
         """Re-verify the staged instruction surface against the __init__
@@ -3235,16 +3564,23 @@ class Runner:
                 )
 
     def cleanup_wrapper_stage(self) -> None:
-        """Remove the runner-lifetime staged files (main()'s finally): the
-        wrapper stage file and the child skill snapshot directory.
+        """Remove the runner-lifetime staged files: the wrapper stage file
+        and the child skill snapshot directory. Called from main()'s
+        finally AND from the __init__ construction guard (admin#1495 r12
+        F18) — a partially constructed runner may not have created both
+        yet, so each attribute is guarded.
 
         Best-effort by design: both carry unpredictable names, so a leak on
         a hard kill is bounded and harmless."""
-        try:
-            self.wrapper_stage_path.unlink()
-        except OSError:
-            pass
-        shutil.rmtree(self.child_skill_dir, ignore_errors=True)
+        stage = getattr(self, "wrapper_stage_path", None)
+        if isinstance(stage, Path):
+            try:
+                stage.unlink()
+            except OSError:
+                pass
+        snapshot = getattr(self, "child_skill_dir", None)
+        if isinstance(snapshot, Path):
+            shutil.rmtree(snapshot, ignore_errors=True)
 
     def _verify_and_commit(
         self,
@@ -3530,6 +3866,40 @@ class Runner:
                 and candidate_extract.get("blocked_evidence_present") is True
             )
         )
+        # algo#1216 r16 F11: destructive post-deploy entries surfaced by
+        # the extract are NAMED DEFERRED WORK the PR body must carry - an
+        # evidence requirement at the terminal commit, deliberately not a
+        # hold (finding 3813789228: holding would force destructive DDL
+        # under the still-deployed old code). A terminal candidate with a
+        # nonempty merge_readiness_post_deploy must ledger a COMPLETE
+        # head-bound deferred-work artifact record (the anchored PR-body
+        # list) whose evidence names exactly the extracted entries at the
+        # candidate's own observed head. A missing record, a stale head,
+        # or a drifted list rejects the candidate for the child to
+        # remediate.
+        if outcome == "terminal":
+            post_deploy = (
+                candidate_extract.get("merge_readiness_post_deploy") or []
+            )
+            if post_deploy:
+                head = candidate_extract.get("last_observed_head_sha")
+                evidence_map = (
+                    candidate_extract.get("deferred_work_evidence") or {}
+                )
+                recorded = (
+                    evidence_map.get(head) if isinstance(head, str) else None
+                )
+                exact = (
+                    isinstance(recorded, list)
+                    and all(isinstance(item, str) for item in recorded)
+                    and sorted(recorded) == list(post_deploy)
+                )
+                if not exact:
+                    self._preserve_failed(candidate)
+                    self.charge_failure(
+                        fresh, "monitor-child:deferred_work_unrecorded"
+                    )
+                    return "retry"
         # Candidate taint is NOT rejected here: feedback excerpts land in
         # state by design, and the acknowledge-aware _gate_taint re-gates
         # every subsequent write-capable launch (R6-F5) — commit-time
@@ -3785,6 +4155,16 @@ class Runner:
                 "suspect_state",
                 "; ".join(extract.get("errors") or ["suspect"]) + orphan_note,
             )
+        # admin#1495 r12 F6: the READ-ONLY no-signal liveness check runs
+        # IMMEDIATELY after the validity gate, before the taint and
+        # capability gates — a persistently failing gate must never hide
+        # an already-live write-capable child behind its own block; the
+        # live-child report outranks every gate. Signal authority is
+        # unchanged (none), and an invalid state still only NOTES the
+        # record above — no liveness conclusion is drawn from untrusted
+        # state.
+        if isinstance(prior_in_flight, dict):
+            self._reconcile_recorded_orphan(prior_in_flight)
         # R6-F5: the taint gate runs before ANY write-capable child can
         # launch — recovery's ledger write is state-local and safe, but no
         # tick may start on taint-flagged state without the explicit
@@ -3792,8 +4172,6 @@ class Runner:
         self._gate_taint(extract)
         # finding 3825265272: capability fail-fast before any child launch.
         self._child_capability_probe(extract)
-        if isinstance(prior_in_flight, dict):
-            self._reconcile_recorded_orphan(prior_in_flight)
         if isinstance(prior, dict):
             recorded_failures = prior.get("child_failures")
             if isinstance(recorded_failures, list):

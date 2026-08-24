@@ -183,6 +183,141 @@ OPERATION_RESULT_ALLOWED_KEYS = frozenset(
     )
 )
 
+# --- Persisted handoff-kind vocabulary (single source of truth) -----------
+# This schema is the dependency root, so the operation-ID grammar the planner
+# MINTS and the grammar this validator ENFORCES must live here; handoff_decision
+# REBINDS these names (see its rebind block) rather than re-declaring them, so a
+# fabricated id can never pass one side while failing the other.
+#
+# Post-merge codex F3 + pass-3 codex F4: a prunable / persisted prior-generation
+# id must match the COMPLETE grammar `family(:identity)?:g<12-hex>` - not merely
+# end in the digest tail. A tail-only check let an extra-segment id like
+# `qa.linear.assign_ticket:gBAD:g<hex>` launder as history while the real
+# mutation re-queued. \Z, not $: a stray trailing newline would satisfy $ and
+# launder a CURRENT completed id as history (replay).
+GENERATION_SCOPED_ID = re.compile(
+    r"(?P<family>[a-z_]+(?:\.[a-z_]+)+)"
+    r"(?::(?P<identity>[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?))?"
+    r":g[0-9a-f]{12}\Z"
+)
+# Maps family -> whether the id carries a per-reviewer identity segment.
+# Pass-4 codex F1: identity is ARITY-CHECKED per family, not globally optional -
+# `qa.github.replace_assignees:bogus:g<current>` parsed as a well-formed id under
+# the optional grammar and pruned as history while the real operation re-queued.
+QA_OPERATION_FAMILIES = {
+    "qa.github.replace_assignees": False,
+    "qa.github.verify_assignees": False,
+    "qa.github.request_review": True,
+    "qa.github.verify_review_request": True,
+    "qa.linear.verify_ticket_binding": False,
+    "qa.linear.assign_ticket": False,
+    "qa.linear.verify_ticket_assignee": False,
+    "qa.linear.set_ticket_state": False,
+    "qa.linear.verify_ticket_state": False,
+    "qa.linear.record_unavailable": False,
+    "qa.linear.record_state_unavailable": False,
+}
+REVIEWER_REQUEST_FAMILIES = {
+    "reviewer.github.request_review": True,
+    "reviewer.github.verify_review_request": True,
+    "reviewer.github.replace_assignees": False,
+    "reviewer.github.verify_assignees": False,
+}
+ROUNDTRIP_FAMILIES = {
+    "roundtrip.github.request_review": True,
+    "roundtrip.github.verify_review_request": True,
+    "roundtrip.github.replace_assignees": False,
+    "roundtrip.github.verify_assignees": False,
+}
+# pr_artifacts is the DISTINCT artifact contract (references/state-and-safety.md):
+# generic PR-anchored lifecycle mutations that are HEAD-bound, never generation-
+# scoped, and never planned by handoff_decision.py. Its ids are
+# `ci-evidence:<head_sha>` / `qa-rehearsal:<head_sha>` / `deferred-work:<head_sha>`
+# (the last added by algo#1216 r16 F11 for the anchored deferred-work body
+# record the terminal gate requires); the sha is an
+# abbreviated-or-full git object id (7-64 hex, matching handoff_decision's
+# GIT_OBJECT_ID range). The generation-family grammar would wrongly reject these,
+# so this kind carries its own grammar - preserving that contract is an explicit
+# requirement of algo#1216 r16 F6.
+PR_ARTIFACT_ID = re.compile(
+    r"(?:ci-evidence|qa-rehearsal|deferred-work):[0-9a-fA-F]{7,64}\Z"
+)
+
+
+def parsed_generation_family(
+    operation_id: str, vocabulary: dict[str, bool]
+) -> str | None:
+    """Family of a well-formed generation-scoped id, else ``None``.
+
+    A record is a generation-scoped operation ONLY when this returns a family
+    the vocabulary names AND the id's identity segment matches that family's
+    arity (pass-4 codex F1): a surplus identity on an identity-free family, a
+    missing identity on a per-reviewer family, a wrong digest shape, extra
+    segments, uppercase identity, or a trailing newline all stay unknown-ID
+    errors - pruned by neither planner sweep, accepted by neither this
+    validator.
+    """
+
+    match = GENERATION_SCOPED_ID.fullmatch(operation_id)
+    if match is None:
+        return None
+    family = match.group("family")
+    requires_identity = vocabulary.get(family)
+    if requires_identity is None:
+        return None
+    if (match.group("identity") is not None) != requires_identity:
+        return None
+    return family
+
+
+# The persisted handoff kinds this schema accepts (algo#1216 r16 F6). Before
+# this allowlist the validator accepted ARBITRARY kinds and operation IDs, so a
+# mapped runner treated a fabricated terminal `bogus.qa.done` as valid. Each
+# generation-scoped kind pins the family vocabulary its IDs must match; a kind
+# absent from the union below is rejected outright.
+HANDOFF_KIND_GENERATION_VOCABULARY = {
+    "qa": QA_OPERATION_FAMILIES,
+    "review_roundtrip": ROUNDTRIP_FAMILIES,
+    "reviewer_request": REVIEWER_REQUEST_FAMILIES,
+}
+# pr_artifacts is allowed too, under PR_ARTIFACT_ID (head-bound) not a family
+# vocabulary - the distinct artifact contract above.
+ALLOWED_HANDOFF_KINDS = frozenset(
+    (*HANDOFF_KIND_GENERATION_VOCABULARY, "pr_artifacts")
+)
+# "require applicable repository bindings" (F6): a qa handoff's operations act on
+# a specific PR and the runner maps them by nameWithOwner, so a qa handoff that
+# CARRIES operations must persist a non-empty repository_name_with_owner. The
+# binding is applicable only where operations exist - an idle qa handoff
+# (operations: []) keeps the template's null default. review_roundtrip persists
+# the same binding for NEW ledgers (template + monitor-exit-handoffs Step 1)
+# but stays OUT of this frozenset: its binding feeds the blocked-evidence
+# recompute, which derives a pre-upgrade ledger's repo from
+# monitor_cli.repository (algo#1216 r16 F1) - a hard requirement here would
+# fail-closed every legacy ledger at resume instead of deriving. pr_artifacts
+# is repo-agnostic.
+HANDOFF_KINDS_REQUIRING_REPOSITORY = frozenset(("qa",))
+
+
+def handoff_operation_id_valid(kind: str, operation_id: str) -> bool:
+    """True when ``operation_id`` is well-formed for persisted handoff ``kind``.
+
+    Generation-scoped kinds (qa/review_roundtrip/reviewer_request) require a
+    ``family(:identity)?:g<12-hex>`` id whose family the kind mints, arity
+    enforced. ``pr_artifacts`` requires a head-bound
+    ``(ci-evidence|qa-rehearsal):<git-object-id>`` id. Callers gate on
+    ALLOWED_HANDOFF_KINDS first, so an unlisted kind never reaches here; the
+    closing ``False`` is a fail-closed backstop, not a reachable branch.
+    """
+
+    vocabulary = HANDOFF_KIND_GENERATION_VOCABULARY.get(kind)
+    if vocabulary is not None:
+        return parsed_generation_family(operation_id, vocabulary) is not None
+    if kind == "pr_artifacts":
+        return PR_ARTIFACT_ID.fullmatch(operation_id) is not None
+    return False
+
+
 # Canonical cross-helper constants — single source of truth. Consumers REBIND
 # these names (handoff_decision.MAX_OPERATION_ATTEMPTS and
 # model_policy.MAX_QUOTA_WAIT_SECONDS) instead of re-declaring literals;
@@ -227,7 +362,10 @@ TERMINAL_MONITOR = frozenset(("complete", "paused", "blocked"))
 # versioned handoff fails closed on missing fields, never half-binds).
 # pending_owner is the one optional field: a continuity binding carries the
 # nominal owner it defers to the next session boundary, and MUST carry it.
-MONITOR_OWNERSHIP_LINEAGE_ENUM = frozenset(("reviewer", "base"))
+# "codex" joined for admin#1495 r12 F1: the OpenAI entry's Phase 6
+# controller continues on the recorded codex leg (orchestrator continuity
+# only — pinned children stay on the nominal Claude owner via pending_owner).
+MONITOR_OWNERSHIP_LINEAGE_ENUM = frozenset(("reviewer", "base", "codex"))
 MONITOR_OWNERSHIP_REQUIRED_KEYS = frozenset(
     ("lineage", "model", "bound_at", "reason_code")
 )
@@ -238,6 +376,11 @@ MONITOR_OWNERSHIP_KEYS = MONITOR_OWNERSHIP_REQUIRED_KEYS | frozenset(
 # RUNNER-OWNED: the runner is the sole writer, a child candidate must carry
 # it value-identical, and every field is required when the block is present
 # (fail closed — a half-written control block is corruption, not progress).
+# The immutable Phase 6 logical-work cap. Mirrors
+# monitor_runner.MAX_WORK_ITERATIONS (the runner stays import-free of this
+# module); validate_package's size/constant parity check compares the two
+# assignment literals textually (admin#1495 r12 F8).
+MAX_WORK_ITERATIONS = 50
 # Mirrors monitor_runner.MAX_CANDIDATE_BYTES (language-boundary twin — the
 # CLI must not import the runner); a canonical state past this is corruption.
 STATE_READ_CEILING_BYTES = 8 * 1_048_576
@@ -1196,15 +1339,41 @@ class _Validator:
         # is DECLARED, not only where it is consumed — a silently-applied
         # default would surface only as a confusing ceiling error at the
         # first push, whose re-arm advice re-reads the same bad override and
-        # reproduces itself forever. Only this key is schema-consumed; the
-        # sibling monitor_constants are prose-consumed and stay unvalidated
-        # here by design.
+        # reproduces itself forever. Two keys are schema-consumed here
+        # (this one and the immutable max_iterations below); the sibling
+        # monitor_constants are prose-consumed and stay unvalidated by
+        # design.
         conventions = state.get("resolved_conventions")
         constants = (
             conventions.get("monitor_constants")
             if isinstance(conventions, dict)
             else None
         )
+        # admin#1495 r12 F8: max_iterations is IMMUTABLE. The 50-iteration
+        # logical-work cap is enforced by the trusted runner
+        # (MAX_WORK_ITERATIONS — parity-guarded by validate_package), and
+        # it was never actually overridable: the template advertised a
+        # knob the schema ignored and the runner overrode. Absent and null
+        # mean the cap; the literal legacy 50 (states written from the
+        # template) is tolerated; ANY other declaration is rejected rather
+        # than silently ignored.
+        declared_cap = (
+            constants.get("max_iterations")
+            if isinstance(constants, dict)
+            else None
+        )
+        if declared_cap is not None and (
+            not isinstance(declared_cap, int)
+            or isinstance(declared_cap, bool)
+            or declared_cap != MAX_WORK_ITERATIONS
+        ):
+            self.error(
+                "resolved_conventions.monitor_constants.max_iterations:"
+                f" immutable — the {MAX_WORK_ITERATIONS}-iteration work cap"
+                " is not project-overridable; remove the key (absent, null,"
+                f" and the literal {MAX_WORK_ITERATIONS} all mean the same"
+                " enforced cap)"
+            )
         declared = (
             constants.get("bot_grace_window_seconds")
             if isinstance(constants, dict)
@@ -2180,6 +2349,12 @@ class _Validator:
             monitor_status = phases.get("monitor")
         for kind, handoff in handoffs.items():
             safe_kind = _safe_key(str(kind))
+            if kind not in ALLOWED_HANDOFF_KINDS:
+                self.error(
+                    f"handoffs.{safe_kind}: unknown handoff kind; allowed kinds are "
+                    + ", ".join(sorted(ALLOWED_HANDOFF_KINDS))
+                )
+                continue
             if not isinstance(handoff, dict):
                 self.error(f"handoffs.{safe_kind}: must be a mapping")
                 continue
@@ -2200,6 +2375,21 @@ class _Validator:
             if len(set(operations)) != len(operations):
                 self.error(f"handoffs.{safe_kind}.operations: operation IDs must be unique")
                 continue
+            malformed = [op for op in operations if not handoff_operation_id_valid(kind, op)]
+            if malformed:
+                self.error(
+                    f"handoffs.{safe_kind}.operations: malformed operation ID(s) for kind "
+                    f"{safe_kind}: " + ", ".join(_safe_key(op) for op in malformed)
+                )
+                continue
+            if kind in HANDOFF_KINDS_REQUIRING_REPOSITORY and operations:
+                binding = handoff.get("repository_name_with_owner")
+                if not isinstance(binding, str) or not binding:
+                    self.error(
+                        f"handoffs.{safe_kind}.repository_name_with_owner: required "
+                        "(non-empty) when the handoff carries operations"
+                    )
+                    continue
             if not isinstance(results, dict):
                 self.error(f"handoffs.{safe_kind}.operation_results: must be a mapping")
                 continue
@@ -2408,6 +2598,29 @@ class _Validator:
                             f"resolved_conventions.quality_check_steps[{position}]: "
                             "must be a non-empty argv list of strings"
                         )
+        # algo#1216 r16 F14: dev-server commands are the same executable-
+        # cache class as quality_check_steps and validate the same way -
+        # argv vectors, never shell strings. A legacy plain string still
+        # validates (pre-upgrade states must resume) but is BY CONTRACT a
+        # cache miss: it can never exact-argv compare, so the runtime
+        # re-resolves from repository sources and executes only the
+        # re-resolved form (state-and-safety rule 4).
+        for dev_key in ("dev_server_frontend", "dev_server_backend"):
+            value = conventions.get(dev_key)
+            if value is None or (isinstance(value, str) and value):
+                continue
+            if (
+                not isinstance(value, list)
+                or not value
+                or any(
+                    not isinstance(part, str) or not part for part in value
+                )
+            ):
+                self.error(
+                    f"resolved_conventions.{dev_key}: must be a non-empty"
+                    " argv list of strings (null allowed; a legacy plain"
+                    " string is tolerated as an always-cache-miss value)"
+                )
         branches = conventions.get("protected_branches")
         if branches is not None and (
             not isinstance(branches, list)
@@ -3052,8 +3265,10 @@ def roundtrip_generation(
     # admin#1495 finding 3793025386: the digest binds the PLAN TARGET too —
     # replanning a completed ledger from one PR onto another produced the
     # same generation and returned complete with zero calls. Repo + PR join
-    # the payload; a missing value hashes as null on BOTH producer and
-    # recompute sides, so older states simply roll the generation once.
+    # the payload; a missing value hashes as null, which fails CLOSED on
+    # comparison — so the blocked-evidence recompute must resolve the repo
+    # (the ledger's persisted binding, else monitor_cli.repository; algo#1216
+    # r16 F1) rather than count on the omission being symmetric.
     payload = {
         "repository": name_with_owner if isinstance(name_with_owner, str) else None,
         "pull_request": pull_request_number
@@ -3196,10 +3411,27 @@ def monitor_blocked_evidence_present(state: Any) -> bool:
                 for login, record in reviewers.items():
                     if isinstance(login, str) and isinstance(record, dict):
                         entries.append({**record, "login": login})
+            # algo#1216 r16 F1: the planner mints these IDs with the
+            # request's real nameWithOwner, but no pre-F1 ledger ever
+            # persisted the binding — recomputing with the missing value
+            # hashed null and PERMANENTLY mismatched every real ledger, so
+            # a successful handback could never prove durable evidence
+            # post-reassignment. Prefer the ledger's own persisted binding
+            # (new ledgers; the template carries it); a pre-upgrade ledger
+            # derives it from monitor_cli.repository, which the runner has
+            # already live-origin-agreed (it fails closed on disagreement
+            # before this predicate runs). Neither present still hashes
+            # null and fails closed.
+            bound_repo = rt.get("repository_name_with_owner")
+            if not (isinstance(bound_repo, str) and bound_repo):
+                cli = state.get("monitor_cli")
+                bound_repo = (
+                    cli.get("repository") if isinstance(cli, dict) else None
+                )
             suffix = ":g" + roundtrip_generation(
                 entries,
                 target_logins if isinstance(target_logins, list) else [],
-                rt.get("repository_name_with_owner"),
+                bound_repo,
                 state.get("pr_number"),
             )
             if any(
@@ -3249,6 +3481,8 @@ def monitor_extract(text: str) -> dict[str, Any]:
         "phases_merge_readiness": None,
         "merge_readiness_hold": False,
         "merge_readiness_post_deploy": [],
+        "last_observed_head_sha": None,
+        "deferred_work_evidence": {},
         "blocked_evidence_present": False,
     }
     try:
@@ -3355,6 +3589,41 @@ def monitor_extract(text: str) -> dict[str, Any]:
     extract["handoff_operations"] = operations_map
     extract["handoff_results"] = results_map
     extract["handoff_result_digests"] = digests_map
+    # algo#1216 r16 F11: the terminal deferred-work contract compares the
+    # ledgered evidence PAYLOAD, not only statuses - expose each COMPLETE
+    # deferred-work artifact record's list keyed by its head sha, plus the
+    # state's own observed head, so the runner can require the exact
+    # deferred list at the current head before committing terminal.
+    head_value = state.get("last_observed_head_sha")
+    extract["last_observed_head_sha"] = (
+        head_value if isinstance(head_value, str) and head_value else None
+    )
+    artifacts = (
+        handoffs.get("pr_artifacts") if isinstance(handoffs, dict) else None
+    )
+    artifact_results = (
+        artifacts.get("operation_results")
+        if isinstance(artifacts, dict)
+        else None
+    )
+    deferred_evidence: dict[str, Any] = {}
+    if isinstance(artifact_results, dict):
+        for op_id, record in artifact_results.items():
+            if not isinstance(op_id, str) or not op_id.startswith(
+                "deferred-work:"
+            ):
+                continue
+            if (
+                not isinstance(record, dict)
+                or record.get("status") != "complete"
+            ):
+                continue
+            evidence = record.get("evidence")
+            if isinstance(evidence, dict):
+                deferred_evidence[op_id.split(":", 1)[1]] = evidence.get(
+                    "deferred"
+                )
+    extract["deferred_work_evidence"] = deferred_evidence
     extract["handoff_result_attempts"] = attempts_map
     phases_map = state.get("phases")
     if isinstance(phases_map, dict):
@@ -3458,16 +3727,186 @@ def monitor_extract(text: str) -> dict[str, Any]:
 
 _CLI_USAGE = (
     "usage: state_schema.py <state-file> | state_schema.py"
-    " --monitor-extract|--monitor-digest <state-file>"
+    " --monitor-extract|--monitor-digest <state-file> | state_schema.py"
+    " --append-attempt <state-file> <human:key>"
 )
+
+
+def append_attempt_key(text: str, key: str) -> str | None:
+    """Surgical textual append/increment of one ``attempt_log`` key.
+
+    algo#1216 r16 F13: the stash-restore failure arms must persist the
+    durable ``human:stash-restore`` blocked record with ONE concrete
+    atomic call — a printed warning evaporates with the session. This is
+    deliberately a TEXT operation (never a reserialization): the state
+    file is agent-maintained, and rewriting unrelated lines would destroy
+    content the schema does not model. Returns the new text, or ``None``
+    when no top-level ``attempt_log`` line exists to anchor the surgery.
+    """
+
+    lines = text.split("\n")
+    for index, line in enumerate(lines):
+        if line == "attempt_log: {}":
+            lines[index] = "attempt_log:"
+            lines.insert(index + 1, f'  "{key}": 1')
+            return "\n".join(lines)
+        if line == "attempt_log:":
+            prefix = f'  "{key}": '
+            scan = index + 1
+            while scan < len(lines) and lines[scan].startswith("  "):
+                existing = lines[scan]
+                if existing.startswith(prefix):
+                    count_text = existing[len(prefix):].strip()
+                    try:
+                        count = int(count_text)
+                    except ValueError:
+                        return None
+                    if isinstance(count, bool) or count < 0:
+                        return None
+                    lines[scan] = f"{prefix}{count + 1}"
+                    return "\n".join(lines)
+                scan += 1
+            lines.insert(index + 1, f'  "{key}": 1')
+            return "\n".join(lines)
+    return None
+
+
+def _append_attempt_cli(path: str, key: str) -> int:
+    """CLI glue for ``--append-attempt``: lock-probe, validate, atomic
+    replace. Restricted to ``human:*`` keys — those are the presence-fired
+    durable blocker records this persist call exists for; anything wider
+    would turn a narrow persist helper into a general state mutator."""
+
+    def _refuse(errors: list[str]) -> int:
+        print(
+            json.dumps(
+                {
+                    "version": SCHEMA_VERSION,
+                    "state": SUSPECT,
+                    "errors": errors,
+                    "tainted": [],
+                    "phase_requirements": "unparsed",
+                }
+            )
+        )
+        return 1
+
+    if not key.startswith("human:") or len(key) <= len("human:"):
+        return _refuse(["--append-attempt accepts only human:* keys"])
+    import fcntl as _fcntl
+
+    lock_path = path + ".monitor.lock"
+    try:
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError:
+        return _refuse(["append-attempt could not open the runner lock"])
+    try:
+        try:
+            _fcntl.flock(lock_fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        except OSError:
+            return _refuse(
+                ["a monitor runner is active — persist the record after"
+                 " it exits (lock held)"]
+            )
+        try:
+            text = _read_state_file(path)
+        except (OSError, UnicodeDecodeError):
+            return _refuse(["state file could not be read or decoded"])
+        updated = append_attempt_key(text, key)
+        if updated is None:
+            return _refuse(
+                ["no top-level attempt_log line to anchor the append"]
+            )
+        result = evaluate_state_text(updated)
+        if result["state"] != VALID:
+            return _refuse(
+                ["append would leave the state invalid; file untouched:"]
+                + list(result["errors"])
+            )
+        tmp_path = path + ".append-attempt.tmp"
+        try:
+            tmp_fd = os.open(
+                tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644
+            )
+            try:
+                os.write(tmp_fd, updated.encode("utf-8"))
+                os.fsync(tmp_fd)
+            finally:
+                os.close(tmp_fd)
+            os.replace(tmp_path, path)
+        except OSError:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            return _refuse(["atomic replace failed; original untouched"])
+        print(
+            json.dumps(
+                {
+                    "version": SCHEMA_VERSION,
+                    "state": VALID,
+                    "appended": key,
+                }
+            )
+        )
+        return 0
+    finally:
+        os.close(lock_fd)
+
+
+def _read_state_file(path: str) -> str:
+    # mm#3551 finding 3806719734: the CLI's target is child-writable —
+    # refuse special files without blocking and bound the read (the
+    # ceiling mirrors the runner's MAX_CANDIDATE_BYTES; a state past it
+    # is corruption, not progress). O_NONBLOCK is harmless on regular
+    # files; S_ISREG is proven on the OPEN descriptor.
+    import stat as _stat
+
+    _fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    try:
+        if not _stat.S_ISREG(os.fstat(_fd).st_mode):
+            raise OSError("target is not a regular file")
+        _chunks = []
+        _budget = STATE_READ_CEILING_BYTES + 1
+        while _budget > 0:
+            _chunk = os.read(_fd, min(1_048_576, _budget))
+            if not _chunk:
+                break
+            _chunks.append(_chunk)
+            _budget -= len(_chunk)
+    finally:
+        os.close(_fd)
+    _raw = b"".join(_chunks)
+    if len(_raw) > STATE_READ_CEILING_BYTES:
+        raise OSError("target exceeds the state read ceiling")
+    return _raw.decode("utf-8")
 
 
 def main(argv: list[str]) -> int:
     mode = "validate"
     args = argv[1:]
-    if args and args[0] in ("--monitor-extract", "--monitor-digest"):
+    if args and args[0] in (
+        "--monitor-extract",
+        "--monitor-digest",
+        "--append-attempt",
+    ):
         mode = args[0]
         args = args[1:]
+    if mode == "--append-attempt":
+        if len(args) != 2:
+            print(
+                json.dumps(
+                    {
+                        "version": SCHEMA_VERSION,
+                        "state": SUSPECT,
+                        "errors": [_CLI_USAGE],
+                        "tainted": [],
+                        "phase_requirements": "unparsed",
+                    }
+                )
+            )
+            return 2
+        return _append_attempt_cli(args[0], args[1])
     if len(args) != 1:
         print(
             json.dumps(
@@ -3482,31 +3921,7 @@ def main(argv: list[str]) -> int:
         )
         return 2
     try:
-        # mm#3551 finding 3806719734: the CLI's target is child-writable —
-        # refuse special files without blocking and bound the read (the
-        # ceiling mirrors the runner's MAX_CANDIDATE_BYTES; a state past it
-        # is corruption, not progress). O_NONBLOCK is harmless on regular
-        # files; S_ISREG is proven on the OPEN descriptor.
-        import stat as _stat
-
-        _fd = os.open(args[0], os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
-        try:
-            if not _stat.S_ISREG(os.fstat(_fd).st_mode):
-                raise OSError("target is not a regular file")
-            _chunks = []
-            _budget = STATE_READ_CEILING_BYTES + 1
-            while _budget > 0:
-                _chunk = os.read(_fd, min(1_048_576, _budget))
-                if not _chunk:
-                    break
-                _chunks.append(_chunk)
-                _budget -= len(_chunk)
-        finally:
-            os.close(_fd)
-        _raw = b"".join(_chunks)
-        if len(_raw) > STATE_READ_CEILING_BYTES:
-            raise OSError("target exceeds the state read ceiling")
-        text = _raw.decode("utf-8")
+        text = _read_state_file(args[0])
     except (OSError, UnicodeDecodeError):
         print(
             json.dumps(

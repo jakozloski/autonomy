@@ -41,6 +41,11 @@ EXEC_MODEL_FLAGS = (
 REVIEW_MODEL_FLAGS = (
     f"-c 'model=\"<selected>\"' -c 'model_reasoning_effort=\"{model_policy.CODEX_EFFORT}\"'"
 )
+# admin#1495 r12 F10: codex CLI 0.144.x accepts exec-level flags (including
+# the -s sandbox pin) BEFORE the `resume` subcommand and none after it — a
+# package documenting only trailing flags lets a delegated resume silently
+# drop the sandbox pin. The exact ordered shape must appear in the text.
+EXEC_RESUME_SHAPE = f"codex exec {EXEC_MODEL_FLAGS} resume"
 
 REQUIRED_REFERENCE_FILES = (
     "references/project-and-entry.md",
@@ -337,6 +342,10 @@ REQUIRED_GATE_MARKERS = {
 REQUIRED_PY_BINDINGS = {
     "scripts/handoff_decision.py": (
         "MAX_OPERATION_ATTEMPTS = state_schema.MAX_OPERATION_ATTEMPTS",
+        "QA_OPERATION_FAMILIES = state_schema.QA_OPERATION_FAMILIES",
+        "REVIEWER_REQUEST_FAMILIES = state_schema.REVIEWER_REQUEST_FAMILIES",
+        "ROUNDTRIP_FAMILIES = state_schema.ROUNDTRIP_FAMILIES",
+        "parsed_generation_family = state_schema.parsed_generation_family",
     ),
     "scripts/model_policy.py": (
         "MAX_QUOTA_WAIT_SECONDS = state_schema.MAX_QUOTA_WAIT_SECONDS",
@@ -389,6 +398,21 @@ REQUIRED_ANCHORED_MARKERS = {
             "d. If everything is clean AND",
             True,
             ("grace_elapsed(post_push_until)",),
+        ),
+    ),
+    # algo#1216 r16 F12: the operative claims-audit instruction — Check 4's
+    # verify step — is pinned like the exit conditions: a regeneration that
+    # drops or relocates it (or parks a decoy inside a fenced block) fails
+    # validation. Substrings avoid the apostrophe on purpose (a curly-quote
+    # regeneration would false-fail an exact ASCII pin).
+    "references/merge-readiness.md": (
+        (
+            "2. For each claim, verify against the actual code path",
+            False,
+            (
+                "re-read the intention",
+                "Three outcomes:",
+            ),
         ),
     ),
 }
@@ -1269,6 +1293,11 @@ def _validate_policy_text(package_dir: Path) -> list[str]:
         errors.append("missing exact codex exec flags: " + EXEC_MODEL_FLAGS)
     if REVIEW_MODEL_FLAGS not in combined:
         errors.append("missing exact codex review flags: " + REVIEW_MODEL_FLAGS)
+    if EXEC_RESUME_SHAPE not in combined:
+        errors.append(
+            "missing exact codex exec-resume shape (flags BEFORE the resume"
+            " subcommand): " + EXEC_RESUME_SHAPE
+        )
     if CODEX_FLOOR_MODEL not in combined:
         errors.append("missing documented codex floor model: " + CODEX_FLOOR_MODEL)
     state_path = package_dir / "references" / "state-and-safety.md"
@@ -1518,7 +1547,149 @@ def validate_package(package_dir: Path) -> list[str]:
     errors.extend(_validate_anchored_markers(package_dir))
     errors.extend(_validate_openai_yaml(package_dir))
     errors.extend(_validate_entry_points(package_dir))
+    errors.extend(_validate_size_boundary_parity(package_dir))
     return errors
+
+
+def _validate_size_boundary_parity(package_dir: Path) -> list[str]:
+    """algo#1216 r16 F5 + admin#1495 r12 F8: boundary constants defined
+    independently in the runner and the schema CLI carry mirror comments
+    but had no guard. Compare each pair's assignment literals TEXTUALLY:
+    the isolated runner must stay import-free of the schema module, so
+    the parity guard lives here."""
+
+    pairs = (
+        (
+            "size-boundary parity",
+            "MAX_CANDIDATE_BYTES",
+            "STATE_READ_CEILING_BYTES",
+            "the schema read ceiling must mirror the runner candidate cap"
+            " exactly",
+        ),
+        (
+            "work-cap parity",
+            "MAX_WORK_ITERATIONS",
+            "MAX_WORK_ITERATIONS",
+            "the schema's immutable work cap must mirror the runner's"
+            " enforced cap exactly",
+        ),
+    )
+    errors: list[str] = []
+    sources: dict[str, str] = {}
+    for rel_path in ("scripts/monitor_runner.py", "scripts/state_schema.py"):
+        path = package_dir / rel_path
+        if not path.is_file():
+            errors.append(f"constant parity: missing {rel_path}")
+            continue
+        sources[rel_path] = path.read_text(encoding="utf-8")
+    for label, runner_name, schema_name, requirement in pairs:
+        values: list[str] = []
+        for rel_path, constant in (
+            ("scripts/monitor_runner.py", runner_name),
+            ("scripts/state_schema.py", schema_name),
+        ):
+            text = sources.get(rel_path)
+            if text is None:
+                continue
+            match = re.search(
+                rf"^{constant} = (.+)$", text, re.MULTILINE
+            )
+            if match is None:
+                errors.append(
+                    f"{label}: no {constant} assignment found in {rel_path}"
+                )
+                continue
+            values.append(match.group(1).strip())
+        if len(values) == 2 and values[0] != values[1]:
+            errors.append(
+                f"{label}: monitor_runner.{runner_name} ({values[0]}) !="
+                f" state_schema.{schema_name} ({values[1]}) — {requirement}"
+            )
+    return errors
+
+
+def _workflow_pull_request_paths(text: str) -> list[str]:
+    """Narrow std-lib structural read of a workflow's ``on.pull_request.paths``
+    entries (admin#1495 r12 F20). Deliberately NARROW: a top-level ``on:``
+    mapping, a block-form ``pull_request:`` child, a block-form ``paths:``
+    child, and ``- item`` entries — comment lines and inline `` #`` comments
+    stripped, quotes unwrapped. Flow-form or otherwise unrecognized shapes
+    yield no entries and fail closed at the caller (use block form)."""
+
+    def _operative(raw: str) -> str:
+        if raw.lstrip().startswith("#"):
+            return ""
+        if " #" in raw:
+            raw = raw.split(" #", 1)[0]
+        return raw.rstrip()
+
+    paths: list[str] = []
+    in_on = False
+    on_child_indent: int | None = None
+    in_pull_request = False
+    pr_child_indent: int | None = None
+    in_paths = False
+    for raw in text.splitlines():
+        line = _operative(raw)
+        if not line.strip():
+            continue
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip(" "))
+        if indent == 0:
+            in_on = stripped in ("on:", '"on":', "'on':")
+            on_child_indent = None
+            in_pull_request = False
+            pr_child_indent = None
+            in_paths = False
+            continue
+        if not in_on:
+            continue
+        if on_child_indent is None:
+            on_child_indent = indent
+        if indent == on_child_indent:
+            in_pull_request = stripped == "pull_request:"
+            pr_child_indent = None
+            in_paths = False
+            continue
+        if not in_pull_request:
+            continue
+        if pr_child_indent is None:
+            pr_child_indent = indent
+        if indent == pr_child_indent:
+            in_paths = stripped == "paths:"
+            continue
+        if in_paths and indent > pr_child_indent and stripped.startswith("- "):
+            paths.append(stripped[2:].strip().strip("'\""))
+    return paths
+
+
+def _strip_html_comments(text: str) -> str:
+    """Remove ``<!-- ... -->`` spans (inline and multi-line) so delegation
+    checks see only operative Markdown (admin#1495 r12 F20)."""
+
+    operative_lines: list[str] = []
+    open_comment = False
+    for raw_line in text.splitlines():
+        piece = raw_line
+        while True:
+            if open_comment:
+                end = piece.find("-->")
+                if end == -1:
+                    piece = ""
+                    break
+                piece = piece[end + 3:]
+                open_comment = False
+            start = piece.find("<!--")
+            if start == -1:
+                break
+            end = piece.find("-->", start + 4)
+            if end == -1:
+                piece = piece[:start]
+                open_comment = True
+                break
+            piece = piece[:start] + piece[end + 3:]
+        operative_lines.append(piece)
+    return "\n".join(operative_lines)
 
 
 def _validate_entry_points(package_dir: Path) -> list[str]:
@@ -1552,12 +1723,16 @@ def _validate_entry_points(package_dir: Path) -> list[str]:
                             f"unreadable legacy entry point: {entry}"
                         )
                         continue
-                    if "skills/autonomy" not in content:
+                    # admin#1495 r12 F20: delegation must be OPERATIVE text
+                    # — a mention inside an HTML comment reads as compliant
+                    # to a substring check while delegating nothing.
+                    if "skills/autonomy" not in _strip_html_comments(content):
                         errors.append(
                             "legacy autonomy entry point does not delegate"
                             f" to the canonical package: {entry} — make it"
                             " a thin pointer at the autonomy skill or"
-                            " remove it (finding 3813789192)"
+                            " remove it (finding 3813789192; HTML comments"
+                            " do not count)"
                         )
             # admin#1495 finding 3816225750 / algo r13 F5: the trigger
             # wiring is required UNCONDITIONALLY whenever the workflow
@@ -1577,12 +1752,17 @@ def _validate_entry_points(package_dir: Path) -> list[str]:
                     workflow_text = workflow.read_text(encoding="utf-8")
                 except OSError:
                     workflow_text = ""
-                if ".cursor/commands/autonomous-*.md" not in workflow_text:
+                if ".cursor/commands/autonomous-*.md" not in (
+                    _workflow_pull_request_paths(workflow_text)
+                ):
                     errors.append(
                         "skill-package-checks.yml does not trigger on"
-                        " .cursor/commands/autonomous-*.md — the FIRST"
-                        " legacy-command addition would bypass the"
-                        " entry-point guard (findings 3816225750 / r13 F5)"
+                        " .cursor/commands/autonomous-*.md under structural"
+                        " on.pull_request.paths — the FIRST legacy-command"
+                        " addition would bypass the entry-point guard, and"
+                        " a YAML comment, push-only trigger, or wrong"
+                        " key/indent does not count (findings 3816225750 /"
+                        " r13 F5; admin#1495 r12 F20)"
                     )
             # admin#1495 finding 3822586140: the SYMLINK load roots are
             # entry points too. Whichever of the two known roots is the
