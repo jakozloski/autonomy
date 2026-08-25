@@ -134,10 +134,19 @@ class SuperviseStreamLiveProcessTests(unittest.TestCase):
             )
             pgid = os.getpgid(process.pid)
             try:
+                # algo#1216 r18 F1 / admin#1495 r14 F6: the callback is
+                # LEADER-ONLY on purpose. The r13 F9 version passed a
+                # group-killing callback, so the descendant died through the
+                # test's own os.killpg while the module-internal group kill
+                # NameError-ed on a missing import — the assertion below could
+                # not fail on the defect it existed to catch. With a
+                # leader-targeted callback (a no-op here: the leader already
+                # exited), descendant extinction can only come from
+                # supervise_stream's own killpg.
                 result = supervise_stream(
                     process.stdout,
                     process.stderr,
-                    lambda: os.killpg(pgid, signal.SIGKILL),
+                    process.kill,
                     child_wait=process.wait,
                     child_pgid=pgid,
                 )
@@ -164,6 +173,84 @@ class SuperviseStreamLiveProcessTests(unittest.TestCase):
                 for pipe in (process.stdout, process.stderr):
                     if pipe is not None:
                         pipe.close()
+
+    def test_auth_classification_survives_exited_group_kill(self) -> None:
+        # algo#1216 r18 F1 / admin#1495 r14 F6 (already-exited leader-only
+        # group): a child that reports a structured 401 and exits leaves the
+        # process group empty by kill time. The internal group kill's
+        # existence probe must swallow ProcessLookupError (the kill's goal
+        # state) and PRESERVE the deterministic auth classification. Before
+        # the fix, killpg raised NameError (missing os import), the broad
+        # except degraded ok, and the auth_error outcome was overwritten
+        # with internal_failure — decaying an immediate deterministic block
+        # into generic retryable noise.
+        script = textwrap.dedent(
+            """
+            import json, sys
+            sys.stdout.write(json.dumps({"type": "error", "status": 401}) + "\\n")
+            sys.stdout.flush()
+            """
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        pgid = os.getpgid(process.pid)
+        process.wait(timeout=10)  # group fully gone before supervision
+        try:
+            result = supervise_stream(
+                process.stdout,
+                process.stderr,
+                lambda: None,  # leader-only seam: only killpg can act
+                child_pgid=pgid,
+            )
+            self.assertEqual(result["outcome"], "auth_error")
+        finally:
+            for pipe in (process.stdout, process.stderr):
+                if pipe is not None:
+                    pipe.close()
+
+    def test_live_leader_only_group_is_killed_by_internal_group_kill(
+        self,
+    ) -> None:
+        # algo#1216 r18 F1 / admin#1495 r14 F6 (live leader-only group): a
+        # silent child hits the idle deadline while its group is alive. With
+        # a NO-OP callback, termination can only come from the module's own
+        # os.killpg — before the fix the NameError left the child running,
+        # the bounded reap ground to its deadline, and the timeout
+        # classification decayed to internal_failure.
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(120)"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        pgid = os.getpgid(process.pid)
+        started = time.monotonic()
+        try:
+            result = supervise_stream(
+                process.stdout,
+                process.stderr,
+                lambda: None,  # no-op: only the internal group kill acts
+                child_wait=process.wait,
+                child_pgid=pgid,
+                idle_timeout_seconds=1.0,
+            )
+            elapsed = time.monotonic() - started
+            self.assertEqual(result["outcome"], "timeout")
+            self.assertEqual(result["exit_code"], CLASSIFY_EXIT_TIMEOUT)
+            self.assertLess(elapsed, 30, "kill+reap must not grind the reap deadline")
+            # The wait supplied above already collected the leader.
+            self.assertEqual(process.poll(), -signal.SIGKILL)
+        finally:
+            if process.poll() is None:  # pragma: no cover - cleanup safety
+                os.killpg(pgid, signal.SIGKILL)
+                process.wait(timeout=10)
+            for pipe in (process.stdout, process.stderr):
+                if pipe is not None:
+                    pipe.close()
 
     def test_dead_child_kill_race_returns_structured_result(self) -> None:
         # R2 round-2 finding 3737466443, second leg: a CLI that prints its

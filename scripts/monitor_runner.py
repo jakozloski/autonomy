@@ -180,85 +180,171 @@ def _terminal_missing_planned_qa(bound_repo: object, qa_status: object) -> bool:
 REQUIRED_CHILD_CAPABILITIES = frozenset({"github", "linear"})
 
 
-def _capability_family_of(token: str) -> str | None:
-    """Map a single permission pattern, MCP server name, or ``mcp list``
-    line to the handoff capability family it names, or ``None``.
-    Case-insensitive. ``linear`` is tested first so a token can only ever
-    resolve to one family."""
+# algo#1216 r18 F3 / admin#1495 r14 F9: authorization is resolved from
+# EXACT mutation-capable operations, and health from per-row connected
+# status — never from name substrings. The closed tables below name the
+# only shapes that count; everything else (read-only grants, unrelated
+# servers, failed/pending/auth-required rows, unknown shapes) grants
+# nothing.
+_MCP_FAMILY_SERVERS = {
+    # exact `mcp list` server names (bare and plugin-scoped) per family
+    "github": frozenset({"github", "plugin:github:github"}),
+    "linear": frozenset({"linear", "plugin:linear:linear"}),
+}
+_MCP_TOKEN_SERVERS = {
+    # exact server components of mcp__<server>__<tool> permission tokens
+    "github": frozenset({"github", "plugin_github_github"}),
+    "linear": frozenset({"linear", "plugin_linear_linear"}),
+}
+_MCP_MUTATION_TOOLS = {
+    # the mutation tools the mapped handoffs execute; "*" covers them
+    "github": frozenset(
+        {"update_pull_request", "issue_write", "pull_request_review_write"}
+    ),
+    "linear": frozenset({"update_issue"}),
+}
+# gh CLI wildcard prefixes whose expansion includes the handoff mutations
+# (request reviewers / replace assignees via `gh api` PATCH, `gh pr edit`).
+# `Bash(gh pr view:*)` and other read-only prefixes are deliberately
+# absent: a read grant is not a mutation route.
+_GH_MUTATION_PREFIXES = frozenset({"gh", "gh api", "gh pr", "gh issue"})
 
-    lowered = token.lower()
-    if "linear" in lowered:
-        return "linear"
-    if "github" in lowered or "bash(gh" in lowered:
-        return "github"
+_ROW_UNHEALTHY = re.compile(
+    r"fail|disconnect|pending|auth|error|not connected", re.IGNORECASE
+)
+_ROW_CONNECTED = re.compile(r"\u2713|\bconnected\b", re.IGNORECASE)
+
+
+def _mutation_grant(token: str) -> tuple[str, str] | None:
+    """(family, route) for an allow token naming an EXACT mutation-capable
+    operation, else None. Routes: "bash" (gh CLI) and "mcp" (tool token).
+    """
+
+    text = token.strip()
+    if text.startswith("Bash(") and text.endswith(")"):
+        inner = text[len("Bash("):-1].strip()
+        for suffix in (":*", " *"):
+            if inner.endswith(suffix):
+                base = inner[: -len(suffix)].strip()
+                if base in _GH_MUTATION_PREFIXES:
+                    return ("github", "bash")
+                return None
+        return None  # a fully-literal Bash grant is not a general route
+    if text.startswith("mcp__"):
+        parts = text.split("__", 2)
+        server = parts[1] if len(parts) >= 2 else ""
+        tool = parts[2] if len(parts) == 3 else None
+        for family, servers in _MCP_TOKEN_SERVERS.items():
+            if server in servers and (
+                tool is None or tool == "*" or tool in _MCP_MUTATION_TOOLS[family]
+            ):
+                return (family, "mcp")
+        return None
     return None
 
 
-def _resolved_capability_families(
-    settings_data: object, listing_text: str | None
-) -> set[str]:
-    """The handoff capability families the resolved user-scope surface
-    GRANTS minus those it DENIES, unioned across the settings
-    ``permissions.allow`` list, the ``mcpServers`` keys, and the
-    exact-invocation ``mcp list`` output. Deny precedence mirrors Claude
-    Code: an explicit family deny (or a catch-all ``*``) removes the family
-    even when an allow entry or a configured server would otherwise grant
-    it."""
+def _denied_families(deny_value: object) -> set[str]:
+    """Families removed by ``permissions.deny``. Fail-closed on shape: a
+    deny that exists but cannot be parsed as a list of strings denies
+    everything (r18 F3: unknown shapes are rejected), and a deny naming
+    ANY of a family's servers or mutation prefixes, however scoped,
+    conservatively denies the family — a partially-denied route cannot be
+    proven usable from here."""
 
-    granted: set[str] = set()
+    if deny_value is None:
+        return set()
+    if not isinstance(deny_value, list):
+        return set(REQUIRED_CHILD_CAPABILITIES)
     denied: set[str] = set()
-    if isinstance(settings_data, dict):
-        perms = settings_data.get("permissions")
-        if isinstance(perms, dict):
-            allow = perms.get("allow")
-            if isinstance(allow, list):
-                for token in allow:
-                    if isinstance(token, str):
-                        family = _capability_family_of(token)
-                        if family:
-                            granted.add(family)
-            deny = perms.get("deny")
-            if isinstance(deny, list):
-                for token in deny:
-                    if isinstance(token, str):
-                        if token.strip() == "*":
-                            denied |= set(REQUIRED_CHILD_CAPABILITIES)
-                        else:
-                            family = _capability_family_of(token)
-                            if family:
-                                denied.add(family)
-        servers = settings_data.get("mcpServers")
-        if isinstance(servers, dict):
-            for name in servers:
-                if isinstance(name, str):
-                    family = _capability_family_of(name)
-                    if family:
-                        granted.add(family)
-    if listing_text:
-        for line in listing_text.splitlines():
-            family = _capability_family_of(line)
-            if family:
-                granted.add(family)
-    return granted - denied
+    for token in deny_value:
+        if not isinstance(token, str):
+            return set(REQUIRED_CHILD_CAPABILITIES)
+        text = token.strip()
+        if text == "*":
+            return set(REQUIRED_CHILD_CAPABILITIES)
+        grant = _mutation_grant(text)
+        if grant is not None:
+            denied.add(grant[0])
+            continue
+        if text.startswith("mcp__"):
+            parts = text.split("__", 2)
+            server = parts[1] if len(parts) >= 2 else ""
+            for family, servers in _MCP_TOKEN_SERVERS.items():
+                if server in servers:
+                    denied.add(family)
+    return denied
+
+
+def _allowed_routes(settings_data: object) -> dict[str, set[str]]:
+    """family -> routes granted by ``permissions.allow`` (exact mutation
+    grammar only), minus ``permissions.deny``. ``mcpServers`` config keys
+    grant NOTHING (r18 F3: configuration presence is not a usable route —
+    health comes from the connected ``mcp list`` row alone), and every
+    unknown shape resolves to no grant."""
+
+    routes: dict[str, set[str]] = {}
+    if not isinstance(settings_data, dict):
+        return routes
+    perms = settings_data.get("permissions")
+    if not isinstance(perms, dict):
+        return routes
+    allow = perms.get("allow")
+    if isinstance(allow, list):
+        for token in allow:
+            if isinstance(token, str):
+                grant = _mutation_grant(token)
+                if grant is not None:
+                    routes.setdefault(grant[0], set()).add(grant[1])
+    for family in _denied_families(perms.get("deny")):
+        routes.pop(family, None)
+    return routes
+
+
+def _parse_mcp_list_rows(listing_text: str) -> dict[str, bool]:
+    """``{server_name_lower: connected}`` from ``claude mcp list`` output.
+    Health is per row and fail-closed (admin#1495 r14 F9): an unhealthy
+    marker (failed, disconnected, pending, auth-required, error) rejects
+    the row even when a connected word also appears; a row with neither
+    marker, or with no ``name:`` shape at all, never grants."""
+
+    rows: dict[str, bool] = {}
+    for line in listing_text.splitlines():
+        if ":" not in line:
+            continue
+        name, _, rest = line.partition(":")
+        name = name.strip().lower()
+        if not name:
+            continue
+        if _ROW_UNHEALTHY.search(rest):
+            rows[name] = False
+        elif _ROW_CONNECTED.search(rest):
+            rows[name] = True
+        else:
+            rows[name] = False
+    return rows
 
 
 class AttemptContainment:
     """Per-attempt descendant containment (r13 F8).
 
     On Linux with a writable cgroup v2 hierarchy, the runner creates a
-    per-attempt cgroup and moves the
-    PAUSED wrapper into it BEFORE sending the GO token (r14 F2: managed
-    Keeper slots run ProtectControlGroups=yes with a read-only cgroup
-    mount, so THOSE runs take the disclosed degraded path — the strict
-    boundary activates only where the host delegates a writable
-    hierarchy): the wrapper execs
+    per-attempt cgroup and moves the PAUSED wrapper into it BEFORE
+    sending the GO token: the wrapper execs
     nothing until GO, descendants inherit membership, and a process
     cannot leave a cgroup by re-sessioning or double-forking. Extinction
     is proven by reading ``cgroup.procs`` and termination goes through
     ``cgroup.kill`` — no pid identity involved, so pid/pgid reuse and the
     between-snapshot setsid escape are structurally impossible inside the
-    boundary. Hosts without delegation (macOS dev) DEGRADE to the
-    snapshot+group proof with the reason recorded in
+    boundary. Hosts without delegation BLOCK before GO for every
+    repository (algo#1216 r18 F5 — there is no read-only monitor child,
+    so no degraded launch is safe): managed Keeper slots running
+    ``ProtectControlGroups=yes`` with a read-only cgroup mount, and macOS
+    dev hosts, cannot launch the monitor until the host delegates a
+    writable subtree (admin#1495 r14 F2's host contract). The single
+    exception is an operator-attested hermetic TEST child on a
+    non-Keeper-bound repository
+    (``MONITOR_RUNNER_UNCONTAINED_TEST_CHILD=1``), which degrades to the
+    snapshot+group proof with the attestation recorded in
     ``in_flight.containment`` — disclosed, never silent.
     ``MONITOR_RUNNER_CGROUP_ROOT`` is the hermetic test seam: a plain tmpdir
     reaches the DEGRADE branches (missing root, un-creatable target, a
@@ -2412,30 +2498,7 @@ class Runner:
         # names only: the child needs its config dir; every other CLAUDE_*
         # variable is either one of the three deliberately-unset overrides
         # or something the child must not inherit.
-        allowed_prefixes = ("LC_",)
-        allowed_names = {
-            "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TERM",
-            "TZ", "LANG", "COLUMNS", "LINES", "SSH_AUTH_SOCK", "XDG_CACHE_HOME",
-            "XDG_CONFIG_HOME", "XDG_DATA_HOME", "CLAUDE_CONFIG_DIR",
-            # algo#1216 finding 3807740755: Keeper agent VMs run an
-            # OAuth-only Claude contract — the child's OWN session auth
-            # arrives through this one variable (startup.sh / the
-            # orchestrator token refresher), and stripping it left the
-            # child unauthenticated. The ACCOUNT-token bundle and every
-            # other CLAUDE_* name stay excluded (finding 3806719670).
-            "CLAUDE_CODE_OAUTH_TOKEN",
-        }
-        fake_child = Path(self.claude_bin).name != "claude"
-        child_env = {
-            key: value
-            for key, value in os.environ.items()
-            if key not in CLAUDE_READ_ONLY_ENV_UNSET
-            and (
-                key in allowed_names
-                or key.startswith(allowed_prefixes)
-                or (fake_child and key.startswith("FAKE_"))
-            )
-        }
+        child_env = self._sanitized_child_env()
         try:
             # algo#1216 R2 finding 3779532260: restore the stage file
             # from the __init__-pinned wrapper bytes immediately before the
@@ -2536,10 +2599,7 @@ class Runner:
             return "retry"
         # r13 F8: containment attaches while the wrapper is PAUSED — the
         # GO token has not been sent, so nothing has executed and every
-        # future descendant inherits membership. A host without cgroup v2
-        # delegation records the degraded mode instead, never silently —
-        # for UNMAPPED repositories only; a mapped repository fails closed
-        # below before GO (r17 F9 / r13 F3).
+        # future descendant inherits membership.
         containment = AttemptContainment.create(attempt_id)
         containment_record = (
             containment.record
@@ -2550,39 +2610,43 @@ class Runner:
             containment.remove()
             containment = None
             containment_record = "degraded:cgroup-adopt-failed"
-        # algo#1216 r17 F9 / admin#1495 r13 F3 (package half): a MAPPED
-        # repository's monitor child is a write-capable managed run, and
-        # the snapshot fallback's between-snapshot double-fork/setsid
-        # escape is not enforceable containment. Degraded containment
-        # therefore fails CLOSED here — before the GO token, while the
+        # algo#1216 r18 F5 (superseding the r17 F9 mapped-only gate): EVERY
+        # reachable monitor child is write-capable — there is no read-only
+        # monitor child — and the snapshot fallback's between-snapshot
+        # double-fork/setsid escape is not enforceable containment. Missing
+        # or failed containment (creation OR adoption) therefore fails
+        # CLOSED for every repository — before the GO token, while the
         # paused wrapper has executed nothing: close stdin (no GO), reap
-        # the wrapper, and block naming the host obligation. Unmapped
-        # repositories retain the documented degraded operation; the
-        # host-delegated-cgroup provisioning itself stays a host contract.
-        if containment is None and self._bound_mapped_repository(extract):
-            try:
-                proc.stdin.close()
-            except OSError:
-                pass
-            if not _bounded_reap(proc):
-                raise RunnerExit(
-                    5,
-                    "blocked",
-                    "paused launch wrapper could not be reaped while"
-                    " refusing an uncontained mapped launch — a"
-                    " possibly-live process needs a human",
-                )
-            raise RunnerExit(
-                5,
-                "blocked",
-                f"cgroup v2 delegation is unavailable ({containment_record})"
-                " and this repository is Keeper-mapped — a write-capable"
-                " managed launch requires enforceable per-attempt"
-                " containment (the snapshot fallback admits a"
-                " between-snapshot setsid escape); provision delegated"
-                " cgroups (MONITOR_RUNNER_CGROUP_ROOT) or run this"
-                " workflow on a delegating host",
-            )
+        # the wrapper, and block naming the host obligation. ONE explicit
+        # carve-out keeps the behavioral suite runnable on non-delegating
+        # hosts: an operator-attested hermetic TEST child
+        # (MONITOR_RUNNER_UNCONTAINED_TEST_CHILD=1 — the same operator
+        # trust class as --claude-bin, which already substitutes the child
+        # binary itself) may launch uncontained ONLY when the bound
+        # repository is not a Keeper repository; the attestation is
+        # recorded in the containment record, never silent. A
+        # Keeper-bound launch ("keeper-dating/" owner, mapped or not —
+        # r18 F5's repro was exact-Algo, which the QA map excludes)
+        # blocks unconditionally; host-delegated-cgroup provisioning
+        # itself stays a host contract.
+        if containment is None:
+            refusal = self._containment_refusal(containment_record, extract)
+            if refusal is None:
+                containment_record += ";uncontained-test-child-attested"
+            else:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+                if not _bounded_reap(proc):
+                    raise RunnerExit(
+                        5,
+                        "blocked",
+                        "paused launch wrapper could not be reaped while"
+                        " refusing an uncontained launch — a"
+                        " possibly-live process needs a human",
+                    )
+                raise RunnerExit(5, "blocked", refusal)
         self.attempt_containment = containment
         # R6-F15: one instant defines both the persisted deadline_at and the
         # enforced monotonic deadline, so the record matches enforcement.
@@ -2855,9 +2919,19 @@ class Runner:
                 if action == "block":
                     self._clear_in_flight(fresh)
                     raise RunnerExit(5, "blocked", detail)
-                if drained["outcome"] != "clean":
-                    self.charge_failure(fresh, f"monitor-child:{drained['outcome']}")
-                    return "retry"
+                # algo#1216 r18 F2 / admin#1495 r14 F5: dispatch the
+                # RECOVERY classifications before any generic non-clean
+                # charge. The generic charge previously ran first, so a
+                # trusted rate-limit diagnostic followed by a hang consumed
+                # the three-strike budget instead of taking the no-charge
+                # liveness ladder, and a dead resume target followed by a
+                # hang never cleared the stale session. Order mirrors the
+                # structured-error branch above: block, fresh_session,
+                # ladder, then — only for signals with no recovery
+                # classification — the generic outcome charge. The
+                # candidate was preserved at branch entry and group
+                # extinction plus canonical revalidation already ran, so
+                # every path below acts on verified state.
                 if action == "fresh_session":
                     _heartbeat("resume target gone — clearing session for a fresh owner child")
                     self.child_session_id = None
@@ -2865,6 +2939,9 @@ class Runner:
                     return "retry_now"
                 if action == "ladder":
                     self._clear_in_flight(fresh)
+                    return "retry"
+                if drained["outcome"] != "clean":
+                    self.charge_failure(fresh, f"monitor-child:{drained['outcome']}")
                     return "retry"
                 self.charge_failure(fresh, detail)
                 return "retry"
@@ -3143,34 +3220,42 @@ class Runner:
         )
 
     def _child_capability_probe(self, extract: dict[str, Any]) -> None:
-        """admin#1495 finding 3825265272 + algo#1216 F3: fail FAST when the
-        child's resolved user-scope capability surface cannot execute the
-        mapped handoffs, instead of stranding after PR creation.
+        """admin#1495 finding 3825265272 + algo#1216 r18 F3 + admin r14
+        F9: fail FAST when the child's resolved user-scope capability
+        surface cannot execute the mapped handoffs, instead of stranding
+        after PR creation.
 
         Deterministic and model-free. The mapped Phase-6 handoffs emit
-        ``*.github.*`` and ``*.linear.*`` operations, so a mapped run needs
-        BOTH families in ``REQUIRED_CHILD_CAPABILITIES``. This extracts the
-        families the resolved surface actually GRANTS (minus denials) from
-        the user settings (``permissions.allow`` + ``mcpServers``) and, only
-        when that is insufficient, completes the surface with the
-        exact-invocation ``claude --setting-sources user mcp list`` the child
-        itself would resolve — then blocks naming the MISSING families. The
-        r25 probe passed on any truthy ``permissions`` object or any MCP
-        server; a deny-all policy or an unrelated server slipped through.
-        Mapped repositories only — an unmapped dev run uses the developer's
-        own settings, and a genuinely read-only scheduled run never reaches
-        this mutation path, so scheduled-readonly behavior is preserved. The
-        package self-provisions NOTHING: this only reports what the host
-        supplied, and the immutable per-profile descriptor remains a host
-        contract.
+        ``*.github.*`` and ``*.linear.*`` operations, so a mapped run
+        needs BOTH families in ``REQUIRED_CHILD_CAPABILITIES`` — proven,
+        not merely configured:
+
+        * an MCP route is proven only by a CONNECTED ``mcp list`` row for
+          one of the family's EXACT server names, resolved by the exact
+          child invocation under the sanitized child environment (a
+          connected row is also the authentication evidence — the server
+          completed its auth handshake);
+        * the gh CLI route (github only) is proven by an exact
+          mutation-capable allow token PLUS a bounded non-mutating
+          repository-permission probe (``gh api repos/<bound>`` must
+          report push) under the same sanitized environment;
+        * configuration presence (``mcpServers`` keys), name substrings,
+          read-only grants, and failed/pending/auth-required rows prove
+          nothing — the r25/r17 probes accepted each of these shapes.
+
+        Mapped repositories only, because only the mapped QA handoffs
+        REQUIRE both families — an unmapped run uses the developer's own
+        settings and plans no Keeper handoff operations. (algo#1216 r18
+        F5 removed the former "read-only scheduled run" justification:
+        every reachable monitor child is write-capable, so no read-only
+        cohort exists to preserve.) The package self-provisions NOTHING:
+        this only reports what the host supplied, and the immutable
+        per-profile descriptor remains a host contract (admin r14 F3).
         """
 
-        bound = self._bound_repository(extract)
-        if not (
-            isinstance(bound, str)
-            and bound.casefold() in MAPPED_QA_REPOSITORIES
-        ):
+        if not self._bound_mapped_repository(extract):
             return
+        bound = self._bound_repository(extract)
         settings_override = os.environ.get("MONITOR_RUNNER_USER_SETTINGS")
         settings_path = (
             Path(settings_override)
@@ -3184,12 +3269,12 @@ class Runner:
             )
         except (OSError, ValueError, RunnerExit):
             settings_data = None
-        if REQUIRED_CHILD_CAPABILITIES <= _resolved_capability_families(
-            settings_data, None
-        ):
-            return
-        # Insufficient from settings alone — complete the surface with the
-        # exact-invocation MCP discovery the child itself resolves.
+        routes = _allowed_routes(settings_data)
+        probe_env = self._sanitized_child_env()
+        # The exact-invocation MCP discovery the child itself resolves —
+        # always consulted (linear has no non-MCP route, so a mapped run
+        # can never prove its surface from settings alone), and run under
+        # the sanitized child environment (r18 F3).
         listing: str | None = None
         try:
             completed = subprocess.run(
@@ -3197,28 +3282,97 @@ class Runner:
                 capture_output=True,
                 text=True,
                 timeout=30,
+                env=probe_env,
             )
             if completed.returncode == 0:
                 listing = completed.stdout or ""
         except (OSError, subprocess.TimeoutExpired):
             listing = None
-        resolved = _resolved_capability_families(settings_data, listing)
-        if REQUIRED_CHILD_CAPABILITIES <= resolved:
+        rows = _parse_mcp_list_rows(listing or "")
+        denied = (
+            _denied_families(settings_data.get("permissions", {}).get("deny"))
+            if isinstance(settings_data, dict)
+            and isinstance(settings_data.get("permissions"), dict)
+            else set()
+        )
+        unproven: dict[str, str] = {}
+        for family in sorted(REQUIRED_CHILD_CAPABILITIES):
+            if family in denied:
+                unproven[family] = "denied by permissions.deny"
+                continue
+            if any(rows.get(server) for server in _MCP_FAMILY_SERVERS[family]):
+                continue  # connected MCP row: configured AND authenticated
+            if family == "github" and "bash" in routes.get("github", set()):
+                if self._gh_mutation_probe(bound, probe_env):
+                    continue
+                unproven[family] = (
+                    "gh CLI route granted but the non-mutating repository"
+                    " probe could not confirm push permission"
+                )
+                continue
+            unproven[family] = (
+                "no CONNECTED MCP row for an exact family server and no"
+                " proven mutation route"
+            )
+        if not unproven:
             return
-        missing = ", ".join(sorted(REQUIRED_CHILD_CAPABILITIES - resolved))
+        detail = "; ".join(
+            f"{family}: {reason}" for family, reason in unproven.items()
+        )
         raise RunnerExit(
             5,
             "blocked",
             "child capability probe failed for a mapped repository"
-            f" ({bound}): the user-scope surface the --setting-sources user"
-            f" child resolves grants no {missing} capability, so Phase 6"
-            " handoffs would strand after PR creation (admin#1495 finding"
-            " 3825265272 / algo#1216 F3). The HOST must supply a trusted"
-            " least-privilege user-scope policy naming the GitHub+Linear"
-            " handoff surface (permission allowlist and/or MCP config) — the"
-            " package deliberately never self-provisions it, and the"
-            " immutable per-profile descriptor remains a host contract",
+            f" ({bound}): {detail}. The user-scope surface the"
+            " --setting-sources user child resolves cannot execute the"
+            " Phase 6 handoffs, which would strand after PR creation"
+            " (admin#1495 finding 3825265272 / algo#1216 r18 F3 / admin"
+            " r14 F9). Authorization needs EXACT mutation-capable"
+            " operations and health needs CONNECTED MCP rows — name"
+            " substrings, configuration presence, read-only grants, and"
+            " failed/pending/auth-required rows prove nothing. The HOST"
+            " must supply a trusted least-privilege user-scope policy"
+            " naming the GitHub+Linear handoff surface — the package"
+            " deliberately never self-provisions it, and the immutable"
+            " per-profile descriptor remains a host contract",
         )
+
+    def _gh_mutation_probe(
+        self, bound: str | None, probe_env: dict[str, str]
+    ) -> bool:
+        """Bounded NON-MUTATING proof that the gh CLI route can execute
+        the github handoffs: ``gh api repos/<bound>`` must succeed and
+        report push permission (r18 F3's "auth/repository-permission
+        probes where needed" — an allow token proves policy, not a live
+        credential). Any failure — missing binary, timeout, non-zero
+        exit, unparseable payload, permissions absent — is False."""
+
+        if not isinstance(bound, str) or not bound:
+            return False
+        try:
+            gh_bin = _resolve_system_binary("gh")
+        except RunnerExit:
+            return False
+        try:
+            completed = subprocess.run(
+                [gh_bin, "api", f"repos/{bound}"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                env=probe_env,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        if completed.returncode != 0:
+            return False
+        try:
+            payload = json.loads(completed.stdout)
+        except ValueError:
+            return False
+        permissions = (
+            payload.get("permissions") if isinstance(payload, dict) else None
+        )
+        return isinstance(permissions, dict) and permissions.get("push") is True
 
     def _gate_taint(self, extract: dict[str, Any]) -> None:
         """R6-F5 + admin-portal#1495 R2 finding 3776596739: fail closed on
@@ -3603,6 +3757,37 @@ class Runner:
                     " each parse under the byte ceiling)",
                 )
 
+    def _sanitized_child_env(self) -> dict[str, str]:
+        """The allowlisted environment every child-facing invocation gets —
+        the model launch AND the capability probes (algo#1216 r18 F3: the
+        ``mcp list`` discovery must resolve under the exact environment the
+        child itself will see, or the probe proves a different surface)."""
+
+        allowed_prefixes = ("LC_",)
+        allowed_names = {
+            "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TERM",
+            "TZ", "LANG", "COLUMNS", "LINES", "SSH_AUTH_SOCK", "XDG_CACHE_HOME",
+            "XDG_CONFIG_HOME", "XDG_DATA_HOME", "CLAUDE_CONFIG_DIR",
+            # algo#1216 finding 3807740755: Keeper agent VMs run an
+            # OAuth-only Claude contract — the child's OWN session auth
+            # arrives through this one variable (startup.sh / the
+            # orchestrator token refresher), and stripping it left the
+            # child unauthenticated. The ACCOUNT-token bundle and every
+            # other CLAUDE_* name stay excluded (finding 3806719670).
+            "CLAUDE_CODE_OAUTH_TOKEN",
+        }
+        fake_child = Path(self.claude_bin).name != "claude"
+        return {
+            key: value
+            for key, value in os.environ.items()
+            if key not in CLAUDE_READ_ONLY_ENV_UNSET
+            and (
+                key in allowed_names
+                or key.startswith(allowed_prefixes)
+                or (fake_child and key.startswith("FAKE_"))
+            )
+        }
+
     def _bound_repository(self, extract: dict[str, Any]) -> str | None:
         """The bound repository: persisted ``monitor_cli.repository``, else
         the live origin hint."""
@@ -3625,6 +3810,52 @@ class Runner:
         return (
             isinstance(bound, str)
             and bound.casefold() in MAPPED_QA_REPOSITORIES
+        )
+
+    def _keeper_bound_repository(self, extract: dict[str, Any]) -> bool:
+        """The bound repository belongs to the Keeper organization — the
+        r18 F5 containment floor. Broader than the QA map on purpose: the
+        finding's repro was exact-Algo, which the QA map excludes, and the
+        uncontained-test-child attestation must never cover ANY Keeper
+        repository."""
+
+        bound = self._bound_repository(extract)
+        return isinstance(bound, str) and bound.casefold().startswith(
+            "keeper-dating/"
+        )
+
+    def _containment_refusal(
+        self, containment_record: str, extract: dict[str, Any]
+    ) -> str | None:
+        """The r18 F5 universal-gate decision for an UNCONTAINED launch:
+        the refusal reason, or ``None`` when the launch may proceed. Real
+        containment never reaches this method. ``None`` is returned for
+        exactly one shape — an operator-attested hermetic TEST child
+        (``MONITOR_RUNNER_UNCONTAINED_TEST_CHILD=1``, the same operator
+        trust class as ``--claude-bin``, which already substitutes the
+        child binary itself) on a repository that is NOT Keeper-bound;
+        the caller records the attestation in the containment record,
+        never silently. Both degraded records — creation failure and
+        adoption failure — refuse identically: the launch is uncontained
+        either way."""
+
+        attested_test_child = (
+            os.environ.get("MONITOR_RUNNER_UNCONTAINED_TEST_CHILD") == "1"
+            and not self._keeper_bound_repository(extract)
+        )
+        if attested_test_child:
+            return None
+        return (
+            f"cgroup v2 delegation is unavailable ({containment_record})"
+            " — a write-capable monitor launch requires enforceable"
+            " per-attempt containment for EVERY repository (the snapshot"
+            " fallback admits a between-snapshot setsid escape; algo#1216"
+            " r18 F5); provision delegated cgroups"
+            " (MONITOR_RUNNER_CGROUP_ROOT) or run on a delegating host."
+            " Hermetic test fixtures binding non-Keeper repositories may"
+            " attest an operator-supplied fake child via"
+            " MONITOR_RUNNER_UNCONTAINED_TEST_CHILD=1; the attestation"
+            " never applies to a Keeper-bound repository"
         )
 
     def _verify_skill_snapshot(self) -> None:

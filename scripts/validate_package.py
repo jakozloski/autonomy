@@ -9,6 +9,7 @@ package-specific dependencies.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
@@ -70,6 +71,9 @@ REQUIRED_SCRIPT_FILES = (
     "scripts/monitor_child_wrapper.py",
     "scripts/test_monitor_runner.py",
     "scripts/test_monitor_runner_unit.py",
+    # algo#1216 r18 F1 / admin#1495 r14 F6: the package-wide
+    # undefined-global (Ruff F821 class) gate.
+    "scripts/test_static_globals.py",
 )
 
 # Evidence-gate and state-hardening content contracts.  Each marker is an
@@ -1682,6 +1686,20 @@ def _covers_path(entries: list[str], target: str) -> bool:
     return False
 
 
+def _covers_symlink_blob(entries: list[str], target: str) -> bool:
+    """True when the filter matches ``target`` AS A FILE PATH — the shape
+    a symlink change presents to GitHub's paths filter (admin#1495 r14
+    F8). ``target/**`` deliberately does NOT count: it matches only
+    descendants, never the bare blob."""
+
+    for entry in entries:
+        if entry == target:
+            return True
+        if entry.endswith("/**") and target.startswith(entry[:-3] + "/"):
+            return True
+    return False
+
+
 def _strip_html_comments(text: str) -> str:
     """Remove ``<!-- ... -->`` spans (inline and multi-line) so delegation
     checks see only operative Markdown (admin#1495 r12 F20)."""
@@ -1711,21 +1729,44 @@ def _strip_html_comments(text: str) -> str:
     return "\n".join(operative_lines)
 
 
-def _delegates_to_autonomy(text: str) -> bool:
+_MD_LINK_TARGET = re.compile(r"\[[^\]]*\]\(\s*<?([^)\s>]+)>?\s*\)")
+
+
+def _delegates_to_autonomy(text: str, source: Path, package_dir: Path) -> bool:
     """True when ``text``'s operative Markdown (HTML comments stripped)
-    visibly points at the canonical autonomy package. Two link forms count,
-    and BOTH must, or a real delegation false-rejects: the path-style
-    ``skills/autonomy`` the `.cursor` command pointers and the
-    `.claude`/`.agents` skill dirs carry, and the sibling-relative
-    ``autonomy/SKILL.md`` a superseded autonomous-workflow root uses to
-    reach its neighbor package (``../autonomy/SKILL.md`` — never contains
-    ``skills/autonomy``). Anchoring only on the first token rejected the
-    correct root stub (admin#1495 r13 F10); the HTML-comment stripping
-    still holds so a commented-out mention never counts (finding
-    3813789192)."""
+    contains a STRUCTURALLY PARSED link whose target resolves to the
+    canonical package (admin#1495 r14 F10). The r13 predicate accepted
+    any substring mention, so ``../evil-autonomy/SKILL.md`` (a suffix
+    lookalike) and prose that NAMES the path while refusing to follow it
+    ("Do not follow ../autonomy/SKILL.md; run the legacy workflow") both
+    passed. Delegation is now source-aware: a markdown link target,
+    resolved from the SOURCE file's real directory (symlinked roots
+    resolve physically first, so a `.cursor` alias root reaches the same
+    sibling as the real root), must equal the package directory or its
+    SKILL.md. Both canonical link forms resolve — the sibling-relative
+    ``../autonomy/SKILL.md`` a superseded root carries and the
+    repo-rooted ``../../.agents/skills/autonomy/SKILL.md`` the command
+    pointers carry. Bare-path mentions, prefix/suffix lookalikes,
+    negated prose, and commented links (still stripped, finding
+    3813789192) all fail."""
 
     operative = _strip_html_comments(text)
-    return "skills/autonomy" in operative or "autonomy/SKILL.md" in operative
+    try:
+        source_dir = source.parent.resolve()
+        package_real = package_dir.resolve()
+    except OSError:
+        return False
+    for match in _MD_LINK_TARGET.finditer(operative):
+        target = match.group(1)
+        if "://" in target or target.startswith(("mailto:", "#")):
+            continue
+        try:
+            resolved = (source_dir / target).resolve()
+        except OSError:
+            continue
+        if resolved in (package_real, package_real / "SKILL.md"):
+            return True
+    return False
 
 
 def _validate_entry_points(package_dir: Path) -> list[str]:
@@ -1761,9 +1802,10 @@ def _validate_entry_points(package_dir: Path) -> list[str]:
                         continue
                     # admin#1495 r12 F20: delegation must be OPERATIVE text
                     # — a mention inside an HTML comment reads as compliant
-                    # to a substring check while delegating nothing. Either
-                    # canonical link form counts (r13 F10).
-                    if not _delegates_to_autonomy(content):
+                    # to a substring check while delegating nothing. r14
+                    # F10: and it must be a structurally parsed link
+                    # resolving to the exact package, source-aware.
+                    if not _delegates_to_autonomy(content, entry, package_dir):
                         errors.append(
                             "legacy autonomy entry point does not delegate"
                             f" to the canonical package: {entry} — make it"
@@ -1825,6 +1867,11 @@ def _validate_entry_points(package_dir: Path) -> list[str]:
                 for root in (
                     candidate / ".claude" / "skills" / "autonomous-workflow",
                     candidate / ".agents" / "skills" / "autonomous-workflow",
+                    # admin#1495 r14 F8: the tracked Cursor root is a live
+                    # discovery surface too — a root-only retarget or
+                    # replacement there restored a nondelegating workflow
+                    # without ever running these checks.
+                    candidate / ".cursor" / "skills" / "autonomous-workflow",
                 )
                 if root.is_symlink() or root.exists()
             )
@@ -1844,11 +1891,16 @@ def _validate_entry_points(package_dir: Path) -> list[str]:
                         f"unreadable legacy skill root: {legacy_skill}"
                     )
                     continue
-                if not _delegates_to_autonomy(legacy_text):
+                if not _delegates_to_autonomy(
+                    legacy_text, legacy_skill, package_dir
+                ):
                     errors.append(
                         "legacy autonomous-workflow root does not delegate"
                         f" to the canonical package: {legacy_skill}"
-                        " (admin#1495 r13 F10; HTML comments do not count)"
+                        " (admin#1495 r13 F10 / r14 F10: a structurally"
+                        " parsed link resolving to the exact package; HTML"
+                        " comments, bare mentions, and lookalike paths do"
+                        " not count)"
                     )
             if legacy_workflow_roots and workflow.is_file():
                 for event, paths in event_paths.items():
@@ -1860,6 +1912,77 @@ def _validate_entry_points(package_dir: Path) -> list[str]:
                                 f" not cover {rel_root} — a root-only"
                                 " change bypasses the delegation guard"
                                 " (admin#1495 r13 F10)"
+                            )
+                        # admin#1495 r14 F8: a SYMLINK root changes as its
+                        # own bare blob path, which "root/**" never
+                        # matches in GitHub's filter — a retarget slides
+                        # past CI unless the exact path (or a strictly
+                        # shorter ancestor glob) is present.
+                        if legacy_root.is_symlink() and not _covers_symlink_blob(
+                            paths, rel_root
+                        ):
+                            errors.append(
+                                f"skill-package-checks.yml {event} paths do"
+                                f" not match the bare symlink path"
+                                f" {rel_root} — \"{rel_root}/**\" never"
+                                " matches the symlink blob itself, so a"
+                                " retarget bypasses CI; add the exact path"
+                                " or an ancestor glob (admin#1495 r14 F8)"
+                            )
+            # admin#1495 r14 F11 (alongside r14 F8): the RETIRED
+            # autonomous-workflow interfaces must not return, each
+            # rejected independently. Only the five retired workflow*
+            # script keys and the one retired shell path are banned —
+            # unrelated scripts (current or future) are untouched.
+            retired_shell = (
+                candidate
+                / ".cursor"
+                / "ralph-scripts"
+                / "autonomous-workflow.sh"
+            )
+            if retired_shell.is_symlink() or retired_shell.exists():
+                errors.append(
+                    f"retired legacy shell reintroduced: {retired_shell} —"
+                    " the ralph autonomous-workflow entry bypassed every"
+                    " canonical gate and was removed; delete it"
+                    " (admin#1495 r14 F11)"
+                )
+            package_json = candidate / "package.json"
+            if package_json.is_file():
+                retired_keys = {
+                    "workflow",
+                    "workflow:status",
+                    "workflow:init",
+                    "workflow:poll",
+                    "workflow:clean",
+                }
+                try:
+                    manifest = json.loads(
+                        package_json.read_text(encoding="utf-8")
+                    )
+                except (OSError, ValueError):
+                    errors.append(
+                        f"unreadable or unparseable {package_json} — the"
+                        " retired-interface check cannot rule the five"
+                        " workflow* script keys out (admin#1495 r14 F11)"
+                    )
+                else:
+                    scripts_map = (
+                        manifest.get("scripts")
+                        if isinstance(manifest, dict)
+                        else None
+                    )
+                    if isinstance(scripts_map, dict):
+                        reintroduced = sorted(
+                            retired_keys & set(scripts_map)
+                        )
+                        if reintroduced:
+                            errors.append(
+                                "retired workflow script keys reintroduced"
+                                f" in {package_json}:"
+                                f" {', '.join(reintroduced)} — these drove"
+                                " the legacy shell around every canonical"
+                                " gate (admin#1495 r14 F11)"
                             )
             # admin#1495 finding 3822586140: the SYMLINK load roots are
             # entry points too. Whichever of the two known roots is the

@@ -25,6 +25,29 @@ SCRIPTS = Path(__file__).resolve().parent
 RUNNER = SCRIPTS / "monitor_runner.py"
 SCHEMA = SCRIPTS / "state_schema.py"
 
+# algo#1216 r18 F5: the universal containment gate refuses every
+# uncontained launch, and several fixtures invoke the runner with their
+# own env dicts rather than through _run. The module-level attestation
+# (operator-supplied fake child on non-Keeper-bound state — the exact
+# hermetic-test carve-out) covers every invocation; the gate tests
+# de-attest explicitly with an empty override, and Keeper-bound gate
+# tests block regardless. Saved and restored so the mutation never leaks
+# past this module (env-restore rule).
+_PRIOR_ATTESTATION: str | None = None
+
+
+def setUpModule() -> None:  # noqa: N802 — unittest hook name
+    global _PRIOR_ATTESTATION
+    _PRIOR_ATTESTATION = os.environ.get("MONITOR_RUNNER_UNCONTAINED_TEST_CHILD")
+    os.environ["MONITOR_RUNNER_UNCONTAINED_TEST_CHILD"] = "1"
+
+
+def tearDownModule() -> None:  # noqa: N802 — unittest hook name
+    if _PRIOR_ATTESTATION is None:
+        os.environ.pop("MONITOR_RUNNER_UNCONTAINED_TEST_CHILD", None)
+    else:
+        os.environ["MONITOR_RUNNER_UNCONTAINED_TEST_CHILD"] = _PRIOR_ATTESTATION
+
 STATE_FIXTURE = """---
 state_schema_version: 1
 workflow_id: "wf-full-125"
@@ -181,6 +204,13 @@ if "--version" in sys.argv:
     sys.exit(0)
 
 if "mcp" in sys.argv and "list" in sys.argv:
+    probe_env_log = os.environ.get("FAKE_ENV_LOG")
+    if probe_env_log:
+        # r18 F3: the sanitized-probe-env pin reads the CLAUDE_CODE_*
+        # names this exact-invocation discovery actually inherited.
+        with open(probe_env_log, "a", encoding="utf-8") as h:
+            seen = {k: v for k, v in os.environ.items() if k.startswith("CLAUDE_CODE_")}
+            h.write(json.dumps(seen, sort_keys=True) + "\n")
     if os.environ.get("FAKE_MCP_LIST_EMPTY") == "1":
         print("No MCP servers configured")
     else:
@@ -276,6 +306,30 @@ if mode == "rate_then_ok":
         sys.stderr.write("429 Too Many Requests: rate limit exceeded\n")
         sys.stderr.flush()
         sys.exit(1)
+
+if mode == "rate_limited_then_hang":
+    # algo#1216 r18 F2 / admin#1495 r14 F5: call 1 emits the trusted 429
+    # diagnostic then HANGS past the idle bound (drain outcome "timeout",
+    # not a clean nonzero exit) — the recovery classification must
+    # dispatch the no-charge ladder before the generic non-clean charge.
+    # Call 2 falls through to the normal ok flow.
+    with open(argv_log, "r", encoding="utf-8") as h:
+        calls_so_far = sum(1 for _ in h)
+    if calls_so_far <= 1:
+        sys.stderr.write("429 Too Many Requests: rate limit exceeded\n")
+        sys.stderr.flush()
+        time.sleep(float(os.environ.get("FAKE_SLEEP", "30")))
+        sys.exit(1)
+
+if mode == "resume_missing_then_hang" and "--resume" in sys.argv:
+    # r18 F2 / r14 F5 second leg: the dead-resume diagnostic followed by
+    # a hang must clear the stale session (fresh_session), not charge
+    # generic timeout noise while --resume persists on every retry. The
+    # fresh relaunch (no --resume) falls through to the ok flow.
+    sys.stderr.write("No conversation found with the provided session id\n")
+    sys.stderr.flush()
+    time.sleep(float(os.environ.get("FAKE_SLEEP", "30")))
+    sys.exit(1)
 
 if mode == "resume_not_found" and "--resume" in sys.argv:
     # Only the RESUMED attempt fails; the fresh relaunch (no --resume)
@@ -477,6 +531,39 @@ if os.environ.get("FAKE_RESET_HANDOFFS") == "1":
     )
 if os.environ.get("FAKE_ROLL_HANDOFFS") == "1":
     text = text.replace(":g0123456789ab", ":gba9876543210")
+if os.environ.get("FAKE_SET_PENDING_OPERATION") == "1":
+    # r18 F2 third leg: the candidate records a PENDING external intent —
+    # the shape the sidecar gate must reconcile before any later launch.
+    old_qa = "\n".join([
+        "  qa:",
+        "    scenario: null",
+        '    status: "idle"',
+        "    repository_name_with_owner: null",
+        "    targets:",
+        "      github_assignees: []",
+        "      tracker_assignee_id: null",
+        "      tracker_assignee_name: null",
+        "    operations: []",
+        "    operation_results: {}",
+    ])
+    new_qa = "\n".join([
+        "  qa:",
+        '    scenario: "clean_unapproved"',
+        '    status: "pending"',
+        '    repository_name_with_owner: "Keeper-Dating/matchmaking"',
+        "    targets:",
+        '      github_assignees: ["tjkeeper"]',
+        "      tracker_assignee_id: null",
+        "      tracker_assignee_name: null",
+        '    operations: ["qa.github.replace_assignees:g0123456789ab"]',
+        "    operation_results:",
+        '      "qa.github.replace_assignees:g0123456789ab":',
+        '        status: "pending"',
+        "        attempts: 1",
+        '        started_at: "2026-08-08T00:00:00Z"',
+    ])
+    assert old_qa in text
+    text = text.replace(old_qa, new_qa, 1)
 corrupt_target = os.environ.get("FAKE_CORRUPT_FILE")
 if corrupt_target:
     with open(corrupt_target, "w", encoding="utf-8") as h:
@@ -498,6 +585,16 @@ if mode == "tamper_block":
     text = text.replace("child_session_id: null", 'child_session_id: "hacked"', 1)
 with open(candidate_path, "w", encoding="utf-8") as h:
     h.write(text)
+
+if mode == "candidate_then_hang":
+    # r18 F2 third leg: the candidate (with whatever intents the env flags
+    # recorded) is already written; emit the trusted 429 then hang. The
+    # no-charge ladder path must still preserve this candidate so the
+    # next launch's sidecar gate reconciles its intents.
+    sys.stderr.write("429 Too Many Requests: rate limit exceeded\n")
+    sys.stderr.flush()
+    time.sleep(float(os.environ.get("FAKE_SLEEP", "30")))
+    sys.exit(1)
 
 digest_raw = subprocess.run(
     [sys.executable, os.path.join(skill_dir, "scripts", "state_schema.py"),
@@ -744,6 +841,13 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         env = dict(os.environ)
         env["FAKE_MODE"] = mode
         env["FAKE_ARGV_LOG"] = str(self.argv_log)
+        # algo#1216 r18 F5: the universal containment gate refuses every
+        # uncontained launch. These fixtures run an operator-supplied fake
+        # child against non-Keeper-bound state — the exact hermetic-test
+        # carve-out the attestation names. Gate tests either bind a Keeper
+        # repository (where the attestation NEVER applies) or override
+        # this to "" to exercise the unattested block.
+        env.setdefault("MONITOR_RUNNER_UNCONTAINED_TEST_CHILD", "1")
         env.update(env_extra or {})
         return subprocess.run(
             [
@@ -1086,7 +1190,7 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         )
         self.assertEqual(blocked.returncode, 5, blocked.stdout + blocked.stderr)
         reason = self._summary(blocked)["reason"]
-        self.assertIn("grants no linear capability", reason)
+        self.assertIn("linear: no CONNECTED MCP row", reason)
         self.assertNotIn("no kill authority", reason)
 
     def test_clean_exit_with_surviving_group_member_is_charged(self) -> None:
@@ -2186,10 +2290,11 @@ class MonitorRunnerE2ETests(unittest.TestCase):
 
     def _capable_settings(self) -> str:
         """A hermetic user-settings file granting BOTH handoff capability
-        families (github via the gh CLI, linear via its MCP tool), so a
-        mapped-origin run passes the narrowed capability probe deterministically
-        without depending on the real ``~/.claude/settings.json`` or the fake's
-        ``mcp list`` fallthrough."""
+        families' ALLOW half (github via the gh CLI wildcard, linear via
+        its MCP tool token). Under the r18 F3 probe this alone proves
+        nothing — callers must also supply the connected linear row
+        (FAKE_MCP_LIST) and the gh permission probe fake
+        (MONITOR_RUNNER_BIN_GH) to pass."""
 
         path = self.dir / "capable-settings.json"
         path.write_text(
@@ -2214,12 +2319,14 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         self,
     ) -> None:
         # algo#1216 finding 3813491661's scenario (a Keeper-mapped run whose
-        # QA handoff aggregate is idle) is now PREEMPTED by the r17 F9
-        # containment gate on a non-delegating host: the capability probe
-        # passes (capable settings), but the mapped write-capable launch is
-        # refused BEFORE any child runs, so the manifest-level
-        # ``handoff_missing`` rejection is never reached through this path.
-        # The manifest predicate itself is pinned below the gate by
+        # QA handoff aggregate is idle) is now PREEMPTED by the r18 F5
+        # universal containment gate on a non-delegating host: the
+        # capability probe passes (capable settings), but the Keeper-bound
+        # write-capable launch is refused BEFORE any child runs — the
+        # harness's test-child attestation never applies to Keeper
+        # repositories — so the manifest-level ``handoff_missing``
+        # rejection is never reached through this path. The manifest
+        # predicate itself is pinned below the gate by
         # TerminalPlannedQaTests in test_monitor_runner_unit.
         self._bind_origin("git@github.com:Keeper-Dating/matchmaking.git")
         completed = self._run(
@@ -2227,6 +2334,8 @@ class MonitorRunnerE2ETests(unittest.TestCase):
             env_extra={
                 "FAKE_OUTCOME": "terminal",
                 "MONITOR_RUNNER_USER_SETTINGS": self._capable_settings(),
+                "FAKE_MCP_LIST": "linear: npx @linear/mcp - \u2713 Connected",
+                "MONITOR_RUNNER_BIN_GH": str(self._fake_gh(push=True)),
             },
         )
         self.assertEqual(completed.returncode, 5, completed.stderr)
@@ -2242,6 +2351,9 @@ class MonitorRunnerE2ETests(unittest.TestCase):
 
     def test_unmapped_repo_terminal_with_idle_handoffs_commits(self) -> None:
         # Idle handoffs stay valid for deliberately unmapped repositories.
+        # Under the r18 F5 universal gate this launch proceeds ONLY through
+        # the harness's operator attestation (non-Keeper binding + fake
+        # child) — the unattested twin below proves the same shape blocks.
         self._bind_origin("git@github.com:someone-else/sandbox.git")
         completed = self._run(
             budget="2000", env_extra={"FAKE_OUTCOME": "terminal"}
@@ -2251,6 +2363,46 @@ class MonitorRunnerE2ETests(unittest.TestCase):
             completed.returncode, 0, completed.stdout + completed.stderr
         )
         self.assertEqual(summary["runner_outcome"], "terminal")
+
+    def test_unattested_launch_blocks_for_any_repository(self) -> None:
+        # algo#1216 r18 F5: with no attestation, an ARBITRARY unmapped
+        # repository on a non-delegating host blocks before GO exactly like
+        # a mapped one — there is no silent degraded launch left. The empty
+        # override de-attests the harness default.
+        self._bind_origin("git@github.com:someone-else/sandbox.git")
+        completed = self._run(
+            budget="900", timeout=90, wait_scale="0.02", max_ticks="2",
+            env_extra={
+                "FAKE_OUTCOME": "terminal",
+                "MONITOR_RUNNER_UNCONTAINED_TEST_CHILD": "",
+            },
+        )
+        self.assertEqual(completed.returncode, 5, completed.stdout + completed.stderr)
+        summary = self._summary(completed)
+        self.assertIn("cgroup v2 delegation is unavailable", summary["reason"])
+        self.assertIn("EVERY repository", summary["reason"])
+        self.assertEqual(summary["ticks_completed"], 0)
+        self.assertFalse(self.argv_log.exists(), "the child must never execute")
+
+    def test_keeper_algo_binding_blocks_despite_attestation(self) -> None:
+        # algo#1216 r18 F5's exact repro: Keeper-Dating/algo is NOT in the
+        # QA map, and the r17 gate let it reach child execution through the
+        # degraded fallback. The Keeper floor now blocks it before GO even
+        # with the harness attestation set — the attestation never applies
+        # to a Keeper-bound repository — and the capability probe stays
+        # scoped to MAPPED repositories (no capability wording in the
+        # refusal).
+        self._bind_origin("git@github.com:Keeper-Dating/algo.git")
+        completed = self._run(
+            budget="900", timeout=90, wait_scale="0.02", max_ticks="2",
+            env_extra={"FAKE_OUTCOME": "terminal"},
+        )
+        self.assertEqual(completed.returncode, 5, completed.stdout + completed.stderr)
+        summary = self._summary(completed)
+        self.assertNotIn("capability", summary["reason"])
+        self.assertIn("cgroup v2 delegation is unavailable", summary["reason"])
+        self.assertEqual(summary["ticks_completed"], 0)
+        self.assertFalse(self.argv_log.exists(), "the child must never execute")
 
     def test_bare_vm_capability_probe_blocks_mapped_runs(self) -> None:
         # admin#1495 finding 3825265272 (re-eval-named closure): a mapped
@@ -2279,9 +2431,10 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         # probe (github via the gh CLI, linear via its MCP tool — both
         # required), a DIFFERENT probe-satisfaction path than the ``mcp list``
         # union in test_capability_completed_via_mcp_list_passes. Past the
-        # probe, the mapped run stops at the r17 F9 containment gate on this
-        # non-delegating host: the capability reason is absent, the cgroup
-        # reason is present, and the child never executes.
+        # probe, the mapped run stops at the r18 F5 universal containment
+        # gate on this non-delegating host (Keeper-bound, so the harness
+        # attestation never applies): the capability reason is absent, the
+        # cgroup reason is present, and the child never executes.
         self._bind_origin("git@github.com:Keeper-Dating/matchmaking.git")
         provisioned = self.dir / "provisioned-settings.json"
         provisioned.write_text(
@@ -2294,6 +2447,8 @@ class MonitorRunnerE2ETests(unittest.TestCase):
             env_extra={
                 "MONITOR_RUNNER_USER_SETTINGS": str(provisioned),
                 "FAKE_OUTCOME": "terminal",
+                "FAKE_MCP_LIST": "linear: npx @linear/mcp - \u2713 Connected",
+                "MONITOR_RUNNER_BIN_GH": str(self._fake_gh(push=True)),
             },
         )
         self.assertEqual(completed.returncode, 5, completed.stderr)
@@ -2341,8 +2496,107 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 5, completed.stdout + completed.stderr)
         summary = self._summary(completed)
-        self.assertIn("github, linear", summary["reason"])
+        self.assertIn("github: denied by permissions.deny", summary["reason"])
+        self.assertIn("linear: denied by permissions.deny", summary["reason"])
         self.assertEqual(summary["ticks_completed"], 0)
+
+    def _fake_gh(self, push: bool) -> "Path":
+        # r18 F3: the gh mutation probe runs a real subprocess — tests pin
+        # it to a local fake so no network is touched.
+        script = self.dir / f"fake-gh-{'push' if push else 'nopush'}.sh"
+        script.write_text(
+            "#!/bin/sh\n"
+            f"printf '{{\"permissions\":{{\"push\":{str(push).lower()}}}}}'\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        return script
+
+    def test_read_only_grants_and_unrelated_tokens_block(self) -> None:
+        # algo#1216 r18 F3's exact repro class: read-only GitHub/Linear
+        # grants and unrelated tokens satisfied the substring probe. The
+        # exact-operation grammar grants nothing for any of these.
+        self._bind_origin("git@github.com:Keeper-Dating/matchmaking.git")
+        settings = self.dir / "read-only.json"
+        settings.write_text(
+            '{"permissions": {"allow": ["Bash(gh pr view:*)",'
+            ' "mcp__github__pull_request_read", "mcp__linear__get_issue",'
+            ' "Read(~/github-notes/**)"]},'
+            ' "mcpServers": {"linear": {"command": "npx"}}}',
+            encoding="utf-8",
+        )
+        completed = self._run(
+            budget="900", timeout=60,
+            env_extra={
+                "MONITOR_RUNNER_USER_SETTINGS": str(settings),
+                "FAKE_MCP_LIST_EMPTY": "1",
+            },
+        )
+        self.assertEqual(completed.returncode, 5, completed.stdout + completed.stderr)
+        summary = self._summary(completed)
+        self.assertIn("github: no CONNECTED MCP row", summary["reason"])
+        self.assertIn("linear: no CONNECTED MCP row", summary["reason"])
+        self.assertEqual(summary["ticks_completed"], 0)
+
+    def test_unhealthy_mcp_rows_never_grant(self) -> None:
+        # admin#1495 r14 F9's exact repro: failed / auth-required /
+        # pending / disconnected / malformed rows counted as grants under
+        # the substring parser. A mixed-health listing (github connected,
+        # linear failed) must block naming linear only.
+        self._bind_origin("git@github.com:Keeper-Dating/matchmaking.git")
+        settings = self.dir / "empty-perms.json"
+        settings.write_text("{}", encoding="utf-8")
+        listing = (
+            "github: gh-mcp - \u2713 Connected\n"
+            "linear: npx @linear/mcp - \u2717 Failed to connect\n"
+            "other: srv - authentication required\n"
+            "pending-one: srv - pending\n"
+            "dropped: srv - disconnected\n"
+            "malformed line without separator\n"
+        )
+        completed = self._run(
+            budget="900", timeout=60,
+            env_extra={
+                "MONITOR_RUNNER_USER_SETTINGS": str(settings),
+                "FAKE_MCP_LIST": listing,
+            },
+        )
+        self.assertEqual(completed.returncode, 5, completed.stdout + completed.stderr)
+        summary = self._summary(completed)
+        self.assertNotIn("github:", summary["reason"])
+        self.assertIn("linear: no CONNECTED MCP row", summary["reason"])
+
+    def test_gh_probe_failure_and_sanitized_probe_env(self) -> None:
+        # r18 F3 second half: an exact Bash grant proves policy, not a
+        # live credential — a repository probe reporting push=false leaves
+        # github unproven. The same run pins the sanitized environment:
+        # the probe invocations must not inherit ambient CLAUDE_CODE_*
+        # overrides (recorded by the fake claude's env log).
+        self._bind_origin("git@github.com:Keeper-Dating/matchmaking.git")
+        settings = self.dir / "gh-only.json"
+        settings.write_text(
+            '{"permissions": {"allow": ["Bash(gh *)"]}}', encoding="utf-8"
+        )
+        env_log = self.dir / "probe-env.jsonl"
+        completed = self._run(
+            budget="900", timeout=60,
+            env_extra={
+                "MONITOR_RUNNER_USER_SETTINGS": str(settings),
+                "FAKE_MCP_LIST": "linear: npx - \u2713 Connected",
+                "MONITOR_RUNNER_BIN_GH": str(self._fake_gh(push=False)),
+                "FAKE_ENV_LOG": str(env_log),
+                "CLAUDE_CODE_SUBAGENT_MODEL": "ambient-override",
+            },
+        )
+        self.assertEqual(completed.returncode, 5, completed.stdout + completed.stderr)
+        self.assertIn(
+            "gh CLI route granted but the non-mutating repository probe",
+            self._summary(completed)["reason"],
+        )
+        recorded = env_log.read_text(encoding="utf-8").splitlines()
+        self.assertTrue(recorded, "the mcp list probe must have run")
+        for line in recorded:
+            self.assertNotIn("CLAUDE_CODE_SUBAGENT_MODEL", line)
 
     def test_unrelated_mcp_server_blocks_mapped_run(self) -> None:
         # A configured-but-irrelevant MCP server grants neither family; the
@@ -2376,10 +2630,14 @@ class MonitorRunnerE2ETests(unittest.TestCase):
             env_extra={
                 "MONITOR_RUNNER_USER_SETTINGS": str(settings),
                 "FAKE_MCP_LIST_EMPTY": "1",
+                "MONITOR_RUNNER_BIN_GH": str(self._fake_gh(push=True)),
             },
         )
         self.assertEqual(completed.returncode, 5, completed.stdout + completed.stderr)
-        self.assertIn("grants no linear capability", self._summary(completed)["reason"])
+        self.assertIn(
+            "linear: no CONNECTED MCP row",
+            self._summary(completed)["reason"],
+        )
 
     def test_capability_completed_via_mcp_list_passes(self) -> None:
         # github from settings, linear from the exact-invocation `mcp list`
@@ -2398,8 +2656,9 @@ class MonitorRunnerE2ETests(unittest.TestCase):
             budget="900", timeout=90, wait_scale="0.02", max_ticks="2",
             env_extra={
                 "MONITOR_RUNNER_USER_SETTINGS": str(settings),
-                "FAKE_MCP_LIST": "linear: connected",
+                "FAKE_MCP_LIST": "linear: npx @linear/mcp - \u2713 Connected",
                 "FAKE_OUTCOME": "terminal",
+                "MONITOR_RUNNER_BIN_GH": str(self._fake_gh(push=True)),
             },
         )
         self.assertEqual(completed.returncode, 5, completed.stderr)
@@ -3173,6 +3432,89 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         self.assertNotIn("--resume", calls[2], "fresh relaunch must drop --resume")
         extract = self._extract()
         self.assertEqual(extract["monitor_cli"]["child_session_id"], "fake-sid-2")
+
+    def test_rate_limit_behind_a_hang_takes_the_ladder_not_the_budget(self) -> None:
+        # algo#1216 r18 F2 / admin#1495 r14 F5: a trusted rate-limit
+        # diagnostic followed by a hang previously charged the generic
+        # monitor-child:timeout BEFORE the ladder dispatch could run —
+        # three such hangs consumed the whole failure budget and blocked
+        # a recoverable run. The non-clean drain must take the no-charge
+        # ladder; the laddered retry then succeeds.
+        completed = self._run(
+            mode="rate_limited_then_hang", budget="900", timeout=90,
+            wait_scale="0.02", max_ticks="2",
+            extra_args=["--child-idle-timeout", "2"],
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        summary = self._summary(completed)
+        self.assertEqual(summary["ticks_completed"], 1)
+        self.assertEqual(len(self._argv_calls()), 2, "one laddered retry then success")
+        extract = self._extract()
+        charges = [
+            f["signature"]
+            for f in extract["monitor_cli"]["child_failures"]
+            # The streak-reset marker a SUCCESSFUL tick appends is not a
+            # charge; only real failure signatures spend the budget.
+            if f["signature"] != "monitor-child:success"
+        ]
+        self.assertEqual(charges, [], "the liveness ladder never charges the budget")
+        self.assertIsNone(extract["monitor_cli"]["liveness"], "rung clears after success")
+
+    def test_resume_miss_behind_a_hang_clears_the_session_fresh(self) -> None:
+        # r18 F2 / r14 F5 second leg: the dead-resume diagnostic behind a
+        # hang must clear the stale session and relaunch WITHOUT --resume.
+        # Previously the generic charge ran first and the stale session
+        # was never cleared — every laddered retry resumed the dead
+        # target again until three strikes blocked the run.
+        first = self._run(budget="365")
+        self.assertEqual(self._summary(first)["child_session_id"], "fake-sid-1")
+        completed = self._run(
+            mode="resume_missing_then_hang", budget="2000", timeout=90,
+            wait_scale="0.02", max_ticks="2",
+            env_extra={"FAKE_SID": "fake-sid-2"},
+            extra_args=["--child-idle-timeout", "2"],
+        )
+        summary = self._summary(completed)
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertEqual(summary["ticks_completed"], 1)
+        self.assertEqual(summary["child_session_id"], "fake-sid-2")
+        calls = self._argv_calls()
+        self.assertEqual(len(calls), 3)
+        self.assertIn("--resume", calls[1])
+        self.assertNotIn("--resume", calls[2], "fresh relaunch must drop --resume")
+        extract = self._extract()
+        charges = [
+            f["signature"]
+            for f in extract["monitor_cli"]["child_failures"]
+            if f["signature"] != "monitor-child:success"
+        ]
+        self.assertEqual(charges, [], "fresh_session never charges the budget")
+
+    def test_laddered_hang_still_preserves_the_pending_sidecar(self) -> None:
+        # r18 F2 third leg: taking the no-charge ladder must not skip
+        # candidate preservation. A hung child that already recorded a
+        # pending external intent gates the NEXT launch through sidecar
+        # reconciliation instead of silently relaunching a write-capable
+        # child — and the hang itself still charges nothing.
+        completed = self._run(
+            mode="candidate_then_hang", budget="900", timeout=90,
+            wait_scale="0.02", max_ticks="2",
+            env_extra={"FAKE_SET_PENDING_OPERATION": "1"},
+            extra_args=["--child-idle-timeout", "2"],
+        )
+        self.assertEqual(completed.returncode, 5, completed.stdout + completed.stderr)
+        summary = self._summary(completed)
+        self.assertIn("unreconciled pending external intents", summary.get("reason", ""))
+        self.assertEqual(
+            len(self._argv_calls()), 1,
+            "the pending sidecar must gate the second launch",
+        )
+        extract = self._extract()
+        signatures = [f["signature"] for f in extract["monitor_cli"]["child_failures"]]
+        self.assertEqual(
+            signatures, [],
+            "the laddered hang charges nothing; only the sidecar gate acts",
+        )
 
     def test_auth_signature_survives_stderr_noise(self) -> None:
         # opus L3: 30 noise lines would evict the auth line from the rolling

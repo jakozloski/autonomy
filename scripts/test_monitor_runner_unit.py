@@ -1361,131 +1361,18 @@ class TerminalPlannedQaTests(unittest.TestCase):
             )
 
 
-class CapabilityFamilyResolutionTests(unittest.TestCase):
-    # admin#1495 finding 3825265272 / algo#1216 F3: the narrowed probe accepts
-    # a mapped run only when the resolved user-scope surface grants BOTH the
-    # github and linear handoff families. These pin the deterministic core the
-    # e2e probe tests exercise end-to-end — token matching and deny precedence.
-
-    def test_family_of_maps_each_token_shape(self) -> None:
-        cases = {
-            "mcp__linear__create_issue": "linear",
-            "Linear": "linear",
-            "mcp__github__create_pull_request": "github",
-            "Bash(gh pr create)": "github",
-            "bash(gh ": "github",
-            "GitHub": "github",
-            "Bash(git push)": None,
-            "mcp__sentry__event": None,
-            "": None,
-        }
-        for token, expected in cases.items():
-            self.assertEqual(
-                monitor_runner._capability_family_of(token), expected, token
-            )
-
-    def test_linear_wins_when_a_token_names_both(self) -> None:
-        # linear is tested first so a single token resolves to exactly one
-        # family — a server literally named "linear-github" counts as linear,
-        # never silently as github.
-        self.assertEqual(
-            monitor_runner._capability_family_of("linear-github-bridge"),
-            "linear",
-        )
-
-    def test_allow_list_unions_both_families(self) -> None:
-        self.assertEqual(
-            monitor_runner._resolved_capability_families(
-                {"permissions": {"allow": ["Bash(gh *)", "mcp__linear__*"]}},
-                None,
-            ),
-            {"github", "linear"},
-        )
-
-    def test_github_only_allow_is_incomplete(self) -> None:
-        resolved = monitor_runner._resolved_capability_families(
-            {"permissions": {"allow": ["Bash(gh *)"]}}, None
-        )
-        self.assertEqual(resolved, {"github"})
-        self.assertFalse(monitor_runner.REQUIRED_CHILD_CAPABILITIES <= resolved)
-
-    def test_catch_all_deny_removes_every_family(self) -> None:
-        self.assertEqual(
-            monitor_runner._resolved_capability_families(
-                {
-                    "permissions": {
-                        "allow": ["mcp__github__*", "mcp__linear__*"],
-                        "deny": ["*"],
-                    }
-                },
-                None,
-            ),
-            set(),
-        )
-
-    def test_explicit_family_deny_beats_its_own_allow(self) -> None:
-        # deny precedence mirrors Claude Code: an allow + a same-family deny
-        # nets to denied, so a run granting github but denying linear is not
-        # complete even though both appear.
-        self.assertEqual(
-            monitor_runner._resolved_capability_families(
-                {
-                    "permissions": {
-                        "allow": ["Bash(gh *)", "mcp__linear__*"],
-                        "deny": ["mcp__linear__*"],
-                    }
-                },
-                None,
-            ),
-            {"github"},
-        )
-
-    def test_mcp_servers_keys_grant_families(self) -> None:
-        self.assertEqual(
-            monitor_runner._resolved_capability_families(
-                {"mcpServers": {"linear": {}, "github": {}, "filesystem": {}}},
-                None,
-            ),
-            {"github", "linear"},
-        )
-
-    def test_listing_text_completes_a_partial_surface(self) -> None:
-        # settings grant github; the exact-invocation `mcp list` supplies the
-        # linear half — the union is complete.
-        self.assertEqual(
-            monitor_runner._resolved_capability_families(
-                {"permissions": {"allow": ["Bash(gh *)"]}},
-                "linear: connected\nfilesystem: connected",
-            ),
-            {"github", "linear"},
-        )
-
-    def test_non_dict_settings_falls_back_to_listing_only(self) -> None:
-        # a missing/unparseable settings file (None) contributes nothing; the
-        # listing alone must still resolve families.
-        self.assertEqual(
-            monitor_runner._resolved_capability_families(
-                None, "github: connected\nlinear: connected"
-            ),
-            {"github", "linear"},
-        )
-
-    def test_malformed_tokens_are_ignored_not_crashing(self) -> None:
-        # non-string entries in allow/deny and a non-list allow must be
-        # skipped, never raise — hostile or hand-edited settings stay safe.
-        self.assertEqual(
-            monitor_runner._resolved_capability_families(
-                {
-                    "permissions": {
-                        "allow": ["mcp__linear__*", 7, None, {"x": 1}],
-                        "deny": "not-a-list",
-                    }
-                },
-                None,
-            ),
-            {"linear"},
-        )
-
+# CapabilityFamilyResolutionTests (r17) was REPLACED by
+# CapabilityGrammarTests + the capability-probe e2e set (algo#1216 r18 F3
+# / admin#1495 r14 F9): the helpers it pinned resolved families from name
+# substrings, granted them from mcpServers configuration presence, and
+# accepted any listing line naming a family — each shape R2 demonstrated
+# as a live false-grant. Its still-valid concerns carry forward: the
+# allow-union and github-only-incomplete pins live in
+# test_mutation_grant_matrix + the github-only e2e block test; deny
+# precedence (explicit and catch-all) lives in
+# test_denied_families_shapes + the deny-all e2e; malformed-token
+# tolerance lives in test_mutation_grant_matrix and unknown-shape
+# fail-closed in test_denied_families_shapes.
 
 class SidecarQuarantineRenameTests(unittest.TestCase):
     # admin#1495 F5: quarantine must be ONE atomic no-replace move, never
@@ -1777,6 +1664,259 @@ class AttemptContainmentTests(unittest.TestCase):
         while _time.monotonic() < deadline and containment.live_pids():
             _time.sleep(0.2)
         self.assertEqual(containment.live_pids(), [])
+
+    def test_adopt_fails_closed_on_an_unwritable_membership_file(self) -> None:
+        # algo#1216 r18 F5 (adoption-failure leg): a target whose
+        # cgroup.procs cannot be written reports False — the runner then
+        # holds containment=None with the degraded:cgroup-adopt-failed
+        # record and the universal gate refuses the launch. (On a plain
+        # filesystem write_text would CREATE the file, so the fixture
+        # pre-creates it read-only; the real-kernel rejection is covered
+        # by the delegation-gated dead-pid test below.)
+        tmp = Path(tempfile.mkdtemp(prefix="unit-cgroup-roprocs-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        procs = tmp / "cgroup.procs"
+        procs.write_text("")
+        procs.chmod(0o444)
+        self.addCleanup(procs.chmod, 0o644)
+        containment = monitor_runner.AttemptContainment(tmp)
+        self.assertFalse(containment.adopt(os.getpid()))
+
+    @unittest.skipUnless(
+        Path("/sys/fs/cgroup").is_dir()
+        and os.access("/sys/fs/cgroup", os.W_OK),
+        "requires cgroup v2 delegation",
+    )
+    def test_real_adoption_of_a_dead_pid_fails_closed(self) -> None:
+        # r18 F5: the kernel rejects adopting a reaped pid (ESRCH) — the
+        # REAL adoption-failure path, not the fake-fs proxy above.
+        containment = monitor_runner.AttemptContainment.create("d" * 32)
+        if containment is None:
+            self.skipTest("cgroup delegation unavailable")
+        self.addCleanup(containment.remove)
+        import subprocess as sp
+
+        proc = sp.Popen([sys.executable, "-c", "pass"])
+        proc.wait(timeout=10)  # fully reaped: the pid no longer exists
+        self.assertFalse(containment.adopt(proc.pid))
+
+    @unittest.skipUnless(
+        Path("/sys/fs/cgroup").is_dir()
+        and os.access("/sys/fs/cgroup", os.W_OK),
+        "requires cgroup v2 delegation",
+    )
+    def test_concurrent_attempts_are_isolated_and_cleaned(self) -> None:
+        # r18 F5 / admin#1495 r14 F2 (package half of the host smoke):
+        # two attempts hold disjoint memberships; killing one leaves the
+        # other's member alive; remove() leaves no directory behind.
+        import subprocess as sp
+        import time as _time
+
+        first = monitor_runner.AttemptContainment.create("a1" * 16)
+        second = monitor_runner.AttemptContainment.create("b2" * 16)
+        if first is None or second is None:
+            if first is not None:
+                first.remove()
+            if second is not None:
+                second.remove()
+            self.skipTest("cgroup delegation unavailable")
+        procs = [
+            sp.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+            for _ in range(2)
+        ]
+        try:
+            self.assertTrue(first.adopt(procs[0].pid))
+            self.assertTrue(second.adopt(procs[1].pid))
+            self.assertEqual(first.live_pids(), [procs[0].pid])
+            self.assertEqual(second.live_pids(), [procs[1].pid])
+            first.kill()
+            deadline = _time.monotonic() + 10
+            while _time.monotonic() < deadline and first.live_pids():
+                _time.sleep(0.2)
+            self.assertEqual(first.live_pids(), [])
+            self.assertEqual(
+                second.live_pids(), [procs[1].pid],
+                "killing one attempt must not touch its sibling",
+            )
+        finally:
+            for proc in procs:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait(timeout=10)
+            for containment in (first, second):
+                containment.kill()
+                containment.remove()
+        self.assertFalse(first.path.exists(), "remove() must clean the dir")
+        self.assertFalse(second.path.exists(), "remove() must clean the dir")
+
+
+class CapabilityGrammarTests(unittest.TestCase):
+    """algo#1216 r18 F3 / admin#1495 r14 F9: exact mutation-operation
+    grammar and per-row connected-status parsing — the substring matcher
+    granted families from read-only tokens, unrelated names, and
+    failed/pending rows."""
+
+    def test_mutation_grant_matrix(self) -> None:
+        cases = {
+            "Bash(gh *)": ("github", "bash"),
+            "Bash(gh:*)": ("github", "bash"),
+            "Bash(gh api:*)": ("github", "bash"),
+            "Bash(gh pr *)": ("github", "bash"),
+            "mcp__github__*": ("github", "mcp"),
+            "mcp__github__update_pull_request": ("github", "mcp"),
+            "mcp__plugin_github_github__issue_write": ("github", "mcp"),
+            "mcp__linear__*": ("linear", "mcp"),
+            "mcp__linear__update_issue": ("linear", "mcp"),
+            "mcp__plugin_linear_linear__*": ("linear", "mcp"),
+            # read-only, literal, lookalike, and unrelated shapes grant nothing
+            "Bash(gh pr view:*)": None,
+            "Bash(gh pr edit --add-assignee x)": None,
+            "Bash(ghq *)": None,
+            "mcp__github__pull_request_read": None,
+            "mcp__linear__get_issue": None,
+            "mcp__github_evil__*": None,
+            "Read(~/github-notes/**)": None,
+            "linear": None,
+            "WebFetch(domain:github.com)": None,
+        }
+        for token, want in cases.items():
+            with self.subTest(token=token):
+                self.assertEqual(monitor_runner._mutation_grant(token), want)
+
+    def test_denied_families_shapes(self) -> None:
+        every = set(monitor_runner.REQUIRED_CHILD_CAPABILITIES)
+        self.assertEqual(monitor_runner._denied_families(None), set())
+        # unknown shapes deny everything (fail closed)
+        self.assertEqual(monitor_runner._denied_families("nope"), every)
+        self.assertEqual(monitor_runner._denied_families([1]), every)
+        self.assertEqual(monitor_runner._denied_families(["*"]), every)
+        self.assertEqual(
+            monitor_runner._denied_families(["mcp__linear__*"]), {"linear"}
+        )
+        # denying ANY family tool conservatively denies the family
+        self.assertEqual(
+            monitor_runner._denied_families(["mcp__github__get_me"]),
+            {"github"},
+        )
+        self.assertEqual(
+            monitor_runner._denied_families(["Bash(rm *)"]), set()
+        )
+
+    def test_mcp_row_health_matrix(self) -> None:
+        listing = "\n".join(
+            (
+                "github: gh-mcp - ✓ Connected",
+                "linear: npx @linear/mcp - ✗ Failed to connect",
+                "auth-one: srv - authentication required",
+                "pending-one: srv - pending",
+                "dropped: srv - disconnected",
+                "erroring: srv - error while connecting",
+                "notyet: srv - not connected",
+                "wordy: srv - connected",
+                "unknown-status: srv - warming up",
+                "malformed line with no separator",
+                "tricky: fails yet says connected",
+            )
+        )
+        rows = monitor_runner._parse_mcp_list_rows(listing)
+        self.assertTrue(rows["github"])
+        self.assertTrue(rows["wordy"])
+        for name in (
+            "linear",
+            "auth-one",
+            "pending-one",
+            "dropped",
+            "erroring",
+            "notyet",
+            "unknown-status",
+            "tricky",
+        ):
+            self.assertFalse(rows[name], name)
+        self.assertNotIn("malformed line with no separator", rows)
+
+    def test_probe_timeout_blocks_fail_closed(self) -> None:
+        # admin#1495 r14 F9's "timeout" output: a hung `mcp list` proves
+        # nothing — no family is granted and the probe blocks.
+        runner = _runner("claude-opus-5", None)
+        runner.repository_hint = "keeper-dating/matchmaking"
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Path(tmp) / "settings.json"
+            settings.write_text("{}", encoding="utf-8")
+            with mock.patch.dict(
+                os.environ, {"MONITOR_RUNNER_USER_SETTINGS": str(settings)}
+            ), mock.patch.object(
+                monitor_runner.subprocess,
+                "run",
+                side_effect=monitor_runner.subprocess.TimeoutExpired(
+                    cmd="mcp list", timeout=30
+                ),
+            ):
+                with self.assertRaises(RunnerExit) as caught:
+                    runner._child_capability_probe({"monitor_cli": {}})
+        self.assertEqual(caught.exception.code, 5)
+        self.assertIn("no CONNECTED MCP row", caught.exception.reason)
+
+
+class ContainmentRefusalDecisionTests(unittest.TestCase):
+    """algo#1216 r18 F5: the universal-gate decision matrix, pinned at the
+    decision layer. The e2e block tests pin the process path (stdin closed
+    before GO, wrapper reaped, RunnerExit 5); this pins WHO may proceed:
+    nothing uncontained, except an operator-attested hermetic test child
+    on a repository that is not Keeper-bound. Both degraded records —
+    creation failure and adoption failure — refuse identically."""
+
+    _CREATE_FAILED = "degraded:no-cgroup-v2-delegation"
+    _ADOPT_FAILED = "degraded:cgroup-adopt-failed"
+
+    def _decide(
+        self, record: str, repository: str | None, attested: bool
+    ) -> str | None:
+        runner = _runner("claude-opus-5", None)
+        extract = {"monitor_cli": {"repository": repository}}
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MONITOR_RUNNER_UNCONTAINED_TEST_CHILD", None)
+            if attested:
+                os.environ["MONITOR_RUNNER_UNCONTAINED_TEST_CHILD"] = "1"
+            return runner._containment_refusal(record, extract)
+
+    def test_keeper_bound_refuses_even_when_attested(self) -> None:
+        # The floor is the OWNER, not the QA map — r18 F5's repro was
+        # exact-Algo, which the QA map excludes.
+        for repository in (
+            "Keeper-Dating/matchmaking",
+            "Keeper-Dating/algo",
+            "keeper-dating/ALGO",
+        ):
+            for record in (self._CREATE_FAILED, self._ADOPT_FAILED):
+                with self.subTest(repository=repository, record=record):
+                    refusal = self._decide(record, repository, attested=True)
+                    self.assertIsNotNone(refusal)
+                    self.assertIn(record, refusal)
+                    self.assertIn("EVERY repository", refusal)
+
+    def test_unattested_refuses_for_every_repository(self) -> None:
+        for repository in (
+            "Keeper-Dating/matchmaking",
+            "someone-else/sandbox",
+            None,
+        ):
+            for record in (self._CREATE_FAILED, self._ADOPT_FAILED):
+                with self.subTest(repository=repository, record=record):
+                    refusal = self._decide(record, repository, attested=False)
+                    self.assertIsNotNone(refusal)
+                    self.assertIn(record, refusal)
+                    self.assertIn(
+                        "MONITOR_RUNNER_CGROUP_ROOT", refusal,
+                        "the refusal must name the host remediation",
+                    )
+
+    def test_attested_non_keeper_proceeds(self) -> None:
+        for repository in ("someone-else/sandbox", None):
+            for record in (self._CREATE_FAILED, self._ADOPT_FAILED):
+                with self.subTest(repository=repository, record=record):
+                    self.assertIsNone(
+                        self._decide(record, repository, attested=True)
+                    )
 
 
 class OriginTrustTests(unittest.TestCase):

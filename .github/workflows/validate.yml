@@ -15,5 +15,16 @@ jobs:
           python-version: "3.12"
       - name: Validate package structure
         run: python3 scripts/validate_package.py
+      - name: Enforce package-wide Ruff F821
+        # algo#1216 r18 F1: an undefined module global (import os missing
+        # under an os.killpg call) compiles fine and NameErrors only at
+        # call time — inside a broad except it silently becomes the
+        # handler's failure path. scripts/test_static_globals.py enforces
+        # the same class dependency-free in every consumer repository's
+        # CI; this step is the literal Ruff gate where installing a
+        # linter is cheap.
+        run: |
+          pip install ruff==0.8.4
+          ruff check --select F821 --no-cache scripts/
       - name: Run unit tests
         run: python3 -m unittest discover -s scripts -p 'test_*.py' -v

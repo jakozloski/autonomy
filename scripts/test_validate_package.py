@@ -1581,9 +1581,12 @@ class EntryPointScanTests(unittest.TestCase):
             self.assertTrue(
                 any("3813789192" in error for error in errors), errors
             )
+            # r14 F10: delegation is a structurally parsed link resolving
+            # to the package — the earlier bare-path prose form is now one
+            # of the rejected shapes (pinned in the dedicated test below).
             legacy.write_text(
-                "Delegate: read .agents/skills/autonomy/SKILL.md and"
-                " follow it.\n",
+                "Delegate: read [the autonomy skill]"
+                "(../../.agents/skills/autonomy/SKILL.md) and follow it.\n",
                 encoding="utf-8",
             )
             self.assertEqual(_validate_entry_points(package), [])
@@ -1796,7 +1799,8 @@ class EntryPointScanTests(unittest.TestCase):
             legacy = repo / ".claude" / "skills" / "autonomous-workflow"
             legacy.mkdir(parents=True)
             (legacy / "SKILL.md").write_text(
-                "Superseded: read .agents/skills/autonomy/SKILL.md.\n",
+                "Superseded: read [the autonomy skill]"
+                "(../../../.agents/skills/autonomy/SKILL.md).\n",
                 encoding="utf-8",
             )
             self.assertEqual(_validate_entry_points(package), [])
@@ -1810,7 +1814,9 @@ class EntryPointScanTests(unittest.TestCase):
                 any("r13 F10" in error for error in errors), errors
             )
             (legacy / "SKILL.md").write_text(
-                "Delegates to .agents/skills/autonomy.\n", encoding="utf-8"
+                "Delegates to [the package]"
+                "(../../../.agents/skills/autonomy).\n",
+                encoding="utf-8",
             )
             # a push filter missing the legacy root fails structurally
             wf.write_text(
@@ -1843,30 +1849,63 @@ class EntryPointScanTests(unittest.TestCase):
                 sum(".gitignore" in error for error in errors), 2, errors
             )
 
-    def test_delegates_to_autonomy_accepts_both_link_forms(self) -> None:
-        # r13 F10: the delegation check must accept BOTH canonical link
-        # forms. Anchoring only on "skills/autonomy" false-rejected the real
-        # superseded root stub, whose operative link is the verbatim
-        # sibling-relative `[`autonomy`](../autonomy/SKILL.md)` — that
-        # contains "autonomy/SKILL.md" but never "skills/autonomy".
+    def test_delegation_requires_a_resolving_structural_link(self) -> None:
+        # admin#1495 r14 F10 (supersedes the r13 substring predicate,
+        # whose both-token acceptance is preserved below as the two
+        # RESOLVING link forms): delegation is a structurally parsed
+        # markdown link whose target, resolved from the SOURCE file's
+        # real directory, is exactly the canonical package. The substring
+        # form accepted `../evil-autonomy/SKILL.md` (suffix lookalike)
+        # and prose that names the path while refusing to follow it.
         from validate_package import _delegates_to_autonomy
 
-        # path-style token: commands and the .claude/.agents skill dirs
-        self.assertTrue(
-            _delegates_to_autonomy("read .agents/skills/autonomy/SKILL.md")
-        )
-        self.assertTrue(_delegates_to_autonomy("delegates to skills/autonomy"))
-        # sibling-relative token, verbatim from the real root stub. It has
-        # NO "skills/autonomy" substring, so this assertion is what turns
-        # red if the helper reverts to a single accepted token.
-        sibling = "Invoke the [`autonomy`](../autonomy/SKILL.md) skill instead"
-        self.assertNotIn("skills/autonomy", sibling)
-        self.assertTrue(_delegates_to_autonomy(sibling))
-        # neither token, and an HTML-commented mention, still fail closed
-        self.assertFalse(_delegates_to_autonomy("run the legacy flow directly"))
-        self.assertFalse(
-            _delegates_to_autonomy("legacy\n<!-- ../autonomy/SKILL.md -->\n")
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            package = repo / ".agents" / "skills" / "autonomy"
+            package.mkdir(parents=True)
+            legacy = repo / ".agents" / "skills" / "autonomous-workflow"
+            legacy.mkdir(parents=True)
+            source = legacy / "SKILL.md"
+            commands = repo / ".cursor" / "commands"
+            commands.mkdir(parents=True)
+            pointer = commands / "autonomous-feature.md"
+
+            # both canonical link forms, each from its real caller's
+            # location (r13 F10's both-form guarantee, now by resolution)
+            self.assertTrue(_delegates_to_autonomy(
+                "Invoke the [`autonomy`](../autonomy/SKILL.md) skill",
+                source, package,
+            ))
+            self.assertTrue(_delegates_to_autonomy(
+                "See [the canonical workflow]"
+                "(../../.agents/skills/autonomy/SKILL.md).",
+                pointer, package,
+            ))
+            # a link to the package DIRECTORY resolves too
+            self.assertTrue(_delegates_to_autonomy(
+                "See [the package](../autonomy).", source, package,
+            ))
+            rejected = (
+                # bare-path prose is a mention, not a delegation
+                "read .agents/skills/autonomy/SKILL.md and follow it",
+                "delegates to skills/autonomy",
+                # negated prose mention — r14 F10's exact fixture
+                "Do not follow ../autonomy/SKILL.md; execute the legacy"
+                " workflow.",
+                # suffix and prefix lookalikes as REAL links
+                "[go](../evil-autonomy/SKILL.md)",
+                "[go](../autonomy-evil/SKILL.md)",
+                # commented-out link still never counts (finding 3813789192)
+                "legacy\n<!-- [go](../autonomy/SKILL.md) -->\n",
+                # external-scheme target never resolves locally
+                "[docs](https://example.com/autonomy/SKILL.md)",
+                "run the legacy flow directly",
+            )
+            for text in rejected:
+                with self.subTest(text=text):
+                    self.assertFalse(
+                        _delegates_to_autonomy(text, source, package)
+                    )
 
     def test_legacy_root_sibling_relative_link_is_accepted(self) -> None:
         # r13 F10 end to end: a superseded root whose ONLY delegation is the
@@ -1908,6 +1947,165 @@ class EntryPointScanTests(unittest.TestCase):
             self.assertNotIn("skills/autonomy", stub)
             (legacy / "SKILL.md").write_text(stub, encoding="utf-8")
             self.assertEqual(_validate_entry_points(package), [])
+
+    def test_cursor_legacy_root_is_enumerated_with_blob_triggers(self) -> None:
+        # admin#1495 r14 F8: the tracked .cursor/skills/autonomous-workflow
+        # root was outside enumeration and both CI filters — a root-only
+        # retarget could restore a nondelegating Cursor workflow without
+        # running Skill Package Checks. Also pins the symlink-blob trigger
+        # rule: "root/**" never matches the symlink blob itself.
+        import shutil as _shutil
+
+        from validate_package import _validate_entry_points
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            (repo / ".git").mkdir(parents=True)
+            package = repo / ".agents" / "skills" / "autonomy"
+            package.mkdir(parents=True)
+            real_legacy = repo / ".agents" / "skills" / "autonomous-workflow"
+            real_legacy.mkdir(parents=True)
+            (real_legacy / "SKILL.md").write_text(
+                "Superseded. Invoke [`autonomy`](../autonomy/SKILL.md).\n",
+                encoding="utf-8",
+            )
+            cursor_skills = repo / ".cursor" / "skills"
+            cursor_skills.mkdir(parents=True)
+            cursor_root = cursor_skills / "autonomous-workflow"
+            cursor_root.symlink_to(
+                Path("..") / ".." / ".agents" / "skills" / "autonomous-workflow"
+            )
+            workflows = repo / ".github" / "workflows"
+            workflows.mkdir(parents=True)
+            wf = workflows / "skill-package-checks.yml"
+
+            def wf_with(*paths: str) -> None:
+                # the commands filter is required unconditionally whenever
+                # the workflow exists (finding 3816225750)
+                entries = "".join(
+                    f'      - "{p}"\n'
+                    for p in paths + (".cursor/commands/autonomous-*.md",)
+                )
+                wf.write_text(
+                    "on:\n  pull_request:\n    paths:\n" + entries
+                    + "  push:\n    paths:\n" + entries,
+                    encoding="utf-8",
+                )
+
+            # ancestor glob covers descendants AND the bare symlink blob
+            wf_with(".agents/skills/**", ".cursor/skills/**")
+            self.assertEqual(_validate_entry_points(package), [])
+            # exact bare + descendants pair also satisfies
+            wf_with(
+                ".agents/skills/**",
+                ".cursor/skills/autonomous-workflow",
+                ".cursor/skills/autonomous-workflow/**",
+            )
+            self.assertEqual(_validate_entry_points(package), [])
+            # "root/**" alone: descendant coverage passes but the bare
+            # symlink blob is unmatched — a retarget would slide past CI
+            wf_with(".agents/skills/**", ".cursor/skills/autonomous-workflow/**")
+            errors = _validate_entry_points(package)
+            self.assertTrue(
+                any("bare symlink path" in e for e in errors), errors
+            )
+            # missing entirely — the r13 F10 coverage error now names the
+            # cursor root too
+            wf_with(".agents/skills/**")
+            errors = _validate_entry_points(package)
+            self.assertTrue(
+                any(
+                    ".cursor/skills/autonomous-workflow" in e
+                    and "do not cover" in e
+                    for e in errors
+                ),
+                errors,
+            )
+            # dangling: the cursor symlink outlives its target
+            _shutil.rmtree(real_legacy)
+            wf_with(".agents/skills/**", ".cursor/skills/**")
+            errors = _validate_entry_points(package)
+            self.assertTrue(
+                any("no readable SKILL.md" in e for e in errors), errors
+            )
+            # regular-directory replacement that does not delegate
+            cursor_root.unlink()
+            cursor_root.mkdir()
+            (cursor_root / "SKILL.md").write_text(
+                "run the legacy flow directly\n", encoding="utf-8"
+            )
+            errors = _validate_entry_points(package)
+            self.assertTrue(
+                any("does not delegate" in e for e in errors), errors
+            )
+            # retargeted at a lookalike package: the link in the lookalike
+            # resolves to the WRONG directory, so delegation fails
+            _shutil.rmtree(cursor_root)
+            lookalike = repo / ".agents" / "skills" / "evil-autonomy"
+            lookalike.mkdir(parents=True)
+            (lookalike / "SKILL.md").write_text(
+                "Invoke [`autonomy`](../evil-autonomy/SKILL.md).\n",
+                encoding="utf-8",
+            )
+            cursor_root.symlink_to(
+                Path("..") / ".." / ".agents" / "skills" / "evil-autonomy"
+            )
+            errors = _validate_entry_points(package)
+            self.assertTrue(
+                any("does not delegate" in e for e in errors), errors
+            )
+
+    def test_retired_interfaces_are_rejected_independently(self) -> None:
+        # admin#1495 r14 F11 (alongside F8): the five retired workflow*
+        # package-script keys and the retired ralph shell must not return
+        # — each rejected on its own, unrelated scripts untouched.
+        import json as _json
+
+        from validate_package import _validate_entry_points
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            (repo / ".git").mkdir(parents=True)
+            package = repo / ".agents" / "skills" / "autonomy"
+            package.mkdir(parents=True)
+            self.assertEqual(_validate_entry_points(package), [])
+            # the retired shell alone
+            ralph = repo / ".cursor" / "ralph-scripts"
+            ralph.mkdir(parents=True)
+            shell = ralph / "autonomous-workflow.sh"
+            shell.write_text("#!/bin/sh\n", encoding="utf-8")
+            errors = _validate_entry_points(package)
+            self.assertTrue(
+                any("retired legacy shell" in e for e in errors), errors
+            )
+            shell.unlink()
+            # unrelated ralph scripts and unrelated script keys stay legal
+            (ralph / "ralph-loop.sh").write_text(
+                "#!/bin/sh\n", encoding="utf-8"
+            )
+            manifest = repo / "package.json"
+            manifest.write_text(
+                _json.dumps(
+                    {"scripts": {"build": "x", "workflow-viz": "y"}}
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(_validate_entry_points(package), [])
+            # any single retired key alone
+            manifest.write_text(
+                _json.dumps({"scripts": {"build": "x", "workflow:poll": "s"}}),
+                encoding="utf-8",
+            )
+            errors = _validate_entry_points(package)
+            self.assertTrue(
+                any("workflow:poll" in e for e in errors), errors
+            )
+            # unparseable manifest fails closed
+            manifest.write_text("{not json", encoding="utf-8")
+            errors = _validate_entry_points(package)
+            self.assertTrue(
+                any("unparseable" in e for e in errors), errors
+            )
 
     def test_load_root_mirror_orientation_is_supported(self) -> None:
         # The algo layout: canonical at .claude, symlink at .agents,
