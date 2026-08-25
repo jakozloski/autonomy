@@ -1343,40 +1343,92 @@ class MappedRepositoryParityTests(unittest.TestCase):
 
 
 class TerminalPlannedQaTests(unittest.TestCase):
+    @staticmethod
+    def _launch(qa_ops=(), roundtrip_ops=()) -> dict:
+        return {
+            "handoff_operations": {
+                "qa": list(qa_ops),
+                "review_roundtrip": list(roundtrip_ops),
+            }
+        }
+
+    _RESOLVED_HANDBACK = (
+        "qa.github.replace_assignees:g0123456789ab",
+        "qa.github.verify_assignees:g0123456789ab",
+    )
+    _RESOLVED_LINEAR = ("qa.linear.record_unavailable:g0123456789ab",)
+
     def test_terminal_missing_planned_qa_follows_the_target_manifest(self) -> None:
         # algo#1216 finding 3813491661, pinned at the predicate the manifest
         # rule calls. The r17 F9 containment gate now preempts that branch end
-        # to end on a non-delegating host (a mapped launch blocks BEFORE any
-        # child produces a terminal candidate), so the rule is verified here
-        # directly rather than through the now-gated e2e path. admin#1495 r16
-        # F3: the predicate is keyed on the derived target manifest, so ANY
-        # repository with planned target families - Linear-mapped AND
-        # Keeper-org unmapped (exact-Algo plans GitHub handback/review
-        # targets) - rejects an idle or absent terminal QA aggregate; idle
-        # stays valid only for a genuinely targetless binding.
+        # to end on a non-delegating host (a Keeper-bound launch blocks BEFORE
+        # any child produces a terminal candidate), so the rule is verified
+        # here directly rather than through the now-gated e2e path.
+        # admin#1495 r17 F7 (reworking r16 F3): the predicate is keyed on the
+        # LAUNCH extract's resolved targets - a launch that resolved a
+        # handback target rejects an idle or absent terminal QA aggregate
+        # whatever the repository (the fail-closed floor), while a genuinely
+        # targetless launch keeps idle valid for EVERY binding, exact-Algo
+        # and the Linear-mapped repositories included (r16's class derivation
+        # false-rejected the planner's legitimate idle Algo plan).
         mapped = "keeper-dating/matchmaking"
         self.assertIn(mapped, monitor_runner.MAPPED_QA_REPOSITORIES)
         self.assertNotIn("keeper-dating/algo", monitor_runner.MAPPED_QA_REPOSITORIES)
-        for bound_repo, qa_status, expected in (
-            (mapped, "idle", True),
-            (mapped, None, True),
-            ("Keeper-Dating/Matchmaking", "idle", True),  # case-insensitive
-            (mapped, "failed", False),
-            (mapped, "complete", False),
-            ("keeper-dating/algo", "idle", True),  # r16 F3: github-only manifest
-            ("keeper-dating/algo", None, True),
-            ("keeper-dating/algo", "complete", False),
-            ("someone/unmapped-repo", "idle", False),  # targetless
-            ("someone/unmapped-repo", None, False),
-            (None, "idle", False),  # a non-str bound repo derives no manifest
+        resolved = self._launch(self._RESOLVED_HANDBACK)
+        reviewer_only = self._launch(
+            roundtrip_ops=(
+                "roundtrip.github.request_review:motykadaw:g0123456789ab",
+            )
+        )
+        targetless = self._launch()
+        for bound_repo, launch, qa_status, expected in (
+            (mapped, resolved, "idle", True),
+            (mapped, resolved, None, True),
+            ("Keeper-Dating/Matchmaking", resolved, "idle", True),
+            ("keeper-dating/algo", resolved, "idle", True),
+            ("keeper-dating/algo", resolved, None, True),
+            ("someone/unmapped-repo", resolved, "idle", True),  # target-keyed
+            (None, resolved, "idle", True),  # even with no binding at all
+            ("keeper-dating/algo", reviewer_only, "idle", True),
+            (mapped, resolved, "failed", False),
+            (mapped, resolved, "complete", False),
+            ("keeper-dating/algo", resolved, "complete", False),
+            # genuinely targetless launches keep idle valid - the r17 F7 fix
+            (mapped, targetless, "idle", False),
+            ("keeper-dating/algo", targetless, "idle", False),
+            ("someone/unmapped-repo", targetless, "idle", False),
+            (None, targetless, None, False),
         ):
             self.assertIs(
                 monitor_runner._terminal_missing_planned_qa(
-                    bound_repo, qa_status
+                    bound_repo, launch, qa_status
                 ),
                 expected,
                 (bound_repo, qa_status),
             )
+
+    def test_linear_family_needs_map_and_resolved_tracker_leg(self) -> None:
+        # admin#1495 r17 F7: the Linear map stays real routing config -
+        # but only as ELIGIBILITY. The family derives exactly when the
+        # repository is mapped AND the launch plan resolved a tracker leg;
+        # an unmapped repository never derives it (a persisted qa.linear
+        # op there is planner-impossible output the coverage audit
+        # rejects separately).
+        with_linear = self._launch(
+            self._RESOLVED_HANDBACK + self._RESOLVED_LINEAR
+        )
+        mapped = monitor_runner._qa_target_manifest(
+            "keeper-dating/matchmaking", with_linear
+        )
+        self.assertIn(monitor_runner._QA_TARGET_LINEAR_QA, mapped)
+        without_linear = monitor_runner._qa_target_manifest(
+            "keeper-dating/matchmaking", self._launch(self._RESOLVED_HANDBACK)
+        )
+        self.assertNotIn(monitor_runner._QA_TARGET_LINEAR_QA, without_linear)
+        unmapped = monitor_runner._qa_target_manifest(
+            "keeper-dating/algo", with_linear
+        )
+        self.assertNotIn(monitor_runner._QA_TARGET_LINEAR_QA, unmapped)
 
 
 # CapabilityFamilyResolutionTests (r17) was REPLACED by
@@ -1854,14 +1906,24 @@ class CapabilityGrammarTests(unittest.TestCase):
 
     def test_probe_timeout_blocks_fail_closed(self) -> None:
         # admin#1495 r14 F9's "timeout" output: a hung `mcp list` proves
-        # nothing — no family is granted and the probe blocks.
+        # nothing — no family is granted and the probe blocks. r17 F7:
+        # the probe is armed by the launch extract's resolved targets
+        # (a targetless extract would skip it); r17 F5: the managed seam
+        # points at an absent file so a real host-managed policy cannot
+        # leak into the fixture.
         runner = _runner("claude-opus-5", None)
         runner.repository_hint = "keeper-dating/matchmaking"
         with tempfile.TemporaryDirectory() as tmp:
             settings = Path(tmp) / "settings.json"
             settings.write_text("{}", encoding="utf-8")
             with mock.patch.dict(
-                os.environ, {"MONITOR_RUNNER_USER_SETTINGS": str(settings)}
+                os.environ,
+                {
+                    "MONITOR_RUNNER_USER_SETTINGS": str(settings),
+                    "MONITOR_RUNNER_MANAGED_SETTINGS": str(
+                        Path(tmp) / "managed-absent.json"
+                    ),
+                },
             ), mock.patch.object(
                 monitor_runner.subprocess,
                 "run",
@@ -1870,7 +1932,19 @@ class CapabilityGrammarTests(unittest.TestCase):
                 ),
             ):
                 with self.assertRaises(RunnerExit) as caught:
-                    runner._child_capability_probe({"monitor_cli": {}})
+                    runner._child_capability_probe(
+                        {
+                            "monitor_cli": {},
+                            "handoff_operations": {
+                                "qa": [
+                                    "qa.github.replace_assignees:g0123456789ab",
+                                    "qa.github.verify_assignees:g0123456789ab",
+                                    "qa.linear.record_unavailable:g0123456789ab",
+                                ],
+                                "review_roundtrip": [],
+                            },
+                        }
+                    )
         self.assertEqual(caught.exception.code, 5)
         self.assertIn("no CONNECTED MCP row", caught.exception.reason)
 
@@ -2561,8 +2635,13 @@ class TrustedControlDriftTests(unittest.TestCase):
                 self.assertIsNotNone(self._drift(mutate))
 
     def test_forged_sensitive_append_rejects(self) -> None:
+        # admin#1495 r17 F8: plan-review-verdict joins the sensitive
+        # classes - the Phase-2 session produces it pre-launch and the
+        # state validator binds plan_verdict.invocation to it, so a child
+        # append would forge mandatory-gate evidence.
         for forged in ("r2-gate:waived", "branch-established:y@" + "b" * 40,
-                       "package-validated:def@2026", "validation-before-push:" + "c" * 40):
+                       "package-validated:def@2026", "validation-before-push:" + "c" * 40,
+                       "plan-review-verdict:codex-plan-99"):
             with self.subTest(forged=forged):
                 self.assertIsNotNone(
                     self._drift(lambda c, f=forged: c["decision_audit_trail"].append(f))
@@ -2597,20 +2676,8 @@ class TrustedControlDriftTests(unittest.TestCase):
 
 
 class QaManifestViolationTests(unittest.TestCase):
-    """admin#1495 r15 F17: the canonical mapped-repository QA manifest."""
-
-    def _extract(self, ops, results=None, status="pending"):
-        return {
-            "handoff_status_by_kind": {"qa": status},
-            "handoff_operations": {"qa": ops},
-            "handoff_results": {"qa": results if results is not None else {o: "complete" for o in ops}},
-        }
-
-    def _violation(self, ops, **kw):
-        runner = _runner("claude-opus-5", None)
-        return runner._qa_manifest_violation(
-            "Keeper-Dating/matchmaking", self._extract(ops, **kw)
-        )
+    """admin#1495 r15 F17: the canonical QA coverage audit, keyed on the
+    LAUNCH-resolved target manifest (admin#1495 r17 F7)."""
 
     FULL = [
         "qa.github.replace_assignees:gaaaaaaaaaaaa",
@@ -2621,6 +2688,31 @@ class QaManifestViolationTests(unittest.TestCase):
         "qa.linear.set_ticket_state:gaaaaaaaaaaaa",
         "qa.linear.verify_ticket_state:gaaaaaaaaaaaa",
     ]
+
+    def _extract(self, ops, results=None, status="pending"):
+        return {
+            "handoff_status_by_kind": {"qa": status},
+            "handoff_operations": {"qa": ops},
+            "handoff_results": {"qa": results if results is not None else {o: "complete" for o in ops}},
+        }
+
+    def _launch(self, ops=None):
+        # r17 F7: the launch extract whose write-ahead plan records the
+        # resolved targets; default = the FULL resolved mapped plan.
+        return {
+            "handoff_operations": {
+                "qa": list(self.FULL if ops is None else ops),
+                "review_roundtrip": [],
+            }
+        }
+
+    def _violation(self, ops, launch_ops=None, **kw):
+        runner = _runner("claude-opus-5", None)
+        return runner._qa_manifest_violation(
+            "Keeper-Dating/matchmaking",
+            self._launch(launch_ops),
+            self._extract(ops, **kw),
+        )
 
     def test_complete_manifest_passes(self) -> None:
         self.assertIsNone(self._violation(self.FULL))
@@ -2633,9 +2725,22 @@ class QaManifestViolationTests(unittest.TestCase):
         ]))
 
     def test_subset_omission_rejects(self) -> None:
-        # github-only (the exact F17 shape) and assign-without-state
+        # github-only (the exact F17 shape) and assign-without-state -
+        # the launch resolved the Linear leg, so a candidate omitting it
+        # violates the floor (r17 F7's fail-closed direction).
         self.assertIsNotNone(self._violation(self.FULL[:2]))
         self.assertIsNotNone(self._violation(self.FULL[:5]))
+
+    def test_launch_resolved_handback_omitted_rejects(self) -> None:
+        # admin#1495 r17 F7 fail-closed pin: the launch plan resolved a
+        # handback target; a non-idle terminal candidate whose operations
+        # omit the handback pair is a floor violation.
+        self.assertIsNotNone(
+            self._violation(
+                ["qa.linear.record_unavailable:gaaaaaaaaaaaa"],
+                launch_ops=self.FULL[:2],
+            )
+        )
 
     def test_mixed_generations_reject(self) -> None:
         ops = list(self.FULL)
@@ -2645,10 +2750,15 @@ class QaManifestViolationTests(unittest.TestCase):
     def test_missing_results_reject(self) -> None:
         self.assertIsNotNone(self._violation(self.FULL, results={}))
 
-    def test_unmapped_and_idle_skip(self) -> None:
+    def test_targetless_and_idle_skip(self) -> None:
+        # r17 F7: a targetless LAUNCH derives an empty manifest, so the
+        # audit skips whatever the candidate claims (the launch, not the
+        # candidate's own operations, is the trusted input); idle
+        # aggregates stay owned by the planned-QA gate.
         runner = _runner("claude-opus-5", None)
         self.assertIsNone(runner._qa_manifest_violation(
-            "someone-else/sandbox", self._extract(self.FULL[:1])))
+            "Keeper-Dating/matchmaking", self._launch([]),
+            self._extract(self.FULL[:1])))
         self.assertIsNone(self._violation([], status="idle"))
 
     def test_manifest_table_matches_the_planner(self) -> None:
@@ -2682,6 +2792,115 @@ class QaManifestViolationTests(unittest.TestCase):
         if linear:
             self.assertIn(
                 frozenset(linear), monitor_runner._QA_LINEAR_LEG_SHAPES
+            )
+
+
+class ClassificationFingerprintTests(unittest.TestCase):
+    """admin#1495 r17 F9: the recompute helper (the EXACT
+    references/project-and-entry.md Step 2 recipe) and the narrow
+    front-matter reader feeding the runner's terminal-candidate gate."""
+
+    def test_recompute_matches_known_sha256_literals(self) -> None:
+        # Literal expected values (computed independently of the code
+        # under test) pin the recipe: sha256 over
+        # "<merge_base>\n<head>\n<worktree_digest>\n" where the worktree
+        # digest is sha256 over the raw porcelain bytes - empty output
+        # digests EMPTY BYTES (computed, never assumed).
+        self.assertEqual(
+            monitor_runner.classification_fingerprint_value(
+                "a" * 40, "b" * 40, b""
+            ),
+            "f3dfd0365aebbb687a29b8055d6036a116ca075a00c3627b2f02e121cb16db7a",
+        )
+        self.assertEqual(
+            monitor_runner.classification_fingerprint_value(
+                "1234abcd" * 5, "feedbeef" * 5,
+                b" M scripts/monitor_runner.py\x00",
+            ),
+            "a800aaab9d0ed0cd32e85cff4b1c4d7d1da15f098a65f87e1ba36eddc3508bf1",
+        )
+
+    def test_recompute_emits_lowercase_only(self) -> None:
+        # The documented encoding is lowercase; an uppercase persisted
+        # value can therefore never match the recompute.
+        value = monitor_runner.classification_fingerprint_value(
+            "a" * 40, "b" * 40, b"payload"
+        )
+        self.assertRegex(value, r"\A[0-9a-f]{64}\Z")
+        self.assertNotEqual(value, value.upper())
+
+    _FRONTMATTER = (
+        "---\n"
+        'base_branch: "main"\n'
+        "other_block:\n"
+        '  classification_fingerprint: "0" \n'
+        "gstack_integration:\n"
+        "  available: false\n"
+        '  classification_fingerprint: "abc123" # trailing comment\n'
+        "  review:\n"
+        '    status: "pending"\n'
+        "---\n"
+        "body\n"
+    )
+
+    def test_frontmatter_scalar_reads_both_target_fields(self) -> None:
+        self.assertEqual(
+            monitor_runner._frontmatter_scalar(
+                self._FRONTMATTER, ("base_branch",)
+            ),
+            "main",
+        )
+        # the nested read is BLOCK-SCOPED: other_block's same-named child
+        # never leaks into the gstack_integration lookup, and the
+        # quote-aware comment strip drops the trailing comment.
+        self.assertEqual(
+            monitor_runner._frontmatter_scalar(
+                self._FRONTMATTER,
+                ("gstack_integration", "classification_fingerprint"),
+            ),
+            "abc123",
+        )
+
+    def test_frontmatter_scalar_grammar_twins_the_restricted_parser(self) -> None:
+        # The reader twins state_schema's restricted scalar grammar for
+        # these fields: plain tokens, JSON-quoted values (with '#'
+        # inside), JSON-quoted keys, null/absent -> None, deeper child
+        # indents, and end-of-block scoping.
+        cases = (
+            ("---\nbase_branch: main\n---\n", ("base_branch",), "main"),
+            (
+                '---\nbase_branch: "a # b"\n---\n',
+                ("base_branch",),
+                "a # b",
+            ),
+            (
+                '---\n"base_branch": "quoted-key"\n---\n',
+                ("base_branch",),
+                "quoted-key",
+            ),
+            ("---\nbase_branch: null\n---\n", ("base_branch",), None),
+            ("---\nworkflow_id: \"x\"\n---\n", ("base_branch",), None),
+            (
+                # children at a 4-space indent are still direct children
+                '---\ngstack_integration:\n'
+                '    classification_fingerprint: "deep"\n---\n',
+                ("gstack_integration", "classification_fingerprint"),
+                "deep",
+            ),
+            (
+                # a key AFTER the block ends never matches into it
+                '---\ngstack_integration:\n  available: false\n'
+                'classification_fingerprint: "stray"\n---\n',
+                ("gstack_integration", "classification_fingerprint"),
+                None,
+            ),
+            ("no fences at all", ("base_branch",), None),
+        )
+        for text, key_path, expected in cases:
+            self.assertEqual(
+                monitor_runner._frontmatter_scalar(text, key_path),
+                expected,
+                (text, key_path),
             )
 
 

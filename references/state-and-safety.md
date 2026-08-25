@@ -58,7 +58,7 @@ resolved_conventions:
       gate_status: "pending"
       policy_decision: {}
     claude:
-      # Base leg (explorers, delegated work, fresh-context escalation voice). Gating — a blocked gate stops the workflow.
+      # Base leg (explorers, delegated work, fresh-context escalation voice). Gating — a blocked gate stops the workflow. A "waived" decision never persists here (admin#1495 r17 F4): gate_status stays pending until scripts/model_policy.py waiver_gate_resolution consumes the named fallback's real invocation and lands ready (success) or blocked (failure or a malformed/mismatched observation), with the waiver retained under policy_decision.waiver.
       model: "claude-fable-5"
       effort: "max"
       subagent_override: null
@@ -67,7 +67,7 @@ resolved_conventions:
       gate_status: "pending"
       policy_decision: {}
     claude_reviewer:
-      # Reviewer leg (always-runs structured review + every Claude review fallback). Availability failures degrade onto the ready base lineage (recorded in policy_decision.degradation + the audit trail); malformed observations still block.
+      # Reviewer leg (always-runs structured review + every Claude review fallback). Availability failures degrade onto the ready base lineage (recorded in policy_decision.degradation + the audit trail); malformed observations still block. An explicit reviewer waiver follows the same admin#1495 r17 F4 transition as the base leg: gate_status stays pending until waiver_gate_resolution lands ready or blocked from the named fallback's real invocation.
       model: "claude-opus-5"
       effort: "max"
       subagent_override: null
@@ -76,7 +76,7 @@ resolved_conventions:
       gate_status: "pending"
       policy_decision: {}
     escalation_invocations: [] # append-only: { trigger, voice, reason, phase, session_id, pass_number }
-    plan_verdict: null # REQUIRED once phases.plan_review is complete (admin#1495 r16 F6) — typed evidence of the mandatory Codex approval, closed shape: { verdict: "approved" (affirmative-only; a non-approval resets plan_review and reruns the review), plan_digest: 12-64 lowercase hex binding the exact reviewed plan revision (the runtime recomputes it and invalidates the verdict when the plan changes), model: selected-model descriptor, invocation: invocation evidence (e.g., session/run id) }
+    plan_verdict: null # REQUIRED once phases.plan_review is complete (r16 F6) and MACHINE-BOUND per r17 F8, closed shape: { verdict: "approved" (affirmative-only; a non-approval resets plan_review and reruns the review), plan_digest: 12-64 lowercase-hex prefix of sha256 over the state body's "## Plan (Phase 1)" section (state_schema recomputes it at validation - a plan edit after review invalidates the verdict), model: must EQUAL the frozen codex.model selection above, invocation: must have a matching "plan-review-verdict:<invocation>" Decision Audit Trail record, written by the Phase-2 session when the verdict is produced (runner-protected sensitive prefix - a monitor child cannot forge it) }
 validated_ticket:
   tracker_type: null
   identifier: null # Human-facing ticket identifier, e.g. WEB-8877.
@@ -210,7 +210,7 @@ gstack_integration:
   scope_skill_only: false # <-> change_type skill_only holds in BOTH directions: Step 3 rule 1 (project-and-entry.md) is the sole producer of skill_only
   change_type: "feature" # bug_fix|feature|refactor|skill_only
   defect_evidence_mode: "none" # runtime_bug_fix|skill_helper_defect|none — set at Scope Analysis, recomputed with change_type after Phase 3; drives the regression/variant terminal rules
-  classification_fingerprint: null # 64-hex over the classified tree (merge-base, head SHA, worktree diff digest) — binds the selectors above to the inputs they were derived from, so selector freshness is checkable before any phase branches on them (r16 F7); recompute with change_type after Phase 3
+  classification_fingerprint: null # 64 LOWERCASE hex over the classified tree per the exact recipe in project-and-entry.md Step 2 (r16 F7 / r17 F9) — binds the selectors above to the inputs they were derived from; recompute with change_type after Phase 3, and the monitor runner recomputes and compares it before accepting any terminal candidate, so a stale classification blocks instead of shipping
   investigate:
     status: "complete|skipped" # skipped = not a bug fix, Entry B, or not selected
   review:

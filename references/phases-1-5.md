@@ -32,7 +32,7 @@ Create a clear implementation plan.
    - **UX edge cases** — empty states, error states, loading states, permissions-based visibility
      For every real edge case identified: you MUST add it to the plan as an implementation step or test case. This is not optional. Skip phantom complexity that can't actually happen.
      Output: "Edge cases found: N; added plan steps: M; dimensions marked N/A: K" before proceeding.
-6. Present the plan to the user, and write it AT CREATION to a durable location: the state file body's `## Plan (Phase 1)` section (replaced in place on each revision; the Prompt Ledger is never touched; secret/PII redaction applies) or a repository-local git-ignored artifact. Never `/tmp` — it is purged mid-session on some hosts, and a blocked run whose only plan copy vanished has nothing to resume from. Durable workflow artifacts stay out of commits and the PR diff.
+6. Present the plan to the user, and write it AT CREATION to the state file body's `## Plan (Phase 1)` section (replaced in place on each revision; the Prompt Ledger is never touched; secret/PII redaction applies). The in-body section is REQUIRED, not one option among several (admin#1495 r17 F8): the Phase-2 plan verdict's digest is recomputed over exactly this section by the state validator, so a plan that lives only in an external artifact cannot bind its verdict — keep artifact copies as extras if useful, never as the sole location, and never `/tmp` (purged mid-session on some hosts). Durable workflow artifacts stay out of commits and the PR diff.
 
 ---
 
@@ -88,7 +88,7 @@ Entitlement denial, authentication failure, missing CLI, old CLI, or missing liv
    - **Taste decisions:** Close approaches, borderline scope, and Codex disagreements are logged in the Decision Audit Trail and auto-decided using the 6 principles above.
    - All decisions logged to the `decision_audit_trail` state field FIRST (it is the authoritative trail; on divergence it wins), then copied into the plan file's readable trail section when a plan file exists
    - Set `gstack_integration.autoplan.status: "complete"` in state
-   - On success: set `phases.plan_review: "complete"` in state
+   - On success: persist the plan-verdict evidence exactly as the direct-Codex path below specifies, then set `phases.plan_review: "complete"` in state
    - A failed Claude voice may use the explicit reviewer CLI path. A failed Codex voice follows the core blocking matrix; it may not degrade to a different model or Claude-only approval.
 
 2. **Direct Codex review** (when `/autoplan` is not selected):
@@ -99,7 +99,7 @@ Entitlement denial, authentication failure, missing CLI, old CLI, or missing liv
    - If Codex suggests something contradicting explicit user requirements or repo rules, skip with logged note
    - A round makes progress when at least one previously-open finding is resolved (revision accepted or pushback accepted — it no longer appears in the next REVISE output). Two consecutive no-progress rounds = a stall: the reviewer has now held the same position three times (the core three-strike invariant) — BLOCK and ask the user, listing each disputed finding with both positions
    - **On the FIRST no-progress round, bring in the Claude reviewer before continuing** (trigger `plan_review_no_progress`; the recorded reviewer-leg decision — floor Opus 5, or its recorded fallback lineage — at max). Give it the plan, the disputed findings, and both positions, and ask it to break the deadlock — not to re-review from scratch. Record its verdict in the Decision Audit Trail. Its round does not count toward the stall counter: it is a new voice in the discussion, not the disputants repeating themselves. If the next round still resolves nothing, that is the second no-progress round and the stall BLOCK fires as specified above
-   - On approval: set `phases.plan_review: "complete"` in state
+   - On approval: persist the machine-bound verdict evidence FIRST (admin#1495 r17 F8), then set `phases.plan_review: "complete"` in state. The evidence is `resolved_conventions.model_runtime.plan_verdict` — `verdict: "approved"`; `plan_digest` = a 12-64 lowercase-hex prefix of sha256 over the state body's `## Plan (Phase 1)` section as reviewed; `model` = exactly the frozen `model_runtime.codex.model` selection; `invocation` = the review invocation's identifier — plus, in the SAME write, the Decision Audit Trail record `plan-review-verdict:<invocation>`. The state validator recomputes all three bindings on every read (digest over the body section, model against the frozen selection, invocation against the trail), so an approval written for a different plan, model, or invocation is rejected as suspect state, and any later plan edit invalidates the verdict — reset `plan_review` and rerun the review on the current plan
 
 3. **Claude-reviewer supplement:** when the selected plan-review flow calls for an extra Claude perspective, run the recorded reviewer-leg decision (floor Opus 5, or its recorded degraded/waived fallback) at max via the verified Agent-tool or explicit CLI path. It may strengthen or challenge the plan, but it does not replace the mandatory Codex verdict — the plan discussion's two reviewers are different models, and the verdict stays with Codex.
 

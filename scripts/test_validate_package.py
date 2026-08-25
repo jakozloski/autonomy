@@ -1892,6 +1892,19 @@ class EntryPointScanTests(unittest.TestCase):
             self.assertTrue(_delegates_to_autonomy(
                 "See [the package](../autonomy).", source, package,
             ))
+            # admin#1495 r17 F1: the guard proves DELEGATION of this
+            # skill's entry points, never single-implementation
+            # exclusivity - an alias that also names a coexisting legacy
+            # runner (Ralph) as a distinct, ungated delivery route still
+            # delegates cleanly. The exclusivity claim was the falsehood;
+            # the link is the contract.
+            self.assertTrue(_delegates_to_autonomy(
+                "Invoke the [`autonomy`](../autonomy/SKILL.md) skill."
+                " The separate Ralph Wiggum loop (yarn ralph*) is a"
+                " distinct legacy runner with its own push/PR capability"
+                " and none of these gates.",
+                source, package,
+            ))
             rejected = (
                 # bare-path prose is a mention, not a delegation
                 "read .agents/skills/autonomy/SKILL.md and follow it",

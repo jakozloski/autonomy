@@ -119,6 +119,18 @@ observations still block — garbage input is corrected, never degraded around
 — an unverified observation ("unknown" access/ZDR) blocks until probed, and
 an explicit reviewer waiver still preempts auto-degradation.
 
+A ``waived`` decision on either Claude leg is a PRE-invocation policy
+decision, not a persisted gate status (admin#1495 r17 F4): the persisted
+contract (``resolved_conventions.model_runtime``) accepts only
+``pending|ready|blocked`` gate statuses (plus reviewer ``degraded``), and the
+monitor binder requires ``gate_status == "ready"``.
+``waiver_gate_resolution`` is the single transition between the two - it
+consumes the waived decision plus the observed result of invoking the exact
+waiver-named fallback and returns the leg record to persist: ``ready`` only
+on that route's success, ``blocked`` on failure or on a malformed/mismatched
+observation, with the waiver decision retained as evidence under
+``policy_decision.waiver``.
+
 Model selection is floor-based, not pinned.  From the observed facts the
 helper selects the newest eligible model at or above each floor: for Codex,
 live-catalog models named ``gpt-<version>[-variant]`` that support the
@@ -2281,6 +2293,17 @@ def _waive_or_block_claude(
     reason_code: str,
     reason: str,
 ) -> dict[str, Any]:
+    """Grant the leg's explicit waiver, or block it pending one.
+
+    admin#1495 r17 F4: the ``waived`` decision written here is a
+    pre-invocation policy decision, not a persisted gate status - its
+    ``next_action`` demands a real invocation of the named fallback, and
+    ``waiver_gate_resolution`` is the one transition that consumes that
+    invocation's observed result and lands the persisted gate (``ready``
+    on success, ``blocked`` otherwise), retaining this decision under
+    ``policy_decision.waiver``.
+    """
+
     waiver = config.get("explicit_waiver", False)
     if not isinstance(waiver, bool):
         decision.update(
@@ -2333,6 +2356,9 @@ def _waive_or_block_claude(
                 "execution_path": "explicit_cli",
                 "arguments": _explicit_cli_arguments(fallback_model, spec.effort),
                 "environment_unset": list(CLAUDE_READ_ONLY_ENV_UNSET),
+                # admin#1495 r17 F4: run the named fallback's real
+                # invocation, then land the persisted gate through
+                # waiver_gate_resolution - "waived" itself never persists.
                 "next_action": "invoke_explicit_named_fallback",
                 "waiver_granted": True,
                 # A named waiver fallback is floor-enforced substitution, not a
@@ -2384,7 +2410,9 @@ def _evaluate_claude_leg(raw: Any, spec: _ClaudeLegSpec) -> dict[str, Any]:
 
     Both legs are gating: any failure blocks unless an explicit waiver names an
     observed model from the other leg's lineage at or above that lineage's
-    floor, at max effort.
+    floor, at max effort.  A ``waived`` decision is pre-invocation - the
+    persisted gate lands only through ``waiver_gate_resolution`` consuming
+    the named fallback's real invocation (admin#1495 r17 F4).
     """
 
     config = raw if isinstance(raw, dict) else {}
@@ -2691,6 +2719,187 @@ def _degrade_reviewer_to_base(
     return degraded
 
 
+# admin#1495 r17 F4: the waiver transition's per-leg bindings - the decision's
+# ``role`` names the leg in policy vocabulary ("base"/"reviewer"), the
+# persisted contract keys the same legs "claude"/"claude_reviewer", and a
+# waiver crosses to the OTHER lineage, so the floor re-check runs against
+# that lineage's floor.
+_WAIVER_ROLE_BINDINGS: dict[str, tuple[str, Callable[[Any], bool]]] = {
+    "base": ("claude", _at_or_above_reviewer_floor),
+    "reviewer": ("claude_reviewer", _at_or_above_base_floor),
+}
+
+
+def waiver_gate_resolution(
+    decision: Any, invocation_result: Any
+) -> dict[str, Any]:
+    """Land a waived Claude leg's persisted gate from its fallback invocation.
+
+    admin#1495 r17 F4: a valid waiver returns ``state: "waived"`` with
+    ``next_action: "invoke_explicit_named_fallback"`` - a PRE-invocation
+    policy decision, not a persisted gate status.  The persisted contract
+    (``resolved_conventions.model_runtime``; references/state-and-safety.md)
+    accepts only ``pending|ready|blocked`` (plus reviewer ``degraded``), and
+    ``monitor_orchestrator_binding`` requires ``gate_status == "ready"``.
+    This helper is the single transition between the two for BOTH Claude
+    legs (the decision's own ``role`` selects the leg): it consumes the
+    waived decision record plus the terminal observation of invoking the
+    exact waiver-named fallback, and returns the leg record to persist -
+    every key in the record is in ``state_schema.MODEL_RUNTIME_LEG_KEYS``'
+    closed set, and ALL evidence rides inside ``policy_decision``.
+
+    ``invocation_result`` is ``{"leg", "status", "model", "effort", ...}``
+    with ``leg`` the persisted leg key (``claude``/``claude_reviewer``);
+    extra fields (attempts, observed_at) ride along as evidence.  Liveness
+    pacing (immediate retry, ladder waits) happens at invocation time - the
+    caller feeds the invocation's final observation here.
+
+    ``gate_status`` lands ``"ready"`` ONLY on a success observation naming
+    the exact waiver-named model at the waiver-named effort on the waived
+    leg - exact slug equality: a context-window variant names the same
+    version but is a different invocation route than the one authorized.
+    A failed invocation lands ``"blocked"`` with the failure recorded; a
+    malformed or mismatched observation also lands ``"blocked"`` (garbage
+    is corrected, never degraded around).  Every returned record retains
+    the waiver decision as evidence under ``policy_decision.waiver``,
+    beside the consumed observation (``policy_decision.fallback_invocation``)
+    and this transition's verdict (``policy_decision.resolution``);
+    ``policy_decision.selection`` carries the waiver's selection - the
+    cross-floor evidence shape the monitor binder requires before a
+    ``ready`` leg may bind on the other lineage's model.
+
+    An unusable decision record - not a granted waiver, or an inconsistent
+    or below-floor fallback name (the decision may round-trip through
+    persisted state before its invocation lands, and state is untrusted) -
+    fails closed as ``{"state": "invalid", "errors": [...]}`` with NO leg
+    record: it names no trustworthy leg to write, and ``state`` is not a
+    leg key, so persisting it by mistake fails
+    ``validate_model_runtime_shape`` loudly instead of landing a forged
+    gate.
+    """
+
+    if not isinstance(decision, dict):
+        return {
+            "state": "invalid",
+            "errors": ["waiver decision must be a JSON object"],
+        }
+
+    role = decision.get("role")
+    # Validate before subscripting: an unhashable role would raise out of
+    # the transition, which is strictly worse than failing closed.
+    binding = _WAIVER_ROLE_BINDINGS.get(role) if isinstance(role, str) else None
+    model = decision.get("model")
+    effort = decision.get("effort")
+    selection = decision.get("selection")
+    selected = (
+        selection.get("selected_model") if isinstance(selection, dict) else None
+    )
+    errors: list[str] = []
+    if binding is None:
+        errors.append("waiver decision role must be base or reviewer")
+    if (
+        decision.get("state") != "waived"
+        or decision.get("next_action") != "invoke_explicit_named_fallback"
+        or decision.get("waiver_granted") is not True
+    ):
+        errors.append(
+            "decision must be a granted waiver awaiting its named fallback"
+            " (state waived, next_action invoke_explicit_named_fallback,"
+            " waiver_granted true)"
+        )
+    if not isinstance(model, str) or not model:
+        errors.append("waiver decision model must be a non-empty string")
+    elif decision.get("fallback_model") != model or selected != model:
+        errors.append(
+            "waiver decision model, fallback_model, and"
+            " selection.selected_model must name one fallback model"
+        )
+    elif binding is not None and not binding[1](model):
+        errors.append(
+            "waiver-named fallback is below its lineage's floor - a waiver"
+            " may cross lineages, never authorize a downgrade"
+        )
+    if not isinstance(effort, str) or not effort:
+        errors.append("waiver decision effort must be a non-empty string")
+    if errors:
+        return {"state": "invalid", "errors": errors}
+    leg_name = binding[0]
+
+    def _resolved(
+        gate_status: str, reason_code: str, reason: str, next_action: str
+    ) -> dict[str, Any]:
+        return {
+            "model": model,
+            "effort": effort,
+            "gate_status": gate_status,
+            "policy_decision": {
+                # The exact cross-floor evidence shape the monitor binder
+                # reads (policy_decision.selection.selected_model).
+                "selection": dict(selection),
+                "waiver": dict(decision),
+                "fallback_invocation": (
+                    dict(invocation_result)
+                    if isinstance(invocation_result, dict)
+                    else invocation_result
+                ),
+                "resolution": {
+                    "leg": leg_name,
+                    "reason_code": reason_code,
+                    "reason": reason,
+                    "next_action": next_action,
+                },
+            },
+        }
+
+    if not isinstance(invocation_result, dict) or not all(
+        isinstance(invocation_result.get(field), str)
+        and invocation_result.get(field)
+        for field in ("leg", "status", "model", "effort")
+    ):
+        return _resolved(
+            "blocked",
+            "invalid_fallback_observation",
+            "the fallback invocation observation must be an object with"
+            " non-empty leg/status/model/effort strings",
+            "correct_observation_input",
+        )
+    # Identity precedes outcome: an observation for another route (wrong
+    # leg, wrong model, wrong effort) decides nothing about this waiver -
+    # even a success must not open the gate, and a failure must not be
+    # recorded as the named route's failure.
+    if (
+        invocation_result["leg"] != leg_name
+        or invocation_result["model"] != model
+        or invocation_result["effort"] != effort
+    ):
+        return _resolved(
+            "blocked",
+            "fallback_observation_mismatch",
+            f"the observation must record the {leg_name} leg invoking the"
+            f" exact waiver-named fallback ({model} at {effort}); an"
+            " observation for any other route decides nothing about this"
+            " waiver",
+            "correct_observation_input",
+        )
+    if invocation_result["status"] != "success":
+        return _resolved(
+            "blocked",
+            "waived_fallback_invocation_failed",
+            f"the waiver-named fallback ({model} at {effort}) failed its"
+            f" real invocation ({invocation_result['status']}) - re-enter"
+            " the model gate: restore primary access or waive onto a live"
+            " observed route",
+            "start_new_workflow_entry_preflight",
+        )
+    return _resolved(
+        "ready",
+        "waived_fallback_ready",
+        f"the waiver-named fallback ({model} at {effort}) succeeded its"
+        " real invocation; the leg proceeds on the waived selection",
+        "proceed_with_waived_fallback",
+    )
+
+
 def monitor_orchestrator_binding(
     model_runtime: Any, session_model: Any = None
 ) -> dict[str, Any]:
@@ -2736,7 +2945,8 @@ def monitor_orchestrator_binding(
         # the reviewer leg) silently invert which lineage owns the
         # session. A cross-floor model is legitimate only when the leg's
         # own persisted policy_decision records it as the selection — the
-        # shape every waiver/degradation writer produces.
+        # shape every waiver/degradation writer produces (admin#1495 r17
+        # F4: waiver_gate_resolution is the waived legs' writer).
         decision = leg.get("policy_decision")
         selection = (
             decision.get("selection") if isinstance(decision, dict) else None

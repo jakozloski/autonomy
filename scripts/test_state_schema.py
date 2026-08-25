@@ -27,6 +27,7 @@ from state_schema import (
     monitor_blocked_evidence_present,
     monitor_digest,
     monitor_extract,
+    plan_section_digest,
 )
 
 SHA_A = "a" * 40
@@ -190,25 +191,39 @@ def _mutate(text: str, old: str, new: str) -> str:
     return text.replace(old, new, 1)
 
 
+_PLAN_BODY_SECTION = (
+    "\n## Plan (Phase 1)\n\n- fix the thing\n- pin it with a test\n"
+)
+_PLAN_SECTION_DIGEST = plan_section_digest(_PLAN_BODY_SECTION.split("\n"))
 _MODEL_RUNTIME_VERDICT_BLOCK = (
     "  model_runtime:\n"
+    "    codex:\n"
+    '      model: "gpt-5.6-sol"\n'
     "    plan_verdict:\n"
     '      verdict: "approved"\n'
-    '      plan_digest: "abc123def456"\n'
+    f'      plan_digest: "{_PLAN_SECTION_DIGEST[:16]}"\n'
     '      model: "gpt-5.6-sol"\n'
     '      invocation: "codex-plan-01"'
 )
 
 
+_VERDICT_TRAIL = 'decision_audit_trail:\n  - "plan-review-verdict:codex-plan-01"'
+
+
 def _with_plan_verdict(text: str) -> str:
-    """F6: a fixture that advances phases.plan_review to complete off a raw
-    FULL_STATE must carry the Phase-1 runtime record plus the typed Codex
-    plan verdict. Injects the block as a resolved_conventions sibling."""
-    return _mutate(
+    """F6/r17 F8: a fixture that advances phases.plan_review to complete off
+    a raw FULL_STATE must carry the Phase-1 runtime record plus the typed
+    Codex plan verdict AND its three bindings: the frozen codex selection
+    the verdict model binds to, the plan-review-verdict Decision Audit
+    Trail record the invocation binds to, and the body plan section the
+    digest is recomputed over."""
+    text = _mutate(
         text,
         '    write_path: "environment_tool"',
         '    write_path: "environment_tool"\n' + _MODEL_RUNTIME_VERDICT_BLOCK,
     )
+    text = _mutate(text, "decision_audit_trail: []", _VERDICT_TRAIL)
+    return text + _PLAN_BODY_SECTION
 
 
 def _terminal_monitor_state() -> str:
@@ -2354,8 +2369,8 @@ class MergeReadinessTests(unittest.TestCase):
             text = _with_plan_verdict(text)
             return _mutate(
                 text,
-                "decision_audit_trail: []",
-                capture + "\ndecision_audit_trail: []",
+                _VERDICT_TRAIL,
+                capture + "\n" + _VERDICT_TRAIL,
             )
 
         no_waiver = evaluate_state_text(completed_gate("unavailable", False))
@@ -2400,7 +2415,11 @@ class MergeReadinessTests(unittest.TestCase):
         # paused-monitor fixture with the gate + AC blocks added.
         base = _terminal_monitor_state()
         base = _mutate(base, '  monitor: "paused"', '  monitor: "in_progress"')
-        base = _mutate(base, "decision_audit_trail: []", self._AC_BLOCK)
+        base = _mutate(
+            base,
+            _VERDICT_TRAIL,
+            self._AC_BLOCK.replace("decision_audit_trail: []", _VERDICT_TRAIL),
+        )
         text = _mutate(
             base,
             '  monitor: "in_progress"',
@@ -2416,8 +2435,8 @@ class MergeReadinessTests(unittest.TestCase):
         )
         marked = _mutate(
             text,
-            "decision_audit_trail: []",
-            'decision_audit_trail:\n  - "legacy-4b-reentry:2026-08-18T18:00:00Z"',
+            _VERDICT_TRAIL,
+            _VERDICT_TRAIL + '\n  - "legacy-4b-reentry:2026-08-18T18:00:00Z"',
         )
         result = evaluate_state_text(marked)
         self.assertFalse(
@@ -5980,6 +5999,92 @@ class PlanVerdictTests(unittest.TestCase):
         self.assertEqual(result["errors"], [])
         self.assertEqual(result["state"], VALID)
 
+    def _assert_binding_error(self, text: str, marker: str) -> None:
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT, result["errors"])
+        self.assertTrue(
+            any(marker in error for error in result["errors"]),
+            result["errors"],
+        )
+
+    def test_verdict_model_must_match_the_frozen_codex_selection(self) -> None:
+        # r17 F8: an invented model descriptor no longer validates - the
+        # verdict must carry the policy-selected model the codex leg froze.
+        text = _mutate(
+            _with_plan_verdict(self._implementation_state()),
+            "    plan_verdict:\n"
+            '      verdict: "approved"\n'
+            f'      plan_digest: "{_PLAN_SECTION_DIGEST[:16]}"\n'
+            '      model: "gpt-5.6-sol"',
+            "    plan_verdict:\n"
+            '      verdict: "approved"\n'
+            f'      plan_digest: "{_PLAN_SECTION_DIGEST[:16]}"\n'
+            '      model: "invented-model"',
+        )
+        self._assert_binding_error(
+            text, "does not match the frozen Codex selection"
+        )
+
+    def test_verdict_requires_the_frozen_codex_leg(self) -> None:
+        text = _mutate(
+            _with_plan_verdict(self._implementation_state()),
+            '    codex:\n      model: "gpt-5.6-sol"\n',
+            "",
+        )
+        self._assert_binding_error(
+            text, "requires the frozen Codex selection"
+        )
+
+    def test_verdict_invocation_requires_the_trail_record(self) -> None:
+        # r17 F8: invented invocation evidence - no matching
+        # plan-review-verdict record in the Decision Audit Trail.
+        text = _mutate(
+            _with_plan_verdict(self._implementation_state()),
+            _VERDICT_TRAIL,
+            "decision_audit_trail: []",
+        )
+        self._assert_binding_error(
+            text, "has no matching 'plan-review-verdict:"
+        )
+
+    def test_plan_mutation_after_review_invalidates_the_digest(self) -> None:
+        # r17 F8: the core forgery - the plan changes after the review
+        # approved it, while the digest stays. The recompute over the body
+        # section catches it.
+        text = _mutate(
+            _with_plan_verdict(self._implementation_state()),
+            "- fix the thing",
+            "- fix a different thing entirely",
+        )
+        self._assert_binding_error(
+            text, "plan changed after review or the digest was fabricated"
+        )
+
+    def test_missing_plan_section_fails_closed(self) -> None:
+        text = _with_plan_verdict(self._implementation_state())
+        text = text.replace(_PLAN_BODY_SECTION, "\n")
+        self._assert_binding_error(
+            text, "requires the reviewed plan persisted in the state body"
+        )
+
+    def test_plan_section_digest_normalization_is_pinned(self) -> None:
+        # Independent oracle: the documented normalization (heading
+        # excluded, lines rstripped of trailing newlines, joined with \n)
+        # computed with hashlib directly, against the helper.
+        import hashlib
+
+        lines = ["## Plan (Phase 1)", "", "step one", "step two"]
+        expected = hashlib.sha256("\nstep one\nstep two".encode("utf-8")).hexdigest()
+        self.assertEqual(plan_section_digest(lines), expected)
+        self.assertIsNone(plan_section_digest(["# Workflow State", "notes"]))
+        # A later "## " heading terminates the section.
+        bounded = plan_section_digest(
+            ["## Plan (Phase 1)", "step one", "## Notes", "ignored"]
+        )
+        self.assertEqual(
+            bounded, hashlib.sha256(b"step one").hexdigest()
+        )
+
     def test_verdict_shape_is_closed(self) -> None:
         from state_schema import validate_model_runtime_shape
 
@@ -6142,10 +6247,14 @@ class GstackClassificationTests(unittest.TestCase):
         self.assertEqual(result["errors"], [])
         self.assertEqual(result["state"], VALID)
 
-    def test_classification_fingerprint_must_be_64_hex(self) -> None:
+    def test_classification_fingerprint_must_be_64_lowercase_hex(self) -> None:
+        # r17 F9: uppercase is rejected too - the documented encoding is
+        # lowercase and the runner's recompute emits lowercase, so an
+        # uppercase value could never match the comparison it exists for.
         for label, bad in (
             ("short", '"' + "a" * 63 + '"'),
             ("non-hex", '"' + "g" * 64 + '"'),
+            ("uppercase", '"' + "ABCDEF0123456789" * 4 + '"'),
             ("non-string", "12345"),
         ):
             with self.subTest(case=label):
@@ -6158,7 +6267,8 @@ class GstackClassificationTests(unittest.TestCase):
                 self.assertEqual(result["state"], SUSPECT)
                 self.assertTrue(
                     any(
-                        "classification_fingerprint: must be a 64-hex" in error
+                        "classification_fingerprint: must be a 64-character"
+                        " lowercase hex" in error
                         for error in result["errors"]
                     ),
                     result["errors"],

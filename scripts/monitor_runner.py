@@ -115,6 +115,11 @@ _SENSITIVE_TRAIL_PREFIXES = (
     "package-validated:",
     "validation-before-push:",
     "r2-gate:",
+    # admin#1495 r17 F8: the plan-review verdict trail record is produced
+    # by the Phase-2 session pre-launch (the state validator binds
+    # plan_verdict.invocation to exactly this record class); a monitor
+    # child appending one would forge mandatory-gate evidence.
+    "plan-review-verdict:",
 )
 
 
@@ -263,18 +268,21 @@ WAIT_CHUNK_SECONDS = 60
 MAX_WORK_ITERATIONS = 50
 
 # algo#1216 finding 3813491661: repositories whose workflows carry a
-# REQUIRED clean-exit QA handoff — a terminal candidate for one of these
-# with the qa handoff still idle/unplanned is rejected. Casefolded for
-# membership tests (GitHub owner/name is case-insensitive). The runner is
-# deliberately import-free of package modules (it shells to the schema
-# CLI), so this restates the key set of
+# Linear QA leg - the tracker half of the clean-exit QA handoff.
+# Casefolded for membership tests (GitHub owner/name is case-insensitive).
+# The runner is deliberately import-free of package modules (it shells to
+# the schema CLI), so this restates the key set of
 # handoff_decision.QA_OWNER_BY_REPOSITORY — that map stays canonical, and
 # test_monitor_runner_unit's parity regression fails on any drift.
-# admin#1495 r16 F3: membership here now feeds _qa_target_manifest below
-# (it selects the Linear-leg target family) and is no longer the gate key
-# itself - exact-Algo sits outside this map yet still plans GitHub
-# handback/review targets, so the terminal gate, the manifest audit, and
-# the capability preflight all consume the derived manifest instead.
+# admin#1495 r17 F7 (reworking r16 F3): membership here now gates ONLY
+# the Linear-leg target family in _qa_target_manifest below - the Linear
+# map is real routing config, but it never invents GitHub families from
+# repository identity. The GitHub families derive from the launch
+# extract's RESOLVED targets, so the planner's legitimate idle,
+# targetless plan (neither ball holder nor reviewers resolve - the r17
+# F7 Algo repro) stays valid instead of being over-required, and the
+# terminal gate, the manifest audit, and the capability preflight all
+# consume that same launch-derived manifest.
 # admin#1495 r15 F17: the canonical mapped-repository QA manifest, by
 # operation FAMILY. Terminal acceptance requires the github pair plus one
 # complete Linear-leg shape, all sharing ONE generation, each with a
@@ -318,57 +326,106 @@ MAPPED_QA_REPOSITORIES = frozenset(
 )
 
 
-# admin#1495 r16 F3: ONE spelling of the Keeper organization boundary -
-# shared by the r18 F5 containment floor (_keeper_bound_repository) and
-# the target-manifest derivation below.
+# admin#1495 r16 F3 (narrowed by r17 F7): ONE spelling of the Keeper
+# organization boundary - consumed ONLY by the r18 F5 containment floor
+# (_keeper_bound_repository), which is repository-identity-based ON
+# PURPOSE (the uncontained-test-child attestation must never cover any
+# Keeper repository). The target manifest no longer derives any family
+# from it.
 _KEEPER_ORG_PREFIX = "keeper-dating/"
 
 # admin#1495 r16 F3: the handoff TARGET FAMILIES the canonical planner can
-# resolve for a bound repository - the manifest vocabulary. Runner-derived
-# only, never persisted to state.
+# resolve for a run - the manifest vocabulary. Runner-derived only, never
+# persisted to state.
 _QA_TARGET_GITHUB_HANDBACK = "github-assignee-replace"
 _QA_TARGET_GITHUB_REVIEW = "github-review-request"
 _QA_TARGET_LINEAR_QA = "linear-qa"
 
+# admin#1495 r17 F7: the persisted operation families that record each
+# resolved target class. Resolved targets and their planned operations
+# persist in ONE write-ahead commit (monitor-exit-handoffs.md Step 1:
+# "persist handoffs.qa.scenario, exact targets, and the first operation
+# as pending"), so the launch state's qa/review_roundtrip plan is the
+# durable record of resolved targets: the planner mints a
+# replace/verify_assignees pair only when a handback assignee resolved,
+# and request/verify review operations only for resolved reviewers. The
+# verify halves are included so a hand-broken plan carrying only the
+# verify leg still derives its family (fail closed toward auditing).
+_QA_TARGET_SOURCE_KINDS = ("qa", "review_roundtrip")
+_HANDBACK_TARGET_FAMILIES = frozenset(
+    (
+        "qa.github.replace_assignees",
+        "qa.github.verify_assignees",
+        "roundtrip.github.replace_assignees",
+        "roundtrip.github.verify_assignees",
+    )
+)
+_REVIEW_TARGET_FAMILIES = frozenset(
+    (
+        "qa.github.request_review",
+        "qa.github.verify_review_request",
+        "roundtrip.github.request_review",
+        "roundtrip.github.verify_review_request",
+    )
+)
 
-def _qa_target_manifest(bound_repo: object) -> frozenset[str]:
-    """admin#1495 r16 F3: the immutable-input-bound target manifest -
-    which handoff target families handoff_decision's planner resolves for
-    the bound repository. Derived ONLY from the runner-owned repository
-    binding (never from child-written candidate state, which is
-    untrusted) and recomputed by every consumer through this one pure
-    function, so the preflight copy persisted on the runner and the
-    per-candidate terminal gates can never diverge. Restates the
-    planner's own routing:
 
-    * a Linear-mapped repository (MAPPED_QA_REPOSITORIES, the restated
-      key set of handoff_decision.QA_OWNER_BY_REPOSITORY) plans the
-      github handback pair, routed reviewer requests, and a Linear QA
-      leg;
-    * every OTHER Keeper-organization repository (exact-Algo is the r16
-      F3 repro) still gets the UNIVERSAL reviewer/ball-holder handback
-      (handoff_decision r16 F2) but never a Linear leg - github families
-      only;
-    * a non-Keeper or unresolved binding plans no Keeper handoff at all:
-      a genuinely targetless run, where an idle QA aggregate stays
-      valid."""
+def _qa_target_manifest(
+    bound_repo: object, launch_extract: dict[str, Any]
+) -> frozenset[str]:
+    """admin#1495 r17 F7 (reworking r16 F3): the launch-resolved target
+    manifest - which handoff target families the canonical planner has
+    RESOLVED for this run. Derived ONLY from the runner-owned LAUNCH
+    extract (the state the runner itself loaded and verified - never the
+    child-written candidate, which is untrusted) plus the Linear routing
+    map, and recomputed by every consumer through this one pure function
+    of the same trusted inputs. r16 derived the GitHub families from
+    repository class alone, which falsely rejected the planner's
+    legitimate idle, targetless Algo plan (neither ball holder nor
+    reviewers resolve) and over-required assignee operations for
+    reviewer-only plans:
 
-    if not isinstance(bound_repo, str):
-        return frozenset()
-    folded = bound_repo.casefold()
-    if folded in MAPPED_QA_REPOSITORIES:
-        return frozenset(
-            (
-                _QA_TARGET_GITHUB_HANDBACK,
-                _QA_TARGET_GITHUB_REVIEW,
-                _QA_TARGET_LINEAR_QA,
-            )
-        )
-    if folded.startswith(_KEEPER_ORG_PREFIX):
-        return frozenset(
-            (_QA_TARGET_GITHUB_HANDBACK, _QA_TARGET_GITHUB_REVIEW)
-        )
-    return frozenset()
+    * github handback family iff a resolved handback assignee exists -
+      recorded by a persisted ``*.replace_assignees`` /
+      ``*.verify_assignees`` operation in the qa or review_roundtrip
+      plan (_HANDBACK_TARGET_FAMILIES above explains why the persisted
+      plan IS the resolved-target record);
+    * github review family iff resolved reviewers exist - recorded by a
+      persisted ``*.request_review`` / ``*.verify_review_request``
+      operation;
+    * linear-qa family iff the repository is Linear-mapped
+      (MAPPED_QA_REPOSITORIES - real routing config, the one
+      repository-identity leg F7 keeps) AND the tracker leg resolved -
+      recorded by a persisted ``qa.linear.*`` operation;
+    * no resolved targets anywhere - a genuinely targetless launch: an
+      empty manifest, the capability preflight skips, and an idle
+      terminal QA aggregate stays valid.
+
+    The launch-derived manifest is a FLOOR the candidate must satisfy
+    (that is exactly what makes it immutable-input-bound): a target
+    resolved at launch that the candidate's terminal plan omits is still
+    a violation, enforced by the terminal gates below."""
+
+    families: set[str] = set()
+    operations_by_kind = launch_extract.get("handoff_operations")
+    if isinstance(operations_by_kind, dict):
+        for kind in _QA_TARGET_SOURCE_KINDS:
+            for op_id in operations_by_kind.get(kind) or []:
+                if isinstance(op_id, str):
+                    head, _, _generation = op_id.rpartition(":")
+                    families.add(head.split(":", 1)[0])
+    manifest: set[str] = set()
+    if families & _HANDBACK_TARGET_FAMILIES:
+        manifest.add(_QA_TARGET_GITHUB_HANDBACK)
+    if families & _REVIEW_TARGET_FAMILIES:
+        manifest.add(_QA_TARGET_GITHUB_REVIEW)
+    if (
+        isinstance(bound_repo, str)
+        and bound_repo.casefold() in MAPPED_QA_REPOSITORIES
+        and any(family.startswith("qa.linear.") for family in families)
+    ):
+        manifest.add(_QA_TARGET_LINEAR_QA)
+    return frozenset(manifest)
 
 
 def _manifest_missing_planned_qa(
@@ -376,52 +433,58 @@ def _manifest_missing_planned_qa(
 ) -> bool:
     """admin#1495 r16 F3: ANY planned target family makes an idle or
     absent terminal QA aggregate a missing-handoff violation - the run
-    reported completion without recording one handoff artifact for
-    targets the planner resolves from immutable inputs. An empty
-    manifest (a genuinely targetless run) keeps idle valid."""
+    reported completion without recording one handoff artifact for the
+    targets the launch state resolved (admin#1495 r17 F7). An empty
+    manifest (a genuinely targetless launch) keeps idle valid."""
 
     return bool(manifest) and qa_status in (None, "idle")
 
 
-def _terminal_missing_planned_qa(bound_repo: object, qa_status: object) -> bool:
-    """algo#1216 finding 3813491661: a terminal candidate for a repository
-    with planned handoff targets must show the clean-exit QA handoff
+def _terminal_missing_planned_qa(
+    bound_repo: object, launch_extract: dict[str, Any], qa_status: object
+) -> bool:
+    """algo#1216 finding 3813491661: a terminal candidate for a run with
+    planned handoff targets must show the clean-exit QA handoff
     actually planned - an idle or absent QA aggregate means completion was
     reported without assigning QA, moving the ticket, or recording any
-    handoff artifact. Idle stays valid for targetless repositories.
+    handoff artifact. Idle stays valid for a targetless launch.
 
-    admin#1495 r16 F3: keyed on the derived target manifest, no longer on
-    MAPPED_QA_REPOSITORIES membership - the map excludes exact-Algo, whose
-    planning still emits GitHub review and assignment operations, so a
-    delegated-host algo run could finish with handoffs.qa idle despite
-    resolved handback targets.
+    admin#1495 r17 F7 (reworking r16 F3): keyed on the LAUNCH-resolved
+    target manifest, no longer on repository class - r16's class
+    derivation rejected the planner's legitimate idle, targetless Algo
+    plan, while a launch whose canonical state carries resolved handback
+    targets (whatever the repository) still fails closed here when the
+    candidate drops them.
 
     Extracted so the manifest rule keeps a reachable pin: the r17 F9
     containment gate now preempts this branch end to end on a non-delegating
-    host (a mapped launch blocks BEFORE any child produces a candidate), so the
-    predicate is verified directly here rather than through the now-gated e2e
-    path."""
+    host (a Keeper-bound launch blocks BEFORE any child produces a
+    candidate), so the predicate is verified directly here rather than
+    through the now-gated e2e path."""
 
     return _manifest_missing_planned_qa(
-        _qa_target_manifest(bound_repo), qa_status
+        _qa_target_manifest(bound_repo, launch_extract), qa_status
     )
 
 
 def _qa_manifest_coverage_violation(
     manifest: frozenset[str], candidate_extract: dict[str, Any]
 ) -> str | None:
-    """admin#1495 r15 F17 / r16 F3: a non-idle terminal QA aggregate must
-    carry the COMPLETE operation set for the families the target manifest
-    plans - one generation, the github handback pair when the handback is
-    planned, a canonical Linear-leg shape exactly when the Linear leg is
-    planned (and NO Linear operations when it is not: the planner never
-    mints a Linear leg for an unmapped repository), and a recorded result
-    per operation. The manifest is a coverage floor, not a ceiling:
-    reviewer request/verify operations mint only when reviewers are
-    routed, so they are never REQUIRED coverage. Identity inputs beyond
-    the family manifest (Linear provider ids, reviewer logins) are
-    live-service facts the executor re-verifies at postcondition time;
-    this gate closes the omitted-effect hole, not identity forgery."""
+    """admin#1495 r15 F17 / r16 F3 / r17 F7: a non-idle terminal QA
+    aggregate must carry the COMPLETE operation set for the families the
+    launch-derived target manifest plans - one generation, the github
+    handback pair when the handback is planned (the fail-closed floor: a
+    handback target resolved at launch that the candidate's terminal
+    plan omits rejects here), a canonical Linear-leg shape exactly when
+    the Linear leg is planned (and NO Linear operations when it is not:
+    the planner never mints a Linear leg for an unmapped repository),
+    and a recorded result per operation. The manifest is a coverage
+    floor, not a ceiling: reviewer request/verify operations mint only
+    when reviewers are routed, so they are never REQUIRED coverage.
+    Identity inputs beyond the family manifest (Linear provider ids,
+    reviewer logins) are live-service facts the executor re-verifies at
+    postcondition time; this gate closes the omitted-effect hole, not
+    identity forgery."""
 
     if not manifest:
         return None
@@ -491,7 +554,8 @@ def _qa_manifest_coverage_violation(
 # families the probe knows how to prove (and the fail-closed deny set for
 # unparseable ``permissions.deny`` shapes in _denied_families) - the
 # per-run REQUIRED subset now comes from _manifest_required_capabilities
-# over the derived target manifest, so a github-only manifest (exact-Algo)
+# over the launch-derived target manifest (admin#1495 r17 F7), so a
+# github-only manifest (resolved handback/review targets, no Linear leg)
 # demands github without demanding linear.
 REQUIRED_CHILD_CAPABILITIES = frozenset({"github", "linear"})
 
@@ -848,6 +912,143 @@ def taint_digest(tainted: list[Any]) -> str:
         if isinstance(record, dict)
     )
     return hashlib.sha256("\n".join(rows).encode("utf-8")).hexdigest()
+
+
+def classification_fingerprint_value(
+    merge_base_sha: str, head_sha: str, status_bytes: bytes
+) -> str:
+    """admin#1495 r17 F9: the classification-fingerprint recipe, EXACTLY
+    references/project-and-entry.md Step 2's binding (that reference is
+    canonical; this is the runner's recompute of it):
+    ``sha256(merge_base_sha + "\\n" + head_sha + "\\n" + worktree_digest
+    + "\\n")`` hex lowercase, where ``worktree_digest`` is the sha256 hex
+    digest of the raw bytes of ``git status --porcelain=v1 -z`` (empty
+    output digests empty bytes - a clean tree is computed, never
+    assumed). hexdigest() emits lowercase by construction, so an
+    uppercase persisted value can never match."""
+
+    worktree_digest = hashlib.sha256(status_bytes).hexdigest()
+    return hashlib.sha256(
+        f"{merge_base_sha}\n{head_sha}\n{worktree_digest}\n".encode("utf-8")
+    ).hexdigest()
+
+
+def _frontmatter_scalar(text: str, key_path: tuple[str, ...]) -> str | None:
+    """String scalar at ``key_path`` (depth 1 or 2) in the state front
+    matter, or None when absent/null/non-scalar.
+
+    admin#1495 r17 F9: the runner needs two schema-validated scalars
+    (top-level ``base_branch``; ``gstack_integration.
+    classification_fingerprint``) that the monitor-extract contract does
+    not carry. Same local-twin doctrine as _parse_retry_deadline:
+    state_schema's restricted parser stays the canonical grammar, and
+    this narrow reader twins exactly the subset those fields can legally
+    serialize under it - JSON-double-quoted or plain scalars, optionally
+    JSON-quoted keys, quote-aware trailing comments, block children at
+    one shared deeper indent, duplicate keys impossible (the parser
+    rejects them). Only ever run on text the schema CLI has already
+    validated; anything unrecognized returns None - and for the
+    fingerprint the full-tier validator independently requires the
+    field, so None cannot fail open into an accepted terminal."""
+
+    lines = text.split("\n")
+    fences = [i for i, line in enumerate(lines) if line.strip() == "---"]
+    if len(fences) < 2:
+        return None
+
+    def _strip_trailing_comment(value_text: str) -> str:
+        out: list[str] = []
+        in_string = False
+        escaped = False
+        for ch in value_text:
+            if in_string:
+                out.append(ch)
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+                out.append(ch)
+                continue
+            if ch == "#" and (not out or out[-1] in " \t"):
+                break
+            out.append(ch)
+        return "".join(out).strip()
+
+    def _key_and_value(content: str) -> tuple[str, str] | None:
+        if content.startswith('"'):
+            try:
+                decoder = json.JSONDecoder()
+                key, end = decoder.raw_decode(content)
+            except ValueError:
+                return None
+            if not isinstance(key, str):
+                return None
+            rest = content[end:].lstrip()
+        else:
+            match = re.match(r"^([^\s:]+)", content)
+            if match is None:
+                return None
+            key = match.group(1)
+            rest = content[match.end():].lstrip()
+        if not rest.startswith(":"):
+            return None
+        return key, rest[1:].strip()
+
+    def _scalar_string(value_text: str) -> str | None:
+        token = _strip_trailing_comment(value_text)
+        if token in ("", "null", "~"):
+            return None
+        if token.startswith('"'):
+            try:
+                decoder = json.JSONDecoder()
+                value, end = decoder.raw_decode(token)
+            except ValueError:
+                return None
+            if not isinstance(value, str) or token[end:].strip():
+                return None
+            return value
+        return token
+
+    depth = 0
+    child_indent: int | None = None
+    for raw in lines[fences[0] + 1 : fences[1]]:
+        if "\t" in raw:
+            return None
+        stripped = raw.rstrip()
+        if not stripped.strip():
+            continue
+        indent = len(stripped) - len(stripped.lstrip(" "))
+        content = stripped.strip()
+        if depth == 0:
+            if indent != 0:
+                continue
+            parsed = _key_and_value(content)
+            if parsed is None or parsed[0] != key_path[0]:
+                continue
+            if len(key_path) == 1:
+                return _scalar_string(parsed[1])
+            depth = 1
+            child_indent = None
+            continue
+        # depth == 1: inside the matched top-level block. The restricted
+        # parser pins all direct children to ONE shared indent (the first
+        # child's); deeper lines belong to grandchildren.
+        if indent == 0:
+            return None  # block ended; duplicate top-level keys are
+            # parser-rejected, so the path cannot recur
+        if child_indent is None:
+            child_indent = indent
+        if indent != child_indent:
+            continue
+        parsed = _key_and_value(content)
+        if parsed is not None and parsed[0] == key_path[1]:
+            return _scalar_string(parsed[1])
+    return None
 
 
 def _emit(payload: dict[str, Any]) -> None:
@@ -2339,12 +2540,15 @@ class Runner:
             except (OSError, subprocess.TimeoutExpired):
                 self.repository_probe = "unavailable"
                 self.repository_hint = None
-        # admin#1495 r16 F3: the preflight-derived target/capability
-        # manifest for this run. Seeded empty; _child_capability_probe
-        # derives and persists it from the resolved binding BEFORE any
-        # capability check, and the per-candidate terminal gates recompute
-        # it through the same pure function of the same immutable binding
-        # (_qa_target_manifest), so the copies cannot diverge.
+        # admin#1495 r16 F3 / r17 F7: the preflight-derived
+        # target/capability manifest for this slice. Seeded empty;
+        # _child_capability_probe derives and persists it from the LAUNCH
+        # extract's resolved targets BEFORE any capability check, and the
+        # per-candidate terminal gates recompute it through the same pure
+        # function (_qa_target_manifest) of the verified launch extract -
+        # the floor can only grow mid-slice, when a committed tick
+        # persists newly resolved targets into canonical state (those are
+        # preflighted at the next slice).
         self.target_manifest: frozenset[str] = frozenset()
         self.slice_deadline = time.monotonic() + args.slice_budget
         # Testability seam (same class as --claude-bin): scales ladder and
@@ -3684,38 +3888,69 @@ class Runner:
           read-only grants, and failed/pending/auth-required rows prove
           nothing — the r25/r17 probes accepted each of these shapes.
 
-        Scoped by the derived target manifest (admin#1495 r16 F3), not
-        by Linear-map membership: a Linear-mapped repository needs github
-        AND linear, an unmapped Keeper-organization repository
-        (exact-Algo, the r16 F3 repro) plans GitHub handback/review
-        targets and needs github WITHOUT linear, and a binding with no
-        planned targets skips the probe entirely - that run uses the
-        developer's own settings and plans no Keeper handoff operations.
+        Scoped by the launch-derived target manifest (admin#1495 r16 F3,
+        reworked by r17 F7): the required families come from the LAUNCH
+        extract's resolved targets, never from repository class - a
+        launch whose canonical state resolved handback/review targets
+        needs github, one whose Linear-mapped tracker leg resolved needs
+        linear, and a genuinely targetless launch (no resolved targets
+        anywhere - the planner's legitimate idle Algo plan included)
+        skips the probe entirely: nothing is planned yet, and targets
+        that resolve mid-slice are preflighted at the next slice while
+        the terminal gates recompute the floor per candidate.
         (algo#1216 r18 F5 removed the former "read-only scheduled run"
         justification: every reachable monitor child is write-capable,
-        so no read-only cohort exists to preserve.) The package
-        self-provisions NOTHING: this only reports what the host
-        supplied, and the immutable per-profile descriptor remains a
-        host contract (admin r14 F3).
+        so no read-only cohort exists to preserve.)
+
+        Authorization is resolved from the EXACT environment the child
+        will receive (admin#1495 r17 F5). Resolution order for the
+        user-scope settings file: the MONITOR_RUNNER_USER_SETTINGS test
+        seam when set (hermetic fixtures; same operator trust class as
+        --claude-bin), else ``$CLAUDE_CONFIG_DIR/settings.json`` from
+        the sanitized child env (that variable relocates ``~/.claude``
+        for the child, so reading the home profile while the child runs
+        a custom profile proved the wrong surface), else the child
+        HOME's ``~/.claude/settings.json``. Managed settings
+        (``/Library/Application Support/ClaudeCode/managed-settings.json``
+        on macOS, ``/etc/claude-code/managed-settings.json`` elsewhere;
+        MONITOR_RUNNER_MANAGED_SETTINGS is the matching test seam)
+        contribute DENIES only - the ONE cross-scope rule applied is
+        deny-wins: a family denied in any consulted scope is denied,
+        while allows still come from the user-scope grant table; no
+        partial home-directory precedence parser is built here. A
+        managed file that EXISTS but cannot be read or parsed fails
+        CLOSED - the deny it might carry is unprovable, so no launch.
+        The package self-provisions NOTHING: this only reports what the
+        host supplied, and the immutable per-profile descriptor remains
+        a host contract (admin r14 F3).
         """
 
         bound = self._bound_repository(extract)
-        # admin#1495 r16 F3: derive the immutable-input-bound target
+        # admin#1495 r16 F3 / r17 F7: derive the launch-resolved target
         # manifest BEFORE any preflight check and persist it runner-side
         # for the slice; the terminal gates recompute it through the same
-        # pure function of the same binding. An empty manifest (no
-        # planned targets) skips the probe - there is no handoff surface
-        # to prove.
-        self.target_manifest = _qa_target_manifest(bound)
+        # pure function of the same trusted launch inputs. An empty
+        # manifest (no resolved targets) skips the probe - there is no
+        # handoff surface to prove.
+        self.target_manifest = _qa_target_manifest(bound, extract)
         required = _manifest_required_capabilities(self.target_manifest)
         if not required:
             return
+        # admin#1495 r17 F5: the sanitized child env is resolved FIRST -
+        # it is the settings-root authority, not just the probe env.
+        probe_env = self._sanitized_child_env()
         settings_override = os.environ.get("MONITOR_RUNNER_USER_SETTINGS")
-        settings_path = (
-            Path(settings_override)
-            if settings_override
-            else Path.home() / ".claude" / "settings.json"
-        )
+        if settings_override:
+            settings_path = Path(settings_override)
+        else:
+            child_config_dir = probe_env.get("CLAUDE_CONFIG_DIR")
+            child_home = probe_env.get("HOME")
+            if child_config_dir:
+                settings_path = Path(child_config_dir) / "settings.json"
+            elif child_home:
+                settings_path = Path(child_home) / ".claude" / "settings.json"
+            else:
+                settings_path = Path.home() / ".claude" / "settings.json"
         settings_data: object = None
         try:
             settings_data = json.loads(
@@ -3724,7 +3959,59 @@ class Runner:
         except (OSError, ValueError, RunnerExit):
             settings_data = None
         routes = _allowed_routes(settings_data)
-        probe_env = self._sanitized_child_env()
+        # admin#1495 r17 F5: managed settings are consulted for DENIES.
+        # Absent file = no managed constraints; present-but-unreadable or
+        # unparseable = fail closed (an effective managed deny cannot be
+        # ruled out, so authorization is unprovable).
+        managed_override = os.environ.get("MONITOR_RUNNER_MANAGED_SETTINGS")
+        if managed_override:
+            managed_path = Path(managed_override)
+        elif platform.system() == "Darwin":
+            managed_path = Path(
+                "/Library/Application Support/ClaudeCode/managed-settings.json"
+            )
+        else:
+            managed_path = Path("/etc/claude-code/managed-settings.json")
+        managed_denied: set[str] = set()
+        managed_raw: bytes | None = None
+        try:
+            managed_raw = _read_regular_file(managed_path, 1_048_576)
+        except FileNotFoundError:
+            managed_raw = None
+        except (OSError, RunnerExit):
+            raise RunnerExit(
+                5,
+                "blocked",
+                f"managed settings at {managed_path} exist but cannot be"
+                " read - the effective permission set cannot be proven"
+                " (a managed deny takes precedence over every user-scope"
+                " allow), so the capability probe fails closed"
+                " (admin#1495 r17 F5); fix the file's readability or"
+                " remove it, then re-run",
+            )
+        if managed_raw is not None:
+            managed_data: object
+            try:
+                managed_data = json.loads(managed_raw.decode("utf-8"))
+            except ValueError:
+                managed_data = None
+            if not isinstance(managed_data, dict):
+                raise RunnerExit(
+                    5,
+                    "blocked",
+                    f"managed settings at {managed_path} exist but cannot"
+                    " be parsed as a JSON object - the effective"
+                    " permission set cannot be proven (a managed deny"
+                    " takes precedence over every user-scope allow), so"
+                    " the capability probe fails closed (admin#1495 r17"
+                    " F5); fix the file, then re-run",
+                )
+            managed_perms = managed_data.get("permissions")
+            managed_denied = (
+                _denied_families(managed_perms.get("deny"))
+                if isinstance(managed_perms, dict)
+                else set()
+            )
         # The exact-invocation MCP discovery the child itself resolves —
         # always consulted (linear has no non-MCP route, so a mapped run
         # can never prove its surface from settings alone), and run under
@@ -3751,6 +4038,14 @@ class Runner:
         )
         unproven: dict[str, str] = {}
         for family in sorted(required):
+            # admin#1495 r17 F5: deny-wins across scopes - a managed deny
+            # blocks the family whatever the user scope allows.
+            if family in managed_denied:
+                unproven[family] = (
+                    "denied by managed settings (a managed deny takes"
+                    " precedence over every user-scope allow)"
+                )
+                continue
             if family in denied:
                 unproven[family] = "denied by permissions.deny"
                 continue
@@ -3801,9 +4096,10 @@ class Runner:
             5,
             "blocked",
             f"child capability probe failed for {bound}: {detail}. The"
-            f" repository's target manifest plans [{planned}] handoffs"
-            " (admin#1495 r16 F3), and the user-scope surface the"
-            " --setting-sources user child resolves cannot execute the"
+            f" launch state's resolved targets plan [{planned}] handoffs"
+            " (admin#1495 r16 F3 / r17 F7), and the settings surface the"
+            " --setting-sources user child resolves under its exact"
+            " environment (admin#1495 r17 F5) cannot execute the"
             " Phase 6 handoffs, which would strand after PR creation"
             " (admin#1495 finding 3825265272 / algo#1216 r18 F3 / admin"
             " r14 F9). Authorization needs EXACT mutation-capable"
@@ -4401,20 +4697,124 @@ class Runner:
             shutil.rmtree(snapshot, ignore_errors=True)
 
     def _qa_manifest_violation(
-        self, bound_repo: object, candidate_extract: dict[str, Any]
+        self,
+        bound_repo: object,
+        launch_extract: dict[str, Any],
+        candidate_extract: dict[str, Any],
     ) -> str | None:
         """admin#1495 r15 F17: a terminal candidate must carry the
         COMPLETE canonical QA operation set for every family its target
-        manifest plans. admin#1495 r16 F3: the manifest is derived from
-        the runner-owned repository binding through _qa_target_manifest -
-        no longer gated on MAPPED_QA_REPOSITORIES membership, which
-        excluded exact-Algo while its planning still emitted GitHub
-        operations. The coverage rules live in the module-level
-        _qa_manifest_coverage_violation so tests can pin manifest shapes
-        no current repository class derives (reviewer-only)."""
+        manifest plans. admin#1495 r17 F7 (reworking r16 F3): the
+        manifest is derived from the runner-owned LAUNCH extract's
+        resolved targets through _qa_target_manifest - never from
+        repository class (which falsely rejected the planner's idle,
+        targetless Algo plan) and never from the child-written
+        candidate (which could drop a launch-resolved target to shrink
+        its own audit: the launch manifest is the floor). The coverage
+        rules live in the module-level _qa_manifest_coverage_violation
+        so tests can pin manifest shapes directly (reviewer-only)."""
 
         return _qa_manifest_coverage_violation(
-            _qa_target_manifest(bound_repo), candidate_extract
+            _qa_target_manifest(bound_repo, launch_extract),
+            candidate_extract,
+        )
+
+    def _stale_classification_reason(
+        self, candidate_text: str
+    ) -> str | None:
+        """admin#1495 r17 F9: the terminal-candidate classification gate.
+        Returns None when the candidate carries no
+        gstack_integration.classification_fingerprint (legacy/absent
+        falls to the state validator's tier rules - never double-reported
+        here) or when the persisted value matches the runner's own
+        recompute; otherwise the rejection reason. The 64-hex SHAPE is
+        the validator's check; this is the CONTENT binding - an all-zero
+        or uppercase value shape-validated fine while the selectors went
+        stale, so the runner compares against the live repository.
+        Raises the fail-closed RunnerExit when git cannot prove the
+        binding at all."""
+
+        persisted = _frontmatter_scalar(
+            candidate_text,
+            ("gstack_integration", "classification_fingerprint"),
+        )
+        if persisted is None:
+            return None
+        recomputed = self._recompute_classification_fingerprint()
+        if persisted == recomputed:
+            return None
+        return (
+            "gstack_integration.classification_fingerprint"
+            f" {persisted[:12]!r} does not match the recomputed"
+            f" base/head/worktree binding {recomputed[:12]!r} - the"
+            " classification is stale: re-run Scope Analysis"
+            " (references/project-and-entry.md Step 2) and recompute the"
+            " fingerprint before re-submitting a terminal candidate"
+            " (admin#1495 r17 F9)"
+        )
+
+    def _recompute_classification_fingerprint(self) -> str:
+        """The runner's OWN base/head/worktree observation, mirroring
+        references/project-and-entry.md Step 2 exactly (admin#1495 r17
+        F9) - bounded subprocesses, no shell, sanitized child env, run
+        at the bound repository checkout. base_branch is read from the
+        CANONICAL launch text (verified unmutated by the caller's
+        _require_unmutated_canonical), never from the child-written
+        candidate: a candidate that could choose its own base could
+        choose the tree it is compared against. Any git failure fails
+        CLOSED - a terminal candidate is never accepted on an unprovable
+        binding."""
+
+        def _refuse(detail: str) -> RunnerExit:
+            return RunnerExit(
+                5,
+                "blocked",
+                "classification fingerprint gate: cannot recompute the"
+                f" base/head/worktree binding ({detail}) at"
+                f" {self.child_cwd} - terminal candidates are not"
+                " accepted on an unprovable classification (admin#1495"
+                " r17 F9); restore repository/git access (including"
+                " origin/<base_branch>) and re-run",
+            )
+
+        base_branch = _frontmatter_scalar(self.read_text(), ("base_branch",))
+        if not base_branch:
+            raise _refuse("state carries no base_branch")
+        try:
+            git_bin = _resolve_system_binary("git")
+        except RunnerExit as error:
+            raise _refuse(f"git unavailable: {error.reason}") from error
+
+        def _run_git(argv: list[str]) -> bytes:
+            try:
+                completed = subprocess.run(
+                    [git_bin, "-C", self.child_cwd, *argv],
+                    capture_output=True,
+                    timeout=30,
+                    env=self._sanitized_child_env(),
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                raise _refuse(
+                    f"git {argv[0]} failed ({error.__class__.__name__})"
+                ) from error
+            if completed.returncode != 0:
+                raise _refuse(f"git {argv[0]} exited {completed.returncode}")
+            return completed.stdout
+
+        merge_base = (
+            _run_git(["merge-base", f"origin/{base_branch}", "HEAD"])
+            .decode("utf-8", "replace")
+            .strip()
+        )
+        head = (
+            _run_git(["rev-parse", "HEAD"]).decode("utf-8", "replace").strip()
+        )
+        for label, value in (("merge-base", merge_base), ("head", head)):
+            if re.fullmatch(r"[0-9a-f]{40,64}", value) is None:
+                raise _refuse(f"git returned a non-object-id {label}")
+        status_bytes = _run_git(["status", "--porcelain=v1", "-z"])
+        return classification_fingerprint_value(
+            merge_base, head, status_bytes
         )
 
     def _fetch_remote_head(
@@ -4648,15 +5048,38 @@ class Runner:
             self._preserve_failed(candidate)
             self.charge_failure(fresh, "monitor-child:work_cap_exceeded")
             return "retry"
-        # algo#1216 finding 3813491661: repository-bound required-handoff
-        # manifest. For a repository with planned handoff targets a
-        # terminal candidate must show the clean-exit QA handoff actually
-        # planned - an idle aggregate on a Keeper run meant completion was
+        # admin#1495 r17 F9: the terminal gates below consume the
+        # classification the child persisted (change_type /
+        # defect_evidence_mode drive the validator's invariant rules and
+        # the manifest audit's inputs), and the runner is the trusted
+        # boundary for terminal-candidate acceptance - so the
+        # base/head/worktree binding is re-proven HERE, against the
+        # runner's own git observations, before any classification-keyed
+        # acceptance math. A candidate carrying a fingerprint that does
+        # not match the recomputed binding is a stale classification and
+        # never commits; a candidate without one falls to the state
+        # validator's tier rules (never double-reported here).
+        if outcome == "terminal":
+            stale_classification = self._stale_classification_reason(
+                candidate_text
+            )
+            if stale_classification is not None:
+                _heartbeat(f"terminal rejected: {stale_classification}")
+                self._preserve_failed(candidate)
+                self.charge_failure(
+                    fresh, "monitor-child:classification_fingerprint_stale"
+                )
+                return "retry"
+        # algo#1216 finding 3813491661: launch-resolved required-handoff
+        # manifest. For a run with resolved handoff targets a terminal
+        # candidate must show the clean-exit QA handoff actually
+        # planned - an idle aggregate on such a run meant completion was
         # reported without assigning QA, moving the ticket, or recording
-        # any handoff artifact. admin#1495 r16 F3: keyed on the derived
-        # target manifest, so exact-Algo (GitHub handback targets, no
-        # Linear leg) rejects idle terminals too; idle stays valid only
-        # for a genuinely targetless binding.
+        # any handoff artifact. admin#1495 r17 F7 (reworking r16 F3):
+        # keyed on the LAUNCH extract's resolved targets, so any run
+        # whose canonical state resolved handback/review targets rejects
+        # idle terminals, while a genuinely targetless launch (the
+        # planner's legitimate idle Algo plan included) keeps idle valid.
         if outcome == "terminal":
             launch_cli = fresh.get("monitor_cli")
             persisted_repo = (
@@ -4672,7 +5095,7 @@ class Runner:
             qa_status = (
                 candidate_extract.get("handoff_status_by_kind") or {}
             ).get("qa")
-            if _terminal_missing_planned_qa(bound_repo, qa_status):
+            if _terminal_missing_planned_qa(bound_repo, fresh, qa_status):
                 self._preserve_failed(candidate)
                 self.charge_failure(fresh, "monitor-child:handoff_missing")
                 return "retry"
@@ -4871,7 +5294,7 @@ class Runner:
             if not (isinstance(manifest_repo, str) and manifest_repo):
                 manifest_repo = self.repository_hint
             manifest_violation = self._qa_manifest_violation(
-                manifest_repo, candidate_extract
+                manifest_repo, fresh, candidate_extract
             )
             if manifest_violation is not None:
                 _heartbeat(

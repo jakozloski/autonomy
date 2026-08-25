@@ -1100,16 +1100,46 @@ MODEL_RUNTIME_LEG_KEYS = frozenset(
         "live_catalog_verified_at",
     )
 )
-# admin#1495 r16 F6: typed evidence that the mandatory Phase-1 Codex plan
-# review returned an affirmative verdict, bound to the exact reviewed plan.
-# verdict is affirmative-only: a non-approval resets plan_review and reruns
-# the review rather than persisting here. plan_digest binds the verdict to
-# the plan revision (the runtime recomputes it and invalidates the verdict
-# when the plan changes); model/invocation are the descriptor + evidence.
+# admin#1495 r16 F6 / r17 F8: typed evidence that the mandatory Phase-1
+# Codex plan review returned an affirmative verdict, MACHINE-BOUND to the
+# exact reviewed plan. verdict is affirmative-only: a non-approval resets
+# plan_review and reruns the review rather than persisting here. The
+# bindings are verified in invariant(vii), not merely shape-checked:
+# plan_digest is recomputed over the state body's "## Plan (Phase 1)"
+# section (plan_section_digest), model must equal the frozen Codex
+# selection at model_runtime.codex.model, and invocation must have a
+# matching "plan-review-verdict:<invocation>" Decision Audit Trail record
+# (a runner-protected sensitive prefix a monitor child cannot forge).
 MODEL_PLAN_VERDICT_ENUM = frozenset(("approved",))
 MODEL_PLAN_VERDICT_KEYS = frozenset(
     ("verdict", "plan_digest", "model", "invocation")
 )
+
+PLAN_SECTION_HEADING = "## Plan (Phase 1)"
+
+
+def plan_section_digest(body_lines: list[str]) -> str | None:
+    """admin#1495 r17 F8: sha256 over the state body's reviewed-plan
+    section - the machine side of the plan-verdict binding. Returns None
+    when the body carries no "## Plan (Phase 1)" heading. Content is the
+    section's lines (heading excluded) up to the next "## " heading or
+    EOF, each stripped of its trailing newline and joined with "\\n" -
+    the same per-line normalization monitor_digest applies, so editor
+    newline styles cannot flip the digest."""
+
+    section: list[str] | None = None
+    for line in body_lines:
+        stripped = line.rstrip("\n")
+        if section is None:
+            if stripped.strip() == PLAN_SECTION_HEADING:
+                section = []
+            continue
+        if stripped.startswith("## "):
+            break
+        section.append(stripped)
+    if section is None:
+        return None
+    return hashlib.sha256("\n".join(section).encode("utf-8")).hexdigest()
 
 
 def validate_model_runtime_shape(model_runtime: Any) -> list[str]:
@@ -1194,11 +1224,13 @@ def validate_model_runtime_shape(model_runtime: Any) -> list[str]:
                         f".escalation_invocations[{position}]: must be a"
                         " mapping with trigger/voice/reason"
                     )
-    # admin#1495 r16 F6: closed-shape validation of the plan verdict, checked
-    # wherever a record is present (the phase-tie in validate_evidence binds
-    # its PRESENCE to phases.plan_review complete). verdict affirmative-only;
-    # plan_digest a lowercase-hex prefix binding the reviewed plan revision;
-    # model/invocation the selected-model descriptor and invocation evidence.
+    # admin#1495 r16 F6 / r17 F8: closed-shape validation of the plan
+    # verdict, checked wherever a record is present. Shape only, on
+    # purpose: invariant(vii) in validate_evidence owns the BINDINGS
+    # (digest recomputed over the body plan section, model against the
+    # frozen Codex selection, invocation against the runner-protected
+    # trail record) because they need state and body context this pure
+    # conventions helper does not have.
     verdict_record = model_runtime.get("plan_verdict")
     if verdict_record is not None:
         prefix = "resolved_conventions.model_runtime.plan_verdict"
@@ -1228,8 +1260,8 @@ def validate_model_runtime_shape(model_runtime: Any) -> list[str]:
                 errors.append(
                     f"{prefix}.plan_digest: must be 12-64 lowercase hex"
                     " binding the verdict to the exact reviewed plan"
-                    " revision (the runtime recomputes it and invalidates"
-                    " the verdict when the plan changes)"
+                    " revision (invariant(vii) recomputes it over the state"
+                    " body's plan section and rejects a mismatch)"
                 )
             for field in ("model", "invocation"):
                 value = verdict_record.get(field)
@@ -1344,8 +1376,13 @@ def _check_test_path(path_value: Any) -> str | None:
 
 
 class _Validator:
-    def __init__(self, state: dict) -> None:
+    def __init__(self, state: dict, body_lines: list[str] | None = None) -> None:
         self.state = state
+        # admin#1495 r17 F8: the state BODY is part of the validated text -
+        # the reviewed plan lives in the body's "## Plan (Phase 1)" section,
+        # and the plan-verdict digest is recomputed over it here, at the
+        # same trusted boundary that validates every other binding.
+        self.body_lines = body_lines if body_lines is not None else []
         self.errors: list[str] = []
 
     def error(self, message: str) -> None:
@@ -2574,19 +2611,21 @@ class _Validator:
                             "invariant(iv): defect mode requires variant_analysis complete once pr is non-pending"
                         )
 
-        # (vii) admin#1495 r16 F6: phases.plan_review == complete IS the
-        # claim that the mandatory Phase-1 Codex plan review ran and approved
-        # (references/state-and-safety.md: "complete requires the mandatory
-        # Codex verdict"). It used to validate with no evidence at all —
-        # validate_model_runtime_shape returns [] for a MISSING record and
-        # the phase chain only checks that phase strings advance in order, so
-        # an implementation-phase state with plan_review complete and no
-        # model_runtime passed clean. Require the Phase-1 runtime record AND
-        # the typed plan_verdict; the verdict's SHAPE is enforced in
-        # validate_model_runtime_shape, and here its PRESENCE is bound to the
-        # phase that asserts it. A legacy downstream state lacking it must
-        # reset plan_review and rerun the review (the runtime owns recomputing
-        # the plan digest and invalidating the verdict when the plan changes).
+        # (vii) admin#1495 r16 F6 / r17 F8: phases.plan_review == complete IS
+        # the claim that the mandatory Phase-1 Codex plan review ran and
+        # approved (references/state-and-safety.md: "complete requires the
+        # mandatory Codex verdict"). r16 required the typed plan_verdict to
+        # be PRESENT; r17 F8 showed shape alone proved nothing - an invented
+        # {digest, model, invocation} validated clean, so a hand-edited
+        # approval could satisfy the gate for a different plan. Each field is
+        # now bound to the evidence it claims, HERE, at the validating
+        # boundary: model to the frozen Codex selection, invocation to a
+        # runner-protected Decision Audit Trail record the Phase-2 session
+        # writes when the verdict is produced, and plan_digest to a digest
+        # recomputed over the state body's "## Plan (Phase 1)" section - a
+        # plan edit after review flips the recompute and invalidates the
+        # verdict. A legacy downstream state lacking any of this must reset
+        # plan_review and rerun the review.
         if phases.get("plan_review") == "complete":
             conventions = state.get("resolved_conventions")
             runtime = (
@@ -2604,11 +2643,83 @@ class _Validator:
             elif not isinstance(runtime.get("plan_verdict"), dict):
                 self.error(
                     "invariant(vii): phases.plan_review complete requires"
-                    " resolved_conventions.model_runtime.plan_verdict — typed"
+                    " resolved_conventions.model_runtime.plan_verdict - typed"
                     " evidence binding an affirmative Codex verdict to the"
                     " reviewed plan; reset plan_review and rerun the review"
                     " if it is absent"
                 )
+            else:
+                verdict_record = runtime.get("plan_verdict")
+                codex_leg = runtime.get("codex")
+                frozen_model = (
+                    codex_leg.get("model")
+                    if isinstance(codex_leg, dict)
+                    else None
+                )
+                verdict_model = verdict_record.get("model")
+                if not isinstance(frozen_model, str) or not frozen_model:
+                    self.error(
+                        "invariant(vii): plan_verdict requires the frozen"
+                        " Codex selection at model_runtime.codex.model to"
+                        " bind against - a verdict with no recorded"
+                        " selection is unverifiable; reset plan_review and"
+                        " rerun the review"
+                    )
+                elif (
+                    isinstance(verdict_model, str)
+                    and verdict_model
+                    and verdict_model != frozen_model
+                ):
+                    self.error(
+                        "invariant(vii): plan_verdict.model"
+                        f" {verdict_model!r} does not match the frozen Codex"
+                        f" selection {frozen_model!r} - the mandatory verdict"
+                        " must come from the policy-selected model; reset"
+                        " plan_review and rerun the review"
+                    )
+                invocation = verdict_record.get("invocation")
+                trail = state.get("decision_audit_trail")
+                trail_entries = trail if isinstance(trail, list) else []
+                if (
+                    isinstance(invocation, str)
+                    and invocation
+                    and f"plan-review-verdict:{invocation}"
+                    not in trail_entries
+                ):
+                    self.error(
+                        "invariant(vii): plan_verdict.invocation"
+                        f" {_safe_key(invocation)!r} has no matching"
+                        " 'plan-review-verdict:<invocation>' Decision Audit"
+                        " Trail record - the Phase-2 session logs that"
+                        " record when the verdict is produced and the"
+                        " prefix is runner-protected against child appends,"
+                        " so a verdict without it is invented evidence;"
+                        " reset plan_review and rerun the review"
+                    )
+                digest = verdict_record.get("plan_digest")
+                recomputed = plan_section_digest(self.body_lines)
+                if recomputed is None:
+                    self.error(
+                        "invariant(vii): plan_review complete requires the"
+                        " reviewed plan persisted in the state body's"
+                        " '## Plan (Phase 1)' section - without it the"
+                        " plan_digest binding cannot be recomputed; restore"
+                        " the plan section or reset plan_review and rerun"
+                        " the review"
+                    )
+                elif (
+                    isinstance(digest, str)
+                    and digest
+                    and recomputed[: len(digest)] != digest
+                ):
+                    self.error(
+                        "invariant(vii): plan_verdict.plan_digest does not"
+                        " match the digest recomputed over the body's"
+                        " '## Plan (Phase 1)' section - the plan changed"
+                        " after review or the digest was fabricated; reset"
+                        " plan_review and rerun the mandatory Codex review"
+                        " on the current plan"
+                    )
 
     def validate_regression_records(self, regression: dict, status: Any) -> None:
         def check_record(record: Any, path: str, expected_exit: int | None) -> bool:
@@ -3019,22 +3130,31 @@ class _Validator:
         # were classified from, so a full-tier gstack must carry the
         # base/head/worktree-bound fingerprint that binds them before any
         # selector-freshness or reverse diff-derived invariant can key off it.
+        # admin#1495 r17 F9: lowercase-only, matching the documented
+        # encoding - the runner recomputes this digest at terminal-candidate
+        # acceptance and emits lowercase, so an uppercase value could never
+        # match and would only defeat the comparison. The CONTENT binding
+        # (does the value match the current merge-base/head/worktree) is the
+        # runner's check; this validator has no repository access.
         fingerprint = gstack.get("classification_fingerprint")
         if fingerprint is None:
             if is_full:
                 self.error(
                     "gstack_integration.classification_fingerprint: required"
-                    " from Phase 1 onward (64-hex over base/head/worktree)"
+                    " from Phase 1 onward (64 lowercase hex over"
+                    " base/head/worktree)"
                 )
         elif not (
             isinstance(fingerprint, str)
             and len(fingerprint) == 64
-            and all(c in "0123456789abcdefABCDEF" for c in fingerprint)
+            and all(c in "0123456789abcdef" for c in fingerprint)
         ):
             self.error(
                 "gstack_integration.classification_fingerprint: must be a"
-                " 64-hex digest binding the classification to"
-                " base/head/worktree"
+                " 64-character lowercase hex digest binding the"
+                " classification to base/head/worktree (the monitor runner"
+                " recomputes and compares it before accepting a terminal"
+                " candidate)"
             )
         mode = gstack.get("defect_evidence_mode")
         if mode is None:
@@ -3758,7 +3878,7 @@ def evaluate_state_text(text: str) -> dict[str, Any]:
             "tainted": [],
             "phase_requirements": "unparsed",
         }
-    validator = _Validator(state)
+    validator = _Validator(state, body_lines)
     tier_name = validator.validate()
     tainted = taint_scan(state, body_lines)
     # R7 codex #7 (narrowed by pass-3 opus #2): comments are stripped before

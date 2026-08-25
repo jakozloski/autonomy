@@ -39,6 +39,7 @@ from model_policy import (
     supervise_stream,
     validate_descriptor,
     verify_frozen_selection,
+    waiver_gate_resolution,
     monitor_child_arguments,
     monitor_child_prompt,
     MONITOR_SLICE_BUDGET_SECONDS,
@@ -2543,10 +2544,32 @@ class MonitorOrchestratorBindingTests(unittest.TestCase):
         # The only base-waiver family the core allows is Opus — the base
         # floor check accepts it WHEN the leg's own policy_decision records
         # that model as its selection (the waiver evidence).
-        runtime = self._runtime(reviewer_status="blocked", base_model="claude-opus-5")
-        runtime["claude"]["policy_decision"] = {
-            "selection": {"selected_model": "claude-opus-5"}
-        }
+        # admin#1495 r17 F4: the leg record now flows through the defined
+        # transition (granted waiver + consumed fallback success) instead
+        # of hand-supplying gate_status "ready".
+        config = valid_base(
+            fable_access="unavailable",
+            explicit_waiver=True,
+            waiver_fallback={
+                "model": "claude-opus-5",
+                "effort": "max",
+                "available": True,
+                "explicitly_authorized": True,
+                "execution_path": "explicit_cli",
+            },
+        )
+        decision = evaluate_model_policy(leg_request("claude", config))["claude"]
+        runtime = self._runtime(reviewer_status="blocked")
+        runtime["claude"] = waiver_gate_resolution(
+            decision,
+            {
+                "leg": "claude",
+                "status": "success",
+                "model": "claude-opus-5",
+                "effort": "max",
+                "attempts": 1,
+            },
+        )
         binding = monitor_orchestrator_binding(runtime)
         self.assertEqual(binding["state"], "bound")
         self.assertEqual(binding["lineage"], "base")
@@ -2728,6 +2751,283 @@ class MonitorOrchestratorBindingTests(unittest.TestCase):
         self.assertEqual(binding["model"], "claude-opus-5")
         self.assertEqual(binding["reason_code"], "orchestrator_continuity")
         self.assertEqual(binding["pending_owner"], "claude-fable-5")
+
+
+class WaiverGateResolutionTests(unittest.TestCase):
+    """admin#1495 r17 F4: ``waived`` is a pre-invocation policy decision, and
+    waiver_gate_resolution is the one transition that lands the persisted
+    gate from the named fallback's real invocation - ready only on the exact
+    route's success, blocked on failure or garbage, with the waiver retained
+    as policy_decision evidence. The matrix below pins decision ->
+    invocation -> state validation -> monitor binding for both Claude legs."""
+
+    @staticmethod
+    def _waived_decision(leg: str) -> dict:
+        if leg == "claude":
+            config = valid_base(fable_access="unavailable")
+            fallback_model = "claude-opus-5"
+        else:
+            config = valid_reviewer(opus_access="unavailable")
+            fallback_model = "claude-fable-5"
+        config["explicit_waiver"] = True
+        config["waiver_fallback"] = {
+            "model": fallback_model,
+            "effort": "max",
+            "available": True,
+            "explicitly_authorized": True,
+            "execution_path": "explicit_cli",
+        }
+        return evaluate_model_policy(leg_request(leg, config))[leg]
+
+    @staticmethod
+    def _observation(leg: str, model: str, status: str = "success") -> dict:
+        return {
+            "leg": leg,
+            "status": status,
+            "model": model,
+            "effort": "max",
+            "attempts": 1,
+        }
+
+    @staticmethod
+    def _runtime_with(leg: str, record: dict) -> dict:
+        # The persisted-contract shape MonitorOrchestratorBindingTests
+        # consumes, with the transitioned record standing in for its leg.
+        runtime = {
+            "codex": {
+                "model": "gpt-5.6-sol",
+                "effort": "max",
+                "gate_status": "ready",
+            },
+            "claude": {
+                "model": "claude-fable-5",
+                "gate_status": "ready",
+                "host_agent_selection_verified": True,
+            },
+            "claude_reviewer": {
+                "model": "claude-opus-5",
+                "gate_status": "blocked",
+            },
+        }
+        runtime[leg] = record
+        return runtime
+
+    def test_base_fallback_success_lands_ready_validates_and_binds(
+        self,
+    ) -> None:
+        from state_schema import validate_model_runtime_shape
+
+        decision = self._waived_decision("claude")
+        observation = self._observation("claude", "claude-opus-5")
+        record = waiver_gate_resolution(decision, observation)
+        self.assertEqual(record["gate_status"], "ready")
+        self.assertEqual(record["model"], "claude-opus-5")
+        self.assertEqual(record["effort"], "max")
+        # The waiver decision is retained as evidence, never discarded.
+        self.assertEqual(record["policy_decision"]["waiver"], decision)
+        self.assertEqual(
+            record["policy_decision"]["fallback_invocation"], observation
+        )
+        # The cross-floor evidence shape the monitor binder reads.
+        self.assertEqual(
+            record["policy_decision"]["selection"]["selected_model"],
+            "claude-opus-5",
+        )
+        self.assertEqual(
+            record["policy_decision"]["resolution"]["reason_code"],
+            "waived_fallback_ready",
+        )
+        runtime = self._runtime_with("claude", record)
+        self.assertEqual(validate_model_runtime_shape(runtime), [])
+        binding = monitor_orchestrator_binding(runtime)
+        self.assertEqual(binding["state"], "bound")
+        self.assertEqual(binding["lineage"], "base")
+        self.assertEqual(binding["model"], "claude-opus-5")
+
+    def test_base_fallback_failure_lands_blocked_and_never_binds(self) -> None:
+        from state_schema import validate_model_runtime_shape
+
+        decision = self._waived_decision("claude")
+        record = waiver_gate_resolution(
+            decision,
+            self._observation("claude", "claude-opus-5", status="error"),
+        )
+        self.assertEqual(record["gate_status"], "blocked")
+        resolution = record["policy_decision"]["resolution"]
+        self.assertEqual(
+            resolution["reason_code"], "waived_fallback_invocation_failed"
+        )
+        # The failure reason records the observed status verbatim.
+        self.assertIn("error", resolution["reason"])
+        self.assertEqual(record["policy_decision"]["waiver"], decision)
+        runtime = self._runtime_with("claude", record)
+        self.assertEqual(validate_model_runtime_shape(runtime), [])
+        # No landed Claude leg remains (the reviewer leg is blocked too):
+        # the monitor binder fails closed on the blocked record.
+        self.assertEqual(
+            monitor_orchestrator_binding(runtime)["state"], "invalid"
+        )
+
+    def test_reviewer_fallback_success_lands_ready_validates_and_binds(
+        self,
+    ) -> None:
+        from state_schema import validate_model_runtime_shape
+
+        decision = self._waived_decision("claude_reviewer")
+        observation = self._observation("claude_reviewer", "claude-fable-5")
+        record = waiver_gate_resolution(decision, observation)
+        self.assertEqual(record["gate_status"], "ready")
+        self.assertEqual(record["model"], "claude-fable-5")
+        self.assertEqual(record["policy_decision"]["waiver"], decision)
+        self.assertEqual(
+            record["policy_decision"]["fallback_invocation"], observation
+        )
+        runtime = self._runtime_with("claude_reviewer", record)
+        self.assertEqual(validate_model_runtime_shape(runtime), [])
+        # The same-lineage collapse the waiver authorized: the transitioned
+        # reviewer record satisfies the binder's gate_status == "ready"
+        # requirement and owns the session on its recorded fallback.
+        binding = monitor_orchestrator_binding(runtime)
+        self.assertEqual(binding["state"], "bound")
+        self.assertEqual(binding["lineage"], "reviewer")
+        self.assertEqual(binding["model"], "claude-fable-5")
+
+    def test_reviewer_fallback_failure_lands_blocked_monitor_on_base(
+        self,
+    ) -> None:
+        from state_schema import validate_model_runtime_shape
+
+        decision = self._waived_decision("claude_reviewer")
+        record = waiver_gate_resolution(
+            decision,
+            self._observation(
+                "claude_reviewer", "claude-fable-5", status="timeout"
+            ),
+        )
+        self.assertEqual(record["gate_status"], "blocked")
+        self.assertEqual(
+            record["policy_decision"]["resolution"]["reason_code"],
+            "waived_fallback_invocation_failed",
+        )
+        runtime = self._runtime_with("claude_reviewer", record)
+        self.assertEqual(validate_model_runtime_shape(runtime), [])
+        binding = monitor_orchestrator_binding(runtime)
+        self.assertEqual(binding["state"], "bound")
+        self.assertEqual(binding["lineage"], "base")
+        self.assertEqual(binding["model"], "claude-fable-5")
+
+    def test_success_for_a_different_model_never_lands_ready(self) -> None:
+        # A success observation proves only the route it ran: a sibling
+        # slug, the other lineage, or even a context-window variant of the
+        # waiver-named model (same version, DIFFERENT invocation route)
+        # fails closed as a mismatch, never opens the gate.
+        decision = self._waived_decision("claude")
+        for wrong_model in (
+            "claude-opus-5[1m]",
+            "claude-opus-6",
+            "claude-fable-5",
+            "gpt-5.6-sol",
+        ):
+            with self.subTest(model=wrong_model):
+                record = waiver_gate_resolution(
+                    decision, self._observation("claude", wrong_model)
+                )
+                self.assertEqual(record["gate_status"], "blocked")
+                self.assertEqual(
+                    record["policy_decision"]["resolution"]["reason_code"],
+                    "fallback_observation_mismatch",
+                )
+
+    def test_wrong_leg_effort_or_route_failure_is_a_mismatch(self) -> None:
+        decision = self._waived_decision("claude")
+        cross_leg = self._observation("claude_reviewer", "claude-opus-5")
+        wrong_effort = self._observation("claude", "claude-opus-5")
+        wrong_effort["effort"] = "xhigh"
+        # Identity precedes outcome - a failure on another route is a
+        # mismatch, never this waiver's recorded invocation failure.
+        failed_elsewhere = self._observation(
+            "claude", "claude-fable-5", status="error"
+        )
+        for observation in (cross_leg, wrong_effort, failed_elsewhere):
+            with self.subTest(observation=observation):
+                record = waiver_gate_resolution(decision, observation)
+                self.assertEqual(record["gate_status"], "blocked")
+                self.assertEqual(
+                    record["policy_decision"]["resolution"]["reason_code"],
+                    "fallback_observation_mismatch",
+                )
+
+    def test_malformed_observation_blocks_instead_of_raising(self) -> None:
+        from state_schema import validate_model_runtime_shape
+
+        decision = self._waived_decision("claude")
+        missing_field = self._observation("claude", "claude-opus-5")
+        del missing_field["status"]
+        for garbage in (None, [], "success", 7, {}, missing_field):
+            with self.subTest(garbage=garbage):
+                record = waiver_gate_resolution(decision, garbage)
+                self.assertEqual(record["gate_status"], "blocked")
+                resolution = record["policy_decision"]["resolution"]
+                self.assertEqual(
+                    resolution["reason_code"], "invalid_fallback_observation"
+                )
+                self.assertEqual(
+                    resolution["next_action"], "correct_observation_input"
+                )
+        # Even a garbage-evidence record persists shape-clean: the evidence
+        # rides inside free-form policy_decision.
+        record = waiver_gate_resolution(decision, missing_field)
+        self.assertEqual(
+            validate_model_runtime_shape(self._runtime_with("claude", record)),
+            [],
+        )
+
+    def test_unusable_decision_record_is_invalid_with_no_leg_record(
+        self,
+    ) -> None:
+        # A non-waiver or garbage decision names no trustworthy leg to
+        # write: the error shape carries NO gate mutation, and "state" is
+        # not a leg key - persisting it by mistake fails shape validation
+        # loudly instead of landing a forged gate.
+        from state_schema import validate_model_runtime_shape
+
+        ready = evaluate_model_policy(request())["claude"]
+        for garbage in (None, [], "waived", 7, ready):
+            with self.subTest(garbage=garbage):
+                result = waiver_gate_resolution(
+                    garbage, self._observation("claude", "claude-opus-5")
+                )
+                self.assertEqual(result["state"], "invalid")
+                self.assertTrue(result["errors"])
+                self.assertNotIn("gate_status", result)
+        self.assertTrue(
+            validate_model_runtime_shape(
+                {"claude": waiver_gate_resolution(None, None)}
+            )
+        )
+
+    def test_hand_edited_below_floor_fallback_is_invalid(self) -> None:
+        # The decision may round-trip through persisted state before its
+        # invocation lands - state is untrusted, so the transition
+        # re-checks the floor exactly as the monitor binder does.
+        decision = self._waived_decision("claude")
+        for key in ("model", "fallback_model"):
+            decision[key] = "claude-haiku-3"
+        decision["selection"] = dict(decision["selection"])
+        decision["selection"]["selected_model"] = "claude-haiku-3"
+        result = waiver_gate_resolution(
+            decision, self._observation("claude", "claude-haiku-3")
+        )
+        self.assertEqual(result["state"], "invalid")
+        self.assertTrue(any("floor" in error for error in result["errors"]))
+
+    def test_inconsistent_decision_naming_two_models_is_invalid(self) -> None:
+        decision = self._waived_decision("claude")
+        decision["fallback_model"] = "claude-opus-6"
+        result = waiver_gate_resolution(
+            decision, self._observation("claude", "claude-opus-5")
+        )
+        self.assertEqual(result["state"], "invalid")
 
 
 class AuthSignatureOffsetUnicodeTests(unittest.TestCase):
