@@ -55,7 +55,7 @@ import sys
 import tempfile
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, IO
@@ -84,6 +84,49 @@ from model_policy import (  # noqa: E402
 
 WRAPPER_EXEC_FAILED_MARKER = "MONITOR-WRAPPER-EXEC-FAILED"
 _RESUME_NOT_FOUND_HINTS = ("no conversation found", "session not found", "unknown session")
+
+
+def resume_loss_offset(text: str) -> int | None:
+    """Earliest offset of ANY supported resume-loss marker, or None.
+
+    admin#1495 r15 F6: classification recognizes all three markers, but
+    sticky retention preserved only the first and overflow retention plus
+    excerpt anchoring preserved none — a noisy-tail "session not found"
+    decayed into a generic exit_1 strike and could exhaust the retry
+    budget. ONE shared detector now feeds sticky capture, overflow
+    capture, excerpt anchoring, and classification, exactly like the
+    r14 F7 rate-limit matcher.
+    """
+
+    lowered = text.lower()
+    offsets = [
+        offset
+        for offset in (lowered.find(hint) for hint in _RESUME_NOT_FOUND_HINTS)
+        if offset >= 0
+    ]
+    return min(offsets) if offsets else None
+
+
+def _parse_retry_deadline(raw: object) -> "datetime | None":
+    """UTC deadline from any TIMEZONE-AWARE ISO 8601 string, else None.
+
+    admin#1495 r15 F11: mirrors state_schema.normalize_iso_timestamp,
+    which stays the canonical normalizer — the runner never imports
+    on-disk schema code (its pinned-source trust boundary), so this
+    local twin carries the pointer instead of the import. Naive
+    timestamps return None: an offsetless instant is ambiguous and the
+    schema already rejects it.
+    """
+
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
 
 # r14 F7: ONE contextual rate-limit matcher shared by sticky capture,
 # overflow capture, and final classification. A bare "429" substring let
@@ -308,11 +351,33 @@ def _parse_mcp_list_rows(listing_text: str) -> dict[str, bool]:
     marker, or with no ``name:`` shape at all, never grants."""
 
     rows: dict[str, bool] = {}
+    known_names = sorted(
+        {name for servers in _MCP_FAMILY_SERVERS.values() for name in servers},
+        key=len,
+        reverse=True,
+    )
     for line in listing_text.splitlines():
         if ":" not in line:
             continue
-        name, _, rest = line.partition(":")
-        name = name.strip().lower()
+        # admin#1495 r15 F7: the allowed table itself contains
+        # colon-bearing names (plugin:linear:linear), which a first-colon
+        # partition destroyed — both plugin rows parsed as one "plugin"
+        # server and the families stayed unproven. Match the KNOWN family
+        # names longest-first against an exact following delimiter;
+        # unknown servers keep the first-colon shape (they can never
+        # grant, so a misleading-prefix row cannot collide upward).
+        stripped = line.strip()
+        lowered_line = stripped.lower()
+        name = ""
+        rest = ""
+        for candidate in known_names:
+            if lowered_line.startswith(candidate + ":"):
+                name = candidate
+                rest = stripped[len(candidate) + 1:]
+                break
+        if not name:
+            head, _, rest = stripped.partition(":")
+            name = head.strip().lower()
         if not name:
             continue
         if _ROW_UNHEALTHY.search(rest):
@@ -1489,6 +1554,10 @@ def _signature_excerpt(line: str) -> str:
             # auth/exec markers so the downstream re-scan re-derives the
             # same ladder verdict.
             offset = rate_limit_offset(line)
+        if offset is None:
+            # r15 F6: anchor on a late resume-loss marker exactly like the
+            # auth/exec/rate-limit ones, or the downstream re-scan loses it.
+            offset = resume_loss_offset(line)
         idx = offset if offset is not None else 0
     half = STICKY_EXCERPT_BYTES // 2
     start = max(0, idx - half)
@@ -1602,7 +1671,9 @@ def _drain_child(
                 # its marker and decayed to a generic retry charge. These
                 # deterministic signatures are sticky like auth/exec ones.
                 or rate_limit_offset(decoded) is not None
-                or "no conversation found" in lowered_line
+                # r15 F6: ALL resume-loss markers are sticky, via the one
+                # shared detector classification consumes.
+                or resume_loss_offset(decoded) is not None
             ):
                 # R7 codex #12: retain a marker-ANCHORED window, not a fixed
                 # head — a signature past char 400 must survive into the tail
@@ -1659,6 +1730,8 @@ def _drain_child(
                         # a genuine rate-limit marker exactly like an auth
                         # one — capture it sticky before truncation.
                         or rate_limit_offset(overflow) is not None
+                        # r15 F6: resume-loss markers survive overflow too.
+                        or resume_loss_offset(overflow) is not None
                     ):
                         stderr_sticky.append(_signature_excerpt(overflow))
                 buffers[pipe] = buffers[pipe][-PIPE_BUFFER_CAP:]
@@ -1792,7 +1865,7 @@ def classify_child_failure(
         return ("block", "claude CLI binary could not be executed — install or fix PATH")
     if _has_auth_signature(joined):
         return ("block", "claude CLI authentication failure — re-authenticate the owner route")
-    if resumed and any(hint in lowered for hint in _RESUME_NOT_FOUND_HINTS):
+    if resumed and resume_loss_offset(lowered) is not None:
         return ("fresh_session", "monitor-child:resume_not_found")
     if rate_limit_offset(joined) is not None:
         return ("ladder", "monitor-child:rate_limited")
@@ -3300,8 +3373,24 @@ class Runner:
             if family in denied:
                 unproven[family] = "denied by permissions.deny"
                 continue
-            if any(rows.get(server) for server in _MCP_FAMILY_SERVERS[family]):
-                continue  # connected MCP row: configured AND authenticated
+            healthy_row = any(
+                rows.get(server) for server in _MCP_FAMILY_SERVERS[family]
+            )
+            mcp_route = "mcp" in routes.get(family, set())
+            # admin#1495 r15 F14: a healthy row proves CONNECTIVITY and
+            # authentication, never mutation authorization — preflight
+            # passing on the row alone stranded the handoff at the later
+            # authorization check. Both halves are required; authorization
+            # is never tested by performing a mutation.
+            if healthy_row and mcp_route:
+                continue
+            if healthy_row and not mcp_route and family != "github":
+                unproven[family] = (
+                    "connected MCP row present but permissions.allow"
+                    " grants no exact mutation route — connectivity is"
+                    " not authorization"
+                )
+                continue
             if family == "github" and "bash" in routes.get("github", set()):
                 if self._gh_mutation_probe(bound, probe_env):
                     continue
@@ -3310,10 +3399,17 @@ class Runner:
                     " probe could not confirm push permission"
                 )
                 continue
-            unproven[family] = (
-                "no CONNECTED MCP row for an exact family server and no"
-                " proven mutation route"
-            )
+            if healthy_row:
+                unproven[family] = (
+                    "connected MCP row present but permissions.allow"
+                    " grants no exact mutation route — connectivity is"
+                    " not authorization"
+                )
+            else:
+                unproven[family] = (
+                    "no CONNECTED MCP row for an exact family server and no"
+                    " proven mutation route"
+                )
         if not unproven:
             return
         detail = "; ".join(
@@ -4394,12 +4490,25 @@ class Runner:
         deadline_raw = liveness.get("next_retry_at")
         if not isinstance(deadline_raw, str):
             return
-        try:
-            deadline = datetime.strptime(
-                deadline_raw, "%Y-%m-%dT%H:%M:%SZ"
-            ).replace(tzinfo=timezone.utc)
-        except ValueError:
+        # admin#1495 r15 F11: the schema accepts any timezone-aware ISO
+        # form, but this consumer parsed only canonical Z — an offset
+        # timestamp was deterministically IGNORED (the wait vanished) and
+        # an unbounded future one strands every slice. Normalize
+        # timezone-aware forms to UTC and clamp the remainder to the
+        # scaled ladder ceiling plus skew.
+        deadline = _parse_retry_deadline(deadline_raw)
+        if deadline is None:
             return
+        # Clamp the DEADLINE, not just the first remainder — the in-loop
+        # recompute reads the deadline again, so a remainder-only clamp
+        # would unclamp itself after the first sleep.
+        ceiling_seconds = (
+            LIVENESS_BACKOFF_LADDER_SECONDS[-1] + 300.0
+        ) * self.wait_scale
+        deadline = min(
+            deadline,
+            datetime.now(timezone.utc) + timedelta(seconds=ceiling_seconds),
+        )
         remaining_wait = (deadline - datetime.now(timezone.utc)).total_seconds()
         while remaining_wait > 0:
             budget = self.remaining() - MONITOR_SLICE_CLEANUP_MARGIN_SECONDS

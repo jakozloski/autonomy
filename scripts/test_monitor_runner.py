@@ -331,6 +331,17 @@ if mode == "resume_missing_then_hang" and "--resume" in sys.argv:
     time.sleep(float(os.environ.get("FAKE_SLEEP", "30")))
     sys.exit(1)
 
+if mode == "resume_missing_noise" and "--resume" in sys.argv:
+    # admin#1495 r15 F6: a resume-loss marker OTHER than the first
+    # supported form, buried past the rolling 20-line stderr cap — the
+    # sticky capture must preserve it so classification still returns
+    # fresh_session instead of a generic exit_1 charge.
+    sys.stderr.write("session not found: the referenced conversation is gone\n")
+    for i in range(30):
+        sys.stderr.write(f"cleanup line {i}\n")
+    sys.stderr.flush()
+    sys.exit(1)
+
 if mode == "resume_not_found" and "--resume" in sys.argv:
     # Only the RESUMED attempt fails; the fresh relaunch (no --resume)
     # falls through to the normal ok flow below.
@@ -2544,8 +2555,14 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         # the substring parser. A mixed-health listing (github connected,
         # linear failed) must block naming linear only.
         self._bind_origin("git@github.com:Keeper-Dating/matchmaking.git")
-        settings = self.dir / "empty-perms.json"
-        settings.write_text("{}", encoding="utf-8")
+        settings = self.dir / "route-full.json"
+        settings.write_text(
+            # r15 F14: allow routes for both families, so the ONLY
+            # unproven half left is linear's failed row — the health
+            # matrix stays the discriminator.
+            '{"permissions": {"allow": ["mcp__github__*", "mcp__linear__*"]}}',
+            encoding="utf-8",
+        )
         listing = (
             "github: gh-mcp - \u2713 Connected\n"
             "linear: npx @linear/mcp - \u2717 Failed to connect\n"
@@ -2598,6 +2615,86 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         for line in recorded:
             self.assertNotIn("CLAUDE_CODE_SUBAGENT_MODEL", line)
 
+    def test_connected_row_without_mutation_route_blocks(self) -> None:
+        # admin#1495 r15 F14: a healthy exact-family row without an exact
+        # allowed mutation route passed preflight and stranded the handoff
+        # at the later authorization check. Connectivity is not
+        # authorization — both halves are required.
+        self._bind_origin("git@github.com:Keeper-Dating/matchmaking.git")
+        settings = self.dir / "rows-only.json"
+        settings.write_text("{}", encoding="utf-8")
+        completed = self._run(
+            budget="900", timeout=60,
+            env_extra={
+                "MONITOR_RUNNER_USER_SETTINGS": str(settings),
+                "FAKE_MCP_LIST": (
+                    "github: gh-mcp - \u2713 Connected\n"
+                    "linear: npx - \u2713 Connected\n"
+                ),
+            },
+        )
+        self.assertEqual(completed.returncode, 5, completed.stdout + completed.stderr)
+        reason = self._summary(completed)["reason"]
+        self.assertIn("connectivity is not authorization", reason)
+
+    def test_plugin_qualified_rows_prove_their_families(self) -> None:
+        # admin#1495 r15 F7: plugin:linear:linear parsed as server
+        # "plugin" under first-colon partitioning, leaving the family
+        # unproven. Known names now match longest-first; a misleading
+        # plugin-prefixed UNKNOWN server still grants nothing.
+        self._bind_origin("git@github.com:Keeper-Dating/matchmaking.git")
+        settings = self.dir / "plugin-routes.json"
+        settings.write_text(
+            '{"permissions": {"allow": ["mcp__plugin_github_github__*",'
+            ' "mcp__plugin_linear_linear__*"]}}',
+            encoding="utf-8",
+        )
+        self._mutate_state(self._IDLE_QA_HANDOFF, self._FAILED_QA_HANDOFF)
+        completed = self._run(
+            budget="900", timeout=90, wait_scale="0.02", max_ticks="2",
+            env_extra={
+                "MONITOR_RUNNER_USER_SETTINGS": str(settings),
+                "FAKE_OUTCOME": "terminal",
+                "FAKE_MCP_LIST": (
+                    "plugin:github:github: srv - \u2713 Connected\n"
+                    "plugin:linear:linear: npx - \u2713 Connected\n"
+                ),
+            },
+        )
+        # both families prove -> past the probe, stopped by the
+        # containment gate (Keeper-bound; the harness attestation never
+        # applies), with no capability wording in the refusal
+        self.assertEqual(completed.returncode, 5, completed.stderr)
+        reason = self._summary(completed)["reason"]
+        self.assertNotIn("capability", reason)
+        self.assertIn("cgroup v2 delegation is unavailable", reason)
+
+    def test_resume_loss_variant_behind_noise_takes_fresh_session(self) -> None:
+        # admin#1495 r15 F6: "session not found" (a supported marker the
+        # sticky capture previously dropped) buried under 30 noise lines
+        # must still clear the stale session instead of charging a
+        # generic exit_1 strike.
+        first = self._run(budget="365")
+        self.assertEqual(self._summary(first)["child_session_id"], "fake-sid-1")
+        completed = self._run(
+            mode="resume_missing_noise", budget="2000", timeout=90,
+            wait_scale="0.02", max_ticks="2",
+            env_extra={"FAKE_SID": "fake-sid-2"},
+        )
+        summary = self._summary(completed)
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertEqual(summary["child_session_id"], "fake-sid-2")
+        calls = self._argv_calls()
+        self.assertEqual(len(calls), 3)
+        self.assertNotIn("--resume", calls[2], "fresh relaunch must drop --resume")
+        extract = self._extract()
+        charges = [
+            f["signature"]
+            for f in extract["monitor_cli"]["child_failures"]
+            if f["signature"] != "monitor-child:success"
+        ]
+        self.assertEqual(charges, [], "fresh_session never charges the budget")
+
     def test_unrelated_mcp_server_blocks_mapped_run(self) -> None:
         # A configured-but-irrelevant MCP server grants neither family; the
         # r25 probe passed on any truthy `mcpServers`.
@@ -2649,7 +2746,10 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         self._bind_origin("git@github.com:Keeper-Dating/matchmaking.git")
         settings = self.dir / "github-then-list.json"
         settings.write_text(
-            '{"permissions": {"allow": ["Bash(gh *)"]}}', encoding="utf-8"
+            # r15 F14: the connected linear row alone no longer proves the
+            # family — the exact mutation route rides permissions.allow.
+            '{"permissions": {"allow": ["Bash(gh *)", "mcp__linear__*"]}}',
+            encoding="utf-8",
         )
         self._mutate_state(self._IDLE_QA_HANDOFF, self._FAILED_QA_HANDOFF)
         completed = self._run(

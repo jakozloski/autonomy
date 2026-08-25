@@ -1857,6 +1857,87 @@ class CapabilityGrammarTests(unittest.TestCase):
         self.assertIn("no CONNECTED MCP row", caught.exception.reason)
 
 
+class R15RunnerCorrectnessTests(unittest.TestCase):
+    """admin#1495 r15 F6/F7/F11: shared resume-loss detection, plugin
+    row parsing, and the normalized/bounded liveness deadline."""
+
+    def test_resume_loss_offset_matrix(self) -> None:
+        cases = {
+            "No conversation found with id": 0,
+            "prefix Session not found tail": 7,
+            "warn: unknown session 123": 6,
+            "no conversation found ... session not found": 0,
+            "all healthy": None,
+        }
+        for text, want in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(
+                    monitor_runner.resume_loss_offset(text), want
+                )
+
+    def test_signature_excerpt_anchors_late_resume_markers(self) -> None:
+        for marker in ("session not found", "unknown session"):
+            with self.subTest(marker=marker):
+                line = "x" * 3000 + f"error: {marker} mid-run" + "y" * 100
+                excerpt = monitor_runner._signature_excerpt(line)
+                self.assertIn(marker, excerpt)
+
+    def test_plugin_qualified_row_parsing(self) -> None:
+        listing = "\n".join(
+            (
+                "plugin:linear:linear: npx @linear/mcp - \u2713 Connected",
+                "plugin:github:github: srv - \u2717 Failed to connect",
+                "plugin: mystery - \u2713 Connected",
+                "pluginx:linear:linear: srv - \u2713 Connected",
+                "linear: npx - \u2713 Connected",
+            )
+        )
+        rows = monitor_runner._parse_mcp_list_rows(listing)
+        self.assertTrue(rows["plugin:linear:linear"])
+        self.assertFalse(rows["plugin:github:github"])
+        # unknown servers keep first-colon parsing and never grant
+        self.assertTrue(rows["plugin"])
+        self.assertIn("pluginx", rows)
+        self.assertTrue(rows["linear"])
+
+    def test_retry_deadline_normalization(self) -> None:
+        parse = monitor_runner._parse_retry_deadline
+        zulu = parse("2026-08-25T10:00:00Z")
+        offset = parse("2026-08-25T12:00:00+02:00")
+        self.assertIsNotNone(zulu)
+        self.assertEqual(zulu, offset)  # same instant, offset form honored
+        self.assertIsNone(parse("2026-08-25T10:00:00"))  # naive rejected
+        self.assertIsNone(parse("not a time"))
+        self.assertIsNone(parse(None))
+
+    def test_resume_wait_honors_offset_form_and_ceiling(self) -> None:
+        import time as _time
+        from datetime import datetime, timedelta, timezone
+
+        runner = _runner("claude-opus-5", None)
+        runner.wait_scale = 0.001
+        runner.remaining = lambda: 100000.0
+        # far-future OFFSET-form deadline: pre-fix the offset form was
+        # silently ignored (instant return) and a Z-form far future was
+        # unbounded; post-fix the wait is honored AND clamped to the
+        # scaled ladder ceiling (~2.1s at this scale).
+        far = (
+            datetime.now(timezone.utc) + timedelta(days=365000)
+        ).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        started = _time.monotonic()
+        runner._resume_liveness_wait(
+            {"monitor_cli": {"liveness": {"next_retry_at": far}}}
+        )
+        elapsed = _time.monotonic() - started
+        ceiling = (
+            monitor_runner.LIVENESS_BACKOFF_LADDER_SECONDS[-1] + 300.0
+        ) * runner.wait_scale
+        self.assertGreaterEqual(
+            elapsed, min(ceiling, 0.5), "the offset-form wait must be honored"
+        )
+        self.assertLess(elapsed, 30.0, "the far-future wait must be clamped")
+
+
 class ContainmentRefusalDecisionTests(unittest.TestCase):
     """algo#1216 r18 F5: the universal-gate decision matrix, pinned at the
     decision layer. The e2e block tests pin the process path (stdin closed
