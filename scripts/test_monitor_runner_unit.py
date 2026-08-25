@@ -1872,6 +1872,12 @@ class ContainmentRefusalDecisionTests(unittest.TestCase):
         self, record: str, repository: str | None, attested: bool
     ) -> str | None:
         runner = _runner("claude-opus-5", None)
+        # repository=None must mean TRULY unbound: _bound_repository falls
+        # back to the live origin hint, which on a Keeper CI checkout
+        # resolves to the Keeper repository under test and (correctly)
+        # refuses the attestation — the fallback is the gate working, not
+        # the case this matrix isolates.
+        runner.repository_hint = None
         extract = {"monitor_cli": {"repository": repository}}
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("MONITOR_RUNNER_UNCONTAINED_TEST_CHILD", None)
