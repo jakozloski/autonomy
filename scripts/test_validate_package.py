@@ -55,6 +55,13 @@ class PackageFixture:
         (self.root / "agents").mkdir()
         (self.root / "scripts").mkdir()
         (self.root / "SKILL.md").write_text(_valid_skill_text(), encoding="utf-8")
+        # admin#1495 r15 F12: every valid package carries the MIT notice.
+        (self.root / "LICENSE").write_text(
+            "MIT License\n\nCopyright (c) 2026 Jake Kozloski\n\n"
+            "Permission is hereby granted, free of charge, to any person"
+            " obtaining a copy...\n",
+            encoding="utf-8",
+        )
 
         for relative_path, headings in BUILTIN_EXPECTED_HEADINGS.items():
             if relative_path == "SKILL.md":

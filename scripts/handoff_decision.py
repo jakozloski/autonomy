@@ -365,6 +365,18 @@ def qa_generation(request: dict[str, Any]) -> str:
         "write_path": tracker.get("write_path"),
         "qa_assignee_provider_id": qa_assignee.get("provider_id"),
         "qa_state_provider_id": qa_state.get("provider_id"),
+        # algo#1216 r19 F9: a NAME-ONLY workflow state (no provider id) is
+        # mutated by state NAME, so the name IS a plan target — renaming
+        # "Vercel Preview QA" must re-mint the generation or a completed
+        # old ledger satisfies the new plan and strands the ticket in the
+        # obsolete state. Hashed TAGGED and only when the provider id is
+        # absent, so provider-id generations stay byte-identical.
+        "qa_state_name": (
+            "name:" + str(qa_state.get("name"))
+            if qa_state.get("provider_id") is None
+            and qa_state.get("name") is not None
+            else None
+        ),
         # admin#1495 R2 finding 3791925153 (executed repro): the reviewer set
         # shapes operation IDs and dependencies, so it is a TARGET fact —
         # omitting it reused a generation across reviewer changes and

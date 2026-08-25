@@ -154,7 +154,7 @@ Phase transition writes must update both `current_phase` and the phase status. T
 
 ## Feedback Identity and Human Roundtrips
 
-- REST account type is identity truth. Fetch issue comments, reviews, and inline comments from their REST endpoints and use `.user.type == "Bot"`; use GraphQL only for thread state and join by database ID.
+- REST account type is identity truth. Fetch issue comments, reviews, and inline comments from their REST endpoints and use `.user.type == "Bot"`; use GraphQL only for thread state and join by `fullDatabaseId` (decimal-string-normalized on both sides — deprecated `databaseId` cannot carry 64-bit identifiers).
 - Do not infer bot identity from a `[bot]` suffix. GraphQL and `gh pr view` may strip it.
 - Exclude `authenticated_actor` from external feedback even if its account type is `Bot`.
 - Null, deleted, or unknown authors fail closed to manual human review: they may block, but are never auto-assignment targets.

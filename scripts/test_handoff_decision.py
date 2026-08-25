@@ -4069,3 +4069,38 @@ class QaPlanVersionRolloutTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class QaStateNameGenerationTests(unittest.TestCase):
+    """algo#1216 r19 F9: a name-only workflow state is mutated by NAME, so
+    renaming it must re-mint the generation; provider-id generations stay
+    byte-identical to pre-fix."""
+
+    def _request(self, qa_state):
+        return {
+            "repository": {"nameWithOwner": "Keeper-Dating/matchmaking"},
+            "pull_request_number": 7,
+            "authenticated_actor": "jakozloski",
+            "code_reviewers": [],
+            "issue_tracker": {
+                "ticket_identifier": "WEB-1234",
+                "ticket_provider_id": "abc",
+                "write_path": "local_api",
+                "qa_assignee": {"provider_id": "qa-1"},
+                "qa_state": qa_state,
+            },
+        }
+
+    def test_name_only_rename_re_mints_the_generation(self) -> None:
+        old = qa_generation(self._request({"name": "Vercel Preview QA"}))
+        new = qa_generation(self._request({"name": "Preview QA v2"}))
+        self.assertNotEqual(old, new)
+
+    def test_provider_id_states_ignore_the_name(self) -> None:
+        with_name = qa_generation(
+            self._request({"provider_id": "st-1", "name": "Vercel Preview QA"})
+        )
+        renamed = qa_generation(
+            self._request({"provider_id": "st-1", "name": "Preview QA v2"})
+        )
+        self.assertEqual(with_name, renamed)

@@ -177,7 +177,7 @@ gh api graphql -f query='
             id isResolved isOutdated
             comments(first:1) {
               totalCount
-              nodes { databaseId author { __typename login } updatedAt }
+              nodes { fullDatabaseId author { __typename login } updatedAt }
             }
           }
         }
@@ -187,7 +187,7 @@ gh api graphql -f query='
 ' -f owner="$OWNER" -f repo="$REPO" -F pr=<PR_NUMBER>
 # If pageInfo.hasNextPage, re-query with cursor=$endCursor until exhausted
 
-# Review edit timestamps and GraphQL actor type; join to REST reviews by databaseId — REST remains identity truth, GraphQL supplies updatedAt.
+# Review edit timestamps and GraphQL actor type; join to REST reviews by fullDatabaseId (BigInt — values above 32 bits arrive STRING-encoded; deprecated databaseId cannot carry them, algo#1216 r19 F10). Normalize BOTH sides to decimal strings (REST `id` via str(), GraphQL fullDatabaseId as-is) — never numeric coercion; a null legacy fullDatabaseId fails closed to manual review like a null author. REST remains identity truth, GraphQL supplies updatedAt.
 gh api graphql -f query='
   query($owner:String!, $repo:String!, $pr:Int!, $cursor:String) {
     repository(owner:$owner, name:$repo) {
@@ -195,7 +195,7 @@ gh api graphql -f query='
         reviews(first:100, after:$cursor) {
           pageInfo { hasNextPage endCursor }
           nodes {
-            id databaseId submittedAt updatedAt
+            id fullDatabaseId submittedAt updatedAt
             author { __typename login }
           }
         }
@@ -224,7 +224,7 @@ This loop **auto-resolves bot-authored threads only**. It still evaluates, fixes
 
 #### Detect unaddressed human inline threads:
 
-Join every GraphQL thread's first `databaseId` to the REST inline-comment record before classifying it:
+Join every GraphQL thread's first `fullDatabaseId` (decimal-string-normalized on both sides — algo#1216 r19 F10) to the REST inline-comment record before classifying it:
 
 - If the login matches `authenticated_actor`, it is this workflow's own activity and is not external feedback, even if REST reports account type `Bot`.
 - REST `author_type == "Bot"` is bot feedback, never a human roundtrip target. GraphQL typename is diagnostic only; a missing REST join fails closed.

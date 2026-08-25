@@ -48,6 +48,11 @@ REVIEW_MODEL_FLAGS = (
 # drop the sandbox pin. The exact ordered shape must appear in the text.
 EXEC_RESUME_SHAPE = f"codex exec {EXEC_MODEL_FLAGS} resume"
 
+# admin#1495 r15 F12: the pinned upstream source is MIT-licensed; every
+# vendored copy must retain the notice. Checked as its own required file
+# (content-checked below), deliberately separate from byte-parity rules.
+REQUIRED_LICENSE_FILE = "LICENSE"
+
 REQUIRED_REFERENCE_FILES = (
     "references/project-and-entry.md",
     "references/phases-1-5.md",
@@ -81,6 +86,13 @@ REQUIRED_SCRIPT_FILES = (
 # reference must update this inventory in the same commit (same contract as
 # the heading inventory).
 REQUIRED_GATE_MARKERS = {
+    # algo#1216 r19 F10: the GraphQL joins are prose-executed contracts —
+    # pin the fullDatabaseId projections so a revert to the deprecated
+    # 32-bit field fails validation.
+    "references/monitor-ci-feedback.md": (
+        "nodes { fullDatabaseId author { __typename login } updatedAt }",
+        "id fullDatabaseId submittedAt updatedAt",
+    ),
     "SKILL.md": (
         "state_schema.py",
         "monitor_runner.py",
@@ -1551,6 +1563,25 @@ def validate_package(package_dir: Path) -> list[str]:
         if not (package_dir / required_file).is_file():
             errors.append(f"missing required script file: {required_file}")
     errors.extend(_validate_test_collection(package_dir))
+    license_path = package_dir / REQUIRED_LICENSE_FILE
+    try:
+        license_text = license_path.read_text(encoding="utf-8")
+    except OSError:
+        errors.append(
+            "LICENSE: missing — the pinned upstream source is MIT-licensed"
+            " and requires its notice in copies or substantial portions"
+            " (admin#1495 r15 F12); vendor the upstream LICENSE file"
+        )
+    else:
+        for marker in (
+            "MIT License",
+            "Permission is hereby granted, free of charge",
+        ):
+            if marker not in license_text:
+                errors.append(
+                    f"LICENSE: does not carry the MIT notice ({marker!r}"
+                    " absent) — admin#1495 r15 F12"
+                )
     errors.extend(_validate_policy_text(package_dir))
     errors.extend(_validate_gate_markers(package_dir))
     errors.extend(_validate_py_bindings(package_dir))

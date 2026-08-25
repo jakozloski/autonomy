@@ -1224,6 +1224,11 @@ GITIGNORE_ARTIFACT_GLOBS = (
     "workflow-state.local.md.attempt-*",
     "workflow-state.local.md.tmp-*",
     "workflow-state.local.failed-candidate-*.md",
+    # algo#1216 r19 F3: the sidecar gate's quarantine rename appends
+    # .q<pid>[-n]; the attempt glob's trailing * already covers its own
+    # quarantined forms, but the failed-candidate glob ends ".md" and
+    # missed them.
+    "workflow-state.local.failed-candidate-*.md.q*",
 )
 
 
@@ -2762,3 +2767,38 @@ class ContainmentRemovalObservabilityTests(unittest.TestCase):
         ):
             self.assertTrue(runner._extinguish_containment())
         self.assertIsNone(runner.attempt_containment)
+
+
+class QuarantineArtifactGlobTests(unittest.TestCase):
+    """algo#1216 r19 F3: quarantine renames stay inside the documented
+    ignore surface — names come from the REAL _quarantine_sidecar, never
+    a re-derived expression."""
+
+    def test_quarantined_names_match_the_documented_globs(self) -> None:
+        import fnmatch as _fnmatch
+
+        tmp = Path(tempfile.mkdtemp(prefix="unit-qglob-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        for source_name in (
+            "workflow-state.local.failed-candidate-deadbeef.md",
+            "workflow-state.local.md.attempt-deadbeef.md",
+        ):
+            source = tmp / source_name
+            source.write_text("x", encoding="utf-8")
+            quarantined = monitor_runner._quarantine_sidecar(source)
+            self.assertIsNotNone(quarantined, source_name)
+            with self.subTest(name=quarantined.name):
+                self.assertTrue(
+                    any(
+                        _fnmatch.fnmatch(quarantined.name, glob)
+                        for glob in GITIGNORE_ARTIFACT_GLOBS
+                    ),
+                    quarantined.name,
+                )
+        # neighboring negative: an unrelated name stays visible
+        self.assertFalse(
+            any(
+                _fnmatch.fnmatch("workflow-state.local.md.backup", glob)
+                for glob in GITIGNORE_ARTIFACT_GLOBS
+            )
+        )
