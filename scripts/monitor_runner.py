@@ -107,6 +107,96 @@ def resume_loss_offset(text: str) -> int | None:
     return min(offsets) if offsets else None
 
 
+# admin#1495 r15 F19: audit-trail record classes only the RUNNER (or a
+# pre-launch human/session action) may create — a child append carrying one
+# is a forged attestation, ownership, or waiver record.
+_SENSITIVE_TRAIL_PREFIXES = (
+    "branch-established:",
+    "package-validated:",
+    "validation-before-push:",
+    "r2-gate:",
+)
+
+
+def _trusted_control_drift(
+    launch: dict[str, Any], candidate: dict[str, Any]
+) -> str | None:
+    """The first trusted-control violation between the launch extract and
+    the candidate extract, or None (admin#1495 r15 F1/F10/F19).
+
+    The write-capable child legitimately advances WORK state; it never
+    rewrites the control records that authorize that work:
+
+    * the Decision Audit Trail is append-only — the launch trail must be
+      an exact prefix, and appended records must not forge the sensitive
+      runner/human-owned classes;
+    * the acceptance-criteria capture (the launch-authorized scope) and
+      the validated ticket are frozen — re-authorization is a human
+      action between slices, never a child edit;
+    * model-binding identity is frozen per leg, while each leg's
+      post_invocation history and the top-level escalation_invocations
+      grow append-only (launch lists stay exact prefixes).
+    """
+
+    launch_trail = launch.get("decision_audit_trail") or []
+    cand_trail = candidate.get("decision_audit_trail") or []
+    if cand_trail[: len(launch_trail)] != launch_trail:
+        return "decision_audit_trail rewrote or reordered launch records"
+    for appended in cand_trail[len(launch_trail):]:
+        if isinstance(appended, str) and appended.startswith(
+            _SENSITIVE_TRAIL_PREFIXES
+        ):
+            return (
+                "decision_audit_trail append forges a runner/human-owned"
+                f" record class ({appended.split(':', 1)[0]}:)"
+            )
+    for frozen_key in ("acceptance_criteria_capture", "validated_ticket"):
+        if launch.get(frozen_key) != candidate.get(frozen_key):
+            return f"{frozen_key} changed under the child"
+    launch_runtime = launch.get("model_runtime")
+    cand_runtime = candidate.get("model_runtime")
+    if isinstance(launch_runtime, dict):
+        if not isinstance(cand_runtime, dict):
+            return "model_runtime removed under the child"
+        for leg_name in ("codex", "claude", "claude_reviewer"):
+            launch_leg = launch_runtime.get(leg_name)
+            cand_leg = cand_runtime.get(leg_name)
+            if not isinstance(launch_leg, dict):
+                continue
+            if not isinstance(cand_leg, dict):
+                return f"model_runtime.{leg_name} removed under the child"
+            for key in set(launch_leg) | set(cand_leg):
+                if key == "post_invocation":
+                    continue
+                if launch_leg.get(key) != cand_leg.get(key):
+                    return (
+                        f"model_runtime.{leg_name}.{key} is frozen binding"
+                        " identity and changed under the child"
+                    )
+            launch_history = launch_leg.get("post_invocation") or []
+            cand_history = cand_leg.get("post_invocation") or []
+            if (
+                isinstance(launch_history, list)
+                and isinstance(cand_history, list)
+                and cand_history[: len(launch_history)] != launch_history
+            ):
+                return (
+                    f"model_runtime.{leg_name}.post_invocation rewrote its"
+                    " launch prefix"
+                )
+        launch_escalations = launch_runtime.get("escalation_invocations") or []
+        cand_escalations = cand_runtime.get("escalation_invocations") or []
+        if (
+            isinstance(launch_escalations, list)
+            and isinstance(cand_escalations, list)
+            and cand_escalations[: len(launch_escalations)]
+            != launch_escalations
+        ):
+            return "escalation_invocations rewrote its launch prefix"
+    return None
+
+
+
 def _parse_retry_deadline(raw: object) -> "datetime | None":
     """UTC deadline from any TIMEZONE-AWARE ISO 8601 string, else None.
 
@@ -180,6 +270,39 @@ MAX_WORK_ITERATIONS = 50
 # CLI), so this restates the key set of
 # handoff_decision.QA_OWNER_BY_REPOSITORY — that map stays canonical, and
 # test_monitor_runner_unit's parity regression fails on any drift.
+# admin#1495 r15 F17: the canonical mapped-repository QA manifest, by
+# operation FAMILY. Terminal acceptance requires the github pair plus one
+# complete Linear-leg shape, all sharing ONE generation, each with a
+# recorded result — a self-consistent SUBSET (github-only, assign without
+# state) can no longer complete. The alternation mirrors
+# handoff_decision's builder: the Linear leg is either the full
+# bind/assign/state chain, a documented runtime-outage record, or the
+# assign chain with a state-outage record. Parity with the planner is
+# pinned by test (the table and the builder must mint the same families).
+_QA_REQUIRED_GITHUB_FAMILIES = frozenset(
+    ("qa.github.replace_assignees", "qa.github.verify_assignees")
+)
+_QA_LINEAR_LEG_SHAPES = (
+    frozenset(
+        (
+            "qa.linear.verify_ticket_binding",
+            "qa.linear.assign_ticket",
+            "qa.linear.verify_ticket_assignee",
+            "qa.linear.set_ticket_state",
+            "qa.linear.verify_ticket_state",
+        )
+    ),
+    frozenset(("qa.linear.record_unavailable",)),
+    frozenset(
+        (
+            "qa.linear.verify_ticket_binding",
+            "qa.linear.assign_ticket",
+            "qa.linear.verify_ticket_assignee",
+            "qa.linear.record_state_unavailable",
+        )
+    ),
+)
+
 MAPPED_QA_REPOSITORIES = frozenset(
     {
         "keeper-dating/matchmaking",
@@ -795,6 +918,23 @@ def render_monitor_cli_block(block: dict[str, Any]) -> str:
             f"    next_retry_at: {_render_scalar(liveness.get('next_retry_at'))}"
         )
     lines.append(f"  repository: {_render_scalar(block.get('repository'))}")
+    # admin#1495 r15 F18: the runner-owned stability envelope rides every
+    # block write (a fixed renderer silently dropping it would disarm the
+    # envelope one commit after it was recorded).
+    stability = block.get("runner_stability")
+    if stability is None:
+        lines.append("  runner_stability: null")
+    else:
+        lines.append("  runner_stability:")
+        lines.append(f"    head: {_render_scalar(stability['head'])}")
+        lines.append(
+            "    first_observed_at:"
+            f" {_render_scalar(stability['first_observed_at'])}"
+        )
+        lines.append(
+            "    last_observed_at:"
+            f" {_render_scalar(stability['last_observed_at'])}"
+        )
     lines.append(f"  child_session_id: {_render_scalar(block['child_session_id'])}")
     lines.append(f"  owner_model: {_render_scalar(block['owner_model'])}")
     lines.append(
@@ -2186,6 +2326,7 @@ class Runner:
             "liveness": None,
         }
         base.setdefault("liveness", None)
+        base.setdefault("runner_stability", None)
         # algo#1216 finding 3813491661 + r14 F5: the repository binding is
         # STICKY runner-owned state — a later FAILED probe (or a child
         # rewiring .git/config between slices) never downgrades it back to
@@ -4027,6 +4168,203 @@ class Runner:
         if isinstance(snapshot, Path):
             shutil.rmtree(snapshot, ignore_errors=True)
 
+    def _qa_manifest_violation(
+        self, bound_repo: object, candidate_extract: dict[str, Any]
+    ) -> str | None:
+        """admin#1495 r15 F17: a mapped-repository terminal candidate must
+        carry the COMPLETE canonical QA operation set — one generation,
+        the github pair, a complete Linear-leg shape, and a recorded
+        result per operation. Identity inputs beyond the family manifest
+        (Linear provider ids, reviewer logins) are live-service facts the
+        executor re-verifies at postcondition time; this gate closes the
+        omitted-effect hole, not identity forgery."""
+
+        if not (
+            isinstance(bound_repo, str)
+            and bound_repo.casefold() in MAPPED_QA_REPOSITORIES
+        ):
+            return None
+        qa_status = (
+            candidate_extract.get("handoff_status_by_kind") or {}
+        ).get("qa")
+        if qa_status in (None, "idle"):
+            return None  # the planned-QA gate above owns the idle case
+        qa_ops = (candidate_extract.get("handoff_operations") or {}).get(
+            "qa"
+        ) or []
+        generations = set()
+        families = set()
+        for op_id in qa_ops:
+            if not isinstance(op_id, str):
+                return "malformed qa operation id"
+            family, _, tail = op_id.rpartition(":")
+            if not family or not tail.startswith("g"):
+                return f"qa operation {op_id!r} carries no generation"
+            generations.add(tail)
+            families.add(family.split(":", 1)[0])
+        if len(generations) != 1:
+            return (
+                "qa operations span"
+                f" {len(generations)} generations — the canonical plan"
+                " mints one atomic generation"
+            )
+        if not _QA_REQUIRED_GITHUB_FAMILIES <= families:
+            missing = sorted(_QA_REQUIRED_GITHUB_FAMILIES - families)
+            return f"qa manifest omits required github operations {missing}"
+        linear_families = {f for f in families if f.startswith("qa.linear.")}
+        if linear_families not in _QA_LINEAR_LEG_SHAPES:
+            return (
+                "qa manifest's Linear leg"
+                f" {sorted(linear_families)} matches no canonical shape"
+                " (full chain, runtime-outage record, or assign chain with"
+                " a state-outage record)"
+            )
+        qa_results = (candidate_extract.get("handoff_results") or {}).get(
+            "qa"
+        ) or {}
+        unrecorded = [op for op in qa_ops if op not in qa_results]
+        if unrecorded:
+            return f"qa operations without recorded results: {unrecorded[:3]}"
+        return None
+
+    def _fetch_remote_head(
+        self, bound_repo: str, pr_number: int
+    ) -> str | None:
+        """The runner's OWN observation of the PR head (admin#1495 r15
+        F18) — bounded, sanitized, never child-relayed."""
+
+        try:
+            gh_bin = _resolve_system_binary("gh")
+        except RunnerExit:
+            return None
+        try:
+            completed = subprocess.run(
+                [
+                    gh_bin,
+                    "api",
+                    f"repos/{bound_repo}/pulls/{pr_number}",
+                    "--jq",
+                    ".head.sha",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                env=self._sanitized_child_env(),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if completed.returncode != 0:
+            return None
+        head = completed.stdout.strip()
+        return head if re.fullmatch(r"[0-9a-f]{40}", head) else None
+
+    def _stability_unproven_reason(
+        self, fresh: dict[str, Any]
+    ) -> str | None:
+        """admin#1495 r15 F18: terminal acceptance requires TWO
+        runner-created clean observations of the same still-current head,
+        separated by the resolved grace window, timestamped by the
+        runner's own clock and persisted in the runner-owned
+        monitor_cli.runner_stability block. Returns the block reason when
+        the envelope is not yet proven (the caller records the fresh
+        observation and retries without charging — wall-clock stability
+        is not a child fault), or None when proven or inapplicable (no
+        bound repository/PR or no gh route: the pre-upgrade child-poll
+        evidence is then the only envelope, disclosed, never silent)."""
+
+        launch_cli = fresh.get("monitor_cli")
+        bound_repo = (
+            launch_cli.get("repository")
+            if isinstance(launch_cli, dict)
+            else None
+        )
+        if not (isinstance(bound_repo, str) and bound_repo):
+            bound_repo = self.repository_hint
+        pr_number = fresh.get("pr_number")
+        if not (isinstance(bound_repo, str) and bound_repo) or not isinstance(
+            pr_number, int
+        ):
+            _heartbeat(
+                "runner stability envelope inapplicable (no bound"
+                " repository/PR) — child-poll evidence is the only"
+                " envelope for this exit"
+            )
+            return None
+        live_head = self._fetch_remote_head(bound_repo, pr_number)
+        if live_head is None:
+            block = self.current_block(fresh)
+            block["in_flight"] = None
+            self.commit_block(block)
+            self.launch_block = None
+            self.launch_base_digest = None
+            return (
+                "runner head observation unavailable (gh probe failed) —"
+                " retrying; terminal exits need runner-observed stability"
+            )
+        window = fresh.get("bot_grace_window_seconds")
+        if not isinstance(window, int) or window <= 0:
+            window = 900
+        window_seconds = window * self.wait_scale
+        recorded = (
+            launch_cli.get("runner_stability")
+            if isinstance(launch_cli, dict)
+            else None
+        )
+        recorded = recorded if isinstance(recorded, dict) else {}
+        now_iso = _utcnow_iso()
+        first = recorded.get("first_observed_at")
+        if recorded.get("head") != live_head or not isinstance(first, str):
+            self._record_stability(fresh, live_head, now_iso, now_iso)
+            return (
+                "runner stability re-armed on head"
+                f" {live_head[:9]} — first runner observation recorded;"
+                " terminal exits need two observations across the grace"
+                " window"
+            )
+        first_parsed = _parse_retry_deadline(first)
+        now_parsed = _parse_retry_deadline(now_iso)
+        if first_parsed is None or now_parsed is None:
+            self._record_stability(fresh, live_head, now_iso, now_iso)
+            return "runner stability record unreadable — re-armed"
+        elapsed = (now_parsed - first_parsed).total_seconds()
+        if elapsed < window_seconds:
+            self._record_stability(fresh, live_head, first, now_iso)
+            return (
+                "runner stability window still open"
+                f" ({int(elapsed)}s of {int(window_seconds)}s on head"
+                f" {live_head[:9]}) — terminal exit deferred"
+            )
+        # PROVEN: the recorded first observation plus THIS live fetch are
+        # the two runner-created observations across the window, on a
+        # still-current head. Deliberately no canonical write here — the
+        # accept tail re-verifies canonical against the launch snapshot,
+        # and a write now would trip the runner's own tripwire.
+        return None
+
+    def _record_stability(
+        self,
+        fresh: dict[str, Any],
+        head: str,
+        first_observed_at: str,
+        last_observed_at: str,
+    ) -> None:
+        """One commit: the fresh runner observation AND the attempt's
+        in_flight clear (the child already finished) — mirroring
+        charge_failure's single-write shape."""
+
+        block = self.current_block(fresh)
+        block["runner_stability"] = {
+            "head": head,
+            "first_observed_at": first_observed_at,
+            "last_observed_at": last_observed_at,
+        }
+        block["in_flight"] = None
+        self.commit_block(block)
+        # the launch snapshot is history once canonical moved (same rule
+        # as charge_failure's commit)
+        self.launch_block = None
+        self.launch_base_digest = None
+
     def _verify_and_commit(
         self,
         fresh: dict[str, Any],
@@ -4084,6 +4422,18 @@ class Runner:
         candidate_extract = self.schema.extract_text_via_file(
             candidate_text, candidate.with_suffix(candidate.suffix + ".snap")
         )
+        # admin#1495 r15 F1/F10/F19: the trusted-control surface is
+        # compared BEFORE any acceptance math — a candidate that rewrote
+        # the audit trail, the launch-authorized AC capture, the ticket
+        # binding, or the model-binding identity never commits, whatever
+        # else it contains.
+        control_drift = _trusted_control_drift(fresh, candidate_extract)
+        if control_drift is not None:
+            self._preserve_failed(candidate)
+            self.charge_failure(
+                fresh, "monitor-child:trusted_control_rewrite"
+            )
+            return "retry"
         candidate_digest = candidate_extract.get("digest")
         if not (isinstance(candidate_digest, str) and candidate_digest):
             candidate_digest = None
@@ -4319,6 +4669,26 @@ class Runner:
         # or a drifted list rejects the candidate for the child to
         # remediate.
         if outcome == "terminal":
+            launch_cli_manifest = fresh.get("monitor_cli")
+            manifest_repo = (
+                launch_cli_manifest.get("repository")
+                if isinstance(launch_cli_manifest, dict)
+                else None
+            )
+            if not (isinstance(manifest_repo, str) and manifest_repo):
+                manifest_repo = self.repository_hint
+            manifest_violation = self._qa_manifest_violation(
+                manifest_repo, candidate_extract
+            )
+            if manifest_violation is not None:
+                _heartbeat(
+                    f"terminal rejected: {manifest_violation}"
+                )
+                self._preserve_failed(candidate)
+                self.charge_failure(
+                    fresh, "monitor-child:handoff_manifest_incomplete"
+                )
+                return "retry"
             post_deploy = (
                 candidate_extract.get("merge_readiness_post_deploy") or []
             )
@@ -4341,6 +4711,23 @@ class Runner:
                         fresh, "monitor-child:deferred_work_unrecorded"
                     )
                     return "retry"
+        if outcome == "terminal":
+            stability_reason = self._stability_unproven_reason(fresh)
+            if stability_reason is not None:
+                _heartbeat(stability_reason)
+                # No charge (wall-clock stability is not a child fault; the
+                # plain retry rides the liveness ladder) and no
+                # preservation: this candidate is a DEFERRED terminal, not
+                # failure evidence — preserving it would gate the very next
+                # launch on its own terminal records. The child re-derives
+                # the tick under the workflow's verify-before-retry
+                # idempotency; the observation commit (inside the reason
+                # helper) already cleared in_flight in the same write.
+                try:
+                    candidate.unlink()
+                except OSError:
+                    pass
+                return "retry"
         # Candidate taint is NOT rejected here: feedback excerpts land in
         # state by design, and the acknowledge-aware _gate_taint re-gates
         # every subsequent write-capable launch (R6-F5) — commit-time
@@ -4429,9 +4816,18 @@ class Runner:
         """algo#1216 finding 3806594998 (+admin 3806647918, mm 3806719722):
         the ladder rung persists BEFORE the wait, so a slice_exhausted
         re-invocation resumes the escalation instead of restarting at rung
-        1 — state-and-safety's persist-next_retry_at-before-wait rule."""
+        1 — state-and-safety's persist-next_retry_at-before-wait rule.
+
+        admin#1495 r15 F18 companion: committed from a FRESH extract, not
+        the loop-top snapshot — a mid-tick runner write (the stability
+        observation) landed between them, and rendering the stale block
+        clobbered it one commit later (the same lesson
+        _clear_liveness_ladder already carries)."""
         from datetime import timedelta
 
+        refreshed = self.schema.extract(self.state_path)
+        if refreshed.get("state") == "valid":
+            extract = refreshed
         block = self.current_block(extract)
         block["liveness"] = {
             "rung": rung,

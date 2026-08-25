@@ -60,6 +60,8 @@ pr_number: 7
 stash_ref: null
 resolved_conventions:
   quality_check_steps: []
+  monitor_constants:
+    bot_grace_window_seconds: 1
   model_runtime:
     codex:
       model: "gpt-5.6-sol"
@@ -829,6 +831,15 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         self.fake = self.dir / "fake-claude.py"
         self.fake.write_text(FAKE_CLAUDE, encoding="utf-8")
         self.fake.chmod(0o755)
+        # admin#1495 r15 F18: the runner observes the remote head itself;
+        # fixtures answer that probe locally (a fixed, stable head) so no
+        # network is touched and the two-observation envelope can prove.
+        self.fake_gh = self.dir / "fake-gh-head.sh"
+        self.fake_gh.write_text(
+            "#!/bin/sh\nprintf '%s\\n' '" + "ab" * 20 + "'\n",
+            encoding="utf-8",
+        )
+        self.fake_gh.chmod(0o755)
         self.argv_log = self.dir / "argv.jsonl"
         verdict = subprocess.run(
             [sys.executable, str(SCHEMA), str(self.state)],
@@ -859,6 +870,7 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         # repository (where the attestation NEVER applies) or override
         # this to "" to exercise the unattested block.
         env.setdefault("MONITOR_RUNNER_UNCONTAINED_TEST_CHILD", "1")
+        env.setdefault("MONITOR_RUNNER_BIN_GH", str(self.fake_gh))
         env.update(env_extra or {})
         return subprocess.run(
             [
@@ -2366,8 +2378,12 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         # the harness's operator attestation (non-Keeper binding + fake
         # child) — the unattested twin below proves the same shape blocks.
         self._bind_origin("git@github.com:someone-else/sandbox.git")
+        # r15 F18: the first terminal-claiming tick arms the runner's own
+        # stability envelope; the SECOND (after a laddered wait spanning
+        # the scaled grace window) commits. wait_scale keeps both quick.
         completed = self._run(
-            budget="2000", env_extra={"FAKE_OUTCOME": "terminal"}
+            budget="2000", timeout=120, wait_scale="0.02",
+            env_extra={"FAKE_OUTCOME": "terminal"},
         )
         summary = self._summary(completed)
         self.assertEqual(

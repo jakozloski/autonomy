@@ -418,11 +418,17 @@ MONITOR_CLI_SCHEMA_VERSION = 1
 # the runner's sticky origin binding for the required-handoff manifest,
 # absent from pre-r18 states); every other key is required when the block
 # exists.
-MONITOR_CLI_OPTIONAL_KEYS = frozenset(("liveness", "repository"))
+# "runner_stability" (admin#1495 r15 F18) is the RUNNER-OWNED stability
+# envelope: the remote head the runner itself observed plus its own-clock
+# observation instants — never child-authored.
+MONITOR_CLI_OPTIONAL_KEYS = frozenset(
+    ("liveness", "repository", "runner_stability")
+)
 MONITOR_CLI_KEYS = frozenset(
     (
         "liveness",
         "repository",
+        "runner_stability",
         "schema_version",
         "child_session_id",
         "owner_model",
@@ -1786,6 +1792,41 @@ class _Validator:
                 # algo#1216 finding 3806594998 (+admin/mm twins): the
                 # liveness ladder persists so a fresh slice resumes the
                 # rung instead of restarting at 1.
+                # admin#1495 r15 F18: the runner-owned stability envelope.
+                if "runner_stability" in cli and cli.get("runner_stability") is not None:
+                    stability = cli.get("runner_stability")
+                    if not isinstance(stability, dict):
+                        self.error(
+                            "monitor_cli.runner_stability: must be a mapping"
+                            " or null"
+                        )
+                    else:
+                        for skey in stability:
+                            if skey not in (
+                                "head",
+                                "first_observed_at",
+                                "last_observed_at",
+                            ):
+                                self.error(
+                                    "monitor_cli.runner_stability: unknown"
+                                    f" key {_safe_key(str(skey))!r}"
+                                )
+                        head_value = stability.get("head")
+                        if not _is_full_hex(head_value):
+                            self.error(
+                                "monitor_cli.runner_stability.head: must be"
+                                " a full commit SHA"
+                            )
+                        for skey in ("first_observed_at", "last_observed_at"):
+                            if normalize_iso_timestamp(
+                                stability.get(skey)
+                            ) is None:
+                                self.error(
+                                    f"monitor_cli.runner_stability.{skey}:"
+                                    " must be a timezone-aware ISO"
+                                    " timestamp (the runner's own"
+                                    " observation instants)"
+                                )
                 if "liveness" in cli and cli.get("liveness") is not None:
                     liveness = cli.get("liveness")
                     if not isinstance(liveness, dict):
@@ -3824,6 +3865,14 @@ def monitor_extract(text: str) -> dict[str, Any]:
         "last_observed_head_sha": None,
         "deferred_work_evidence": {},
         "blocked_evidence_present": False,
+        # admin#1495 r15 F1/F10/F19 (+F18): the trusted-control surface the
+        # runner freezes or prefix-checks between launch and candidate, and
+        # the resolved grace window its own stability envelope consumes.
+        "decision_audit_trail": [],
+        "acceptance_criteria_capture": None,
+        "validated_ticket": None,
+        "pr_number": None,
+        "bot_grace_window_seconds": None,
     }
     try:
         state, _ = parse_state_text(text)
@@ -3832,6 +3881,20 @@ def monitor_extract(text: str) -> dict[str, Any]:
     if not isinstance(state, dict):
         return extract
     extract["current_phase"] = state.get("current_phase")
+    trail = state.get("decision_audit_trail")
+    if isinstance(trail, list):
+        extract["decision_audit_trail"] = [
+            item for item in trail if isinstance(item, str)
+        ]
+    capture = state.get("acceptance_criteria_capture")
+    if isinstance(capture, dict):
+        extract["acceptance_criteria_capture"] = capture
+    ticket = state.get("validated_ticket")
+    if isinstance(ticket, dict):
+        extract["validated_ticket"] = ticket
+    pr_number = state.get("pr_number")
+    if isinstance(pr_number, int) and not isinstance(pr_number, bool):
+        extract["pr_number"] = pr_number
     if isinstance(state.get("monitor_cli"), dict):
         extract["monitor_cli"] = state["monitor_cli"]
     if isinstance(state.get("monitor_ownership"), dict):
@@ -3842,6 +3905,22 @@ def monitor_extract(text: str) -> dict[str, Any]:
     )
     if isinstance(runtime, dict):
         extract["model_runtime"] = runtime
+    grace_constants = (
+        conventions.get("monitor_constants")
+        if isinstance(conventions, dict)
+        else None
+    )
+    declared_grace = (
+        grace_constants.get("bot_grace_window_seconds")
+        if isinstance(grace_constants, dict)
+        else None
+    )
+    if (
+        isinstance(declared_grace, int)
+        and not isinstance(declared_grace, bool)
+        and declared_grace > 0
+    ):
+        extract["bot_grace_window_seconds"] = declared_grace
     for counter in ("monitor_iterations", "monitor_poll_ticks"):
         value = state.get(counter)
         if isinstance(value, int) and not isinstance(value, bool):
