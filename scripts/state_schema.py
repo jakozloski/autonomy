@@ -118,7 +118,9 @@ VALID = "valid"
 SUSPECT = "suspect"
 
 _PLAIN_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_FULL_HEX = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})$")
+# admin#1495 r15 F16: \Z, not $ — Python's $ also matches before a
+# terminal newline, so "<40 hex>\n" validated as a full SHA.
+_FULL_HEX = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})\Z")
 _ISO_TS = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$"
 )
@@ -539,6 +541,7 @@ KNOWN_TOP_LEVEL_KEYS = frozenset(
         "monitor_cli",
         "post_push_until",
         "next_retry_at",
+        "next_retry_leg",
         "hold_started_at",
         "last_observed_head_sha",
         "clean_poll_timestamps",
@@ -567,6 +570,7 @@ OPTIONAL_TOP_LEVEL_KEYS = frozenset(
         "monitor_ownership",
         "monitor_cli",
         "next_retry_at",
+        "next_retry_leg",
         "hold_started_at",
         # Migration tolerance (finding 3813789199): pre-r18 states never
         # wrote a stash intent; the write-ahead record is required by the
@@ -1056,6 +1060,15 @@ def validate_operation_result_record(record: Any, *, label: str) -> tuple[str | 
 
 
 MODEL_RUNTIME_LEGS = ("codex", "claude", "claude_reviewer")
+# admin#1495 r15 F9: binders compare exact lowercase tokens, so an
+# open-ended gate_status let "Ready"-style drift read as unavailable.
+# degraded is reviewer-only by the model policy (the reviewer leg
+# DEGRADES; base and Codex BLOCK). Future vocabulary arrives with a
+# schema-version migration, never by loosening these enums.
+MODEL_GATE_STATUS_ENUM = frozenset(("pending", "ready", "blocked"))
+MODEL_GATE_REVIEWER_STATUS_ENUM = MODEL_GATE_STATUS_ENUM | frozenset(
+    ("degraded",)
+)
 MODEL_RUNTIME_LEG_KEYS = frozenset(
     (
         "model",
@@ -1107,12 +1120,20 @@ def validate_model_runtime_shape(model_runtime: Any) -> list[str]:
         if model is not None and (not isinstance(model, str) or not model):
             errors.append(f"{prefix}.model: must be a non-empty string")
         gate_status = leg.get("gate_status")
-        if gate_status is not None and (
-            not isinstance(gate_status, str) or not gate_status
-        ):
-            errors.append(
-                f"{prefix}.gate_status: must be a non-empty string"
+        if gate_status is not None:
+            allowed = (
+                MODEL_GATE_REVIEWER_STATUS_ENUM
+                if leg_name == "claude_reviewer"
+                else MODEL_GATE_STATUS_ENUM
             )
+            if not isinstance(gate_status, str) or gate_status not in allowed:
+                errors.append(
+                    f"{prefix}.gate_status: must be one of"
+                    f" {', '.join(sorted(allowed))} (admin#1495 r15 F9 —"
+                    " binders consume exact lowercase tokens; degraded is"
+                    " reviewer-only; new vocabulary needs a schema-version"
+                    " migration)"
+                )
         flag = leg.get("host_agent_selection_verified")
         if flag is not None and not isinstance(flag, bool):
             errors.append(
@@ -1364,10 +1385,10 @@ class _Validator:
         # is DECLARED, not only where it is consumed — a silently-applied
         # default would surface only as a confusing ceiling error at the
         # first push, whose re-arm advice re-reads the same bad override and
-        # reproduces itself forever. Two keys are schema-consumed here
-        # (this one and the immutable max_iterations below); the sibling
-        # monitor_constants are prose-consumed and stay unvalidated by
-        # design.
+        # reproduces itself forever. admin#1495 r15 F8 closed the rest of
+        # the block: every advertised sibling is validated below, and the
+        # liveness pair is immutable because the concrete supervisors pin
+        # the canonical constants — a declared override was never honored.
         conventions = state.get("resolved_conventions")
         constants = (
             conventions.get("monitor_constants")
@@ -1399,6 +1420,79 @@ class _Validator:
                 f" and the literal {MAX_WORK_ITERATIONS} all mean the same"
                 " enforced cap)"
             )
+        # admin#1495 r15 F8: monitor_constants is a CLOSED block and every
+        # advertised key is validated where declared. watch_timeout_seconds
+        # and poll_chunk_seconds are genuine overrides with hard bounds
+        # (the poll chunk must never exceed the 60s progress contract);
+        # the liveness pair is IMMUTABLE — supervise_stream call sites pin
+        # the canonical 180s idle kill and 2700s attempt ceiling
+        # (PER_ATTEMPT_CEILING_SECONDS in scripts/model_policy.py, the
+        # canonical side of this boundary), so a declared override would
+        # be silently dishonored; it is rejected instead.
+        if isinstance(constants, dict):
+            known_constants = {
+                "bot_grace_window_seconds",
+                "watch_timeout_seconds",
+                "liveness_idle_kill_seconds",
+                "liveness_attempt_ceiling_seconds",
+                "poll_chunk_seconds",
+                "max_iterations",
+                "codex_cli_version",
+            }
+            for key in sorted(set(constants) - known_constants):
+                self.error(
+                    "resolved_conventions.monitor_constants:"
+                    f" unknown key {_safe_key(str(key))!r} — the block is"
+                    " closed (admin#1495 r15 F8)"
+                )
+            watch = constants.get("watch_timeout_seconds")
+            if watch is not None and (
+                not isinstance(watch, int)
+                or isinstance(watch, bool)
+                or watch <= 0
+            ):
+                self.error(
+                    "resolved_conventions.monitor_constants"
+                    ".watch_timeout_seconds: must be a positive integer"
+                    " number of seconds"
+                )
+            poll = constants.get("poll_chunk_seconds")
+            if poll is not None and (
+                not isinstance(poll, int)
+                or isinstance(poll, bool)
+                or not 1 <= poll <= 60
+            ):
+                self.error(
+                    "resolved_conventions.monitor_constants"
+                    ".poll_chunk_seconds: must be an integer in 1..60 — the"
+                    " progress contract forbids any blocking wait beyond"
+                    " 60 seconds"
+                )
+            for key, canonical in (
+                ("liveness_idle_kill_seconds", 180),
+                ("liveness_attempt_ceiling_seconds", 2700),
+            ):
+                declared = constants.get(key)
+                if declared is not None and (
+                    not isinstance(declared, int)
+                    or isinstance(declared, bool)
+                    or declared != canonical
+                ):
+                    self.error(
+                        f"resolved_conventions.monitor_constants.{key}:"
+                        f" immutable — supervisors pin the canonical"
+                        f" {canonical}s and never read this key; absent,"
+                        f" null, and the literal {canonical} are"
+                        " equivalent, any other value is suspect state"
+                    )
+            cli_version = constants.get("codex_cli_version")
+            if cli_version is not None and (
+                not isinstance(cli_version, str) or not cli_version
+            ):
+                self.error(
+                    "resolved_conventions.monitor_constants"
+                    ".codex_cli_version: must be a non-empty string or null"
+                )
         declared = (
             constants.get("bot_grace_window_seconds")
             if isinstance(constants, dict)
@@ -1445,6 +1539,11 @@ class _Validator:
                     )
         wait_phases = state.get("phases")
         wait_monitor = wait_phases.get("monitor") if isinstance(wait_phases, dict) else None
+        if state.get("next_retry_leg") is not None and state.get("next_retry_at") is None:
+            self.error(
+                "next_retry_leg: present without next_retry_at — the owner"
+                " and the timestamp clear atomically (admin#1495 r15 F3)"
+            )
         if "next_retry_at" in state and state.get("next_retry_at") is not None:
             parsed_retry = normalize_iso_timestamp(state.get("next_retry_at"))
             if parsed_retry is None:
@@ -1520,6 +1619,54 @@ class _Validator:
                                 " observation instead of sleeping toward it"
                             )
                             break
+                # admin#1495 r15 F3: the wait names its OWNING leg, so a
+                # stale wait cannot outlive the leg that created it.
+                # next_retry_leg is persisted with the timestamp and must
+                # be pending; a legacy state without the key derives the
+                # owner only when exactly one leg is pending. All-ready
+                # and all-blocked gates cannot carry a wait, and the pair
+                # clears atomically (see the sibling check below).
+                declared_leg = state.get("next_retry_leg")
+                pending_legs = [
+                    leg_name
+                    for leg_name in ("codex", "claude", "claude_reviewer")
+                    if isinstance(runtime, dict)
+                    and isinstance(runtime.get(leg_name), dict)
+                    and runtime[leg_name].get("gate_status") == "pending"
+                ]
+                if declared_leg is not None:
+                    if declared_leg not in ("codex", "claude", "claude_reviewer"):
+                        self.error(
+                            "next_retry_leg: must be one of codex, claude,"
+                            " claude_reviewer"
+                        )
+                    elif declared_leg not in pending_legs:
+                        self.error(
+                            f"next_retry_leg: the {declared_leg} gate is not"
+                            " pending — the wait's owner landed (or its"
+                            " status is unrecorded); clear next_retry_at and"
+                            " next_retry_leg atomically and re-run the gate"
+                            " observation (admin#1495 r15 F3)"
+                        )
+                else:
+                    observed_statuses = [
+                        runtime[leg_name].get("gate_status")
+                        for leg_name in ("codex", "claude", "claude_reviewer")
+                        if isinstance(runtime, dict)
+                        and isinstance(runtime.get(leg_name), dict)
+                        and runtime[leg_name].get("gate_status") is not None
+                    ] if isinstance(runtime, dict) else []
+                    if observed_statuses and len(pending_legs) != 1:
+                        self.error(
+                            "next_retry_at: no single pending leg owns this"
+                            " wait — persist next_retry_leg beside the"
+                            " timestamp (a legacy state derives the owner"
+                            " only when exactly one recorded leg is pending;"
+                            " a state recording no gate statuses at all is"
+                            " pre-upgrade history); all-ready and"
+                            " all-blocked gates cannot carry a model-gate"
+                            " wait (admin#1495 r15 F3)"
+                        )
                 # Resume ceiling: a persisted retry instant beyond one bounded
                 # sleep (+ skew) is a suspect resume point — re-derive by
                 # re-running the gate observation, never sleep toward it.
@@ -2855,6 +3002,33 @@ class _Validator:
             # merge-readiness.md) — a deferred AC with no evidence names no
             # follow-up, so the deferral is untracked (algo#1216 R2 finding
             # 3722493004: deferred + null evidence validated clean).
+            # admin#1495 r15 F2: met and n_a are TERMINAL verdicts that
+            # participate in completed merge readiness — merge-readiness.md
+            # requires live-path evidence for met and a one-line
+            # justification for n_a, so a null-evidence terminal verdict
+            # contradicts the contract it feeds. Migration: a state whose
+            # pr phase already completed is pre-upgrade history (resetting
+            # it would retroactively break the shipped chain, the same
+            # boundary the runtime-verification proof rules use); every
+            # pre-Phase-5 state must re-verify the criterion and record
+            # the evidence.
+            if entry.get("verdict") in ("met", "n_a") and (
+                evidence is None or not evidence
+            ):
+                ac_phases = self.state.get("phases") if isinstance(self.state, dict) else None
+                ac_pr_phase = (
+                    ac_phases.get("pr") if isinstance(ac_phases, dict) else None
+                )
+                if ac_pr_phase != "complete":
+                    self.error(
+                        f"{path}.evidence: verdict"
+                        f" {entry.get('verdict')!r} requires nonempty"
+                        " evidence (live-path evidence for met, a one-line"
+                        " justification for n_a — merge-readiness.md;"
+                        " admin#1495 r15 F2); a legacy state with"
+                        " phases.pr complete is tolerated as pre-upgrade"
+                        " history"
+                    )
             if entry.get("verdict") == "deferred":
                 # admin#1495 R2 finding 3791925156: "with a tracked ticket"
                 # means a TICKET, not any prose — "later" validated clean.

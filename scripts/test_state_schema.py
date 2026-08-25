@@ -2292,6 +2292,12 @@ class MergeReadinessTests(unittest.TestCase):
                     '  monitor: "pending"\n  merge_readiness: "complete"',
                 ),
                 ('    verdict: "pending"', '    verdict: "met"'),
+                # r15 F2: a terminal met verdict carries its live-path
+                # evidence — null-evidence met is now rejected pre-ship.
+                (
+                    "    evidence: null",
+                    '    evidence: "form saved end to end on the preview"',
+                ),
             ):
                 text = _mutate(text, old, new)
             for check, value in (
@@ -5500,3 +5506,254 @@ class MonitorBlockedEvidenceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class R15SchemaClosureTests(unittest.TestCase):
+    """admin#1495 r15 F2/F3/F8/F9/F16: terminal-AC evidence, wait-owner
+    binding, monitor_constants closure, gate vocabulary, SHA anchoring."""
+
+    def _with_runtime(
+        self, text: str, codex: str, claude: str, reviewer: str
+    ) -> str:
+        return _mutate(
+            text,
+            "  quality_check_steps: []",
+            "  quality_check_steps: []\n"
+            "  model_runtime:\n"
+            "    codex:\n"
+            f'      gate_status: "{codex}"\n'
+            "    claude:\n"
+            f'      gate_status: "{claude}"\n'
+            "    claude_reviewer:\n"
+            f'      gate_status: "{reviewer}"',
+        )
+
+    def _errors(self, text: str) -> list:
+        return evaluate_state_text(text)["errors"]
+
+    # ---- F9: closed gate vocabulary ----
+    def test_gate_status_vocabulary_is_closed(self) -> None:
+        base = FULL_STATE
+        for value in ("Ready", "unknown", "READY", "ok"):
+            with self.subTest(value=value):
+                errors = self._errors(
+                    self._with_runtime(base, value, "ready", "ready")
+                )
+                self.assertTrue(
+                    any("gate_status: must be one of" in e for e in errors),
+                    errors,
+                )
+        # degraded is reviewer-only
+        self.assertTrue(
+            any(
+                "gate_status: must be one of" in e
+                for e in self._errors(
+                    self._with_runtime(base, "degraded", "ready", "ready")
+                )
+            )
+        )
+        self.assertFalse(
+            any(
+                "gate_status" in e
+                for e in self._errors(
+                    self._with_runtime(base, "ready", "ready", "degraded")
+                )
+            )
+        )
+
+    # ---- F3: the wait names its pending owner ----
+    def _wait_state(self, codex: str, claude: str, reviewer: str) -> str:
+        text = self._with_runtime(FULL_STATE, codex, claude, reviewer)
+        return _mutate(
+            text,
+            'current_phase: "plan"',
+            'current_phase: "plan"\nnext_retry_at: "2026-08-04T10:00:00Z"',
+        )
+
+    def test_declared_pending_owner_is_valid(self) -> None:
+        text = _mutate(
+            self._wait_state("pending", "ready", "ready"),
+            "next_retry_at:",
+            'next_retry_leg: "codex"\nnext_retry_at:',
+        )
+        self.assertFalse(
+            any("next_retry" in e for e in self._errors(text)),
+            self._errors(text),
+        )
+
+    def test_landed_owner_is_a_mismatch(self) -> None:
+        text = _mutate(
+            self._wait_state("ready", "ready", "ready"),
+            "next_retry_at:",
+            'next_retry_leg: "codex"\nnext_retry_at:',
+        )
+        self.assertTrue(
+            any("next_retry_leg: the codex gate is not pending" in e
+                for e in self._errors(text))
+        )
+
+    def test_all_ready_wait_without_owner_is_rejected(self) -> None:
+        errors = self._errors(self._wait_state("ready", "ready", "ready"))
+        self.assertTrue(
+            any("no single pending leg owns this wait" in e for e in errors),
+            errors,
+        )
+
+    def test_single_pending_leg_derives_for_legacy_states(self) -> None:
+        errors = self._errors(self._wait_state("pending", "ready", "ready"))
+        self.assertFalse(any("next_retry" in e for e in errors), errors)
+
+    def test_two_pending_legs_require_the_declared_owner(self) -> None:
+        errors = self._errors(self._wait_state("pending", "pending", "ready"))
+        self.assertTrue(
+            any("no single pending leg owns this wait" in e for e in errors)
+        )
+
+    def test_no_recorded_statuses_stays_pre_upgrade_history(self) -> None:
+        text = _mutate(
+            FULL_STATE,
+            'current_phase: "plan"',
+            'current_phase: "plan"\nnext_retry_at: "2026-08-04T10:00:00Z"',
+        )
+        self.assertFalse(
+            any("next_retry" in e for e in self._errors(text))
+        )
+
+    def test_owner_without_timestamp_is_rejected(self) -> None:
+        text = _mutate(
+            FULL_STATE,
+            'current_phase: "plan"',
+            'current_phase: "plan"\nnext_retry_leg: "codex"',
+        )
+        self.assertTrue(
+            any("present without next_retry_at" in e for e in self._errors(text))
+        )
+
+    # ---- F8: monitor_constants closure ----
+    def _with_constant(self, key: str, value: str) -> str:
+        return _mutate(
+            FULL_STATE,
+            "  quality_check_steps: []",
+            "  quality_check_steps: []\n"
+            "  monitor_constants:\n"
+            f"    {key}: {value}",
+        )
+
+    def test_monitor_constants_block_is_closed(self) -> None:
+        errors = self._errors(self._with_constant("surprise_key", "1"))
+        self.assertTrue(any("unknown key 'surprise_key'" in e for e in errors))
+
+    def test_watch_timeout_bounds(self) -> None:
+        for bad in ("0", "-5", '"soon"', "true"):
+            with self.subTest(bad=bad):
+                errors = self._errors(
+                    self._with_constant("watch_timeout_seconds", bad)
+                )
+                self.assertTrue(
+                    any("watch_timeout_seconds" in e for e in errors), errors
+                )
+        self.assertFalse(
+            any(
+                "watch_timeout_seconds" in e
+                for e in self._errors(
+                    self._with_constant("watch_timeout_seconds", "300")
+                )
+            )
+        )
+
+    def test_poll_chunk_bounds(self) -> None:
+        for bad in ("0", "61", '"1"'):
+            with self.subTest(bad=bad):
+                self.assertTrue(
+                    any(
+                        "poll_chunk_seconds" in e
+                        for e in self._errors(
+                            self._with_constant("poll_chunk_seconds", bad)
+                        )
+                    )
+                )
+        self.assertFalse(
+            any(
+                "poll_chunk_seconds" in e
+                for e in self._errors(
+                    self._with_constant("poll_chunk_seconds", "60")
+                )
+            )
+        )
+
+    def test_liveness_pair_is_immutable(self) -> None:
+        cases = (
+            ("liveness_idle_kill_seconds", "179", "180"),
+            ("liveness_attempt_ceiling_seconds", "2701", "2700"),
+        )
+        for key, bad, canonical in cases:
+            with self.subTest(key=key):
+                self.assertTrue(
+                    any(
+                        f"{key}: immutable" in e
+                        for e in self._errors(self._with_constant(key, bad))
+                    )
+                )
+                self.assertFalse(
+                    any(
+                        key in e
+                        for e in self._errors(
+                            self._with_constant(key, canonical)
+                        )
+                    )
+                )
+
+    # ---- F16: absolute SHA anchoring ----
+    def test_full_hex_rejects_terminal_newline(self) -> None:
+        import state_schema as _schema_module
+
+        self.assertTrue(_schema_module._is_full_hex("a" * 40))
+        self.assertTrue(_schema_module._is_full_hex("b" * 64))
+        for tainted in ("a" * 40 + "\n", "a" * 40 + "\r", "a" * 39 + "\x00"):
+            with self.subTest(tainted=repr(tainted)):
+                self.assertFalse(_schema_module._is_full_hex(tainted))
+
+    # ---- F2: terminal AC verdicts carry evidence ----
+    def _ac_state(self, verdict: str, evidence: str, pr_phase: str) -> str:
+        text = _mutate(
+            FULL_STATE,
+            'current_phase: "plan"',
+            'current_phase: "plan"\n'
+            "acceptance_criteria:\n"
+            '  - id: "AC-1"\n'
+            '    text: "User can save"\n'
+            '    source: "description"\n'
+            f'    verdict: "{verdict}"\n'
+            f"    evidence: {evidence}",
+        )
+        if pr_phase == "complete":
+            text = _mutate(text, 'current_phase: "plan"', 'current_phase: "monitor"')
+            text = text.replace(
+                "acceptance_criteria:",
+                'phases:\n  pr: "complete"\nacceptance_criteria:',
+                1,
+            )
+        return text
+
+    def test_met_requires_nonempty_evidence(self) -> None:
+        for verdict in ("met", "n_a"):
+            with self.subTest(verdict=verdict):
+                errors = self._errors(self._ac_state(verdict, "null", "plan"))
+                self.assertTrue(
+                    any("requires nonempty evidence" in e for e in errors),
+                    errors,
+                )
+        self.assertFalse(
+            any(
+                "requires nonempty evidence" in e
+                for e in self._errors(
+                    self._ac_state("met", '"saved end to end"', "plan")
+                )
+            )
+        )
+
+    def test_legacy_shipped_state_is_tolerated(self) -> None:
+        errors = self._errors(self._ac_state("met", "null", "complete"))
+        self.assertFalse(
+            any("requires nonempty evidence" in e for e in errors), errors
+        )
