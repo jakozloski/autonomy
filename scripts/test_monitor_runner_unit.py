@@ -1343,25 +1343,32 @@ class MappedRepositoryParityTests(unittest.TestCase):
 
 
 class TerminalPlannedQaTests(unittest.TestCase):
-    def test_terminal_missing_planned_qa_flags_only_mapped_idle(self) -> None:
+    def test_terminal_missing_planned_qa_follows_the_target_manifest(self) -> None:
         # algo#1216 finding 3813491661, pinned at the predicate the manifest
         # rule calls. The r17 F9 containment gate now preempts that branch end
         # to end on a non-delegating host (a mapped launch blocks BEFORE any
         # child produces a terminal candidate), so the rule is verified here
-        # directly rather than through the now-gated e2e path. A mapped
-        # repository whose QA aggregate is idle or absent is a missing-handoff
-        # terminal; every other combination stays valid.
+        # directly rather than through the now-gated e2e path. admin#1495 r16
+        # F3: the predicate is keyed on the derived target manifest, so ANY
+        # repository with planned target families - Linear-mapped AND
+        # Keeper-org unmapped (exact-Algo plans GitHub handback/review
+        # targets) - rejects an idle or absent terminal QA aggregate; idle
+        # stays valid only for a genuinely targetless binding.
         mapped = "keeper-dating/matchmaking"
         self.assertIn(mapped, monitor_runner.MAPPED_QA_REPOSITORIES)
+        self.assertNotIn("keeper-dating/algo", monitor_runner.MAPPED_QA_REPOSITORIES)
         for bound_repo, qa_status, expected in (
             (mapped, "idle", True),
             (mapped, None, True),
             ("Keeper-Dating/Matchmaking", "idle", True),  # case-insensitive
             (mapped, "failed", False),
             (mapped, "complete", False),
-            ("someone/unmapped-repo", "idle", False),
+            ("keeper-dating/algo", "idle", True),  # r16 F3: github-only manifest
+            ("keeper-dating/algo", None, True),
+            ("keeper-dating/algo", "complete", False),
+            ("someone/unmapped-repo", "idle", False),  # targetless
             ("someone/unmapped-repo", None, False),
-            (None, "idle", False),  # a non-str bound repo is never mapped
+            (None, "idle", False),  # a non-str bound repo derives no manifest
         ):
             self.assertIs(
                 monitor_runner._terminal_missing_planned_qa(

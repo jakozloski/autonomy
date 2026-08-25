@@ -77,6 +77,9 @@ FULL_STATE = "\n".join(
         "stash_ref: null",
         "resolved_conventions:",
         "  quality_check_steps: []",
+        '  session_environment: "managed"',
+        "  issue_tracker:",
+        '    write_path: "environment_tool"',
         "validated_ticket:",
         "  tracker_type: null",
         "  identifier: null",
@@ -151,6 +154,7 @@ FULL_STATE = "\n".join(
         "  scope_skill_only: false",
         '  change_type: "feature"',
         '  defect_evidence_mode: "none"',
+        '  classification_fingerprint: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"',
         "  review:",
         '    status: "pending"',
         "    tier: null",
@@ -186,9 +190,33 @@ def _mutate(text: str, old: str, new: str) -> str:
     return text.replace(old, new, 1)
 
 
+_MODEL_RUNTIME_VERDICT_BLOCK = (
+    "  model_runtime:\n"
+    "    plan_verdict:\n"
+    '      verdict: "approved"\n'
+    '      plan_digest: "abc123def456"\n'
+    '      model: "gpt-5.6-sol"\n'
+    '      invocation: "codex-plan-01"'
+)
+
+
+def _with_plan_verdict(text: str) -> str:
+    """F6: a fixture that advances phases.plan_review to complete off a raw
+    FULL_STATE must carry the Phase-1 runtime record plus the typed Codex
+    plan verdict. Injects the block as a resolved_conventions sibling."""
+    return _mutate(
+        text,
+        '    write_path: "environment_tool"',
+        '    write_path: "environment_tool"\n' + _MODEL_RUNTIME_VERDICT_BLOCK,
+    )
+
+
 def _terminal_monitor_state() -> str:
     """Full state advanced to a chain-consistent paused monitor."""
     text = FULL_STATE
+    # F6: plan_review advances to complete below, which now requires the
+    # Phase-1 runtime record plus the typed Codex plan verdict.
+    text = _with_plan_verdict(text)
     text = _mutate(text, 'current_phase: "plan"', 'current_phase: "monitor"')
     text = _mutate(text, '  plan: "in_progress"', '  plan: "complete"')
     text = _mutate(text, '  plan_review: "pending"', '  plan_review: "complete"')
@@ -1200,7 +1228,7 @@ class ValueContractTests(unittest.TestCase):
             ):
                 assert old in text, old
                 text = text.replace(old, new, 1)
-            return text
+            return _with_plan_verdict(text)
 
         live = evaluate_state_text(rv_state("in_progress"))
         self.assertEqual(live["state"], VALID, live["errors"])
@@ -1422,7 +1450,13 @@ class ValueContractTests(unittest.TestCase):
         self.assertTrue(any("required when entries exist" in error for error in result3["errors"]))
 
     def test_resolved_conventions_contracts(self) -> None:
-        null_conv = _mutate(FULL_STATE, "resolved_conventions:\n  quality_check_steps: []", "resolved_conventions: null")
+        null_conv = _mutate(
+            FULL_STATE,
+            "resolved_conventions:\n  quality_check_steps: []\n"
+            '  session_environment: "managed"\n  issue_tracker:\n'
+            '    write_path: "environment_tool"',
+            "resolved_conventions: null",
+        )
         self.assertEqual(evaluate_state_text(null_conv)["state"], SUSPECT)
         bad_step = _mutate(
             FULL_STATE,
@@ -1506,7 +1540,7 @@ class ValueContractTests(unittest.TestCase):
         # The resume-to-Phase-5 shape: predecessors complete, pr
         # IN_PROGRESS (still pre-Phase-5 for the proof gate, and the
         # chain accepts it only with runtime_verification terminal).
-        return (
+        return _with_plan_verdict(
             FULL_STATE.replace(
                 self._PHASES_PREFIX_OLD, self._PHASES_PREFIX_DONE
             )
@@ -1629,6 +1663,7 @@ class ValueContractTests(unittest.TestCase):
             '  merge_readiness: "complete"\n'
             '  pr: "complete"\n  monitor: "in_progress"',
         )
+        past = _with_plan_verdict(past)
         result = evaluate_state_text(past)
         self.assertEqual(result["errors"], [], result["errors"])
 
@@ -1667,9 +1702,9 @@ class ValueContractTests(unittest.TestCase):
     def test_conventions_enum_and_list_contracts(self) -> None:
         cases = (
             ('  quality_check_steps: []', '  quality_check_steps: []\n  protected_branches: ["main", 3]', "protected_branches"),
-            ('  quality_check_steps: []', '  quality_check_steps: []\n  session_environment: "cloud"', "session_environment"),
-            ('  quality_check_steps: []', '  quality_check_steps: []\n  issue_tracker: "linear"', "issue_tracker: must be a mapping"),
-            ('  quality_check_steps: []', '  quality_check_steps: []\n  issue_tracker:\n    write_path: "direct"', "write_path"),
+            ('  session_environment: "managed"', '  session_environment: "cloud"', "session_environment"),
+            ('  issue_tracker:\n    write_path: "environment_tool"', '  issue_tracker: "linear"', "issue_tracker: must be a mapping"),
+            ('    write_path: "environment_tool"', '    write_path: "direct"', "write_path"),
         )
         for old, new, marker in cases:
             with self.subTest(marker=marker):
@@ -2316,6 +2351,7 @@ class MergeReadinessTests(unittest.TestCase):
                     '  unavailable_waiver: "user waived AC conformance:'
                     ' tracker outage"',
                 )
+            text = _with_plan_verdict(text)
             return _mutate(
                 text,
                 "decision_audit_trail: []",
@@ -2741,6 +2777,7 @@ class MergeReadinessTests(unittest.TestCase):
             ),
         ):
             text = _mutate(text, old, new)
+        text = _with_plan_verdict(text)
         result = evaluate_state_text(text)
         self.assertEqual(result["errors"], [])
         self.assertEqual(result["state"], VALID)
@@ -2979,6 +3016,7 @@ class ResumeValueContractCoverageTests(unittest.TestCase):
             ),
         ):
             text = _mutate(text, old, new)
+        text = _with_plan_verdict(text)
         result = evaluate_state_text(text)
         self.assertEqual(result["errors"], [])
         self.assertEqual(result["state"], VALID)
@@ -5756,4 +5794,398 @@ class R15SchemaClosureTests(unittest.TestCase):
         errors = self._errors(self._ac_state("met", "null", "complete"))
         self.assertFalse(
             any("requires nonempty evidence" in e for e in errors), errors
+        )
+
+
+class IssueTrackerRoutingTests(unittest.TestCase):
+    """admin#1495 r16 F5: a full-tier state must carry the complete
+    session_environment + issue_tracker.write_path routing tuple, and the
+    pair must satisfy the write-path matrix — managed sessions never route
+    tracker writes through the local API key. Before this, both fields were
+    optional and validated independently, so a full state with no tuple, or
+    managed + local_api, validated clean."""
+
+    def _with_pair(self, environment: str, write_path: str) -> str:
+        text = _mutate(
+            FULL_STATE,
+            '  session_environment: "managed"',
+            f'  session_environment: "{environment}"',
+        )
+        return _mutate(
+            text,
+            '    write_path: "environment_tool"',
+            f'    write_path: "{write_path}"',
+        )
+
+    def test_every_legal_pairing_validates(self) -> None:
+        legal = (
+            ("managed", "environment_tool"),
+            ("managed", "none"),
+            ("local", "environment_tool"),
+            ("local", "local_api"),
+            ("local", "none"),
+        )
+        for environment, write_path in legal:
+            with self.subTest(environment=environment, write_path=write_path):
+                result = evaluate_state_text(
+                    self._with_pair(environment, write_path)
+                )
+                self.assertEqual(result["errors"], [])
+                self.assertEqual(result["state"], VALID)
+
+    def test_managed_plus_local_api_is_rejected(self) -> None:
+        result = evaluate_state_text(self._with_pair("managed", "local_api"))
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any(
+                "'managed' cannot use issue_tracker.write_path 'local_api'"
+                in error
+                for error in result["errors"]
+            ),
+            result["errors"],
+        )
+
+    def test_full_tier_requires_the_complete_tuple(self) -> None:
+        cases = (
+            (
+                "missing-environment",
+                '  session_environment: "managed"\n',
+                "",
+                "session_environment: required from",
+            ),
+            (
+                "missing-tracker",
+                '  issue_tracker:\n    write_path: "environment_tool"\n',
+                "",
+                "issue_tracker: required from",
+            ),
+            (
+                "missing-write-path",
+                '  issue_tracker:\n    write_path: "environment_tool"',
+                "  issue_tracker: {}",
+                "issue_tracker.write_path: required from",
+            ),
+        )
+        for label, old, new, marker in cases:
+            with self.subTest(case=label):
+                result = evaluate_state_text(_mutate(FULL_STATE, old, new))
+                self.assertEqual(result["state"], SUSPECT, result["errors"])
+                self.assertTrue(
+                    any(marker in error for error in result["errors"]),
+                    result["errors"],
+                )
+
+    def _entry_with_conventions(self, block: str) -> str:
+        return _mutate(
+            _entry_state(),
+            'current_phase: "entry"',
+            'current_phase: "entry"\n' + block,
+        )
+
+    def test_non_full_tiers_tolerate_a_missing_tuple(self) -> None:
+        # Pre-Phase-1 states legitimately have no routing yet; required-for-
+        # full must not fire below the full tier.
+        text = self._entry_with_conventions(
+            "resolved_conventions:\n  quality_check_steps: []"
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["errors"], [], result["errors"])
+        self.assertEqual(result["state"], VALID)
+
+    def test_matrix_applies_at_every_tier(self) -> None:
+        # The forbidden pairing is illegal regardless of tier — an entry-tier
+        # state declaring managed + local_api is already contradictory.
+        text = self._entry_with_conventions(
+            "resolved_conventions:\n"
+            '  session_environment: "managed"\n'
+            "  issue_tracker:\n"
+            '    write_path: "local_api"'
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any(
+                "'managed' cannot use issue_tracker.write_path 'local_api'"
+                in error
+                for error in result["errors"]
+            ),
+            result["errors"],
+        )
+
+
+class PlanVerdictTests(unittest.TestCase):
+    """admin#1495 r16 F6: phases.plan_review == complete IS the claim that
+    the mandatory Codex plan review ran and approved, so it now requires the
+    Phase-1 model_runtime record carrying a typed plan_verdict. Before this,
+    validate_model_runtime_shape returned [] for a missing record and the
+    phase chain checked only string ordering, so an implementation-phase
+    state with plan_review complete and no model_runtime validated clean."""
+
+    def _implementation_state(self) -> str:
+        text = FULL_STATE
+        for old, new in (
+            ('current_phase: "plan"', 'current_phase: "implementation"'),
+            ('  plan: "in_progress"', '  plan: "complete"'),
+            ('  plan_review: "pending"', '  plan_review: "complete"'),
+            ('  implementation: "pending"', '  implementation: "in_progress"'),
+        ):
+            text = _mutate(text, old, new)
+        return text
+
+    def test_plan_review_complete_without_model_runtime_is_suspect(self) -> None:
+        # The finding's exact regression shape.
+        result = evaluate_state_text(self._implementation_state())
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any(
+                "invariant(vii)" in error
+                and "model_runtime" in error
+                and "rerun the mandatory Codex plan review" in error
+                for error in result["errors"]
+            ),
+            result["errors"],
+        )
+
+    def test_plan_review_complete_without_the_verdict_is_suspect(self) -> None:
+        # A runtime record alone is not evidence of an affirmative verdict.
+        text = _mutate(
+            self._implementation_state(),
+            '    write_path: "environment_tool"',
+            '    write_path: "environment_tool"\n'
+            "  model_runtime:\n"
+            "    codex:\n"
+            '      model: "gpt-5.6-sol"',
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any(
+                "invariant(vii)" in error and "plan_verdict" in error
+                for error in result["errors"]
+            ),
+            result["errors"],
+        )
+
+    def test_plan_review_complete_with_the_verdict_validates(self) -> None:
+        result = evaluate_state_text(
+            _with_plan_verdict(self._implementation_state())
+        )
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["state"], VALID)
+
+    def test_pending_plan_review_needs_no_verdict(self) -> None:
+        # The pass-through side: FULL_STATE has plan_review pending and no
+        # model_runtime, and stays valid.
+        result = evaluate_state_text(FULL_STATE)
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["state"], VALID)
+
+    def test_verdict_shape_is_closed(self) -> None:
+        from state_schema import validate_model_runtime_shape
+
+        base = {
+            "verdict": "approved",
+            "plan_digest": "abc123def456",
+            "model": "gpt-5.6-sol",
+            "invocation": "codex-plan-01",
+        }
+        self.assertEqual(
+            validate_model_runtime_shape({"plan_verdict": dict(base)}), []
+        )
+        cases = (
+            ("non-affirmative", {**base, "verdict": "rejected"}, "verdict"),
+            ("missing-verdict", {k: v for k, v in base.items() if k != "verdict"}, "verdict"),
+            ("short-digest", {**base, "plan_digest": "abc123def45"}, "plan_digest"),
+            ("uppercase-digest", {**base, "plan_digest": "ABC123DEF456"}, "plan_digest"),
+            ("non-hex-digest", {**base, "plan_digest": "zzzz23def456"}, "plan_digest"),
+            ("empty-model", {**base, "model": ""}, "plan_verdict.model"),
+            ("empty-invocation", {**base, "invocation": ""}, "plan_verdict.invocation"),
+            ("unknown-field", {**base, "extra": 1}, "unknown field"),
+            ("non-mapping", "approved", "must be a mapping"),
+        )
+        for label, record, marker in cases:
+            with self.subTest(case=label):
+                errors = validate_model_runtime_shape({"plan_verdict": record})
+                self.assertTrue(
+                    any(marker in error for error in errors), (label, errors)
+                )
+
+
+class GstackClassificationTests(unittest.TestCase):
+    """admin#1495 r16 F7: a full-tier gstack must carry its core selectors,
+    scope flags must be real booleans (a string "true" read as truthy),
+    selected_skills stays inside the documented capability-matrix allowlist,
+    scope_skill_only <-> change_type skill_only holds in both directions,
+    and the classification binds to base/head/worktree via a 64-hex
+    fingerprint."""
+
+    _FINGERPRINT_LINE = (
+        '  classification_fingerprint: "'
+        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+        '"'
+    )
+
+    def test_full_tier_requires_core_selectors(self) -> None:
+        cases = (
+            ("available", "  available: false\n", "gstack_integration.available: required"),
+            ("scope_frontend", "  scope_frontend: false\n", "gstack_integration.scope_frontend: required"),
+            ("scope_backend", "  scope_backend: false\n", "gstack_integration.scope_backend: required"),
+            ("scope_tests_only", "  scope_tests_only: false\n", "gstack_integration.scope_tests_only: required"),
+            ("scope_skill_only", "  scope_skill_only: false\n", "gstack_integration.scope_skill_only: required"),
+            ("selected_skills", "  selected_skills: []\n", "gstack_integration.selected_skills: required"),
+            ("change_type", '  change_type: "feature"\n', "gstack_integration.change_type: required"),
+            (
+                "classification_fingerprint",
+                self._FINGERPRINT_LINE + "\n",
+                "gstack_integration.classification_fingerprint: required",
+            ),
+        )
+        for label, line, marker in cases:
+            with self.subTest(field=label):
+                result = evaluate_state_text(_mutate(FULL_STATE, line, ""))
+                self.assertEqual(result["state"], SUSPECT, result["errors"])
+                self.assertTrue(
+                    any(marker in error for error in result["errors"]),
+                    result["errors"],
+                )
+
+    def test_scope_flags_must_be_real_booleans(self) -> None:
+        # The finding's string-valued flag: YAML "true" is a str, and the
+        # planner branching on it read it as truthy.
+        for flag in ("scope_frontend", "scope_backend", "scope_tests_only"):
+            with self.subTest(flag=flag):
+                text = _mutate(
+                    FULL_STATE, f"  {flag}: false", f'  {flag}: "true"'
+                )
+                result = evaluate_state_text(text)
+                self.assertEqual(result["state"], SUSPECT)
+                self.assertTrue(
+                    any(
+                        f"{flag}: must be a boolean" in error
+                        for error in result["errors"]
+                    ),
+                    result["errors"],
+                )
+        text = _mutate(FULL_STATE, "  available: false", '  available: "false"')
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any("available: must be a boolean" in error for error in result["errors"]),
+            result["errors"],
+        )
+
+    def test_selected_skills_stay_inside_the_allowlist(self) -> None:
+        every_documented = (
+            '  selected_skills: ["review", "qa", "design-review",'
+            ' "investigate", "cso", "autoplan"]'
+        )
+        ok = _mutate(FULL_STATE, "  selected_skills: []", every_documented)
+        self.assertEqual(evaluate_state_text(ok)["errors"], [])
+        bad = _mutate(
+            FULL_STATE,
+            "  selected_skills: []",
+            '  selected_skills: ["review", "webhook-adapter"]',
+        )
+        result = evaluate_state_text(bad)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any(
+                "selected_skills[1]: must be one of" in error
+                for error in result["errors"]
+            ),
+            result["errors"],
+        )
+
+    def test_scope_skill_only_forces_change_type_skill_only(self) -> None:
+        # The finding's exact contradiction: scope_skill_only true beside
+        # change_type feature.
+        text = _mutate(
+            FULL_STATE, "  scope_skill_only: false", "  scope_skill_only: true"
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any(
+                "scope_skill_only true requires change_type skill_only"
+                in error
+                for error in result["errors"]
+            ),
+            result["errors"],
+        )
+
+    def test_change_type_skill_only_requires_the_scope_flag(self) -> None:
+        # Reverse direction: Step 3 rule 1 is the sole producer of
+        # skill_only, so skill_only without the flag cannot have been
+        # produced by the classifier.
+        text = _mutate(
+            FULL_STATE, '  change_type: "feature"', '  change_type: "skill_only"'
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any(
+                "change_type skill_only requires scope_skill_only true"
+                in error
+                for error in result["errors"]
+            ),
+            result["errors"],
+        )
+
+    def test_consistent_skill_only_pair_validates(self) -> None:
+        text = _mutate(
+            FULL_STATE, "  scope_skill_only: false", "  scope_skill_only: true"
+        )
+        text = _mutate(
+            text, '  change_type: "feature"', '  change_type: "skill_only"'
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["state"], VALID)
+
+    def test_classification_fingerprint_must_be_64_hex(self) -> None:
+        for label, bad in (
+            ("short", '"' + "a" * 63 + '"'),
+            ("non-hex", '"' + "g" * 64 + '"'),
+            ("non-string", "12345"),
+        ):
+            with self.subTest(case=label):
+                text = _mutate(
+                    FULL_STATE,
+                    self._FINGERPRINT_LINE,
+                    f"  classification_fingerprint: {bad}",
+                )
+                result = evaluate_state_text(text)
+                self.assertEqual(result["state"], SUSPECT)
+                self.assertTrue(
+                    any(
+                        "classification_fingerprint: must be a 64-hex" in error
+                        for error in result["errors"]
+                    ),
+                    result["errors"],
+                )
+
+    def test_non_full_tiers_tolerate_a_partial_gstack(self) -> None:
+        # Takeover states may carry an in-progress classification; the
+        # required-for-full checks fire only at the full tier, while the
+        # type checks still apply to whatever is present.
+        text = _mutate(
+            _takeover_state(),
+            "pr_number: 42",
+            "pr_number: 42\ngstack_integration:\n  available: true",
+        )
+        result = evaluate_state_text(text)
+        self.assertEqual(result["errors"], [], result["errors"])
+        typo = _mutate(
+            _takeover_state(),
+            "pr_number: 42",
+            'pr_number: 42\ngstack_integration:\n  available: "yes"',
+        )
+        result = evaluate_state_text(typo)
+        self.assertEqual(result["state"], SUSPECT)
+        self.assertTrue(
+            any(
+                "available: must be a boolean" in error
+                for error in result["errors"]
+            ),
+            result["errors"],
         )

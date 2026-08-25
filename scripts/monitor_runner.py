@@ -270,6 +270,11 @@ MAX_WORK_ITERATIONS = 50
 # CLI), so this restates the key set of
 # handoff_decision.QA_OWNER_BY_REPOSITORY — that map stays canonical, and
 # test_monitor_runner_unit's parity regression fails on any drift.
+# admin#1495 r16 F3: membership here now feeds _qa_target_manifest below
+# (it selects the Linear-leg target family) and is no longer the gate key
+# itself - exact-Algo sits outside this map yet still plans GitHub
+# handback/review targets, so the terminal gate, the manifest audit, and
+# the capability preflight all consume the derived manifest instead.
 # admin#1495 r15 F17: the canonical mapped-repository QA manifest, by
 # operation FAMILY. Terminal acceptance requires the github pair plus one
 # complete Linear-leg shape, all sharing ONE generation, each with a
@@ -313,12 +318,83 @@ MAPPED_QA_REPOSITORIES = frozenset(
 )
 
 
+# admin#1495 r16 F3: ONE spelling of the Keeper organization boundary -
+# shared by the r18 F5 containment floor (_keeper_bound_repository) and
+# the target-manifest derivation below.
+_KEEPER_ORG_PREFIX = "keeper-dating/"
+
+# admin#1495 r16 F3: the handoff TARGET FAMILIES the canonical planner can
+# resolve for a bound repository - the manifest vocabulary. Runner-derived
+# only, never persisted to state.
+_QA_TARGET_GITHUB_HANDBACK = "github-assignee-replace"
+_QA_TARGET_GITHUB_REVIEW = "github-review-request"
+_QA_TARGET_LINEAR_QA = "linear-qa"
+
+
+def _qa_target_manifest(bound_repo: object) -> frozenset[str]:
+    """admin#1495 r16 F3: the immutable-input-bound target manifest -
+    which handoff target families handoff_decision's planner resolves for
+    the bound repository. Derived ONLY from the runner-owned repository
+    binding (never from child-written candidate state, which is
+    untrusted) and recomputed by every consumer through this one pure
+    function, so the preflight copy persisted on the runner and the
+    per-candidate terminal gates can never diverge. Restates the
+    planner's own routing:
+
+    * a Linear-mapped repository (MAPPED_QA_REPOSITORIES, the restated
+      key set of handoff_decision.QA_OWNER_BY_REPOSITORY) plans the
+      github handback pair, routed reviewer requests, and a Linear QA
+      leg;
+    * every OTHER Keeper-organization repository (exact-Algo is the r16
+      F3 repro) still gets the UNIVERSAL reviewer/ball-holder handback
+      (handoff_decision r16 F2) but never a Linear leg - github families
+      only;
+    * a non-Keeper or unresolved binding plans no Keeper handoff at all:
+      a genuinely targetless run, where an idle QA aggregate stays
+      valid."""
+
+    if not isinstance(bound_repo, str):
+        return frozenset()
+    folded = bound_repo.casefold()
+    if folded in MAPPED_QA_REPOSITORIES:
+        return frozenset(
+            (
+                _QA_TARGET_GITHUB_HANDBACK,
+                _QA_TARGET_GITHUB_REVIEW,
+                _QA_TARGET_LINEAR_QA,
+            )
+        )
+    if folded.startswith(_KEEPER_ORG_PREFIX):
+        return frozenset(
+            (_QA_TARGET_GITHUB_HANDBACK, _QA_TARGET_GITHUB_REVIEW)
+        )
+    return frozenset()
+
+
+def _manifest_missing_planned_qa(
+    manifest: frozenset[str], qa_status: object
+) -> bool:
+    """admin#1495 r16 F3: ANY planned target family makes an idle or
+    absent terminal QA aggregate a missing-handoff violation - the run
+    reported completion without recording one handoff artifact for
+    targets the planner resolves from immutable inputs. An empty
+    manifest (a genuinely targetless run) keeps idle valid."""
+
+    return bool(manifest) and qa_status in (None, "idle")
+
+
 def _terminal_missing_planned_qa(bound_repo: object, qa_status: object) -> bool:
-    """algo#1216 finding 3813491661: a terminal candidate for a Keeper-mapped
-    repository must show the clean-exit QA handoff actually planned — an idle
-    or absent QA aggregate means completion was reported without assigning QA,
-    moving the ticket, or recording any handoff artifact. Idle stays valid for
-    unmapped repositories.
+    """algo#1216 finding 3813491661: a terminal candidate for a repository
+    with planned handoff targets must show the clean-exit QA handoff
+    actually planned - an idle or absent QA aggregate means completion was
+    reported without assigning QA, moving the ticket, or recording any
+    handoff artifact. Idle stays valid for targetless repositories.
+
+    admin#1495 r16 F3: keyed on the derived target manifest, no longer on
+    MAPPED_QA_REPOSITORIES membership - the map excludes exact-Algo, whose
+    planning still emits GitHub review and assignment operations, so a
+    delegated-host algo run could finish with handoffs.qa idle despite
+    resolved handback targets.
 
     Extracted so the manifest rule keeps a reachable pin: the r17 F9
     containment gate now preempts this branch end to end on a non-delegating
@@ -326,24 +402,114 @@ def _terminal_missing_planned_qa(bound_repo: object, qa_status: object) -> bool:
     predicate is verified directly here rather than through the now-gated e2e
     path."""
 
-    mapped = (
-        isinstance(bound_repo, str)
-        and bound_repo.casefold() in MAPPED_QA_REPOSITORIES
+    return _manifest_missing_planned_qa(
+        _qa_target_manifest(bound_repo), qa_status
     )
-    return mapped and qa_status in (None, "idle")
+
+
+def _qa_manifest_coverage_violation(
+    manifest: frozenset[str], candidate_extract: dict[str, Any]
+) -> str | None:
+    """admin#1495 r15 F17 / r16 F3: a non-idle terminal QA aggregate must
+    carry the COMPLETE operation set for the families the target manifest
+    plans - one generation, the github handback pair when the handback is
+    planned, a canonical Linear-leg shape exactly when the Linear leg is
+    planned (and NO Linear operations when it is not: the planner never
+    mints a Linear leg for an unmapped repository), and a recorded result
+    per operation. The manifest is a coverage floor, not a ceiling:
+    reviewer request/verify operations mint only when reviewers are
+    routed, so they are never REQUIRED coverage. Identity inputs beyond
+    the family manifest (Linear provider ids, reviewer logins) are
+    live-service facts the executor re-verifies at postcondition time;
+    this gate closes the omitted-effect hole, not identity forgery."""
+
+    if not manifest:
+        return None
+    qa_status = (
+        candidate_extract.get("handoff_status_by_kind") or {}
+    ).get("qa")
+    if qa_status in (None, "idle"):
+        return None  # the planned-QA gate above owns the idle case
+    qa_ops = (candidate_extract.get("handoff_operations") or {}).get(
+        "qa"
+    ) or []
+    generations = set()
+    families = set()
+    for op_id in qa_ops:
+        if not isinstance(op_id, str):
+            return "malformed qa operation id"
+        family, _, tail = op_id.rpartition(":")
+        if not family or not tail.startswith("g"):
+            return f"qa operation {op_id!r} carries no generation"
+        generations.add(tail)
+        families.add(family.split(":", 1)[0])
+    if len(generations) != 1:
+        return (
+            "qa operations span"
+            f" {len(generations)} generations — the canonical plan"
+            " mints one atomic generation"
+        )
+    if (
+        _QA_TARGET_GITHUB_HANDBACK in manifest
+        and not _QA_REQUIRED_GITHUB_FAMILIES <= families
+    ):
+        missing = sorted(_QA_REQUIRED_GITHUB_FAMILIES - families)
+        return f"qa manifest omits required github operations {missing}"
+    linear_families = {f for f in families if f.startswith("qa.linear.")}
+    if _QA_TARGET_LINEAR_QA in manifest:
+        if linear_families not in _QA_LINEAR_LEG_SHAPES:
+            return (
+                "qa manifest's Linear leg"
+                f" {sorted(linear_families)} matches no canonical shape"
+                " (full chain, runtime-outage record, or assign chain with"
+                " a state-outage record)"
+            )
+    elif linear_families:
+        return (
+            "qa manifest plans no Linear leg for this repository -"
+            f" recorded Linear operations {sorted(linear_families)} are"
+            " planner-impossible output for an unmapped binding"
+        )
+    qa_results = (candidate_extract.get("handoff_results") or {}).get(
+        "qa"
+    ) or {}
+    unrecorded = [op for op in qa_ops if op not in qa_results]
+    if unrecorded:
+        return f"qa operations without recorded results: {unrecorded[:3]}"
+    return None
 
 # admin#1495 finding 3825265272 / algo#1216 F3: narrow the capability probe
-# to the exact surface the mapped Phase-6 handoffs exercise. The planner
+# to the exact surface the planned Phase-6 handoffs exercise. The planner
 # emits ``*.github.*`` (request-review / replace-assignees) and
-# ``*.linear.*`` (assign-ticket / set-ticket-state) operations, and a mapped
-# repository is DEFINED by a QA_OWNER_BY_REPOSITORY Linear binding — so it
-# will attempt BOTH families. The r25 probe accepted any truthy
-# ``permissions`` object or any MCP server, so a deny-all policy or an
-# unrelated server passed while granting neither of these. Linear's
-# ``record_unavailable`` fallback covers a RUNTIME outage, not a provisioning
-# gap: a mapped host that never grants linear is a misconfiguration this
-# fails fast on.
+# ``*.linear.*`` (assign-ticket / set-ticket-state) operations. The r25
+# probe accepted any truthy ``permissions`` object or any MCP server, so a
+# deny-all policy or an unrelated server passed while granting neither of
+# these. Linear's ``record_unavailable`` fallback covers a RUNTIME outage,
+# not a provisioning gap: a Linear-mapped host that never grants linear is
+# a misconfiguration this fails fast on.
+# admin#1495 r16 F3: this frozenset is the CLOSED UNIVERSE of capability
+# families the probe knows how to prove (and the fail-closed deny set for
+# unparseable ``permissions.deny`` shapes in _denied_families) - the
+# per-run REQUIRED subset now comes from _manifest_required_capabilities
+# over the derived target manifest, so a github-only manifest (exact-Algo)
+# demands github without demanding linear.
 REQUIRED_CHILD_CAPABILITIES = frozenset({"github", "linear"})
+
+
+def _manifest_required_capabilities(manifest: frozenset[str]) -> frozenset[str]:
+    """admin#1495 r16 F3: the child capability families the manifest's
+    planned target families exercise - github when ANY github family is
+    planned (handback or reviewer requests), linear only when the Linear
+    QA leg is planned. Always a subset of REQUIRED_CHILD_CAPABILITIES."""
+
+    required: set[str] = set()
+    if manifest & frozenset(
+        (_QA_TARGET_GITHUB_HANDBACK, _QA_TARGET_GITHUB_REVIEW)
+    ):
+        required.add("github")
+    if _QA_TARGET_LINEAR_QA in manifest:
+        required.add("linear")
+    return frozenset(required)
 
 
 # algo#1216 r18 F3 / admin#1495 r14 F9: authorization is resolved from
@@ -2173,6 +2339,13 @@ class Runner:
             except (OSError, subprocess.TimeoutExpired):
                 self.repository_probe = "unavailable"
                 self.repository_hint = None
+        # admin#1495 r16 F3: the preflight-derived target/capability
+        # manifest for this run. Seeded empty; _child_capability_probe
+        # derives and persists it from the resolved binding BEFORE any
+        # capability check, and the per-candidate terminal gates recompute
+        # it through the same pure function of the same immutable binding
+        # (_qa_target_manifest), so the copies cannot diverge.
+        self.target_manifest: frozenset[str] = frozenset()
         self.slice_deadline = time.monotonic() + args.slice_budget
         # Testability seam (same class as --claude-bin): scales ladder and
         # poll waits so hermetic failure-path tests finish in seconds. The
@@ -3493,9 +3666,9 @@ class Runner:
         surface cannot execute the mapped handoffs, instead of stranding
         after PR creation.
 
-        Deterministic and model-free. The mapped Phase-6 handoffs emit
-        ``*.github.*`` and ``*.linear.*`` operations, so a mapped run
-        needs BOTH families in ``REQUIRED_CHILD_CAPABILITIES`` — proven,
+        Deterministic and model-free. The planned Phase-6 handoffs emit
+        ``*.github.*`` and ``*.linear.*`` operations, so a run needs
+        every family in its manifest-required capability set - proven,
         not merely configured:
 
         * an MCP route is proven only by a CONNECTED ``mcp list`` row for
@@ -3511,19 +3684,32 @@ class Runner:
           read-only grants, and failed/pending/auth-required rows prove
           nothing — the r25/r17 probes accepted each of these shapes.
 
-        Mapped repositories only, because only the mapped QA handoffs
-        REQUIRE both families — an unmapped run uses the developer's own
-        settings and plans no Keeper handoff operations. (algo#1216 r18
-        F5 removed the former "read-only scheduled run" justification:
-        every reachable monitor child is write-capable, so no read-only
-        cohort exists to preserve.) The package self-provisions NOTHING:
-        this only reports what the host supplied, and the immutable
-        per-profile descriptor remains a host contract (admin r14 F3).
+        Scoped by the derived target manifest (admin#1495 r16 F3), not
+        by Linear-map membership: a Linear-mapped repository needs github
+        AND linear, an unmapped Keeper-organization repository
+        (exact-Algo, the r16 F3 repro) plans GitHub handback/review
+        targets and needs github WITHOUT linear, and a binding with no
+        planned targets skips the probe entirely - that run uses the
+        developer's own settings and plans no Keeper handoff operations.
+        (algo#1216 r18 F5 removed the former "read-only scheduled run"
+        justification: every reachable monitor child is write-capable,
+        so no read-only cohort exists to preserve.) The package
+        self-provisions NOTHING: this only reports what the host
+        supplied, and the immutable per-profile descriptor remains a
+        host contract (admin r14 F3).
         """
 
-        if not self._bound_mapped_repository(extract):
-            return
         bound = self._bound_repository(extract)
+        # admin#1495 r16 F3: derive the immutable-input-bound target
+        # manifest BEFORE any preflight check and persist it runner-side
+        # for the slice; the terminal gates recompute it through the same
+        # pure function of the same binding. An empty manifest (no
+        # planned targets) skips the probe - there is no handoff surface
+        # to prove.
+        self.target_manifest = _qa_target_manifest(bound)
+        required = _manifest_required_capabilities(self.target_manifest)
+        if not required:
+            return
         settings_override = os.environ.get("MONITOR_RUNNER_USER_SETTINGS")
         settings_path = (
             Path(settings_override)
@@ -3564,7 +3750,7 @@ class Runner:
             else set()
         )
         unproven: dict[str, str] = {}
-        for family in sorted(REQUIRED_CHILD_CAPABILITIES):
+        for family in sorted(required):
             if family in denied:
                 unproven[family] = "denied by permissions.deny"
                 continue
@@ -3610,11 +3796,13 @@ class Runner:
         detail = "; ".join(
             f"{family}: {reason}" for family, reason in unproven.items()
         )
+        planned = ", ".join(sorted(self.target_manifest))
         raise RunnerExit(
             5,
             "blocked",
-            "child capability probe failed for a mapped repository"
-            f" ({bound}): {detail}. The user-scope surface the"
+            f"child capability probe failed for {bound}: {detail}. The"
+            f" repository's target manifest plans [{planned}] handoffs"
+            " (admin#1495 r16 F3), and the user-scope surface the"
             " --setting-sources user child resolves cannot execute the"
             " Phase 6 handoffs, which would strand after PR creation"
             " (admin#1495 finding 3825265272 / algo#1216 r18 F3 / admin"
@@ -3623,7 +3811,7 @@ class Runner:
             " substrings, configuration presence, read-only grants, and"
             " failed/pending/auth-required rows prove nothing. The HOST"
             " must supply a trusted least-privilege user-scope policy"
-            " naming the GitHub+Linear handoff surface — the package"
+            " naming the manifest-required handoff surface - the package"
             " deliberately never self-provisions it, and the immutable"
             " per-profile descriptor remains a host contract",
         )
@@ -4091,28 +4279,18 @@ class Runner:
             else self.repository_hint
         )
 
-    def _bound_mapped_repository(self, extract: dict[str, Any]) -> bool:
-        """The bound repository is one of the Keeper-mapped QA
-        repositories — the shared write-capable-managed-run predicate
-        consumed by the capability probe and the r17 F9 containment
-        gate."""
-
-        bound = self._bound_repository(extract)
-        return (
-            isinstance(bound, str)
-            and bound.casefold() in MAPPED_QA_REPOSITORIES
-        )
-
     def _keeper_bound_repository(self, extract: dict[str, Any]) -> bool:
         """The bound repository belongs to the Keeper organization — the
         r18 F5 containment floor. Broader than the QA map on purpose: the
         finding's repro was exact-Algo, which the QA map excludes, and the
         uncontained-test-child attestation must never cover ANY Keeper
-        repository."""
+        repository. (admin#1495 r16 F3: the prefix is the shared
+        _KEEPER_ORG_PREFIX spelling the target-manifest derivation also
+        keys on.)"""
 
         bound = self._bound_repository(extract)
         return isinstance(bound, str) and bound.casefold().startswith(
-            "keeper-dating/"
+            _KEEPER_ORG_PREFIX
         )
 
     def _containment_refusal(
@@ -4225,61 +4403,19 @@ class Runner:
     def _qa_manifest_violation(
         self, bound_repo: object, candidate_extract: dict[str, Any]
     ) -> str | None:
-        """admin#1495 r15 F17: a mapped-repository terminal candidate must
-        carry the COMPLETE canonical QA operation set — one generation,
-        the github pair, a complete Linear-leg shape, and a recorded
-        result per operation. Identity inputs beyond the family manifest
-        (Linear provider ids, reviewer logins) are live-service facts the
-        executor re-verifies at postcondition time; this gate closes the
-        omitted-effect hole, not identity forgery."""
+        """admin#1495 r15 F17: a terminal candidate must carry the
+        COMPLETE canonical QA operation set for every family its target
+        manifest plans. admin#1495 r16 F3: the manifest is derived from
+        the runner-owned repository binding through _qa_target_manifest -
+        no longer gated on MAPPED_QA_REPOSITORIES membership, which
+        excluded exact-Algo while its planning still emitted GitHub
+        operations. The coverage rules live in the module-level
+        _qa_manifest_coverage_violation so tests can pin manifest shapes
+        no current repository class derives (reviewer-only)."""
 
-        if not (
-            isinstance(bound_repo, str)
-            and bound_repo.casefold() in MAPPED_QA_REPOSITORIES
-        ):
-            return None
-        qa_status = (
-            candidate_extract.get("handoff_status_by_kind") or {}
-        ).get("qa")
-        if qa_status in (None, "idle"):
-            return None  # the planned-QA gate above owns the idle case
-        qa_ops = (candidate_extract.get("handoff_operations") or {}).get(
-            "qa"
-        ) or []
-        generations = set()
-        families = set()
-        for op_id in qa_ops:
-            if not isinstance(op_id, str):
-                return "malformed qa operation id"
-            family, _, tail = op_id.rpartition(":")
-            if not family or not tail.startswith("g"):
-                return f"qa operation {op_id!r} carries no generation"
-            generations.add(tail)
-            families.add(family.split(":", 1)[0])
-        if len(generations) != 1:
-            return (
-                "qa operations span"
-                f" {len(generations)} generations — the canonical plan"
-                " mints one atomic generation"
-            )
-        if not _QA_REQUIRED_GITHUB_FAMILIES <= families:
-            missing = sorted(_QA_REQUIRED_GITHUB_FAMILIES - families)
-            return f"qa manifest omits required github operations {missing}"
-        linear_families = {f for f in families if f.startswith("qa.linear.")}
-        if linear_families not in _QA_LINEAR_LEG_SHAPES:
-            return (
-                "qa manifest's Linear leg"
-                f" {sorted(linear_families)} matches no canonical shape"
-                " (full chain, runtime-outage record, or assign chain with"
-                " a state-outage record)"
-            )
-        qa_results = (candidate_extract.get("handoff_results") or {}).get(
-            "qa"
-        ) or {}
-        unrecorded = [op for op in qa_ops if op not in qa_results]
-        if unrecorded:
-            return f"qa operations without recorded results: {unrecorded[:3]}"
-        return None
+        return _qa_manifest_coverage_violation(
+            _qa_target_manifest(bound_repo), candidate_extract
+        )
 
     def _fetch_remote_head(
         self, bound_repo: str, pr_number: int
@@ -4513,11 +4649,14 @@ class Runner:
             self.charge_failure(fresh, "monitor-child:work_cap_exceeded")
             return "retry"
         # algo#1216 finding 3813491661: repository-bound required-handoff
-        # manifest. For a mapped repository a terminal candidate must show
-        # the clean-exit QA handoff actually planned — both aggregates
-        # idle on a Keeper run meant completion was reported without
-        # assigning QA, moving the ticket, or recording any handoff
-        # artifact. Idle stays valid for unmapped repositories.
+        # manifest. For a repository with planned handoff targets a
+        # terminal candidate must show the clean-exit QA handoff actually
+        # planned - an idle aggregate on a Keeper run meant completion was
+        # reported without assigning QA, moving the ticket, or recording
+        # any handoff artifact. admin#1495 r16 F3: keyed on the derived
+        # target manifest, so exact-Algo (GitHub handback targets, no
+        # Linear leg) rejects idle terminals too; idle stays valid only
+        # for a genuinely targetless binding.
         if outcome == "terminal":
             launch_cli = fresh.get("monitor_cli")
             persisted_repo = (

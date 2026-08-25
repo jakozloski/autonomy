@@ -164,6 +164,19 @@ REGRESSION_ENUM = frozenset(
 VARIANT_ENUM = frozenset(("pending", "complete", "skipped"))
 DEFECT_MODE_ENUM = frozenset(("runtime_bug_fix", "skill_helper_defect", "none"))
 CHANGE_TYPE_ENUM = frozenset(("bug_fix", "feature", "refactor", "skill_only"))
+# admin#1495 r16 F7: the capability-gated skill matrix
+# (project-and-entry.md Step 4) is a closed set; selected_skills outside it
+# names an adapter no phase can run. Kept in lockstep with the allowlist
+# enumerated in references/state-and-safety.md's gstack_integration schema.
+GSTACK_SKILL_ALLOWLIST = frozenset(
+    ("review", "qa", "design-review", "investigate", "cso", "autoplan")
+)
+GSTACK_SCOPE_FLAGS = (
+    "scope_frontend",
+    "scope_backend",
+    "scope_tests_only",
+    "scope_skill_only",
+)
 HANDOFF_STATUS_ENUM = frozenset(("idle", "pending", "complete", "failed"))
 OPERATION_STATUS_ENUM = frozenset(
     ("pending", "retryable", "complete", "failed", "skipped_dependency")
@@ -1087,6 +1100,16 @@ MODEL_RUNTIME_LEG_KEYS = frozenset(
         "live_catalog_verified_at",
     )
 )
+# admin#1495 r16 F6: typed evidence that the mandatory Phase-1 Codex plan
+# review returned an affirmative verdict, bound to the exact reviewed plan.
+# verdict is affirmative-only: a non-approval resets plan_review and reruns
+# the review rather than persisting here. plan_digest binds the verdict to
+# the plan revision (the runtime recomputes it and invalidates the verdict
+# when the plan changes); model/invocation are the descriptor + evidence.
+MODEL_PLAN_VERDICT_ENUM = frozenset(("approved",))
+MODEL_PLAN_VERDICT_KEYS = frozenset(
+    ("verdict", "plan_digest", "model", "invocation")
+)
 
 
 def validate_model_runtime_shape(model_runtime: Any) -> list[str]:
@@ -1096,10 +1119,11 @@ def validate_model_runtime_shape(model_runtime: Any) -> list[str]:
     anywhere — unknown legs, unknown fields, and wrong types validated
     clean, leaving the binder's floor re-check as the only defense
     against hand-edited state. Shape per
-    references/state-and-safety.md: the three legs plus the append-only
-    escalation_invocations audit list. policy_decision stays free-form
-    (it is the gate's own evidence record), and escalation entries may
-    carry extra audit keys — required keys checked, growth allowed.
+    references/state-and-safety.md: the three legs, the append-only
+    escalation_invocations audit list, and the typed plan_verdict
+    (admin#1495 r16 F6). policy_decision stays free-form (it is the
+    gate's own evidence record), and escalation entries may carry extra
+    audit keys — required keys checked, growth allowed.
     """
 
     if model_runtime is None:
@@ -1107,7 +1131,10 @@ def validate_model_runtime_shape(model_runtime: Any) -> list[str]:
     if not isinstance(model_runtime, dict):
         return ["resolved_conventions.model_runtime: must be a mapping"]
     errors: list[str] = []
-    allowed_top = set(MODEL_RUNTIME_LEGS) | {"escalation_invocations"}
+    allowed_top = set(MODEL_RUNTIME_LEGS) | {
+        "escalation_invocations",
+        "plan_verdict",
+    }
     for key in sorted(set(model_runtime) - allowed_top):
         errors.append(
             f"resolved_conventions.model_runtime.{key}: unknown leg"
@@ -1166,6 +1193,49 @@ def validate_model_runtime_shape(model_runtime: Any) -> list[str]:
                         "resolved_conventions.model_runtime"
                         f".escalation_invocations[{position}]: must be a"
                         " mapping with trigger/voice/reason"
+                    )
+    # admin#1495 r16 F6: closed-shape validation of the plan verdict, checked
+    # wherever a record is present (the phase-tie in validate_evidence binds
+    # its PRESENCE to phases.plan_review complete). verdict affirmative-only;
+    # plan_digest a lowercase-hex prefix binding the reviewed plan revision;
+    # model/invocation the selected-model descriptor and invocation evidence.
+    verdict_record = model_runtime.get("plan_verdict")
+    if verdict_record is not None:
+        prefix = "resolved_conventions.model_runtime.plan_verdict"
+        if not isinstance(verdict_record, dict):
+            errors.append(f"{prefix}: must be a mapping")
+        else:
+            for key in sorted(set(verdict_record) - MODEL_PLAN_VERDICT_KEYS):
+                errors.append(f"{prefix}.{key}: unknown field")
+            verdict = verdict_record.get("verdict")
+            if (
+                not isinstance(verdict, str)
+                or verdict not in MODEL_PLAN_VERDICT_ENUM
+            ):
+                errors.append(
+                    f"{prefix}.verdict: must be one of "
+                    + ", ".join(sorted(MODEL_PLAN_VERDICT_ENUM))
+                    + " - the mandatory Codex plan review persists an"
+                    " affirmative verdict only; a non-approval resets"
+                    " plan_review and reruns the review"
+                )
+            digest = verdict_record.get("plan_digest")
+            if not (
+                isinstance(digest, str)
+                and 12 <= len(digest) <= 64
+                and all(c in "0123456789abcdef" for c in digest)
+            ):
+                errors.append(
+                    f"{prefix}.plan_digest: must be 12-64 lowercase hex"
+                    " binding the verdict to the exact reviewed plan"
+                    " revision (the runtime recomputes it and invalidates"
+                    " the verdict when the plan changes)"
+                )
+            for field in ("model", "invocation"):
+                value = verdict_record.get(field)
+                if not isinstance(value, str) or not value:
+                    errors.append(
+                        f"{prefix}.{field}: must be a non-empty string"
                     )
     return errors
 
@@ -2197,7 +2267,7 @@ class _Validator:
                     )
         conventions = state.get("resolved_conventions")
         if isinstance(conventions, dict):
-            self.validate_conventions(conventions)
+            self.validate_conventions(conventions, tier_name)
         if "decision_audit_trail" in state:
             trail = self.state.get("decision_audit_trail")
             if not isinstance(trail, list) or any(
@@ -2503,6 +2573,42 @@ class _Validator:
                         self.error(
                             "invariant(iv): defect mode requires variant_analysis complete once pr is non-pending"
                         )
+
+        # (vii) admin#1495 r16 F6: phases.plan_review == complete IS the
+        # claim that the mandatory Phase-1 Codex plan review ran and approved
+        # (references/state-and-safety.md: "complete requires the mandatory
+        # Codex verdict"). It used to validate with no evidence at all —
+        # validate_model_runtime_shape returns [] for a MISSING record and
+        # the phase chain only checks that phase strings advance in order, so
+        # an implementation-phase state with plan_review complete and no
+        # model_runtime passed clean. Require the Phase-1 runtime record AND
+        # the typed plan_verdict; the verdict's SHAPE is enforced in
+        # validate_model_runtime_shape, and here its PRESENCE is bound to the
+        # phase that asserts it. A legacy downstream state lacking it must
+        # reset plan_review and rerun the review (the runtime owns recomputing
+        # the plan digest and invalidating the verdict when the plan changes).
+        if phases.get("plan_review") == "complete":
+            conventions = state.get("resolved_conventions")
+            runtime = (
+                conventions.get("model_runtime")
+                if isinstance(conventions, dict)
+                else None
+            )
+            if not isinstance(runtime, dict):
+                self.error(
+                    "invariant(vii): phases.plan_review complete requires"
+                    " resolved_conventions.model_runtime (the Phase-1 runtime"
+                    " record) - a legacy state without it must reset"
+                    " plan_review and rerun the mandatory Codex plan review"
+                )
+            elif not isinstance(runtime.get("plan_verdict"), dict):
+                self.error(
+                    "invariant(vii): phases.plan_review complete requires"
+                    " resolved_conventions.model_runtime.plan_verdict — typed"
+                    " evidence binding an affirmative Codex verdict to the"
+                    " reviewed plan; reset plan_review and rerun the review"
+                    " if it is absent"
+                )
 
     def validate_regression_records(self, regression: dict, status: Any) -> None:
         def check_record(record: Any, path: str, expected_exit: int | None) -> bool:
@@ -2830,12 +2936,109 @@ class _Validator:
         if not isinstance(gstack, dict):
             self.error("gstack_integration: must be a mapping")
             return
+        is_full = tier_name == "full"
         change_type = gstack.get("change_type")
-        if change_type is not None:
+        # admin#1495 r16 F7: change_type is a core selector every phase branch
+        # keys off, so a full-tier gstack must carry it (it used to be
+        # optional and a missing value left the classification unresolved yet
+        # validated clean).
+        if change_type is None:
+            if is_full:
+                self.error(
+                    "gstack_integration.change_type: required from Phase 1"
+                    " onward (bug_fix|feature|refactor|skill_only)"
+                )
+        else:
             self.check_enum(change_type, CHANGE_TYPE_ENUM, "gstack_integration.change_type")
+        # admin#1495 r16 F7: the scope flags are the file-scope classifier's
+        # output and the capability-gated matrix branches on them, so a
+        # string-valued flag ("true") silently read as truthy and a MISSING
+        # flag left the scope unresolved. Require real booleans, and require
+        # the full-tier core selectors to be present at all.
+        available = gstack.get("available")
+        if available is None:
+            if is_full:
+                self.error(
+                    "gstack_integration.available: required from Phase 1 onward"
+                )
+        elif not isinstance(available, bool):
+            self.error("gstack_integration.available: must be a boolean")
+        for flag in GSTACK_SCOPE_FLAGS:
+            value = gstack.get(flag)
+            if value is None:
+                if is_full:
+                    self.error(
+                        f"gstack_integration.{flag}: required from Phase 1 onward"
+                    )
+            elif not isinstance(value, bool):
+                self.error(f"gstack_integration.{flag}: must be a boolean")
+        # selected_skills must stay inside the documented capability-matrix
+        # allowlist — an unknown adapter names a phase step nothing can run.
+        selected = gstack.get("selected_skills")
+        if selected is None:
+            if is_full:
+                self.error(
+                    "gstack_integration.selected_skills: required from Phase 1"
+                    " onward"
+                )
+        elif not isinstance(selected, list):
+            self.error("gstack_integration.selected_skills: must be a list")
+        else:
+            for position, skill in enumerate(selected):
+                if not isinstance(skill, str) or skill not in GSTACK_SKILL_ALLOWLIST:
+                    self.error(
+                        f"gstack_integration.selected_skills[{position}]: must"
+                        " be one of " + ", ".join(sorted(GSTACK_SKILL_ALLOWLIST))
+                    )
+        # scope_skill_only is the file-scope signal and the change-type
+        # classifier makes it authoritative: scope_skill_only == true forces
+        # change_type "skill_only" (project-and-entry.md Step 3 rule 1), and
+        # rule 1 is the ONLY producer of skill_only, so the implication holds
+        # both ways. Enforced bidirectionally like invariant(iv)'s
+        # change_type<->defect_evidence_mode tie so neither half can drift and
+        # accept a state the classifier could never have produced.
+        scope_skill_only = gstack.get("scope_skill_only")
+        if (
+            isinstance(scope_skill_only, bool)
+            and isinstance(change_type, str)
+            and change_type in CHANGE_TYPE_ENUM
+        ):
+            if scope_skill_only and change_type != "skill_only":
+                self.error(
+                    "gstack_integration: scope_skill_only true requires"
+                    " change_type skill_only (the file-scope signal is"
+                    " authoritative; project-and-entry.md Step 3)"
+                )
+            if change_type == "skill_only" and not scope_skill_only:
+                self.error(
+                    "gstack_integration: change_type skill_only requires"
+                    " scope_skill_only true (rule 1 is the sole producer of"
+                    " skill_only)"
+                )
+        # The selectors above are only trustworthy relative to the tree they
+        # were classified from, so a full-tier gstack must carry the
+        # base/head/worktree-bound fingerprint that binds them before any
+        # selector-freshness or reverse diff-derived invariant can key off it.
+        fingerprint = gstack.get("classification_fingerprint")
+        if fingerprint is None:
+            if is_full:
+                self.error(
+                    "gstack_integration.classification_fingerprint: required"
+                    " from Phase 1 onward (64-hex over base/head/worktree)"
+                )
+        elif not (
+            isinstance(fingerprint, str)
+            and len(fingerprint) == 64
+            and all(c in "0123456789abcdefABCDEF" for c in fingerprint)
+        ):
+            self.error(
+                "gstack_integration.classification_fingerprint: must be a"
+                " 64-hex digest binding the classification to"
+                " base/head/worktree"
+            )
         mode = gstack.get("defect_evidence_mode")
         if mode is None:
-            if tier_name == "full":
+            if is_full:
                 self.error("gstack_integration.defect_evidence_mode: required from Phase 1 onward")
         else:
             self.check_enum(mode, DEFECT_MODE_ENUM, "gstack_integration.defect_evidence_mode")
@@ -2866,7 +3069,7 @@ class _Validator:
                             f"gstack_integration.review.notes[{position}].focus_triggers: must be a list of strings"
                         )
 
-    def validate_conventions(self, conventions: dict) -> None:
+    def validate_conventions(self, conventions: dict, tier_name: str) -> None:
         for message in validate_model_runtime_shape(
             conventions.get("model_runtime")
         ):
@@ -2983,24 +3186,76 @@ class _Validator:
             self.error(
                 "resolved_conventions.protected_branches: must be a list of non-empty strings"
             )
+        # admin#1495 r16 F5: the issue-tracker routing tuple
+        # (session_environment + issue_tracker.write_path) is what Phase 5
+        # consumes to decide whether a Linear write goes through the managed
+        # tool or the local API, so a full-tier state MUST carry both and the
+        # pair MUST satisfy the write-path matrix. Before this the fields were
+        # optional and validated independently, so a full state with no tuple,
+        # or managed + local_api, validated clean and Phase 5 routed off a
+        # missing or contradictory path. The one forbidden pairing is managed +
+        # local_api - kept in lockstep with handoff_decision.py's request-build
+        # guard (local_api requires session_environment=local), the single
+        # source of the matrix (project-and-entry.md rules 1-2: a managed
+        # session selects environment_tool|none and NEVER local_api; a local
+        # session may select environment_tool|local_api|none). A legacy full
+        # state missing the tuple cannot be rederived here (the validator has
+        # no repository context), so it fails closed and the operator resets
+        # and rederives the routing before resuming.
         environment = conventions.get("session_environment")
-        if environment is not None:
+        if environment is None:
+            if tier_name == "full":
+                self.error(
+                    "resolved_conventions.session_environment: required from"
+                    " Phase 1 onward (managed|local) - a legacy full state"
+                    " without it must reset and rederive the issue-tracker"
+                    " routing (project-and-entry.md)"
+                )
+        else:
             self.check_enum(
                 environment,
                 frozenset(("managed", "local")),
                 "resolved_conventions.session_environment",
             )
         tracker = conventions.get("issue_tracker")
-        if tracker is not None and not isinstance(tracker, dict):
+        write_path = None
+        if tracker is None:
+            if tier_name == "full":
+                self.error(
+                    "resolved_conventions.issue_tracker: required from Phase 1"
+                    " onward with a write_path (environment_tool|local_api|"
+                    "none) - a legacy full state without it must reset and"
+                    " rederive the issue-tracker routing"
+                )
+        elif not isinstance(tracker, dict):
             self.error("resolved_conventions.issue_tracker: must be a mapping")
-        elif isinstance(tracker, dict):
+        else:
             write_path = tracker.get("write_path")
-            if write_path is not None:
+            if write_path is None:
+                if tier_name == "full":
+                    self.error(
+                        "resolved_conventions.issue_tracker.write_path:"
+                        " required from Phase 1 onward (environment_tool|"
+                        "local_api|none) - a legacy full state without it must"
+                        " reset and rederive the issue-tracker routing"
+                    )
+            else:
                 self.check_enum(
                     write_path,
                     frozenset(("environment_tool", "local_api", "none")),
                     "resolved_conventions.issue_tracker.write_path",
                 )
+        # The matrix reduces to one forbidden pairing: managed + local_api.
+        # Enforced whenever both resolve to valid enums, at ANY tier - the
+        # pairing is illegal regardless of tier.
+        if environment == "managed" and write_path == "local_api":
+            self.error(
+                "resolved_conventions: session_environment 'managed' cannot"
+                " use issue_tracker.write_path 'local_api' - a managed session"
+                " routes tracker writes through the environment tool, never"
+                " the local API key (local_api requires"
+                " session_environment='local'; matches handoff_decision.py)"
+            )
 
     def validate_clean_polls(self, polls: Any) -> None:
         if not isinstance(polls, list):

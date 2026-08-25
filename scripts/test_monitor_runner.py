@@ -60,6 +60,9 @@ pr_number: 7
 stash_ref: null
 resolved_conventions:
   quality_check_steps: []
+  session_environment: "managed"
+  issue_tracker:
+    write_path: "environment_tool"
   monitor_constants:
     bot_grace_window_seconds: 1
   model_runtime:
@@ -73,6 +76,11 @@ resolved_conventions:
     claude_reviewer:
       model: "claude-opus-5"
       gate_status: "ready"
+    plan_verdict:
+      verdict: "approved"
+      plan_digest: "abc123def456"
+      model: "gpt-5.6-sol"
+      invocation: "codex-plan-01"
 validated_ticket:
   tracker_type: null
   identifier: null
@@ -166,6 +174,7 @@ gstack_integration:
   scope_skill_only: false
   change_type: "feature"
   defect_evidence_mode: "none"
+  classification_fingerprint: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
   review:
     status: "pending"
     tier: null
@@ -2456,13 +2465,28 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         # QA map, and the r17 gate let it reach child execution through the
         # degraded fallback. The Keeper floor now blocks it before GO even
         # with the harness attestation set — the attestation never applies
-        # to a Keeper-bound repository — and the capability probe stays
-        # scoped to MAPPED repositories (no capability wording in the
-        # refusal).
+        # to a Keeper-bound repository. admin#1495 r16 F3: algo's target
+        # manifest plans GitHub handback/review families (no Linear leg),
+        # so the capability preflight now fires for it and requires github
+        # WITHOUT linear - a github-only surface (gh CLI route + push
+        # probe, ZERO linear rows or grants) passes the probe, and the run
+        # then stops at the containment gate with no capability wording.
+        # Under the old map-keyed probe this fixture skipped preflight
+        # entirely; under a both-families demand it would false-block on
+        # linear before reaching the containment pin.
         self._bind_origin("git@github.com:Keeper-Dating/algo.git")
+        settings = self.dir / "algo-github-only.json"
+        settings.write_text(
+            '{"permissions": {"allow": ["Bash(gh *)"]}}', encoding="utf-8"
+        )
         completed = self._run(
             budget="900", timeout=90, wait_scale="0.02", max_ticks="2",
-            env_extra={"FAKE_OUTCOME": "terminal"},
+            env_extra={
+                "FAKE_OUTCOME": "terminal",
+                "MONITOR_RUNNER_USER_SETTINGS": str(settings),
+                "FAKE_MCP_LIST_EMPTY": "1",
+                "MONITOR_RUNNER_BIN_GH": str(self._fake_gh(push=True)),
+            },
         )
         self.assertEqual(completed.returncode, 5, completed.stdout + completed.stderr)
         summary = self._summary(completed)
@@ -2470,6 +2494,202 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         self.assertIn("cgroup v2 delegation is unavailable", summary["reason"])
         self.assertEqual(summary["ticks_completed"], 0)
         self.assertFalse(self.argv_log.exists(), "the child must never execute")
+
+    def test_algo_capability_probe_requires_github_without_linear(self) -> None:
+        # admin#1495 r16 F3 (the regression): exact-Algo sits outside the
+        # Linear QA map, yet its planning emits GitHub review and
+        # assignment operations - the map-keyed probe skipped it entirely,
+        # so a delegated-host algo run could reach PR handoff time with no
+        # proven mutation route. The manifest-scoped probe now fires: a
+        # bare surface blocks BEFORE any child launch, naming the github
+        # family - and never linear, which algo's manifest does not plan.
+        self._bind_origin("git@github.com:Keeper-Dating/algo.git")
+        bare = self.dir / "algo-bare-settings.json"
+        bare.write_text("{}", encoding="utf-8")
+        completed = self._run(
+            budget="900", timeout=60,
+            env_extra={
+                "FAKE_OUTCOME": "terminal",
+                "MONITOR_RUNNER_USER_SETTINGS": str(bare),
+                "FAKE_MCP_LIST_EMPTY": "1",
+            },
+        )
+        self.assertEqual(
+            completed.returncode, 5, completed.stdout + completed.stderr
+        )
+        summary = self._summary(completed)
+        self.assertIn("github: no CONNECTED MCP row", summary["reason"])
+        self.assertNotIn("linear:", summary["reason"])
+        self.assertEqual(summary["ticks_completed"], 0)
+        self.assertFalse(self.argv_log.exists(), "the child must never execute")
+
+    def test_target_manifest_derivation_binds_repository_classes(self) -> None:
+        # admin#1495 r16 F3: the manifest is a pure function of the
+        # runner-owned repository binding (the immutable input) - never of
+        # child-written candidate state. Three derived classes:
+        # Linear-mapped (github handback + reviewer requests + Linear
+        # leg), Keeper-org unmapped (github families only - exact-Algo is
+        # the repro), and non-Keeper/unresolved (genuinely targetless).
+        # Direct-construction pins via the in-process carve-out
+        # (_runner_module): the r18 F5 containment gate preempts every
+        # Keeper-bound e2e launch on this non-delegating host, so the
+        # subprocess path can never reach these predicates.
+        mr = self._runner_module()
+        mapped = mr._qa_target_manifest("Keeper-Dating/matchmaking")
+        self.assertEqual(
+            mr._manifest_required_capabilities(mapped),
+            frozenset({"github", "linear"}),
+        )
+        algo = mr._qa_target_manifest("Keeper-Dating/algo")
+        self.assertTrue(algo, "algo must derive planned target families")
+        self.assertNotIn(mr._QA_TARGET_LINEAR_QA, algo)
+        self.assertEqual(
+            mr._manifest_required_capabilities(algo), frozenset({"github"})
+        )
+        for targetless in ("someone-else/sandbox", "", None, 7):
+            self.assertEqual(
+                mr._qa_target_manifest(targetless), frozenset(), targetless
+            )
+        self.assertEqual(
+            mr._manifest_required_capabilities(frozenset()), frozenset()
+        )
+        # reviewer-only (no handback resolves): review requests are a
+        # github mutation, so github is still the one required capability.
+        self.assertEqual(
+            mr._manifest_required_capabilities(
+                frozenset((mr._QA_TARGET_GITHUB_REVIEW,))
+            ),
+            frozenset({"github"}),
+        )
+
+    def test_terminal_idle_rejection_follows_the_target_manifest(self) -> None:
+        # admin#1495 r16 F3 (the KEY regression): a terminal candidate
+        # with handoffs.qa idle must reject for EVERY repository whose
+        # manifest plans a target family - exact-Algo included, which the
+        # map-keyed predicate silently passed - and stay valid only for a
+        # genuinely targetless run.
+        mr = self._runner_module()
+        for bound_repo, qa_status, expected in (
+            ("Keeper-Dating/algo", "idle", True),  # the r16 F3 escape
+            ("Keeper-Dating/algo", None, True),
+            ("keeper-dating/ALGO", "idle", True),  # case-insensitive
+            ("Keeper-Dating/algo", "pending", False),
+            ("Keeper-Dating/algo", "complete", False),
+            ("Keeper-Dating/matchmaking", "idle", True),  # mapped unchanged
+            ("Keeper-Dating/matchmaking", "complete", False),
+            ("someone-else/sandbox", "idle", False),  # targetless idle is fine
+            (None, "idle", False),
+        ):
+            self.assertIs(
+                mr._terminal_missing_planned_qa(bound_repo, qa_status),
+                expected,
+                (bound_repo, qa_status),
+            )
+        # reviewer-only manifests reject idle terminals through the same
+        # core the repo-derived gate consumes; an empty manifest never
+        # rejects.
+        reviewer_only = frozenset((mr._QA_TARGET_GITHUB_REVIEW,))
+        self.assertIs(
+            mr._manifest_missing_planned_qa(reviewer_only, "idle"), True
+        )
+        self.assertIs(
+            mr._manifest_missing_planned_qa(reviewer_only, "pending"), False
+        )
+        self.assertIs(mr._manifest_missing_planned_qa(frozenset(), "idle"), False)
+
+    def test_qa_manifest_audit_follows_the_target_manifest(self) -> None:
+        # admin#1495 r16 F3: the terminal manifest audit covers exactly
+        # the families the immutable-input manifest plans - github pair
+        # plus a canonical Linear-leg shape for a mapped repository,
+        # github pair with NO Linear leg for exact-Algo, reviewer coverage
+        # alone for a reviewer-only manifest - and skips only the
+        # targetless class.
+        mr = self._runner_module()
+        runner = self._direct_runner(mr)
+
+        def qa_extract(ops, results=None, status="pending"):
+            return {
+                "handoff_status_by_kind": {"qa": status},
+                "handoff_operations": {"qa": ops},
+                "handoff_results": {
+                    "qa": (
+                        results
+                        if results is not None
+                        else {op: "complete" for op in ops}
+                    )
+                },
+            }
+
+        github_pair = [
+            "qa.github.replace_assignees:gaaaaaaaaaaaa",
+            "qa.github.verify_assignees:gaaaaaaaaaaaa",
+        ]
+        linear_outage = ["qa.linear.record_unavailable:gaaaaaaaaaaaa"]
+        # mapped GitHub+Linear: the github pair alone omits the Linear
+        # leg; the pair plus a canonical leg shape passes (unchanged r15
+        # F17 behavior).
+        self.assertIsNotNone(
+            runner._qa_manifest_violation(
+                "Keeper-Dating/matchmaking", qa_extract(github_pair)
+            )
+        )
+        self.assertIsNone(
+            runner._qa_manifest_violation(
+                "Keeper-Dating/matchmaking",
+                qa_extract(github_pair + linear_outage),
+            )
+        )
+        # exact-Algo GitHub-only: the pair with NO Linear leg is the
+        # complete plan; a Linear op is planner-impossible output for an
+        # unmapped binding; a missing verify half still rejects; and the
+        # map-keyed early return no longer skips the audit.
+        self.assertIsNone(
+            runner._qa_manifest_violation(
+                "Keeper-Dating/algo", qa_extract(github_pair)
+            )
+        )
+        self.assertIsNotNone(
+            runner._qa_manifest_violation(
+                "Keeper-Dating/algo",
+                qa_extract(github_pair + linear_outage),
+            )
+        )
+        self.assertIsNotNone(
+            runner._qa_manifest_violation(
+                "Keeper-Dating/algo", qa_extract(github_pair[:1])
+            )
+        )
+        # reviewer-only manifest (no current repository class derives it;
+        # the module core is the consumer surface): recorded reviewer
+        # operations with results pass, an unrecorded result rejects, and
+        # idle stays owned by the planned-QA gate.
+        reviewer_only = frozenset((mr._QA_TARGET_GITHUB_REVIEW,))
+        reviewer_ops = [
+            "qa.github.request_review:tjkeeper:gaaaaaaaaaaaa",
+            "qa.github.verify_review_request:tjkeeper:gaaaaaaaaaaaa",
+        ]
+        self.assertIsNone(
+            mr._qa_manifest_coverage_violation(
+                reviewer_only, qa_extract(reviewer_ops)
+            )
+        )
+        self.assertIsNotNone(
+            mr._qa_manifest_coverage_violation(
+                reviewer_only, qa_extract(reviewer_ops, results={})
+            )
+        )
+        self.assertIsNone(
+            mr._qa_manifest_coverage_violation(
+                reviewer_only, qa_extract([], status="idle")
+            )
+        )
+        # genuinely targetless: the audit never fires, whatever the
+        # candidate claims.
+        self.assertIsNone(
+            runner._qa_manifest_violation(
+                "someone-else/sandbox", qa_extract(github_pair[:1])
+            )
+        )
 
     def test_bare_vm_capability_probe_blocks_mapped_runs(self) -> None:
         # admin#1495 finding 3825265272 (re-eval-named closure): a mapped

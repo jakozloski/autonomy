@@ -32,27 +32,25 @@ resolved_conventions:
     mandatory_kinds: [] # subset of ["ui", "api", "performance"]
     evidence: {} # kind -> exact repository rule/source
   protected_branches: ["main", "master", "prod", "..."]
-  session_environment: "{managed|local}"
+  session_environment: "{managed|local}" # REQUIRED from Phase 1 onward (admin#1495 r16 F5) — a full-tier state without it fails closed: reset and rederive the routing per project-and-entry.md
   issue_tracker:
     type: "{linear|jira|github|none}"
     project_prefix: null # string|null — e.g., "WEB"
     api_key_env: null # string|null — e.g., "LINEAR_API_KEY"
     title_format: null # string|null — e.g., "{PREFIX}-{ID} {type}: {description}"
-    write_path: "{environment_tool|local_api|none}"
+    write_path: "{environment_tool|local_api|none}" # REQUIRED from Phase 1 onward (r16 F5); the pair must satisfy the write-path matrix in project-and-entry.md — managed NEVER selects local_api (enforced at every tier by scripts/state_schema.py, in lockstep with handoff_decision.py's request-build guard)
     ticket_required: true
     ticket_exemption_reason: null
   monitor_constants:
     # Overridable per project: bot_grace_window_seconds, watch_timeout_seconds (positive int), poll_chunk_seconds (1..60). IMMUTABLE: max_iterations AND both liveness_* keys — the supervisors pin the canonical constants, so a declared override was never honored and is rejected as suspect state (admin#1495 r15 F8). The block is CLOSED: unknown keys are rejected. Omitted fields fall back to the listed defaults.
-    # A declared bot_grace_window_seconds must be an integer in (0, 86400]
-    bot_grace_window_seconds: 900 # (MAX_GRACE_WINDOW_OVERRIDE_SECONDS in scripts/state_schema.py) — out-of-bound overrides are rejected as suspect state, never silently replaced; the post_push_until resume ceiling honors the resolved window (+300s skew). Default 15min covers Bugbot's ~13min scan
+    bot_grace_window_seconds: 900 # a declared override must be an integer in (0, 86400] (MAX_GRACE_WINDOW_OVERRIDE_SECONDS in scripts/state_schema.py) — out-of-bound overrides are rejected as suspect state, never silently replaced; the post_push_until resume ceiling honors the resolved window (+300s skew). Default 15min covers Bugbot's ~13min scan
     watch_timeout_seconds: 540 # CI-watch aggregate deadline, polled in <=60s chunks (model-gate calls use liveness supervision instead — see Timeout Heuristics)
     liveness_idle_kill_seconds: 180 # IMMUTABLE (r15 F8): supervise_stream call sites pin 180s; absent/null/180 equivalent, any other value is suspect state
     liveness_attempt_ceiling_seconds: 2700 # IMMUTABLE (r15 F8): PER_ATTEMPT_CEILING_SECONDS in scripts/model_policy.py is canonical; absent/null/2700 equivalent, any other value is suspect state
     poll_chunk_seconds: 60
     max_iterations: 50 # IMMUTABLE (admin#1495 r12 F8): the trusted runner enforces this cap (MAX_WORK_ITERATIONS); absent/null/50 are equivalent, any other value is suspect state — never a project override
     codex_cli_version: null # string|null — captured from `codex --version` at Phase 2 preflight
-  model_runtime:
-    # model = the policy-selected model (floor shown); scripts/model_policy.py auto-selects newer eligible models and records them in policy_decision.selection.
+  model_runtime: # model = the policy-selected model (floor shown); scripts/model_policy.py auto-selects newer eligible models and records them in policy_decision.selection
     codex:
       model: "gpt-5.6-sol"
       effort: "max"
@@ -78,6 +76,7 @@ resolved_conventions:
       gate_status: "pending"
       policy_decision: {}
     escalation_invocations: [] # append-only: { trigger, voice, reason, phase, session_id, pass_number }
+    plan_verdict: null # REQUIRED once phases.plan_review is complete (admin#1495 r16 F6) — typed evidence of the mandatory Codex approval, closed shape: { verdict: "approved" (affirmative-only; a non-approval resets plan_review and reruns the review), plan_digest: 12-64 lowercase hex binding the exact reviewed plan revision (the runtime recomputes it and invalidates the verdict when the plan changes), model: selected-model descriptor, invocation: invocation evidence (e.g., session/run id) }
 validated_ticket:
   tracker_type: null
   identifier: null # Human-facing ticket identifier, e.g. WEB-8877.
@@ -202,15 +201,16 @@ variant_analysis:
   variants_reported: [] # out-of-boundary file:line sites — reported, never silently fixed
   skipped_reason: null
 gstack_integration:
-  available: false # true if gstack skills directory found
+  available: false # true if gstack skills directory found. r16 F7: the core selectors (available, the four scope flags, selected_skills, change_type, classification_fingerprint) are REQUIRED from Phase 1 onward; scope flags are real booleans — a string "true" is suspect state, never truthy
   gstack_dir: null # resolved path, or null
-  selected_skills: [] # e.g., ["review", "qa", "design-review", "investigate", "cso", "autoplan"]
+  selected_skills: [] # subset of ["review", "qa", "design-review", "investigate", "cso", "autoplan"] — CLOSED to the capability-gated matrix's set (GSTACK_SKILL_ALLOWLIST in scripts/state_schema.py, kept in lockstep)
   scope_frontend: false
   scope_backend: false
   scope_tests_only: false
-  scope_skill_only: false
+  scope_skill_only: false # <-> change_type skill_only holds in BOTH directions: Step 3 rule 1 (project-and-entry.md) is the sole producer of skill_only
   change_type: "feature" # bug_fix|feature|refactor|skill_only
   defect_evidence_mode: "none" # runtime_bug_fix|skill_helper_defect|none — set at Scope Analysis, recomputed with change_type after Phase 3; drives the regression/variant terminal rules
+  classification_fingerprint: null # 64-hex over the classified tree (merge-base, head SHA, worktree diff digest) — binds the selectors above to the inputs they were derived from, so selector freshness is checkable before any phase branches on them (r16 F7); recompute with change_type after Phase 3
   investigate:
     status: "complete|skipped" # skipped = not a bug fix, Entry B, or not selected
   review:
@@ -263,7 +263,7 @@ finding_ledger:
   # 5. Clean-pass exit (no cap): the loop ends only when a pass leaves no open findings AND no fix-changed files; rules 1-4 BLOCK on divergence — pass count alone never exits
 phases:
   plan: "{pending|in_progress|complete|blocked}" # blocked = graceful abort
-  plan_review: "{pending|in_progress|complete|blocked}" # complete requires the mandatory Codex verdict (selected model, GPT-5.6 Sol floor, max); the Claude reviewer may supplement but never replace it
+  plan_review: "{pending|in_progress|complete|blocked}" # complete requires the mandatory Codex verdict (selected model, GPT-5.6 Sol floor, max); the Claude reviewer may supplement but never replace it. complete ALSO requires resolved_conventions.model_runtime.plan_verdict — the typed approval evidence above (r16 F6); a legacy downstream state without it resets plan_review and reruns the review
   implementation: "{pending|in_progress|complete|blocked}" # blocked = graceful abort
   self_review: "{pending|in_progress|complete|blocked}"
   # "blocked" = review tools unavailable/failed or convergence rules 1-4 fired (divergence); there is no re-review pass cap
