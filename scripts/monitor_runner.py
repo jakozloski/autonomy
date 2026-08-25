@@ -622,11 +622,16 @@ class AttemptContainment:
         except RunnerExit:
             pass
 
-    def remove(self) -> None:
+    def remove(self) -> bool:
+        """True when the boundary directory was actually removed —
+        algo#1216 r19 F12: a hidden rmdir failure let callers clear the
+        containment pointer over a still-present boundary."""
+
         try:
             self.path.rmdir()
         except OSError:
-            pass
+            return False
+        return True
 
 
 # r14 F5: only GitHub's own URL shapes may bind a repository — the old
@@ -2438,6 +2443,31 @@ class Runner:
         recorded = in_flight.get("child_started_fingerprint")
         if not (isinstance(pid, int) and isinstance(pgid, int)):
             return
+        containment_record = in_flight.get("containment")
+        if isinstance(containment_record, str) and not containment_record.startswith(
+            "degraded:"
+        ):
+            # algo#1216 r19 F11: a persisted CGROUP containment record makes
+            # pid/pgid extinction proof INSUFFICIENT — a re-sessioned,
+            # still-credentialed member may persist inside the boundary
+            # while the recorded group id is long dead, and the runner
+            # cannot re-adopt a boundary across sessions (its provenance is
+            # unprovable). Recovery is therefore UNRESOLVED whatever the
+            # group probe says: retain in_flight and block with the
+            # boundary named — never signal through child-writable state.
+            # A malformed record (neither cgroup: nor degraded:) fails
+            # closed the same way.
+            raise RunnerExit(
+                5,
+                "blocked",
+                "a previously recorded monitor attempt ran under cgroup"
+                f" containment ({containment_record}, pid {pid}, pgid"
+                f" {pgid}, started {recorded!r}) — a dead process group"
+                " does not prove the BOUNDARY extinct (a re-sessioned"
+                " member may remain inside it); inspect the boundary's"
+                " cgroup.procs, terminate any member, remove the"
+                " directory, then clear monitor_cli.in_flight to resume",
+            )
         if _live_group_members(pgid):
             raise RunnerExit(
                 5,
@@ -3258,15 +3288,21 @@ class Runner:
                 time.sleep(0.3)
             if containment.live_pids():
                 return False
-        # r14 F6: remove the boundary once (and only once) extinction is
-        # proven; a boundary that turns unreadable here raises from
-        # live_pids() and is preserved rather than removed.
-        try:
-            if not containment.live_pids():
-                containment.remove()
-                self.attempt_containment = None
-        except RunnerExit:
-            pass
+        # r14 F6 + algo#1216 r19 F12: remove the boundary once (and only
+        # once) extinction is proven. The final read PROPAGATES — the
+        # swallowed RunnerExit contradicted this docstring's own contract
+        # and returned success while retaining an unreadable pointer —
+        # and the pointer clears ONLY after confirmed removal.
+        if containment.live_pids():
+            return False
+        if containment.remove():
+            self.attempt_containment = None
+        else:
+            _heartbeat(
+                f"containment boundary {containment.record} is provably"
+                " empty but could not be removed — pointer retained for a"
+                " later cleanup pass"
+            )
         return True
 
     def _extinguish_child_descendants(
@@ -3359,12 +3395,30 @@ class Runner:
         containment = self.attempt_containment
         if containment is None:
             return
+        # algo#1216 r19 F12 (pre-GO class): the wrapper executed nothing,
+        # so the boundary is empty by construction — an unreadable or
+        # unremovable boundary here is RETAINED AND DISCLOSED (empty
+        # retained resource), never silently swallowed; post-GO paths run
+        # _extinguish_containment, where unreadability is possible-
+        # liveness uncertainty and propagates.
         try:
-            if not containment.live_pids():
-                containment.remove()
-                self.attempt_containment = None
+            empty = not containment.live_pids()
         except RunnerExit:
-            pass
+            _heartbeat(
+                f"pre-GO containment boundary {containment.record} is"
+                " unreadable — retained for a later cleanup pass (the"
+                " paused wrapper executed nothing)"
+            )
+            return
+        if empty:
+            if containment.remove():
+                self.attempt_containment = None
+            else:
+                _heartbeat(
+                    f"pre-GO containment boundary {containment.record}"
+                    " could not be removed — pointer retained for a later"
+                    " cleanup pass"
+                )
 
     def _post_go_backstop(
         self,
@@ -4901,11 +4955,12 @@ class Runner:
         ceiling_seconds = (
             LIVENESS_BACKOFF_LADDER_SECONDS[-1] + 300.0
         ) * self.wait_scale
-        deadline = min(
-            deadline,
-            datetime.now(timezone.utc) + timedelta(seconds=ceiling_seconds),
-        )
-        remaining_wait = (deadline - datetime.now(timezone.utc)).total_seconds()
+        # ONE clock read for both the clamp and the first remainder — the
+        # scripted-clock tests pin the call count, and two reads would
+        # also let real time slip between clamp and computation.
+        now = datetime.now(timezone.utc)
+        deadline = min(deadline, now + timedelta(seconds=ceiling_seconds))
+        remaining_wait = (deadline - now).total_seconds()
         while remaining_wait > 0:
             budget = self.remaining() - MONITOR_SLICE_CLEANUP_MARGIN_SECONDS
             if budget <= MONITOR_CHILD_MIN_VIABLE_SECONDS:

@@ -1131,6 +1131,12 @@ class _ScriptedDatetime:
     def now(cls, tz: timezone | None = None) -> datetime:
         return cls.script.pop(0) if len(cls.script) > 1 else cls.script[0]
 
+    @classmethod
+    def fromisoformat(cls, value: str) -> datetime:
+        # r15 F11: _parse_retry_deadline normalizes via fromisoformat —
+        # the scripted clock stubs `now`, never parsing.
+        return datetime.fromisoformat(value)
+
 
 class ResumeLivenessWaitTests(unittest.TestCase):
     """algo#1216 finding 3807740769 (admin 3807823260 / mm 3808151933):
@@ -2496,3 +2502,263 @@ class WorkCapDocParityTests(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class TrustedControlDriftTests(unittest.TestCase):
+    """admin#1495 r15 F1/F10/F19: the launch-vs-candidate trusted-control
+    comparison — trail prefix + sensitive-append ban, frozen AC capture
+    and ticket, frozen model-binding identity with append-only histories."""
+
+    def _launch(self) -> dict:
+        return {
+            "decision_audit_trail": ["branch-established:x@" + "a" * 40, "note:one"],
+            "acceptance_criteria_capture": {"digest": "d" * 16, "source_revision": "r1"},
+            "validated_ticket": {"identifier": "ADM-953", "provider_id": "p1"},
+            "model_runtime": {
+                "codex": {"model": "gpt-5.6-sol", "gate_status": "ready",
+                          "post_invocation": [{"at": "t1"}]},
+                "claude": {"model": "claude-fable-5", "gate_status": "ready",
+                           "post_invocation": []},
+                "claude_reviewer": {"model": "claude-opus-5", "gate_status": "ready",
+                                    "post_invocation": []},
+                "escalation_invocations": [],
+            },
+        }
+
+    def _drift(self, mutate) -> str | None:
+        import copy
+        launch = self._launch()
+        candidate = copy.deepcopy(launch)
+        mutate(candidate)
+        return monitor_runner._trusted_control_drift(launch, candidate)
+
+    def test_benign_appends_and_work_pass(self) -> None:
+        def mutate(c):
+            c["decision_audit_trail"].append("ref-read:state-and-safety:abc")
+            c["model_runtime"]["codex"]["post_invocation"].append({"at": "t2"})
+            c["model_runtime"]["escalation_invocations"].append({"at": "t3"})
+        self.assertIsNone(self._drift(mutate))
+
+    def test_trail_deletion_rewrite_reorder_reject(self) -> None:
+        for label, mutate in (
+            ("deletion", lambda c: c["decision_audit_trail"].pop(0)),
+            ("rewrite", lambda c: c["decision_audit_trail"].__setitem__(0, "r2-gate:waived")),
+            ("reorder", lambda c: c["decision_audit_trail"].reverse()),
+        ):
+            with self.subTest(label=label):
+                self.assertIsNotNone(self._drift(mutate))
+
+    def test_forged_sensitive_append_rejects(self) -> None:
+        for forged in ("r2-gate:waived", "branch-established:y@" + "b" * 40,
+                       "package-validated:def@2026", "validation-before-push:" + "c" * 40):
+            with self.subTest(forged=forged):
+                self.assertIsNotNone(
+                    self._drift(lambda c, f=forged: c["decision_audit_trail"].append(f))
+                )
+
+    def test_capture_and_ticket_frozen(self) -> None:
+        for label, mutate in (
+            ("capture-digest", lambda c: c["acceptance_criteria_capture"].__setitem__("digest", "e" * 16)),
+            ("capture-removed", lambda c: c.__setitem__("acceptance_criteria_capture", None)),
+            ("ticket", lambda c: c["validated_ticket"].__setitem__("provider_id", "p2")),
+        ):
+            with self.subTest(label=label):
+                self.assertIsNotNone(self._drift(mutate))
+
+    def test_binding_identity_frozen_history_prefix(self) -> None:
+        for label, mutate in (
+            ("gate-flip", lambda c: c["model_runtime"]["claude_reviewer"].__setitem__("gate_status", "blocked")),
+            ("model-swap", lambda c: c["model_runtime"]["codex"].__setitem__("model", "gpt-6")),
+            ("history-rewrite", lambda c: c["model_runtime"]["codex"].__setitem__("post_invocation", [{"at": "tX"}])),
+            ("leg-removed", lambda c: c["model_runtime"].pop("claude")),
+        ):
+            with self.subTest(label=label):
+                self.assertIsNotNone(self._drift(mutate))
+        # clearing escalations only matters once the launch recorded some —
+        # an empty launch list is a prefix of anything, including empty.
+        launch = self._launch()
+        launch["model_runtime"]["escalation_invocations"] = [{"at": "e1"}]
+        import copy
+        candidate = copy.deepcopy(launch)
+        candidate["model_runtime"]["escalation_invocations"] = []
+        self.assertIsNotNone(monitor_runner._trusted_control_drift(launch, candidate))
+
+
+class QaManifestViolationTests(unittest.TestCase):
+    """admin#1495 r15 F17: the canonical mapped-repository QA manifest."""
+
+    def _extract(self, ops, results=None, status="pending"):
+        return {
+            "handoff_status_by_kind": {"qa": status},
+            "handoff_operations": {"qa": ops},
+            "handoff_results": {"qa": results if results is not None else {o: "complete" for o in ops}},
+        }
+
+    def _violation(self, ops, **kw):
+        runner = _runner("claude-opus-5", None)
+        return runner._qa_manifest_violation(
+            "Keeper-Dating/matchmaking", self._extract(ops, **kw)
+        )
+
+    FULL = [
+        "qa.github.replace_assignees:gaaaaaaaaaaaa",
+        "qa.github.verify_assignees:gaaaaaaaaaaaa",
+        "qa.linear.verify_ticket_binding:gaaaaaaaaaaaa",
+        "qa.linear.assign_ticket:gaaaaaaaaaaaa",
+        "qa.linear.verify_ticket_assignee:gaaaaaaaaaaaa",
+        "qa.linear.set_ticket_state:gaaaaaaaaaaaa",
+        "qa.linear.verify_ticket_state:gaaaaaaaaaaaa",
+    ]
+
+    def test_complete_manifest_passes(self) -> None:
+        self.assertIsNone(self._violation(self.FULL))
+
+    def test_outage_shapes_pass(self) -> None:
+        self.assertIsNone(self._violation([
+            "qa.github.replace_assignees:gbbbbbbbbbbbb",
+            "qa.github.verify_assignees:gbbbbbbbbbbbb",
+            "qa.linear.record_unavailable:gbbbbbbbbbbbb",
+        ]))
+
+    def test_subset_omission_rejects(self) -> None:
+        # github-only (the exact F17 shape) and assign-without-state
+        self.assertIsNotNone(self._violation(self.FULL[:2]))
+        self.assertIsNotNone(self._violation(self.FULL[:5]))
+
+    def test_mixed_generations_reject(self) -> None:
+        ops = list(self.FULL)
+        ops[0] = "qa.github.replace_assignees:gcccccccccccc"
+        self.assertIsNotNone(self._violation(ops))
+
+    def test_missing_results_reject(self) -> None:
+        self.assertIsNotNone(self._violation(self.FULL, results={}))
+
+    def test_unmapped_and_idle_skip(self) -> None:
+        runner = _runner("claude-opus-5", None)
+        self.assertIsNone(runner._qa_manifest_violation(
+            "someone-else/sandbox", self._extract(self.FULL[:1])))
+        self.assertIsNone(self._violation([], status="idle"))
+
+    def test_manifest_table_matches_the_planner(self) -> None:
+        # single-source parity: the runner's family table must mint the
+        # SAME families as a real full plan from handoff_decision.
+        import handoff_decision as hd
+        req = {
+            "scenario": "clean_unapproved",
+            "repository": {"nameWithOwner": "Keeper-Dating/matchmaking"},
+            "pull_request_number": 7,
+            "authenticated_actor": "jakozloski",
+            "existing_assignees": ["jakozloski"],
+            "code_reviewers": [],
+            "issue_tracker": {
+                "ticket_identifier": "ADM-953",
+                "ticket_provider_id": "abc",
+                "write_path": "local_api",
+                "qa_assignee": {"provider_id": "qa-1"},
+                "qa_state": {"provider_id": "st-1"},
+            },
+        }
+        plan = hd.plan_handoff(req)
+        self.assertEqual(plan["state"], "pending", plan["errors"])
+        families = {
+            op["id"].rpartition(":")[0].split(":", 1)[0]
+            for op in plan["operations"]
+        }
+        github = {f for f in families if f.startswith("qa.github.")}
+        linear = {f for f in families if f.startswith("qa.linear.")}
+        self.assertTrue(monitor_runner._QA_REQUIRED_GITHUB_FAMILIES <= github)
+        if linear:
+            self.assertIn(
+                frozenset(linear), monitor_runner._QA_LINEAR_LEG_SHAPES
+            )
+
+
+class RecoveryContainmentRecordTests(unittest.TestCase):
+    """algo#1216 r19 F11: a persisted cgroup containment record makes
+    recovery unresolved whatever the group probe says; degraded records
+    keep the group-proof path; malformed records fail closed."""
+
+    def _reconcile(self, containment) -> None:
+        import subprocess as sp
+        import sys as _sys
+
+        proc = sp.Popen([_sys.executable, "-c", "pass"], start_new_session=True)
+        pgid = os.getpgid(proc.pid)
+        proc.wait(timeout=10)  # dead, reaped: the group id is gone
+        runner = _runner("claude-opus-5", None)
+        in_flight = {
+            "child_pid": proc.pid,
+            "child_pgid": pgid,
+            "child_started_fingerprint": "gone",
+        }
+        if containment is not None:
+            in_flight["containment"] = containment
+        runner._reconcile_recorded_orphan(in_flight)
+
+    def test_cgroup_record_blocks_despite_dead_group(self) -> None:
+        with self.assertRaises(RunnerExit) as caught:
+            self._reconcile("cgroup:/sys/fs/cgroup/autonomy-monitor-x")
+        self.assertEqual(caught.exception.code, 5)
+        self.assertIn("does not prove the BOUNDARY extinct", caught.exception.reason)
+
+    def test_malformed_record_fails_closed(self) -> None:
+        with self.assertRaises(RunnerExit):
+            self._reconcile("surprise-shape")
+
+    def test_degraded_record_keeps_the_group_proof_path(self) -> None:
+        # dead group + degraded record: no raise from the orphan check
+        # (the caller's no-candidate reconciliation owns what follows)
+        self._reconcile("degraded:no-cgroup-v2-delegation")
+        self._reconcile(None)
+
+
+class ContainmentRemovalObservabilityTests(unittest.TestCase):
+    """algo#1216 r19 F12: removal success is observable and the pointer
+    clears only after confirmed removal; the post-GO final read
+    propagates while the pre-GO path retains and discloses."""
+
+    def _containment_dir(self):
+        tmp = Path(tempfile.mkdtemp(prefix="unit-qd17-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        (tmp / "cgroup.procs").write_text("")
+        return tmp
+
+    def test_remove_reports_failure(self) -> None:
+        cg = self._containment_dir()
+        containment = monitor_runner.AttemptContainment(cg)
+        # nonempty dir: rmdir fails -> False, dir retained
+        self.assertFalse(containment.remove())
+        self.assertTrue(cg.exists())
+        (cg / "cgroup.procs").unlink()
+        self.assertTrue(containment.remove())
+        self.assertFalse(cg.exists())
+
+    def test_extinguish_propagates_unreadable_final_read(self) -> None:
+        cg = self._containment_dir()
+        runner = _runner("claude-opus-5", None)
+        runner.attempt_containment = monitor_runner.AttemptContainment(cg)
+        (cg / "cgroup.procs").unlink()  # unreadable membership
+        with self.assertRaises(RunnerExit):
+            runner._extinguish_containment()
+        # the pointer survives for the human
+        self.assertIsNotNone(runner.attempt_containment)
+
+    def test_extinguish_retains_pointer_on_failed_removal(self) -> None:
+        cg = self._containment_dir()
+        (cg / "cgroup.procs").write_text("")
+        (cg / "extra-file").write_text("x")  # rmdir will fail
+        runner = _runner("claude-opus-5", None)
+        runner.attempt_containment = monitor_runner.AttemptContainment(cg)
+        self.assertTrue(runner._extinguish_containment())
+        self.assertIsNotNone(
+            runner.attempt_containment,
+            "the pointer must survive a failed removal",
+        )
+        # a real cgroup dir rmdirs clean once empty (cgroup.procs is a
+        # kernel-virtual file); the plain-fs proxy cannot be both readable
+        # and rmdir-able, so the confirmed-removal leg pins the WIRING.
+        with mock.patch.object(
+            monitor_runner.AttemptContainment, "remove", return_value=True
+        ):
+            self.assertTrue(runner._extinguish_containment())
+        self.assertIsNone(runner.attempt_containment)

@@ -1055,8 +1055,11 @@ class MonitorRunnerE2ETests(unittest.TestCase):
     def _strand_live_child(self, env_extra=None) -> dict:
         # admin#1495 r12 F6 harness: leave a LIVE recorded child behind a
         # dead runner. The kill waits for BOTH the in_flight record and the
-        # fake child's argv log, so the parent SIGKILL can never race the
-        # child spawn (the write-ahead record lands before the fork).
+        # fake child's argv log — production SPAWNS the paused wrapper
+        # first, then commits in_flight, then sends GO (algo#1216 r19 F5
+        # corrected the old comment's inverted fork order), so in_flight
+        # alone proves only the pre-GO window; the argv log proves the
+        # model child actually launched.
         env = dict(os.environ)
         env.update(
             {
@@ -1933,51 +1936,88 @@ class MonitorRunnerE2ETests(unittest.TestCase):
             first.send_signal(signal.SIGKILL)
             first.wait(timeout=30)
 
-    def test_crash_recovery_blocks_on_live_child_then_reconciles(self) -> None:
-        # R5-2 (final): the runner has NO kill authority. A live recorded
-        # child blocks with exact manual instructions; once the child is
-        # gone (proven extinct), the next runner reconciles and proceeds.
+    def test_pre_go_crash_recovers_through_the_no_candidate_branch(self) -> None:
+        # algo#1216 r19 F5 second half: a runner killed BETWEEN the
+        # in_flight commit and the GO token leaves a wrapper that exits on
+        # EOF with NO model child and NO candidate. Recovery must treat
+        # that attempt as unknowable-outcome (the no-candidate
+        # reconciliation block), never as a live-child case. The kill is
+        # DETERMINISTIC: a schema-CLI shim SIGKILLs the runner (its
+        # parent) the first time it validates canonical state carrying an
+        # in_flight record — that validation call sits strictly between
+        # the commit and GO.
+        shim = self.dir / "prego-kill-schema.py"
+        shim.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, signal, subprocess, sys\n"
+            f"REAL = {str(SCHEMA)!r}\n"
+            "MARK = os.environ.get('PREGO_KILL_MARK')\n"
+            "argv = sys.argv[1:]\n"
+            "target = argv[-1] if argv else ''\n"
+            "completed = subprocess.run([sys.executable, REAL, *argv],\n"
+            "    capture_output=True, text=True)\n"
+            "sys.stdout.write(completed.stdout)\n"
+            "sys.stderr.write(completed.stderr)\n"
+            "try:\n"
+            "    body = open(target, encoding='utf-8').read()\n"
+            "except OSError:\n"
+            "    body = ''\n"
+            "if (MARK and not os.path.exists(MARK)\n"
+            "        and target.endswith('workflow-state.local.md')\n"
+            "        and '    attempt_id:' in body):\n"
+            "    open(MARK, 'w').close()\n"
+            "    os.kill(os.getppid(), signal.SIGKILL)\n"
+            "sys.exit(completed.returncode)\n",
+            encoding="utf-8",
+        )
+        shim.chmod(0o755)
+        mark = self.dir / "prego-killed"
         env = dict(os.environ)
         env.update(
             {
                 "FAKE_MODE": "sleep",
                 "FAKE_SLEEP": "60",
                 "FAKE_ARGV_LOG": str(self.argv_log),
+                "PREGO_KILL_MARK": str(mark),
+                "MONITOR_RUNNER_UNCONTAINED_TEST_CHILD": "1",
+                "MONITOR_RUNNER_BIN_GH": str(self.fake_gh),
             }
         )
         first = subprocess.Popen(
             [
-                sys.executable,
-                "-I",
-                "-S",
-                str(RUNNER),
-                str(self.state),
-                "--slice-budget",
-                "600",
-                "--skill-dir",
-                str(SCRIPTS.parent),
-                "--claude-bin",
-                str(self.fake),
-                "--schema-cli",
-                str(SCHEMA),
+                sys.executable, "-I", "-S", str(RUNNER), str(self.state),
+                "--slice-budget", "600", "--skill-dir", str(SCRIPTS.parent),
+                "--claude-bin", str(self.fake),
+                "--schema-cli", str(shim),
             ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True,
         )
-        deadline = time.time() + 30
-        in_flight = None
-        while time.time() < deadline:
-            extract = self._extract()
-            block = extract.get("monitor_cli")
-            if isinstance(block, dict) and block.get("in_flight"):
-                in_flight = block["in_flight"]
-                break
-            time.sleep(0.5)
-        self.assertIsNotNone(in_flight, "runner never registered in_flight")
-        first.send_signal(signal.SIGKILL)
-        first.wait(timeout=30)
+        first.wait(timeout=60)
+        self.assertTrue(mark.exists(), "the shim never saw the in_flight commit")
+        self.assertFalse(
+            self.argv_log.exists(),
+            "the GO must never have been sent — this is the pre-GO window",
+        )
+        extract = self._extract()
+        in_flight = (extract.get("monitor_cli") or {}).get("in_flight")
+        self.assertIsNotNone(in_flight, "the write-ahead record must survive")
+        blocked = self._run(budget="365", timeout=60)
+        self.assertEqual(blocked.returncode, 5, blocked.stdout + blocked.stderr)
+        summary = self._summary(blocked)
+        self.assertIn("NO candidate", summary["reason"])
+        self.assertIn(in_flight["attempt_id"], summary["reason"])
+
+    def test_crash_recovery_blocks_on_live_child_then_reconciles(self) -> None:
+        # R5-2 (final): the runner has NO kill authority. A live recorded
+        # child blocks with exact manual instructions; once the child is
+        # gone (proven extinct), the next runner reconciles and proceeds.
+        # algo#1216 r19 F5: strand via the shared helper, which requires
+        # BOTH the in_flight record AND the argv-log launch evidence —
+        # in_flight alone commits BEFORE GO, and a kill in that window
+        # leaves no child, silently routing Phase 1 through the wrong
+        # (dead-group) recovery branch. The deliberate pre-GO case has its
+        # own regression below.
+        in_flight = self._strand_live_child()
         pgid = in_flight["child_pgid"]
         # Phase 1: live child => block with instructions, nothing signaled.
         blocked = self._run(budget="365", timeout=60)
