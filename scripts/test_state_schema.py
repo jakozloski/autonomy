@@ -4971,6 +4971,57 @@ class AppendAttemptTests(unittest.TestCase):
             with open(path, encoding="utf-8") as handle:
                 self.assertEqual(handle.read(), FULL_STATE)
 
+    # admin#1495 r19 F4: the replacement-lock swap regression spawns a
+    # REAL second process, so it lives in test_state_lock_races.py -
+    # this module calls the evaluate-named core API hundreds of times,
+    # and the vendored repos' security scan forbids pairing that name
+    # class with child-process spawning in one file (r32-r33 lesson).
+    def test_cli_pre_promotion_canonical_drift_aborts(self) -> None:
+        # admin#1495 r19 F4: the byte half of the pre-promotion pair.
+        # The lock pathname still names the held inode, but canonical
+        # bytes moved after the locked read (a writer that bypassed the
+        # lock protocol): promotion must abort nonzero and preserve the
+        # newer write - and with no drift the same flow still promotes.
+        real_fsync = os.fsync
+        drifted = append_attempt_key(FULL_STATE, "human:interloper")
+        seam = {"fired": False}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.md")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(FULL_STATE)
+
+            def drift_then_fsync(fd):
+                if not seam["fired"]:
+                    seam["fired"] = True
+                    with open(path, "w", encoding="utf-8") as handle:
+                        handle.write(drifted)
+                return real_fsync(fd)
+
+            out = io.StringIO()
+            with mock.patch("os.fsync", side_effect=drift_then_fsync):
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(
+                        _append_attempt_cli(path, "human:stash-restore"), 1
+                    )
+            self.assertTrue(seam["fired"])
+            self.assertIn("clobber the newer write", out.getvalue())
+            with open(path, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), drifted)
+            self.assertEqual(
+                [n for n in os.listdir(tmp) if ".append-attempt." in n], []
+            )
+            # Happy path through the same code: no drift this time, the
+            # pre-promotion checks pass and promotion lands the key.
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    _append_attempt_cli(path, "human:stash-restore"), 0
+                )
+            with open(path, encoding="utf-8") as handle:
+                final = handle.read()
+            self.assertIn('"human:interloper": 1', final)
+            self.assertIn('"human:stash-restore": 1', final)
+
     def test_cli_preplanted_temp_symlink_refused_and_preserved(self) -> None:
         # Unpredictable temp names close the pre-plant window; even with
         # the name known (uuid pinned), O_EXCL|O_NOFOLLOW refuses the
@@ -5813,6 +5864,36 @@ class R15SchemaClosureTests(unittest.TestCase):
         errors = self._errors(self._ac_state("met", "null", "complete"))
         self.assertFalse(
             any("requires nonempty evidence" in e for e in errors), errors
+        )
+
+
+class HandoffTargetsLeafParityTests(unittest.TestCase):
+    """admin#1495 r19 F7: state_schema cannot import the handoff_targets
+    leaf (the trusted-schema CLI feeds this module's source to a
+    `python -I -S -` child over stdin, so sibling imports are impossible),
+    so its boot-self-contained family copies are bound to the leaf HERE,
+    bidirectionally - nothing in the schema outside the leaf's vocabulary,
+    nothing in the leaf's vocabulary missing from the schema."""
+
+    def test_qa_families_match_the_leaf_bidirectionally(self) -> None:
+        import handoff_targets
+        from state_schema import QA_OPERATION_FAMILIES
+
+        self.assertEqual(
+            set(QA_OPERATION_FAMILIES),
+            set(handoff_targets.QA_REQUIRED_GITHUB_FAMILIES)
+            | set(handoff_targets.QA_REVIEWER_FAMILIES)
+            | set(handoff_targets.QA_LINEAR_OPERATION_FAMILIES),
+        )
+
+    def test_roundtrip_families_match_the_leaf_bidirectionally(self) -> None:
+        import handoff_targets
+        from state_schema import ROUNDTRIP_FAMILIES
+
+        self.assertEqual(
+            set(ROUNDTRIP_FAMILIES),
+            set(handoff_targets.ROUNDTRIP_HANDBACK_FAMILIES)
+            | set(handoff_targets.ROUNDTRIP_REVIEWER_FAMILIES),
         )
 
 

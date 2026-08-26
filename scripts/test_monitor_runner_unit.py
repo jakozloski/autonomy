@@ -1312,20 +1312,43 @@ class GitignoreArtifactShapeTests(unittest.TestCase):
 
 
 class MappedRepositoryParityTests(unittest.TestCase):
-    def test_manifest_matches_the_qa_owner_map(self) -> None:
-        # algo#1216 finding 3813491661: the runner is import-free of
-        # package modules, so its mapped-repository set restates the key
-        # set of handoff_decision.QA_OWNER_BY_REPOSITORY — that map is
-        # canonical, and this regression fails on any drift in either
-        # direction.
+    def test_membership_lives_once_in_the_targets_leaf(self) -> None:
+        # algo#1216 finding 3813491661, reworked by admin#1495 r19 F7:
+        # the membership set lives ONCE in handoff_targets; the runner
+        # and the planner's owner map both derive from it. The rebinds
+        # are pinned by IDENTITY - reverting either consumer to an
+        # independent literal yields a merely-equal object, so `is`
+        # fails while `==` would stay green.
         import handoff_decision
+        import handoff_targets
 
+        self.assertIs(
+            monitor_runner.MAPPED_QA_REPOSITORIES,
+            handoff_targets.LINEAR_MAPPED_REPOSITORY_IDENTITIES,
+        )
+        self.assertEqual(
+            set(handoff_decision.QA_OWNER_BY_REPOSITORY),
+            set(handoff_targets.LINEAR_MAPPED_REPOSITORIES),
+        )
         self.assertEqual(
             monitor_runner.MAPPED_QA_REPOSITORIES,
             {
                 key.casefold()
                 for key in handoff_decision.QA_OWNER_BY_REPOSITORY
             },
+        )
+        # Literal membership pin: with every consumer deriving from the
+        # leaf, a leaf edit would otherwise ripple through the package
+        # with no failing test. A deliberate membership change updates
+        # this literal in the same commit.
+        self.assertEqual(
+            handoff_targets.LINEAR_MAPPED_REPOSITORIES,
+            (
+                "Keeper-Dating/admin-portal",
+                "Keeper-Dating/calculator-api",
+                "Keeper-Dating/keeper-lead-generator",
+                "Keeper-Dating/matchmaking",
+            ),
         )
 
     def test_origin_url_parsing_covers_the_three_git_shapes(self) -> None:
@@ -1907,10 +1930,10 @@ class CapabilityGrammarTests(unittest.TestCase):
     def test_probe_timeout_blocks_fail_closed(self) -> None:
         # admin#1495 r14 F9's "timeout" output: a hung `mcp list` proves
         # nothing — no family is granted and the probe blocks. r17 F7:
-        # the probe is armed by the launch extract's resolved targets
-        # (a targetless extract would skip it); r17 F5: the managed seam
-        # points at an absent file so a real host-managed policy cannot
-        # leak into the fixture.
+        # the resolved plan below arms the manifest half of the probe
+        # (and r19 F3: the mapped binding arms the class half even
+        # without it); r17 F5: the managed seam points at an absent file
+        # so a real host-managed policy cannot leak into the fixture.
         runner = _runner("claude-opus-5", None)
         runner.repository_hint = "keeper-dating/matchmaking"
         with tempfile.TemporaryDirectory() as tmp:
@@ -1947,6 +1970,130 @@ class CapabilityGrammarTests(unittest.TestCase):
                     )
         self.assertEqual(caught.exception.code, 5)
         self.assertIn("no CONNECTED MCP row", caught.exception.reason)
+
+
+class RepositoryClassCapabilityTests(unittest.TestCase):
+    """admin#1495 r19 F3: the class half of the capability preflight -
+    a mapped repository can mint GitHub+Linear work mid-slice and any
+    other Keeper repository can mint GitHub handback/review work, so
+    both are probed even when the launch resolved no targets; only a
+    non-Keeper or unresolved binding truly skips."""
+
+    def test_class_capability_matrix(self) -> None:
+        for bound, expected in (
+            ("keeper-dating/matchmaking", {"github", "linear"}),
+            ("Keeper-Dating/Matchmaking", {"github", "linear"}),
+            ("keeper-dating/admin-portal", {"github", "linear"}),
+            ("keeper-dating/algo", {"github"}),
+            ("Keeper-Dating/ALGO", {"github"}),
+            ("someone-else/sandbox", set()),
+            ("", set()),
+            (None, set()),
+            (7, set()),
+        ):
+            with self.subTest(bound=bound):
+                self.assertEqual(
+                    monitor_runner._repository_class_capabilities(bound),
+                    frozenset(expected),
+                )
+
+    def test_probe_requirement_unions_manifest_and_class(self) -> None:
+        required = monitor_runner._probe_required_capabilities
+        empty = frozenset()
+        review_only = frozenset((monitor_runner._QA_TARGET_GITHUB_REVIEW,))
+        handback_only = frozenset(
+            (monitor_runner._QA_TARGET_GITHUB_HANDBACK,)
+        )
+        # the F3 escape's arming half: a mapped TARGETLESS launch probes
+        # github+linear; an unmapped-Keeper one probes github.
+        self.assertEqual(
+            required("keeper-dating/matchmaking", empty),
+            frozenset({"github", "linear"}),
+        )
+        self.assertEqual(
+            required("keeper-dating/algo", empty), frozenset({"github"})
+        )
+        # only a non-Keeper or unresolved binding truly skips.
+        self.assertEqual(required("someone-else/sandbox", empty), empty)
+        self.assertEqual(required(None, empty), empty)
+        # the manifest half survives unchanged for non-Keeper bindings
+        # with resolved targets (finding 3825265272).
+        self.assertEqual(
+            required("someone-else/sandbox", review_only),
+            frozenset({"github"}),
+        )
+        # the class floor never shrinks a manifest requirement, and a
+        # mapped github-only manifest still probes linear.
+        self.assertEqual(
+            required("keeper-dating/matchmaking", handback_only),
+            frozenset({"github", "linear"}),
+        )
+
+    def test_mapped_targetless_launch_probes_and_blocks_bare(self) -> None:
+        # admin#1495 r19 F3, the finding's exact escape pinned at the
+        # probe boundary: BEFORE any targetless child starts on a mapped
+        # binding, github AND linear must be proven. A child that could
+        # resolve GitHub/Linear work mid-slice and record those handoffs
+        # failed (failed aggregates are terminal-compatible, so the
+        # launch-derived terminal gates never see it) therefore never
+        # launches over a bare surface - the probe blocks first, with
+        # the launch still targetless (the persisted manifest stays
+        # empty, proving the block came from the class floor).
+        runner = _runner("claude-opus-5", None)
+        runner.repository_hint = "keeper-dating/matchmaking"
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Path(tmp) / "settings.json"
+            settings.write_text("{}", encoding="utf-8")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "MONITOR_RUNNER_USER_SETTINGS": str(settings),
+                    "MONITOR_RUNNER_MANAGED_SETTINGS": str(
+                        Path(tmp) / "managed-absent.json"
+                    ),
+                },
+            ), mock.patch.object(
+                monitor_runner.subprocess,
+                "run",
+                side_effect=monitor_runner.subprocess.TimeoutExpired(
+                    cmd="mcp list", timeout=30
+                ),
+            ):
+                with self.assertRaises(RunnerExit) as caught:
+                    runner._child_capability_probe(
+                        {
+                            "monitor_cli": {},
+                            "handoff_operations": {
+                                "qa": [],
+                                "review_roundtrip": [],
+                            },
+                        }
+                    )
+        self.assertEqual(caught.exception.code, 5)
+        self.assertIn("github: no CONNECTED MCP row", caught.exception.reason)
+        self.assertIn("linear: no CONNECTED MCP row", caught.exception.reason)
+        self.assertIn("none yet", caught.exception.reason)
+        self.assertEqual(runner.target_manifest, frozenset())
+
+    def test_non_keeper_targetless_launch_skips_the_probe(self) -> None:
+        # the preserved idle-run liveness trade-off, now scoped to the
+        # one class whose repository can mint no Keeper handoff surface:
+        # the probe returns before resolving settings or spawning any
+        # subprocess (the side_effect would explode otherwise).
+        runner = _runner("claude-opus-5", None)
+        runner.repository_hint = "someone-else/sandbox"
+        with mock.patch.object(
+            monitor_runner.subprocess,
+            "run",
+            side_effect=AssertionError("the skipped probe must not spawn"),
+        ):
+            runner._child_capability_probe(
+                {
+                    "monitor_cli": {},
+                    "handoff_operations": {"qa": [], "review_roundtrip": []},
+                }
+            )
+        self.assertEqual(runner.target_manifest, frozenset())
 
 
 class R15RunnerCorrectnessTests(unittest.TestCase):
@@ -2761,38 +2908,546 @@ class QaManifestViolationTests(unittest.TestCase):
             self._extract(self.FULL[:1])))
         self.assertIsNone(self._violation([], status="idle"))
 
-    def test_manifest_table_matches_the_planner(self) -> None:
-        # single-source parity: the runner's family table must mint the
-        # SAME families as a real full plan from handoff_decision.
-        import handoff_decision as hd
-        req = {
+    # test_manifest_table_matches_the_planner (r15 F17) was REPLACED by
+    # HandoffTargetLeafParityTests below (admin#1495 r19 F7): it compared
+    # one plan with subset assertions, and its fixture omitted
+    # issue_tracker.type, so the Linear branch never executed and the
+    # leg-shape assertion was vacuous - exactly the drift window the
+    # finding names.
+
+
+class ReviewerFloorTests(unittest.TestCase):
+    """admin#1495 r19 F8: the launch-planned reviewer request/verify
+    operation IDs are an immutable per-slice floor across qa and
+    review_roundtrip - terminal evidence is required for EVERY ID, and a
+    differing reviewer op set (dropped reviewer, substituted family,
+    changed login) rejects toward a slice-boundary replan."""
+
+    _G = "g0123456789ab"
+    _QA_REVIEWERS = [
+        f"qa.github.request_review:tjkeeper:{_G}",
+        f"qa.github.verify_review_request:tjkeeper:{_G}",
+        f"qa.github.request_review:motykadaw:{_G}",
+        f"qa.github.verify_review_request:motykadaw:{_G}",
+    ]
+    _QA_HANDBACK = [
+        f"qa.github.replace_assignees:{_G}",
+        f"qa.github.verify_assignees:{_G}",
+    ]
+    _ROUNDTRIP_REVIEWERS = [
+        f"roundtrip.github.request_review:motykadaw:{_G}",
+        f"roundtrip.github.verify_review_request:motykadaw:{_G}",
+    ]
+
+    @staticmethod
+    def _extract(qa_ops=(), roundtrip_ops=(), results=None, status="pending"):
+        ops = {"qa": list(qa_ops), "review_roundtrip": list(roundtrip_ops)}
+        if results is None:
+            results = {
+                kind: {op: "complete" for op in kind_ops}
+                for kind, kind_ops in ops.items()
+            }
+        return {
+            "handoff_status_by_kind": {"qa": status},
+            "handoff_operations": ops,
+            "handoff_results": results,
+        }
+
+    def test_floor_collects_reviewer_ids_per_kind(self) -> None:
+        floor = monitor_runner._launch_reviewer_floor(
+            self._extract(
+                self._QA_REVIEWERS + self._QA_HANDBACK,
+                self._ROUNDTRIP_REVIEWERS,
+            )
+        )
+        # handback ops never enter the floor; reviewer ids do, per kind.
+        self.assertEqual(
+            floor,
+            {
+                "qa": frozenset(self._QA_REVIEWERS),
+                "review_roundtrip": frozenset(self._ROUNDTRIP_REVIEWERS),
+            },
+        )
+        self.assertEqual(
+            monitor_runner._launch_reviewer_floor(self._extract()), {}
+        )
+        self.assertEqual(monitor_runner._launch_reviewer_floor({}), {})
+
+    def test_matching_full_set_accepts(self) -> None:
+        launch = self._extract(
+            self._QA_REVIEWERS + self._QA_HANDBACK, self._ROUNDTRIP_REVIEWERS
+        )
+        candidate = self._extract(
+            self._QA_REVIEWERS + self._QA_HANDBACK, self._ROUNDTRIP_REVIEWERS
+        )
+        self.assertIsNone(
+            monitor_runner._reviewer_floor_violation(launch, candidate)
+        )
+
+    def test_multi_reviewer_omission_rejects(self) -> None:
+        # two reviewers planned at launch; the terminal candidate carries
+        # only one reviewer's pair (plus the full handback) - the omitted
+        # identity's IDs are named.
+        launch = self._extract(self._QA_REVIEWERS + self._QA_HANDBACK)
+        candidate = self._extract(
+            self._QA_REVIEWERS[:2] + self._QA_HANDBACK
+        )
+        violation = monitor_runner._reviewer_floor_violation(
+            launch, candidate
+        )
+        self.assertIsNotNone(violation)
+        self.assertIn("motykadaw", violation)
+        self.assertIn("slice boundary", violation)
+
+    def test_family_substitution_rejects(self) -> None:
+        # the finding's exact shape: a reviewer-only launch whose terminal
+        # candidate carries ONLY an assignee replacement - recorded,
+        # single-generation, non-idle - while every planned reviewer
+        # request and verification is omitted.
+        launch = self._extract(self._QA_REVIEWERS)
+        candidate = self._extract(self._QA_HANDBACK)
+        violation = monitor_runner._reviewer_floor_violation(
+            launch, candidate
+        )
+        self.assertIsNotNone(violation)
+        self.assertIn("qa reviewer operations differ", violation)
+
+    def test_changed_login_rejects(self) -> None:
+        # a re-minted generation carrying a different login satisfies the
+        # single-generation and recorded-result checks; the ID-exact floor
+        # rejects it (the launch identities are gone, the new ones were
+        # never launch-planned).
+        swapped = [
+            "qa.github.request_review:shafqatukhan:gbbbbbbbbbbbb",
+            "qa.github.verify_review_request:shafqatukhan:gbbbbbbbbbbbb",
+        ]
+        launch = self._extract(self._QA_REVIEWERS[:2])
+        candidate = self._extract(swapped)
+        violation = monitor_runner._reviewer_floor_violation(
+            launch, candidate
+        )
+        self.assertIsNotNone(violation)
+        self.assertIn("tjkeeper", violation)
+        self.assertIn("shafqatukhan", violation)
+
+    def test_unrecorded_result_rejects(self) -> None:
+        ops = self._QA_REVIEWERS[:2]
+        launch = self._extract(ops)
+        candidate = self._extract(
+            ops, results={"qa": {ops[0]: "complete"}, "review_roundtrip": {}}
+        )
+        violation = monitor_runner._reviewer_floor_violation(
+            launch, candidate
+        )
+        self.assertIsNotNone(violation)
+        self.assertIn("without recorded results", violation)
+        self.assertIn(ops[1], violation)
+
+    def test_empty_floor_imposes_nothing(self) -> None:
+        # a launch with no planned reviewer operations is unchanged: the
+        # planner may legitimately mint reviewer ops mid-slice (they
+        # become the NEXT launch's floor via the non-terminal commit).
+        launch = self._extract(self._QA_HANDBACK)
+        candidate = self._extract(self._QA_HANDBACK + self._QA_REVIEWERS)
+        self.assertIsNone(
+            monitor_runner._reviewer_floor_violation(launch, candidate)
+        )
+
+    def test_roundtrip_leg_is_floored(self) -> None:
+        # review_roundtrip is covered by the same floor - a candidate
+        # that empties the roundtrip reviewer plan while keeping qa
+        # intact still rejects.
+        launch = self._extract(self._QA_HANDBACK, self._ROUNDTRIP_REVIEWERS)
+        candidate = self._extract(self._QA_HANDBACK)
+        violation = monitor_runner._reviewer_floor_violation(
+            launch, candidate
+        )
+        self.assertIsNotNone(violation)
+        self.assertIn("review_roundtrip reviewer operations", violation)
+
+    def test_idle_qa_defers_to_the_planned_qa_gate(self) -> None:
+        # division of labor (mirroring the coverage audit): an idle or
+        # absent qa aggregate is the planned-QA gate's case - a qa
+        # reviewer floor implies the github-review manifest family, so
+        # that gate already rejects the idle terminal. The floor stays
+        # silent for qa there, but review_roundtrip has no such gate and
+        # never defers.
+        launch = self._extract(self._QA_REVIEWERS, self._ROUNDTRIP_REVIEWERS)
+        idle_candidate = self._extract(status="idle")
+        violation = monitor_runner._reviewer_floor_violation(
+            launch, idle_candidate
+        )
+        self.assertIsNotNone(violation)
+        self.assertIn("review_roundtrip reviewer operations", violation)
+        qa_only_launch = self._extract(self._QA_REVIEWERS)
+        self.assertIsNone(
+            monitor_runner._reviewer_floor_violation(
+                qa_only_launch, self._extract(status="idle")
+            )
+        )
+        # the owning gate rejects that idle terminal: the reviewer plan
+        # derives the github-review family into the manifest.
+        manifest = monitor_runner._qa_target_manifest(
+            "keeper-dating/algo", qa_only_launch
+        )
+        self.assertIn(monitor_runner._QA_TARGET_GITHUB_REVIEW, manifest)
+        self.assertIs(
+            monitor_runner._manifest_missing_planned_qa(manifest, "idle"),
+            True,
+        )
+
+    def test_wired_into_the_terminal_gate(self) -> None:
+        # the floor runs inside _qa_manifest_violation, ahead of the
+        # family-coverage audit, for the exact substitution shape; a
+        # floor-satisfying reviewer-only candidate still falls through
+        # to the audit and passes clean.
+        runner = _runner("claude-opus-5", None)
+        launch = self._extract(self._QA_REVIEWERS)
+        self.assertIn(
+            "reviewer operations differ",
+            runner._qa_manifest_violation(
+                "Keeper-Dating/algo", launch, self._extract(self._QA_HANDBACK)
+            ),
+        )
+        self.assertIsNone(
+            runner._qa_manifest_violation(
+                "Keeper-Dating/algo", launch, self._extract(self._QA_REVIEWERS)
+            )
+        )
+
+
+class HandoffTargetLeafParityTests(unittest.TestCase):
+    """admin#1495 r19 F7: bidirectional parity per shape class - the
+    planner's actually-minted operation families, the leaf's declared
+    shapes, and what the runner's gates require must agree for mapped,
+    unmapped-Keeper, reviewer-only, roundtrip, and every Linear outage
+    shape. Both directions: no plan mints a family outside the leaf's
+    vocabulary, and nothing in the vocabulary is unmintable (the union
+    of these real plans covers it exactly)."""
+
+    maxDiff = None
+
+    @staticmethod
+    def _families(plan):
+        return {
+            op["id"].rpartition(":")[0].split(":", 1)[0]
+            for op in plan["operations"]
+        }
+
+    @staticmethod
+    def _mapped_request(code_reviewers=(), **tracker_overrides):
+        tracker = {
+            "type": "linear",
+            "ticket_validated": True,
+            "ticket_identifier": "WEB-953",
+            "ticket_provider_id": "prov-web-953",
+            "write_path": "environment_tool",
+            "qa_assignee": {
+                "provider_id": "4d5aed4e-076c-47e5-94a1-0a39287364e1",
+                "name": "Timothy Jhon Pascual",
+            },
+            "qa_state": {"name": "Vercel Preview QA"},
+        }
+        tracker.update(tracker_overrides)
+        return {
             "scenario": "clean_unapproved",
             "repository": {"nameWithOwner": "Keeper-Dating/matchmaking"},
             "pull_request_number": 7,
             "authenticated_actor": "jakozloski",
             "existing_assignees": ["jakozloski"],
-            "code_reviewers": [],
-            "issue_tracker": {
-                "ticket_identifier": "ADM-953",
-                "ticket_provider_id": "abc",
-                "write_path": "local_api",
-                "qa_assignee": {"provider_id": "qa-1"},
-                "qa_state": {"provider_id": "st-1"},
+            "code_reviewers": list(code_reviewers),
+            "issue_tracker": tracker,
+        }
+
+    def _pending_plan(self, request):
+        import handoff_decision as hd
+
+        plan = hd.plan_handoff(request)
+        self.assertEqual(plan["state"], "pending", plan["errors"])
+        return plan
+
+    def _runner_accepts_exactly(self, repo, qa_ops=(), roundtrip_ops=()):
+        """The runner-required side: a launch that persisted exactly the
+        planner's operations derives its manifest from them, and a
+        terminal candidate carrying exactly those operations with
+        recorded results satisfies both terminal floors - while
+        dropping any one operation violates one of them."""
+
+        extract = {
+            "handoff_status_by_kind": {"qa": "pending"},
+            "handoff_operations": {
+                "qa": list(qa_ops),
+                "review_roundtrip": list(roundtrip_ops),
+            },
+            "handoff_results": {
+                "qa": {op: "complete" for op in qa_ops},
+                "review_roundtrip": {op: "complete" for op in roundtrip_ops},
             },
         }
-        plan = hd.plan_handoff(req)
-        self.assertEqual(plan["state"], "pending", plan["errors"])
-        families = {
-            op["id"].rpartition(":")[0].split(":", 1)[0]
-            for op in plan["operations"]
-        }
-        github = {f for f in families if f.startswith("qa.github.")}
-        linear = {f for f in families if f.startswith("qa.linear.")}
-        self.assertTrue(monitor_runner._QA_REQUIRED_GITHUB_FAMILIES <= github)
-        if linear:
-            self.assertIn(
-                frozenset(linear), monitor_runner._QA_LINEAR_LEG_SHAPES
+        manifest = monitor_runner._qa_target_manifest(repo, extract)
+        self.assertIsNone(
+            monitor_runner._qa_manifest_coverage_violation(manifest, extract)
+        )
+        self.assertIsNone(
+            monitor_runner._reviewer_floor_violation(extract, extract)
+        )
+        for index in range(len(qa_ops)):
+            mutated_ops = dict(extract["handoff_operations"])
+            mutated_ops["qa"] = [
+                op for position, op in enumerate(qa_ops) if position != index
+            ]
+            mutated = {**extract, "handoff_operations": mutated_ops}
+            self.assertTrue(
+                monitor_runner._qa_manifest_coverage_violation(
+                    manifest, mutated
+                )
+                is not None
+                or monitor_runner._reviewer_floor_violation(extract, mutated)
+                is not None,
+                f"dropping {qa_ops[index]} must violate a terminal floor",
             )
+
+    def test_mapped_full_chain_shape(self) -> None:
+        plan = self._pending_plan(self._mapped_request())
+        import handoff_targets
+
+        self.assertEqual(
+            self._families(plan),
+            handoff_targets.QA_REQUIRED_GITHUB_FAMILIES
+            | handoff_targets.QA_LINEAR_LEG_SHAPES[0],
+        )
+        self._runner_accepts_exactly(
+            "Keeper-Dating/matchmaking",
+            [op["id"] for op in plan["operations"]],
+        )
+
+    def test_mapped_runtime_outage_shape(self) -> None:
+        # write_path "none": the planner records the runtime outage
+        # instead of the Linear chain - the leaf's second leg shape.
+        plan = self._pending_plan(self._mapped_request(write_path="none"))
+        import handoff_targets
+
+        self.assertEqual(
+            self._families(plan),
+            handoff_targets.QA_REQUIRED_GITHUB_FAMILIES
+            | handoff_targets.QA_LINEAR_LEG_SHAPES[1],
+        )
+        self._runner_accepts_exactly(
+            "Keeper-Dating/matchmaking",
+            [op["id"] for op in plan["operations"]],
+        )
+
+    def test_mapped_state_outage_shape(self) -> None:
+        # an unresolved workflow state with a recorded reason: the assign
+        # chain plus the state-outage record - the leaf's third leg shape.
+        plan = self._pending_plan(
+            self._mapped_request(
+                qa_state=None,
+                qa_state_unresolved_reason="state listing unavailable",
+            )
+        )
+        import handoff_targets
+
+        self.assertEqual(
+            self._families(plan),
+            handoff_targets.QA_REQUIRED_GITHUB_FAMILIES
+            | handoff_targets.QA_LINEAR_LEG_SHAPES[2],
+        )
+        self._runner_accepts_exactly(
+            "Keeper-Dating/matchmaking",
+            [op["id"] for op in plan["operations"]],
+        )
+
+    def test_mapped_with_reviewers_adds_the_reviewer_families(self) -> None:
+        plan = self._pending_plan(
+            self._mapped_request(code_reviewers=("motykadaw",))
+        )
+        import handoff_targets
+
+        self.assertEqual(
+            self._families(plan),
+            handoff_targets.QA_REQUIRED_GITHUB_FAMILIES
+            | handoff_targets.QA_REVIEWER_FAMILIES
+            | handoff_targets.QA_LINEAR_LEG_SHAPES[0],
+        )
+        self._runner_accepts_exactly(
+            "Keeper-Dating/matchmaking",
+            [op["id"] for op in plan["operations"]],
+        )
+
+    def test_unmapped_keeper_shape(self) -> None:
+        # an unmapped Keeper repository plans the universal handback and
+        # nothing Linear, whatever tracker facts ride along.
+        plan = self._pending_plan(
+            {
+                "scenario": "clean_unapproved",
+                "repository": {"nameWithOwner": "Keeper-Dating/algo"},
+                "pull_request_number": 7,
+                "authenticated_actor": "jakozloski",
+                "existing_assignees": ["jakozloski"],
+                "ball_holder": "michal-janicki",
+                "code_reviewers": [],
+            }
+        )
+        import handoff_targets
+
+        self.assertEqual(
+            self._families(plan),
+            handoff_targets.QA_REQUIRED_GITHUB_FAMILIES,
+        )
+        self._runner_accepts_exactly(
+            "Keeper-Dating/algo", [op["id"] for op in plan["operations"]]
+        )
+
+    def test_reviewer_only_shape(self) -> None:
+        # no ball holder resolves: reviewer request/verify pairs mint with
+        # no assignee transfer (surfaced as a warning) - the shape whose
+        # terminal omission r19 F8 floors.
+        import handoff_decision as hd
+        import handoff_targets
+
+        plan = hd.plan_handoff(
+            {
+                "scenario": "clean_unapproved",
+                "repository": {"nameWithOwner": "someone-else/sandbox"},
+                "pull_request_number": 7,
+                "authenticated_actor": "jakozloski",
+                "existing_assignees": ["jakozloski"],
+                "code_reviewers": ["motykadaw"],
+            }
+        )
+        self.assertEqual(plan["state"], "pending", plan["errors"])
+        self.assertTrue(plan["warnings"], plan)
+        self.assertEqual(
+            self._families(plan), handoff_targets.QA_REVIEWER_FAMILIES
+        )
+        self._runner_accepts_exactly(
+            "someone-else/sandbox", [op["id"] for op in plan["operations"]]
+        )
+
+    def test_roundtrip_shape(self) -> None:
+        import handoff_targets
+
+        plan = self._pending_plan(
+            {
+                "scenario": "human_review_roundtrip",
+                "repository": {"nameWithOwner": "Keeper-Dating/matchmaking"},
+                "pull_request_number": 7,
+                "authenticated_actor": "jakozloski",
+                "existing_assignees": ["jakozloski"],
+                "reviewers": [
+                    {
+                        "login": "motykadaw",
+                        "account_type": "User",
+                        "deleted": False,
+                        "review_bodies": {
+                            "review-1": {
+                                "updated_at": "2026-07-09T20:09:07Z",
+                                "evaluated_updated_at": "2026-07-09T20:09:07Z",
+                                "evaluated_at": "2026-07-09T20:09:07Z",
+                                "acknowledgment_id": "ack-1",
+                                "acknowledgment_author": "jakozloski",
+                            }
+                        },
+                        "inline_roots": {},
+                        "current_review_body_ids": ["review-1"],
+                        "current_inline_root_ids": [],
+                        "fix_shas": [],
+                        "pushed_fix_shas": [],
+                        "blocker_remaining": False,
+                    }
+                ],
+            }
+        )
+        self.assertEqual(
+            self._families(plan),
+            handoff_targets.ROUNDTRIP_REVIEWER_FAMILIES
+            | handoff_targets.ROUNDTRIP_HANDBACK_FAMILIES,
+        )
+        # runner side for the roundtrip kind: the reviewer floor holds the
+        # minted request/verify IDs and rejects their omission.
+        roundtrip_ids = [op["id"] for op in plan["operations"]]
+        launch = {
+            "handoff_operations": {"qa": [], "review_roundtrip": roundtrip_ids}
+        }
+        floor = monitor_runner._launch_reviewer_floor(launch)
+        self.assertEqual(
+            floor,
+            {
+                "review_roundtrip": frozenset(
+                    op_id
+                    for op_id in roundtrip_ids
+                    if op_id.rpartition(":")[0].split(":", 1)[0]
+                    in handoff_targets.ROUNDTRIP_REVIEWER_FAMILIES
+                )
+            },
+        )
+        self.assertIsNotNone(
+            monitor_runner._reviewer_floor_violation(
+                launch,
+                {
+                    "handoff_operations": {"qa": [], "review_roundtrip": []},
+                    "handoff_results": {},
+                },
+            )
+        )
+
+    def test_vocabulary_is_exactly_mintable(self) -> None:
+        # the reverse direction: the union of the families these REAL
+        # plans mint equals the leaf's whole declared vocabulary - no
+        # leaf entry the planner cannot produce, no minted family the
+        # leaf does not declare.
+        import handoff_decision as hd
+        import handoff_targets
+
+        minted: set[str] = set()
+        for request in (
+            self._mapped_request(code_reviewers=("motykadaw",)),
+            self._mapped_request(write_path="none"),
+            self._mapped_request(
+                qa_state=None,
+                qa_state_unresolved_reason="state listing unavailable",
+            ),
+        ):
+            minted |= self._families(self._pending_plan(request))
+        roundtrip_request = {
+            "scenario": "human_review_roundtrip",
+            "repository": {"nameWithOwner": "Keeper-Dating/matchmaking"},
+            "pull_request_number": 7,
+            "authenticated_actor": "jakozloski",
+            "existing_assignees": ["jakozloski"],
+            "reviewers": [
+                {
+                    "login": "motykadaw",
+                    "account_type": "User",
+                    "deleted": False,
+                    "review_bodies": {
+                        "review-1": {
+                            "updated_at": "2026-07-09T20:09:07Z",
+                            "evaluated_updated_at": "2026-07-09T20:09:07Z",
+                            "evaluated_at": "2026-07-09T20:09:07Z",
+                            "acknowledgment_id": "ack-1",
+                            "acknowledgment_author": "jakozloski",
+                        }
+                    },
+                    "inline_roots": {},
+                    "current_review_body_ids": ["review-1"],
+                    "current_inline_root_ids": [],
+                    "fix_shas": [],
+                    "pushed_fix_shas": [],
+                    "blocker_remaining": False,
+                }
+            ],
+        }
+        minted |= self._families(self._pending_plan(roundtrip_request))
+        self.assertEqual(
+            minted,
+            handoff_targets.QA_REQUIRED_GITHUB_FAMILIES
+            | handoff_targets.QA_REVIEWER_FAMILIES
+            | handoff_targets.QA_LINEAR_OPERATION_FAMILIES
+            | handoff_targets.ROUNDTRIP_HANDBACK_FAMILIES
+            | handoff_targets.ROUNDTRIP_REVIEWER_FAMILIES,
+        )
 
 
 class ClassificationFingerprintTests(unittest.TestCase):

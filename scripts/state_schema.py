@@ -219,6 +219,14 @@ GENERATION_SCOPED_ID = re.compile(
 # Pass-4 codex F1: identity is ARITY-CHECKED per family, not globally optional -
 # `qa.github.replace_assignees:bogus:g<current>` parsed as a well-formed id under
 # the optional grammar and pruned as history while the real operation re-queued.
+# admin#1495 r19 F7: the family NAMES are owned by scripts/handoff_targets.py
+# (the evaluator-free leaf the planner and runner import). This module cannot
+# import it - the trusted-schema CLI feeds THIS file's source to a
+# `python -I -S -` child over stdin, so sibling imports are impossible and
+# "state_schema imports only stdlib" is load-bearing. The copies below are the
+# boot-self-contained restatement, bound to the leaf by test_state_schema's
+# bidirectional parity pins; the bool values (identity arity) stay
+# schema-owned.
 QA_OPERATION_FAMILIES = {
     "qa.github.replace_assignees": False,
     "qa.github.verify_assignees": False,
@@ -4569,7 +4577,19 @@ def _append_attempt_cli(path: str, key: str) -> int:
     """CLI glue for ``--append-attempt``: lock-probe, validate, atomic
     replace. Restricted to ``human:*`` keys — those are the presence-fired
     durable blocker records this persist call exists for; anything wider
-    would turn a narrow persist helper into a general state mutator."""
+    would turn a narrow persist helper into a general state mutator.
+
+    admin#1495 r19 F4: acquisition-time inode validation is not
+    sufficient by itself - it only proves the lock pathname named the
+    held inode at acquisition. A later swap of the pathname
+    (unlink+recreate or rename-over) orphans the held inode and hands a
+    replacement lock to a second writer, so immediately before
+    promotion this helper re-verifies the pair: the lock pathname must
+    still stat to the held descriptor's (st_dev, st_ino), and canonical
+    bytes must still equal the snapshot read at entry. Either mismatch
+    aborts nonzero with canonical state untouched - the stale-promote
+    window shrinks from the whole mutation to the final
+    check-to-replace gap, and the caller re-reads and retries."""
 
     def _refuse(errors: list[str]) -> int:
         print(
@@ -4683,6 +4703,52 @@ def _append_attempt_cli(path: str, key: str) -> int:
                 os.fsync(tmp_fd)
             finally:
                 os.close(tmp_fd)
+            # admin#1495 r19 F4: the acquisition-loop validation above
+            # only proves the lock pathname named the held inode THEN.
+            # An unlink+recreate (or rename-over) of the pathname after
+            # the state read orphans the held inode: a second writer
+            # locks the REPLACEMENT, passes its own validation, and
+            # rewrites canonical state while this call still trusts a
+            # stale snapshot. Re-verify both halves as the last step
+            # before promotion - the pathname must still stat to the
+            # held descriptor, and canonical bytes must still equal the
+            # entry snapshot. Either mismatch aborts with canonical
+            # state untouched so the winner's write survives and the
+            # caller can re-read and retry.
+            held_stat = os.fstat(lock_fd)
+            try:
+                relock_stat = os.stat(lock_path, follow_symlinks=False)
+            except OSError:
+                relock_stat = None
+            if relock_stat is None or (
+                relock_stat.st_ino,
+                relock_stat.st_dev,
+            ) != (held_stat.st_ino, held_stat.st_dev):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                return _refuse(
+                    ["the runner lock was swapped after acquisition -"
+                     " a replacement-lock writer may own canonical"
+                     " state now; canonical state untouched - re-read"
+                     " and retry"]
+                )
+            try:
+                reread = _read_state_file(path)
+            except (OSError, UnicodeDecodeError):
+                reread = None
+            if reread != text:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                return _refuse(
+                    ["canonical state no longer matches the snapshot"
+                     " read under the lock - promoting would clobber"
+                     " the newer write; canonical state untouched -"
+                     " re-read and retry"]
+                )
             os.replace(tmp_path, path)
             replaced = True
             dir_fd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)

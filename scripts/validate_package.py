@@ -63,6 +63,11 @@ REQUIRED_REFERENCE_FILES = (
 )
 REQUIRED_SCRIPT_FILES = (
     "scripts/handoff_decision.py",
+    # admin#1495 r19 F7: the evaluator-free target/family leaf the planner
+    # and runner import at boot - a copy missing it would pass validation
+    # and fail only at import time, so it is inventoried like every other
+    # load-bearing script.
+    "scripts/handoff_targets.py",
     "scripts/model_policy.py",
     "scripts/state_schema.py",
     "scripts/validate_package.py",
@@ -70,6 +75,11 @@ REQUIRED_SCRIPT_FILES = (
     "scripts/test_model_policy.py",
     "scripts/test_model_policy_supervision.py",
     "scripts/test_state_schema.py",
+    # admin#1495 r19 F4: the cross-process lock-race regression lives in
+    # its own module because it spawns a real child while
+    # test_state_schema.py calls the evaluate-named core API - the
+    # security scan forbids pairing those in one file (r32-r33 lesson).
+    "scripts/test_state_lock_races.py",
     "scripts/test_validate_package.py",
     "scripts/test_cli_fail_closed.py",
     "scripts/monitor_runner.py",

@@ -183,6 +183,19 @@ class HandoffDecisionTest(unittest.TestCase):
             },
         )
 
+    def test_qa_repository_membership_derives_from_the_targets_leaf(self) -> None:
+        # admin#1495 r19 F7: the Linear-mapped MEMBERSHIP lives once in
+        # handoff_targets; this module keeps owner-VALUE authority and
+        # derives its key set (and iteration order) from the leaf. The
+        # literal test above still pins the complete map, so a leaf edit
+        # cannot silently reshape routing.
+        import handoff_targets
+
+        self.assertEqual(
+            tuple(QA_OWNER_BY_REPOSITORY),
+            handoff_targets.LINEAR_MAPPED_REPOSITORIES,
+        )
+
     def test_approved_qa_plans_exact_replacement_then_linear_assignment(self) -> None:
         request = {
             "scenario": "approved_qa",

@@ -1313,8 +1313,8 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         # the mapped repository for the second run — where the entry
         # gates fire. r17 F7: the second run's launch state carries a
         # resolved Linear-bearing plan, so the capability gate is ARMED
-        # (a targetless launch would skip it) - and the live-child report
-        # must still outrank it.
+        # (r19 F3: the mapped binding alone would arm it too) - and the
+        # live-child report must still outrank it.
         in_flight = self._strand_live_child()
         self._bind_origin("git@github.com:Keeper-Dating/matchmaking.git")
         self._seed_resolved_qa_plan("Keeper-Dating/matchmaking", linear=True)
@@ -2601,14 +2601,16 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         # algo#1216 finding 3813491661's scenario (a Keeper-mapped run whose
         # QA handoff aggregate is idle) is now PREEMPTED by the r18 F5
         # universal containment gate on a non-delegating host: the
-        # capability probe SKIPS (admin#1495 r17 F7 - this launch resolved
-        # no targets, so no capability surface is required yet), and the
-        # Keeper-bound write-capable launch is refused BEFORE any child
-        # runs — the harness's test-child attestation never applies to
-        # Keeper repositories — so the manifest-level ``handoff_missing``
-        # rejection is never reached through this path. The manifest
-        # predicate itself is pinned below the gate by
-        # TerminalPlannedQaTests in test_monitor_runner_unit.
+        # capability probe RUNS despite the targetless launch (admin#1495
+        # r19 F3 - the mapped binding class-arms github+linear; the env
+        # below satisfies both) and the Keeper-bound write-capable launch
+        # is then refused BEFORE any child runs — the harness's test-child
+        # attestation never applies to Keeper repositories — so the
+        # manifest-level ``handoff_missing`` rejection is never reached
+        # through this path. The manifest predicate itself is pinned below
+        # the gate by TerminalPlannedQaTests in test_monitor_runner_unit;
+        # the bare-surface twin of THIS launch shape now blocks at the
+        # probe instead (test_mapped_targetless_launch_probes_both below).
         self._bind_origin("git@github.com:Keeper-Dating/matchmaking.git")
         completed = self._run(
             budget="900", timeout=90, wait_scale="0.02", max_ticks="3",
@@ -2675,22 +2677,26 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         # degraded fallback. The Keeper floor now blocks it before GO even
         # with the harness attestation set — the attestation never applies
         # to a Keeper-bound repository (that floor is repository-identity
-        # keyed ON PURPOSE). admin#1495 r17 F7: this launch resolved no
-        # targets, so the capability probe SKIPS entirely - the planner's
-        # legitimate idle, targetless Algo plan (neither ball holder nor
-        # reviewers resolve) is a valid run shape, and a bare capability
-        # surface must not false-block it before the containment pin. The
+        # keyed ON PURPOSE). admin#1495 r19 F3 (reworking r17 F7): this
+        # targetless launch no longer skips the capability probe - a
+        # Keeper repository can mint GitHub handback/review work
+        # mid-slice, so github is class-probed before any child; the env
+        # below satisfies it so the run reaches the containment pin under
+        # test. The bare-surface targetless twin blocks at the probe
+        # instead (test_unmapped_keeper_targetless_launch below), and the
         # armed-probe algo shape (resolved github targets, bare surface)
         # is pinned by test_algo_capability_probe_requires_github below.
         self._bind_origin("git@github.com:Keeper-Dating/algo.git")
-        bare = self.dir / "algo-bare-targetless.json"
-        bare.write_text("{}", encoding="utf-8")
+        github_route = self.dir / "algo-github-route.json"
+        github_route.write_text(
+            '{"permissions": {"allow": ["mcp__github__*"]}}', encoding="utf-8"
+        )
         completed = self._run(
             budget="900", timeout=90, wait_scale="0.02", max_ticks="2",
             env_extra={
                 "FAKE_OUTCOME": "terminal",
-                "MONITOR_RUNNER_USER_SETTINGS": str(bare),
-                "FAKE_MCP_LIST_EMPTY": "1",
+                "MONITOR_RUNNER_USER_SETTINGS": str(github_route),
+                "FAKE_MCP_LIST": "github: gh-mcp - \u2713 Connected",
             },
         )
         self.assertEqual(completed.returncode, 5, completed.stdout + completed.stderr)
@@ -2703,11 +2709,12 @@ class MonitorRunnerE2ETests(unittest.TestCase):
     def test_algo_capability_probe_requires_github_without_linear(self) -> None:
         # admin#1495 r16 F3, reworked by r17 F7 (Algo-with-targets): an
         # algo launch whose canonical state RESOLVED handback/review
-        # targets (the write-ahead plan below) needs the github families -
-        # derived from those resolved targets, never from repository
-        # class - so a bare surface blocks BEFORE any child launch,
-        # naming the github family and never linear, which no algo launch
-        # can plan (the Linear leg is map-gated and algo is unmapped).
+        # targets (the write-ahead plan below) needs the github family -
+        # the manifest half from those resolved targets, and (r19 F3) the
+        # class half from the Keeper binding agrees - so a bare surface
+        # blocks BEFORE any child launch, naming the github family and
+        # never linear, which no algo launch can plan or class-mint (the
+        # Linear leg is map-gated and algo is unmapped).
         self._bind_origin("git@github.com:Keeper-Dating/algo.git")
         self._seed_resolved_qa_plan("Keeper-Dating/algo", reviewer=True)
         bare = self.dir / "algo-bare-settings.json"
@@ -2973,12 +2980,14 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         # reviewer-only launch: recorded reviewer operations with results
         # pass (the github handback pair is NOT over-required - the r17
         # F7 regression), an unrecorded result rejects, and idle stays
-        # owned by the planned-QA gate.
+        # owned by the planned-QA gate. r19 F8: the candidate must carry
+        # the launch's exact reviewer IDs (the per-slice floor), so the
+        # launch here plans the same generation the candidate records.
         reviewer_ops = [
             "qa.github.request_review:tjkeeper:gaaaaaaaaaaaa",
             "qa.github.verify_review_request:tjkeeper:gaaaaaaaaaaaa",
         ]
-        reviewer_launch = self._launch_extract(self._REVIEWER_OPS)
+        reviewer_launch = self._launch_extract(reviewer_ops)
         self.assertEqual(
             mr._qa_target_manifest("Keeper-Dating/algo", reviewer_launch),
             frozenset((mr._QA_TARGET_GITHUB_REVIEW,)),
@@ -3010,14 +3019,77 @@ class MonitorRunnerE2ETests(unittest.TestCase):
             )
         )
 
+    def test_reviewer_floor_holds_launch_planned_reviewer_ids(self) -> None:
+        # admin#1495 r19 F8, at the same terminal-gate method the audit
+        # above pins (direct construction for the same containment-gate
+        # reason): the launch-planned reviewer request/verify IDs are an
+        # immutable per-slice floor across qa and review_roundtrip. A
+        # reviewer-only launch whose terminal candidate carries only an
+        # assignee replacement (recorded, single-generation, non-idle)
+        # rejects toward a slice-boundary replan; the exact planned set
+        # with recorded results passes; and an omitted roundtrip leg
+        # rejects even when the qa kind is intact.
+        mr = self._runner_module()
+        runner = self._direct_runner(mr)
+
+        def extract(qa_ops, roundtrip_ops=(), status="pending"):
+            ops = {
+                "qa": list(qa_ops),
+                "review_roundtrip": list(roundtrip_ops),
+            }
+            return {
+                "handoff_status_by_kind": {"qa": status},
+                "handoff_operations": ops,
+                "handoff_results": {
+                    kind: {op: "complete" for op in kind_ops}
+                    for kind, kind_ops in ops.items()
+                },
+            }
+
+        handback = [
+            "qa.github.replace_assignees:gaaaaaaaaaaaa",
+            "qa.github.verify_assignees:gaaaaaaaaaaaa",
+        ]
+        roundtrip = [
+            "roundtrip.github.request_review:motykadaw:gaaaaaaaaaaaa",
+            "roundtrip.github.verify_review_request:motykadaw:gaaaaaaaaaaaa",
+        ]
+        reviewer_launch = self._launch_extract(self._REVIEWER_OPS)
+        substitution = runner._qa_manifest_violation(
+            "Keeper-Dating/algo", reviewer_launch, extract(handback)
+        )
+        self.assertIsNotNone(substitution)
+        self.assertIn("reviewer operations differ", substitution)
+        self.assertIn("slice boundary", substitution)
+        self.assertIsNone(
+            runner._qa_manifest_violation(
+                "Keeper-Dating/algo", reviewer_launch,
+                extract(self._REVIEWER_OPS),
+            )
+        )
+        roundtrip_launch = self._launch_extract(handback, roundtrip)
+        self.assertIn(
+            "review_roundtrip reviewer operations",
+            runner._qa_manifest_violation(
+                "Keeper-Dating/algo", roundtrip_launch, extract(handback)
+            ),
+        )
+        self.assertIsNone(
+            runner._qa_manifest_violation(
+                "Keeper-Dating/algo", roundtrip_launch,
+                extract(handback, roundtrip),
+            )
+        )
+
     def test_bare_vm_capability_probe_blocks_mapped_runs(self) -> None:
         # admin#1495 finding 3825265272 (re-eval-named closure): a mapped
         # run whose resolved user-scope settings carry no permissions and
         # no MCP config fails FAST at monitor entry — never strands after
         # PR creation. The fake claude answers `mcp list` with nothing.
-        # r17 F7: the probe is armed by the launch state's resolved
-        # targets (handback + Linear leg below), not by the mapped
-        # binding alone.
+        # r17 F7: the launch state's resolved targets (handback + Linear
+        # leg below) arm the manifest half of the probe; r19 F3: the
+        # mapped binding class-arms the same two families even without
+        # them (the targetless twin is pinned separately below).
         self._bind_origin("git@github.com:Keeper-Dating/matchmaking.git")
         self._seed_resolved_qa_plan("Keeper-Dating/matchmaking", linear=True)
         bare = self.dir / "bare-settings.json"
@@ -3070,10 +3142,15 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         )
 
     def test_targetless_launch_skips_the_capability_probe(self) -> None:
-        # admin#1495 r17 F7: a launch with NO resolved targets plans no
-        # handoff families, so the probe skips and the terminal (with its
-        # idle QA aggregate) stays valid - a bare settings surface must
-        # not block a run that will execute no Keeper handoffs.
+        # admin#1495 r17 F7, narrowed by r19 F3: the targetless skip now
+        # covers ONLY a non-Keeper or unresolved binding (this fixture
+        # binds no origin, so the binding stays unresolved) - the one
+        # class whose repository can mint no Keeper handoff surface. For
+        # it the documented idle-run liveness trade-off survives: a bare
+        # settings surface must not block a run that will execute no
+        # Keeper handoffs, and the terminal (with its idle QA aggregate)
+        # stays valid. Keeper-bound targetless launches now probe by
+        # repository class instead (the two tests below).
         bare = self.dir / "bare-settings.json"
         bare.write_text("{}", encoding="utf-8")
         completed = self._run(
@@ -3088,6 +3165,67 @@ class MonitorRunnerE2ETests(unittest.TestCase):
             "terminal",
             completed.stdout + completed.stderr,
         )
+
+    def test_mapped_targetless_launch_probes_both_families(self) -> None:
+        # admin#1495 r19 F3, the finding's exact escape: with the probe
+        # skipped on a targetless mapped launch, a child could resolve
+        # GitHub/Linear work during the same slice, record those handoffs
+        # failed, and still pass the launch-derived missing-handoff and
+        # coverage gates (failed aggregates are terminal-compatible). A
+        # mapped repository can always mint that work, so BEFORE any
+        # targetless child starts the probe now demands github AND linear
+        # by repository class - over a bare surface the run blocks at
+        # entry, zero ticks, the child binary never executed (the argv
+        # log is written by any child invocation), which is the proof the
+        # escape's mid-slice work can never precede the preflight.
+        self._bind_origin("git@github.com:Keeper-Dating/matchmaking.git")
+        bare = self.dir / "mapped-bare-targetless.json"
+        bare.write_text("{}", encoding="utf-8")
+        completed = self._run(
+            budget="900", timeout=60,
+            env_extra={
+                "FAKE_OUTCOME": "terminal",
+                "MONITOR_RUNNER_USER_SETTINGS": str(bare),
+                "FAKE_MCP_LIST_EMPTY": "1",
+            },
+        )
+        self.assertEqual(
+            completed.returncode, 5, completed.stdout + completed.stderr
+        )
+        summary = self._summary(completed)
+        self.assertIn("github: no CONNECTED MCP row", summary["reason"])
+        self.assertIn("linear: no CONNECTED MCP row", summary["reason"])
+        # the launch really was targetless - the block came from the
+        # repository-class floor, not from resolved targets.
+        self.assertIn("plan [none yet]", summary["reason"])
+        self.assertEqual(summary["ticks_completed"], 0)
+        self.assertFalse(self.argv_log.exists(), "the child must never execute")
+
+    def test_unmapped_keeper_targetless_launch_probes_github_only(self) -> None:
+        # admin#1495 r19 F3, the unmapped-Keeper half: algo can mint
+        # GitHub handback/review work mid-slice (handoff_decision's
+        # universal handback), so a targetless algo launch probes github -
+        # and only github: the Linear leg is map-gated, and no algo launch
+        # can plan or class-mint it.
+        self._bind_origin("git@github.com:Keeper-Dating/algo.git")
+        bare = self.dir / "algo-bare-targetless.json"
+        bare.write_text("{}", encoding="utf-8")
+        completed = self._run(
+            budget="900", timeout=60,
+            env_extra={
+                "FAKE_OUTCOME": "terminal",
+                "MONITOR_RUNNER_USER_SETTINGS": str(bare),
+                "FAKE_MCP_LIST_EMPTY": "1",
+            },
+        )
+        self.assertEqual(
+            completed.returncode, 5, completed.stdout + completed.stderr
+        )
+        summary = self._summary(completed)
+        self.assertIn("github: no CONNECTED MCP row", summary["reason"])
+        self.assertNotIn("linear:", summary["reason"])
+        self.assertEqual(summary["ticks_completed"], 0)
+        self.assertFalse(self.argv_log.exists(), "the child must never execute")
 
     def test_deny_all_permissions_block_mapped_run(self) -> None:
         # Narrowed probe (admin#1495 3825265272 / algo#1216 F3): a truthy
@@ -3194,8 +3332,10 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         # live credential — a repository probe reporting push=false leaves
         # github unproven. The same run pins the sanitized environment:
         # the probe invocations must not inherit ambient CLAUDE_CODE_*
-        # overrides (recorded by the fake claude's env log). r17 F7: a
-        # github-only resolved plan keeps github the one required family.
+        # overrides (recorded by the fake claude's env log). r19 F3: the
+        # mapped binding class-requires linear too; its row below has no
+        # allow route, so the block names both - the gh-probe wording
+        # under test stays the github half's reason.
         self._bind_origin("git@github.com:Keeper-Dating/matchmaking.git")
         self._seed_resolved_qa_plan("Keeper-Dating/matchmaking")
         settings = self.dir / "gh-only.json"
@@ -3855,9 +3995,11 @@ class MonitorRunnerE2ETests(unittest.TestCase):
 
     def _github_route_env(self) -> dict:
         """r17 F7: launch states seeded with a resolved handback target
-        arm the capability probe (targets, not repository class, are the
-        trigger) - these commit-path fixtures satisfy it through the
-        github MCP route so the behavior under test stays reachable."""
+        arm the capability probe (for these unresolved-binding fixtures
+        the resolved targets are the trigger; r19 F3 adds a
+        repository-class floor only for Keeper-bound launches) - these
+        commit-path fixtures satisfy it through the github MCP route so
+        the behavior under test stays reachable."""
 
         github_route = self.dir / "github-mcp-route.json"
         github_route.write_text(

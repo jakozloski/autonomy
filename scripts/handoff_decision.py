@@ -30,6 +30,12 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import state_schema  # noqa: E402  (sibling module; path set immediately above)
+# admin#1495 r19 F7: the evaluator-free leaf owning the Linear-mapped
+# repository MEMBERSHIP and the canonical operation-family shapes -
+# imported by this planner and the runner, pinned by parity from the
+# schema (whose stdin-fed CLI boot must stay self-contained; see the
+# leaf's docstring), so each fact lives exactly once.
+import handoff_targets  # noqa: E402
 
 
 SCHEMA_VERSION = 1
@@ -78,7 +84,14 @@ MAX_OPERATION_ATTEMPTS = state_schema.MAX_OPERATION_ATTEMPTS
 # accepts for assignment (it resolves IDs internally); provider IDs remain
 # the postcondition-verification key. ``linear_name`` is an ADVISORY display
 # cross-check only: a mismatch warns (display names drift), never blocks.
-QA_OWNER_BY_REPOSITORY = {
+# admin#1495 r19 F7: the mapped-repository MEMBERSHIP lives once in
+# handoff_targets; this module stays authoritative for the OWNER values.
+# QA_OWNER_BY_REPOSITORY derives its key set from the leaf: a leaf entry
+# without an owner value fails the import loudly (KeyError in the
+# comprehension), and an owner value the leaf does not name is dead
+# routing config the length guard below rejects - neither side can drift
+# silently.
+_QA_OWNER_DETAILS = {
     "Keeper-Dating/admin-portal": {
         "github_login": "shafqatukhan",
         "linear_email": "shafqat@keeper.ai",
@@ -104,6 +117,17 @@ QA_OWNER_BY_REPOSITORY = {
         "linear_name": "Timothy Jhon Pascual",
     },
 }
+QA_OWNER_BY_REPOSITORY = {
+    name: _QA_OWNER_DETAILS[name]
+    for name in handoff_targets.LINEAR_MAPPED_REPOSITORIES
+}
+if len(QA_OWNER_BY_REPOSITORY) != len(_QA_OWNER_DETAILS):
+    raise RuntimeError(
+        "handoff_decision owner values name a repository absent from"
+        " handoff_targets.LINEAR_MAPPED_REPOSITORIES - the Linear-mapped"
+        " membership set lives once in the leaf (admin#1495 r19 F7); add"
+        " the repository there or drop the orphaned owner entry"
+    )
 
 # QA workflow state the validated ticket moves to during the first-clean-exit
 # handoff, keyed by Linear team key (the ticket-identifier prefix).  The

@@ -82,6 +82,14 @@ from model_policy import (  # noqa: E402
     sanitize_for_publication,
 )
 
+# admin#1495 r19 F7: the Linear-mapped membership and the canonical
+# operation-family shapes live ONCE in handoff_targets - an evaluator-free,
+# stdlib-only dependency leaf, so the structural rule above (state parsing
+# and validation stay behind the schema CLI; no package evaluators beside
+# ``subprocess``) is preserved. The gate constants below REBIND the leaf's
+# names rather than restating the literals the r17-era runner carried.
+import handoff_targets  # noqa: E402
+
 WRAPPER_EXEC_FAILED_MARKER = "MONITOR-WRAPPER-EXEC-FAILED"
 _RESUME_NOT_FOUND_HINTS = ("no conversation found", "session not found", "unknown session")
 
@@ -270,19 +278,21 @@ MAX_WORK_ITERATIONS = 50
 # algo#1216 finding 3813491661: repositories whose workflows carry a
 # Linear QA leg - the tracker half of the clean-exit QA handoff.
 # Casefolded for membership tests (GitHub owner/name is case-insensitive).
-# The runner is deliberately import-free of package modules (it shells to
-# the schema CLI), so this restates the key set of
-# handoff_decision.QA_OWNER_BY_REPOSITORY — that map stays canonical, and
-# test_monitor_runner_unit's parity regression fails on any drift.
-# admin#1495 r17 F7 (reworking r16 F3): membership here now gates ONLY
-# the Linear-leg target family in _qa_target_manifest below - the Linear
-# map is real routing config, but it never invents GitHub families from
+# admin#1495 r19 F7: the membership set lives ONCE in handoff_targets
+# (handoff_decision.QA_OWNER_BY_REPOSITORY derives its key set from the
+# same leaf and stays authoritative for the owner VALUES), REBOUND here
+# rather than restated - the former runner-side restatement could drift
+# behind only a repository-equality test.
+# admin#1495 r17 F7 (reworking r16 F3): membership here gates the
+# Linear-leg target family in _qa_target_manifest below and (admin#1495
+# r19 F3) the class half of the capability preflight - the Linear map is
+# real routing config, but it never invents GitHub families from
 # repository identity. The GitHub families derive from the launch
 # extract's RESOLVED targets, so the planner's legitimate idle,
 # targetless plan (neither ball holder nor reviewers resolve - the r17
 # F7 Algo repro) stays valid instead of being over-required, and the
-# terminal gate, the manifest audit, and the capability preflight all
-# consume that same launch-derived manifest.
+# terminal gate and the manifest audit consume that same launch-derived
+# manifest.
 # admin#1495 r15 F17: the canonical mapped-repository QA manifest, by
 # operation FAMILY. Terminal acceptance requires the github pair plus one
 # complete Linear-leg shape, all sharing ONE generation, each with a
@@ -291,47 +301,24 @@ MAX_WORK_ITERATIONS = 50
 # handoff_decision's builder: the Linear leg is either the full
 # bind/assign/state chain, a documented runtime-outage record, or the
 # assign chain with a state-outage record. Parity with the planner is
-# pinned by test (the table and the builder must mint the same families).
-_QA_REQUIRED_GITHUB_FAMILIES = frozenset(
-    ("qa.github.replace_assignees", "qa.github.verify_assignees")
-)
-_QA_LINEAR_LEG_SHAPES = (
-    frozenset(
-        (
-            "qa.linear.verify_ticket_binding",
-            "qa.linear.assign_ticket",
-            "qa.linear.verify_ticket_assignee",
-            "qa.linear.set_ticket_state",
-            "qa.linear.verify_ticket_state",
-        )
-    ),
-    frozenset(("qa.linear.record_unavailable",)),
-    frozenset(
-        (
-            "qa.linear.verify_ticket_binding",
-            "qa.linear.assign_ticket",
-            "qa.linear.verify_ticket_assignee",
-            "qa.linear.record_state_unavailable",
-        )
-    ),
-)
+# pinned by test bidirectionally per shape class (admin#1495 r19 F7: the
+# leaf's declared shapes, the planner's minted families, and what this
+# runner requires must agree for mapped, unmapped-Keeper, reviewer-only,
+# roundtrip, and every Linear outage shape).
+_QA_REQUIRED_GITHUB_FAMILIES = handoff_targets.QA_REQUIRED_GITHUB_FAMILIES
+_QA_LINEAR_LEG_SHAPES = handoff_targets.QA_LINEAR_LEG_SHAPES
 
-MAPPED_QA_REPOSITORIES = frozenset(
-    {
-        "keeper-dating/matchmaking",
-        "keeper-dating/admin-portal",
-        "keeper-dating/calculator-api",
-        "keeper-dating/keeper-lead-generator",
-    }
-)
+MAPPED_QA_REPOSITORIES = handoff_targets.LINEAR_MAPPED_REPOSITORY_IDENTITIES
 
 
 # admin#1495 r16 F3 (narrowed by r17 F7): ONE spelling of the Keeper
-# organization boundary - consumed ONLY by the r18 F5 containment floor
+# organization boundary - consumed by the r18 F5 containment floor
 # (_keeper_bound_repository), which is repository-identity-based ON
 # PURPOSE (the uncontained-test-child attestation must never cover any
-# Keeper repository). The target manifest no longer derives any family
-# from it.
+# Keeper repository), and by the r19 F3 class half of the capability
+# preflight (_repository_class_capabilities: any Keeper repository can
+# mint GitHub handback/review work mid-slice). The target manifest still
+# derives no family from it.
 _KEEPER_ORG_PREFIX = "keeper-dating/"
 
 # admin#1495 r16 F3: the handoff TARGET FAMILIES the canonical planner can
@@ -351,23 +338,20 @@ _QA_TARGET_LINEAR_QA = "linear-qa"
 # and request/verify review operations only for resolved reviewers. The
 # verify halves are included so a hand-broken plan carrying only the
 # verify leg still derives its family (fail closed toward auditing).
+# admin#1495 r19 F7: the family unions are the leaf's, rebound.
 _QA_TARGET_SOURCE_KINDS = ("qa", "review_roundtrip")
-_HANDBACK_TARGET_FAMILIES = frozenset(
-    (
-        "qa.github.replace_assignees",
-        "qa.github.verify_assignees",
-        "roundtrip.github.replace_assignees",
-        "roundtrip.github.verify_assignees",
-    )
-)
-_REVIEW_TARGET_FAMILIES = frozenset(
-    (
-        "qa.github.request_review",
-        "qa.github.verify_review_request",
-        "roundtrip.github.request_review",
-        "roundtrip.github.verify_review_request",
-    )
-)
+_HANDBACK_TARGET_FAMILIES = handoff_targets.HANDBACK_OPERATION_FAMILIES
+_REVIEW_TARGET_FAMILIES = handoff_targets.REVIEWER_OPERATION_FAMILIES
+
+
+def _operation_family(op_id: str) -> str:
+    """Family segment of a generation-scoped operation id. The schema CLI
+    owns the full grammar and has already validated every id the
+    runner-owned extracts expose; this is the one shared parse the
+    manifest derivation and the reviewer floor both key on."""
+
+    head, _, _generation = op_id.rpartition(":")
+    return head.split(":", 1)[0]
 
 
 def _qa_target_manifest(
@@ -398,8 +382,11 @@ def _qa_target_manifest(
       repository-identity leg F7 keeps) AND the tracker leg resolved -
       recorded by a persisted ``qa.linear.*`` operation;
     * no resolved targets anywhere - a genuinely targetless launch: an
-      empty manifest, the capability preflight skips, and an idle
-      terminal QA aggregate stays valid.
+      empty manifest, so an idle terminal QA aggregate stays valid.
+      The capability preflight no longer skips on the empty manifest
+      alone - it also probes the repository-CLASS floor (admin#1495
+      r19 F3, _repository_class_capabilities), so only a non-Keeper or
+      unresolved binding truly skips.
 
     The launch-derived manifest is a FLOOR the candidate must satisfy
     (that is exactly what makes it immutable-input-bound): a target
@@ -412,8 +399,7 @@ def _qa_target_manifest(
         for kind in _QA_TARGET_SOURCE_KINDS:
             for op_id in operations_by_kind.get(kind) or []:
                 if isinstance(op_id, str):
-                    head, _, _generation = op_id.rpartition(":")
-                    families.add(head.split(":", 1)[0])
+                    families.add(_operation_family(op_id))
     manifest: set[str] = set()
     if families & _HANDBACK_TARGET_FAMILIES:
         manifest.add(_QA_TARGET_GITHUB_HANDBACK)
@@ -480,11 +466,13 @@ def _qa_manifest_coverage_violation(
     the planner never mints a Linear leg for an unmapped repository),
     and a recorded result per operation. The manifest is a coverage
     floor, not a ceiling: reviewer request/verify operations mint only
-    when reviewers are routed, so they are never REQUIRED coverage.
-    Identity inputs beyond the family manifest (Linear provider ids,
-    reviewer logins) are live-service facts the executor re-verifies at
-    postcondition time; this gate closes the omitted-effect hole, not
-    identity forgery."""
+    when reviewers are routed, so the FAMILY manifest never requires
+    them - their coverage is enforced ID-exact by the companion
+    _reviewer_floor_violation (admin#1495 r19 F8), which the terminal
+    gate runs alongside this audit. Identity inputs beyond the family
+    manifest (Linear provider ids) are live-service facts the executor
+    re-verifies at postcondition time; this gate closes the
+    omitted-effect hole, not identity forgery."""
 
     if not manifest:
         return None
@@ -541,6 +529,107 @@ def _qa_manifest_coverage_violation(
         return f"qa operations without recorded results: {unrecorded[:3]}"
     return None
 
+
+def _launch_reviewer_floor(
+    launch_extract: dict[str, Any],
+) -> dict[str, frozenset[str]]:
+    """admin#1495 r19 F8: the launch-planned reviewer request/verify
+    operation IDs per handoff kind (qa and review_roundtrip) - the
+    immutable per-slice reviewer floor. Reviewer op IDs encode the
+    reviewer login as their identity segment, so the ID set pins the
+    exact planned reviewer identities and their verification legs, not
+    merely the family class. Derived from the runner-owned LAUNCH
+    extract only (the same trust rule as _qa_target_manifest - never
+    the child-written candidate). A kind with no planned reviewer
+    operations is absent: the planner legitimately mints reviewer
+    operations only when reviewers resolve, so an empty floor requires
+    nothing."""
+
+    floor: dict[str, frozenset[str]] = {}
+    operations_by_kind = launch_extract.get("handoff_operations")
+    if not isinstance(operations_by_kind, dict):
+        return floor
+    for kind in _QA_TARGET_SOURCE_KINDS:
+        planned = frozenset(
+            op_id
+            for op_id in operations_by_kind.get(kind) or []
+            if isinstance(op_id, str)
+            and _operation_family(op_id) in _REVIEW_TARGET_FAMILIES
+        )
+        if planned:
+            floor[kind] = planned
+    return floor
+
+
+def _reviewer_floor_violation(
+    launch_extract: dict[str, Any], candidate_extract: dict[str, Any]
+) -> str | None:
+    """admin#1495 r19 F8: a terminal candidate must preserve EVERY
+    launch-planned reviewer request/verify operation ID, each with a
+    recorded result, across qa and review_roundtrip. The family-level
+    manifest deliberately never REQUIRES reviewer coverage (reviewer
+    operations mint only when reviewers resolve), which let a
+    reviewer-only launch reach terminal carrying only an assignee
+    replacement - every planned reviewer identity and verification
+    omitted while the non-idle, single-generation, recorded-result
+    checks all passed. The floor is ID-exact: a dropped reviewer, a
+    substituted family, or a changed login each yields a different ID
+    set and rejects, directing the child to replan at a slice boundary
+    (the plan change commits through a non-terminal candidate first;
+    the next launch's canonical plan is then the new floor). A launch
+    with no planned reviewer operations imposes nothing, so mid-slice
+    reviewer resolution keeps planning through that same non-terminal
+    path. The qa kind defers an idle/absent aggregate to the planned-QA
+    gate (see the loop comment); review_roundtrip never defers."""
+
+    floor = _launch_reviewer_floor(launch_extract)
+    if not floor:
+        return None
+    operations_by_kind = candidate_extract.get("handoff_operations") or {}
+    results_by_kind = candidate_extract.get("handoff_results") or {}
+    qa_status = (
+        candidate_extract.get("handoff_status_by_kind") or {}
+    ).get("qa")
+    for kind in _QA_TARGET_SOURCE_KINDS:
+        planned = floor.get(kind)
+        if planned is None:
+            continue
+        if kind == "qa" and qa_status in (None, "idle"):
+            # The planned-QA gate owns the idle case (mirroring the
+            # coverage audit's division of labor): a qa reviewer floor
+            # implies the github-review manifest family, so an idle or
+            # absent terminal qa aggregate already rejects at
+            # _terminal_missing_planned_qa. review_roundtrip has no such
+            # gate, so its floor below fires regardless.
+            continue
+        recorded_ops = frozenset(
+            op_id
+            for op_id in operations_by_kind.get(kind) or []
+            if isinstance(op_id, str)
+            and _operation_family(op_id) in _REVIEW_TARGET_FAMILIES
+        )
+        if recorded_ops != planned:
+            missing = sorted(planned - recorded_ops)
+            unplanned = sorted(recorded_ops - planned)
+            return (
+                f"{kind} reviewer operations differ from the launch plan"
+                f" (missing {missing[:3]}, unplanned {unplanned[:3]}) -"
+                " the launch-planned reviewer request/verify IDs are an"
+                " immutable per-slice floor; a reviewer target change"
+                " replans at a slice boundary (admin#1495 r19 F8)"
+            )
+        results = results_by_kind.get(kind) or {}
+        unrecorded = sorted(
+            op_id for op_id in planned if op_id not in results
+        )
+        if unrecorded:
+            return (
+                f"{kind} reviewer operations without recorded results:"
+                f" {unrecorded[:3]} (admin#1495 r19 F8)"
+            )
+    return None
+
+
 # admin#1495 finding 3825265272 / algo#1216 F3: narrow the capability probe
 # to the exact surface the planned Phase-6 handoffs exercise. The planner
 # emits ``*.github.*`` (request-review / replace-assignees) and
@@ -553,10 +642,12 @@ def _qa_manifest_coverage_violation(
 # admin#1495 r16 F3: this frozenset is the CLOSED UNIVERSE of capability
 # families the probe knows how to prove (and the fail-closed deny set for
 # unparseable ``permissions.deny`` shapes in _denied_families) - the
-# per-run REQUIRED subset now comes from _manifest_required_capabilities
-# over the launch-derived target manifest (admin#1495 r17 F7), so a
-# github-only manifest (resolved handback/review targets, no Linear leg)
-# demands github without demanding linear.
+# per-run REQUIRED subset comes from _probe_required_capabilities below:
+# the launch-derived target manifest's families (admin#1495 r17 F7)
+# unioned with the repository-class floor (admin#1495 r19 F3), so a
+# github-only manifest on a non-Keeper binding (resolved handback/review
+# targets, no Linear leg) demands github without demanding linear, while
+# a mapped binding always demands both.
 REQUIRED_CHILD_CAPABILITIES = frozenset({"github", "linear"})
 
 
@@ -574,6 +665,50 @@ def _manifest_required_capabilities(manifest: frozenset[str]) -> frozenset[str]:
     if _QA_TARGET_LINEAR_QA in manifest:
         required.add("linear")
     return frozenset(required)
+
+
+def _repository_class_capabilities(bound_repo: object) -> frozenset[str]:
+    """admin#1495 r19 F3: the capability families the repository CLASS
+    can mint MID-SLICE, independent of launch-resolved targets. A
+    Linear-mapped repository can always mint the full GitHub+Linear QA
+    handoff surface; any other Keeper repository can mint GitHub
+    handback/review work (handoff_decision's reviewer/ball-holder
+    handback is universal); a non-Keeper or unresolved binding mints no
+    Keeper handoff surface by class. This is the floor that closes the
+    targetless-launch escape: with an empty manifest the probe used to
+    skip entirely, a child could then resolve GitHub/Linear work during
+    the same slice, record those handoffs failed, and still pass the
+    launch-derived missing-handoff and coverage gates because failed
+    aggregates are terminal-compatible."""
+
+    if not isinstance(bound_repo, str) or not bound_repo:
+        return frozenset()
+    identity = bound_repo.casefold()
+    if identity in MAPPED_QA_REPOSITORIES:
+        return REQUIRED_CHILD_CAPABILITIES
+    if identity.startswith(_KEEPER_ORG_PREFIX):
+        return frozenset({"github"})
+    return frozenset()
+
+
+def _probe_required_capabilities(
+    bound_repo: object, manifest: frozenset[str]
+) -> frozenset[str]:
+    """admin#1495 r19 F3: the capability preflight's REQUIRED set - the
+    launch-resolved manifest's families UNIONED with the
+    repository-class floor. The manifest half keeps resolved targets
+    probed for every binding, mapped or not (finding 3825265272); the
+    class half arms the probe for every Keeper repository even when the
+    launch is targetless. Empty exactly for a targetless launch on a
+    non-Keeper or unresolved binding - the one class that truly skips,
+    preserving the documented idle-run liveness trade-off for it (see
+    _child_capability_probe). The terminal gates keep consuming the
+    launch-resolved manifest alone as their floor - the class floor
+    arms the preflight, never the coverage audit."""
+
+    return _manifest_required_capabilities(
+        manifest
+    ) | _repository_class_capabilities(bound_repo)
 
 
 # algo#1216 r18 F3 / admin#1495 r14 F9: authorization is resolved from
@@ -3888,19 +4023,38 @@ class Runner:
           read-only grants, and failed/pending/auth-required rows prove
           nothing — the r25/r17 probes accepted each of these shapes.
 
-        Scoped by the launch-derived target manifest (admin#1495 r16 F3,
-        reworked by r17 F7): the required families come from the LAUNCH
-        extract's resolved targets, never from repository class - a
-        launch whose canonical state resolved handback/review targets
-        needs github, one whose Linear-mapped tracker leg resolved needs
-        linear, and a genuinely targetless launch (no resolved targets
-        anywhere - the planner's legitimate idle Algo plan included)
-        skips the probe entirely: nothing is planned yet, and targets
-        that resolve mid-slice are preflighted at the next slice while
-        the terminal gates recompute the floor per candidate.
+        Scoped by the launch-derived target manifest UNIONED with the
+        repository-class floor (admin#1495 r16 F3, reworked by r17 F7,
+        re-floored by r19 F3): a launch whose canonical state resolved
+        handback/review targets needs github and one whose Linear-mapped
+        tracker leg resolved needs linear (the manifest half, whatever
+        the binding) - AND a Linear-mapped repository needs github plus
+        linear even when the launch is targetless, because a mapped
+        repository can mint GitHub+Linear work mid-slice, record those
+        handoffs failed, and still pass the launch-derived
+        missing-handoff and coverage gates (failed aggregates are
+        terminal-compatible: the r19 F3 escape). Any other Keeper
+        repository needs github the same way (the universal
+        reviewer/ball-holder handback). Only a targetless launch on a
+        non-Keeper or unresolved binding skips the probe: nothing is
+        planned, the class mints no Keeper handoff surface, and the
+        documented idle-run liveness trade-off - a bare capability
+        surface must not block a run that will execute no Keeper
+        handoffs - survives for exactly that class, whose mid-slice
+        resolved targets are preflighted at the next slice while the
+        terminal gates recompute the floor per candidate.
         (algo#1216 r18 F5 removed the former "read-only scheduled run"
         justification: every reachable monitor child is write-capable,
         so no read-only cohort exists to preserve.)
+
+        Ordering proof (admin#1495 r19 F3): run() calls this probe
+        after the validity, recorded-orphan liveness, and taint gates -
+        all local reads with no signal authority - and BEFORE
+        recovery's state-local ledger write, before the CLI floor
+        probe, and before any run_tick can launch a child, so no child
+        and no remote operation precedes a failed preflight. The
+        probe's own subprocesses (``mcp list``, the ``gh api
+        repos/<bound>`` permission read) are read-only.
 
         Authorization is resolved from the EXACT environment the child
         will receive (admin#1495 r17 F5). Resolution order for the
@@ -3929,11 +4083,13 @@ class Runner:
         # admin#1495 r16 F3 / r17 F7: derive the launch-resolved target
         # manifest BEFORE any preflight check and persist it runner-side
         # for the slice; the terminal gates recompute it through the same
-        # pure function of the same trusted launch inputs. An empty
-        # manifest (no resolved targets) skips the probe - there is no
-        # handoff surface to prove.
+        # pure function of the same trusted launch inputs. admin#1495
+        # r19 F3: the probe's requirement is that manifest's families
+        # unioned with the repository-class floor - only a targetless
+        # launch on a non-Keeper or unresolved binding skips (no planned
+        # surface, no class-mintable surface to prove).
         self.target_manifest = _qa_target_manifest(bound, extract)
-        required = _manifest_required_capabilities(self.target_manifest)
+        required = _probe_required_capabilities(bound, self.target_manifest)
         if not required:
             return
         # admin#1495 r17 F5: the sanitized child env is resolved FIRST -
@@ -4091,13 +4247,18 @@ class Runner:
         detail = "; ".join(
             f"{family}: {reason}" for family, reason in unproven.items()
         )
-        planned = ", ".join(sorted(self.target_manifest))
+        planned = ", ".join(sorted(self.target_manifest)) or "none yet"
+        mintable = ", ".join(
+            sorted(_repository_class_capabilities(bound))
+        ) or "none"
         raise RunnerExit(
             5,
             "blocked",
             f"child capability probe failed for {bound}: {detail}. The"
             f" launch state's resolved targets plan [{planned}] handoffs"
-            " (admin#1495 r16 F3 / r17 F7), and the settings surface the"
+            " and the repository class can mint"
+            f" [{mintable}] mid-slice (admin#1495 r16 F3 / r17 F7 / r19"
+            " F3), and the settings surface the"
             " --setting-sources user child resolves under its exact"
             " environment (admin#1495 r17 F5) cannot execute the"
             " Phase 6 handoffs, which would strand after PR creation"
@@ -4107,7 +4268,7 @@ class Runner:
             " substrings, configuration presence, read-only grants, and"
             " failed/pending/auth-required rows prove nothing. The HOST"
             " must supply a trusted least-privilege user-scope policy"
-            " naming the manifest-required handoff surface - the package"
+            " naming the required handoff surface - the package"
             " deliberately never self-provisions it, and the immutable"
             " per-profile descriptor remains a host contract",
         )
@@ -4710,10 +4871,21 @@ class Runner:
         repository class (which falsely rejected the planner's idle,
         targetless Algo plan) and never from the child-written
         candidate (which could drop a launch-resolved target to shrink
-        its own audit: the launch manifest is the floor). The coverage
-        rules live in the module-level _qa_manifest_coverage_violation
-        so tests can pin manifest shapes directly (reviewer-only)."""
+        its own audit: the launch manifest is the floor). admin#1495
+        r19 F8: the launch-planned reviewer request/verify IDs are a
+        second, ID-exact floor across qa and review_roundtrip - the
+        family manifest alone let a reviewer-only launch reach terminal
+        on an assignee replacement while omitting every planned
+        reviewer identity and verification. The coverage rules live in
+        the module-level _qa_manifest_coverage_violation and
+        _reviewer_floor_violation so tests can pin the shapes directly
+        (reviewer-only included)."""
 
+        reviewer_violation = _reviewer_floor_violation(
+            launch_extract, candidate_extract
+        )
+        if reviewer_violation is not None:
+            return reviewer_violation
         return _qa_manifest_coverage_violation(
             _qa_target_manifest(bound_repo, launch_extract),
             candidate_extract,
