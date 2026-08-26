@@ -3396,8 +3396,10 @@ class TicketBindingGateTests(unittest.TestCase):
         self.assertEqual(binding["service"], "linear")
         self.assertEqual(binding["action"], "verify_ticket_binding")
         # The binding is the execution-boundary re-fetch: it carries every
-        # fact the executor must confirm against the freshly fetched ticket
-        # BEFORE the first mutation fires.
+        # fact the executor must confirm against the freshly fetched
+        # ticket and PR body BEFORE the first mutation fires (admin#1495
+        # r20 F2: the PR body's first-line ticket link is the canonical
+        # linkage source; Linear-side attachments are never required).
         payload = binding["payload"]
         self.assertEqual(payload["ticket_identifier"], "WEB-8877")
         # Identifier-keyed read (algo#1216 finding 3792942223): the broker
@@ -3420,6 +3422,109 @@ class TicketBindingGateTests(unittest.TestCase):
         self.assertIn(
             f"qa.github.verify_assignees:g{QA_G}", binding["depends_on"]
         )
+
+    def test_binding_payload_is_the_complete_source_fingerprint(self) -> None:
+        # admin#1495 r20 F2: the executor's canonical linkage check reads
+        # the freshly fetched PR body's first-line ticket link, so every
+        # fact it binds - repository, PR number, ticket identifier,
+        # provider id, write path - must ride the payload itself. Exact
+        # equality pins the no-side-channel contract from both sides: a
+        # dropped field would force the executor back onto ambient state,
+        # a surplus field would smuggle in a fact the target digest never
+        # covers.
+        plan = plan_handoff(self._qa_request())
+        operations = {op["id"]: op for op in plan["operations"]}
+        binding = operations[f"qa.linear.verify_ticket_binding:g{QA_G}"]
+        self.assertEqual(
+            binding["payload"],
+            {
+                "ticket_identifier": "WEB-8877",
+                "expected_ticket_provider_id": "linear-ticket-web-8877",
+                "expected_repository": "Keeper-Dating/matchmaking",
+                "expected_pull_request_number": PR_NUMBER,
+                "write_path": "environment_tool",
+            },
+        )
+
+    def test_mismatched_fingerprint_component_orphans_prior_binding(
+        self,
+    ) -> None:
+        # admin#1495 r20 F2: the binding is bound to the COMPLETE source
+        # fingerprint. Flip any one component - repository, PR number,
+        # ticket identifier, provider id - and the plan re-mints: the
+        # fresh binding payload tracks the changed component, and a
+        # `complete` binding persisted under the prior fingerprint is
+        # prior-target history (pruned with a warning), never proof the
+        # current fingerprint was verified.
+        stale_id = f"qa.linear.verify_ticket_binding:g{QA_G}"
+
+        def mismatched_request(**overrides: object) -> dict[str, object]:
+            request = self._qa_request(
+                {stale_id: operation_result("complete")}
+            )
+            tracker = dict(request["issue_tracker"])  # type: ignore[arg-type]
+            for key, value in overrides.items():
+                if key in ("repository", "pull_request_number"):
+                    request[key] = value
+                else:
+                    tracker[key] = value
+            request["issue_tracker"] = tracker
+            return request
+
+        cases = [
+            (
+                "repository",
+                mismatched_request(
+                    repository={
+                        "nameWithOwner": "Keeper-Dating/calculator-api"
+                    }
+                ),
+                "expected_repository",
+                "Keeper-Dating/calculator-api",
+            ),
+            (
+                "pull_request_number",
+                mismatched_request(pull_request_number=PR_NUMBER + 1),
+                "expected_pull_request_number",
+                PR_NUMBER + 1,
+            ),
+            (
+                "ticket_identifier",
+                mismatched_request(ticket_identifier="WEB-9999"),
+                "ticket_identifier",
+                "WEB-9999",
+            ),
+            (
+                "ticket_provider_id",
+                mismatched_request(
+                    ticket_provider_id="linear-ticket-web-9999"
+                ),
+                "expected_ticket_provider_id",
+                "linear-ticket-web-9999",
+            ),
+        ]
+        for component, request, payload_key, expected in cases:
+            with self.subTest(component=component):
+                generation = qa_generation(request)
+                self.assertNotEqual(generation, QA_G)
+                plan = plan_handoff(request)
+                operations = {op["id"]: op for op in plan["operations"]}
+                binding = operations[
+                    f"qa.linear.verify_ticket_binding:g{generation}"
+                ]
+                self.assertEqual(binding["payload"][payload_key], expected)
+                # The pruned prior record satisfied nothing: the fresh
+                # binding still awaits execution and the plan is pending.
+                self.assertNotEqual(binding["status"], "complete")
+                self.assertEqual(plan["state"], "pending", plan)
+                self.assertTrue(
+                    any(
+                        "prior-target terminal QA record" in warning
+                        and stale_id in warning
+                        for warning in plan["warnings"]
+                    ),
+                    plan["warnings"],
+                )
 
     def test_failed_descendant_of_failed_binding_is_blocked(self) -> None:
         # Post-merge codex F2: the cascade guard rejected complete/pending/
@@ -3504,6 +3609,63 @@ class TicketBindingGateTests(unittest.TestCase):
         self.assertFalse(
             {op_id for op_id in ids if "verify_ticket_binding" in op_id}, ids
         )
+
+
+class TicketBindingContractSyncTest(unittest.TestCase):
+    """admin#1495 r20 F2: the reference's binding contract must be
+    satisfiable by the managed executor. Keeper's pinned managed
+    ``get_issue``/``get_issue_with_context`` projections return issue
+    fields, comments, and relations - never attachment URLs - so a step
+    that made Linear-side attachments/links MANDATORY failed every
+    otherwise valid managed Linear QA handoff even while a live linkage
+    source (the PR body's first-line ticket link, fully identified by
+    the payload's source fingerprint) existed. These assertions pin the
+    documented contract's discriminating pair: the canonical PR-body
+    definition present at both sites (step 1 defines, step 6
+    references), the attachments-mandatory wording gone."""
+
+    @property
+    def reference_text(self) -> str:
+        reference_path = (
+            Path(__file__).resolve().parent.parent
+            / "references"
+            / "monitor-exit-handoffs.md"
+        )
+        return reference_path.read_text(encoding="utf-8")
+
+    def test_canonical_linkage_check_defined_once_and_referenced(self) -> None:
+        text = self.reference_text
+        # Step 1 DEFINES the check against the payload's complete source
+        # fingerprint...
+        self.assertIn("**canonical linkage check** (admin#1495 r20 F2)", text)
+        self.assertIn(
+            "complete source fingerprint (repository, PR number, ticket"
+            " identifier, provider id)",
+            text,
+        )
+        # ...and step 6 REFERENCES that single definition instead of
+        # restating (or re-contradicting) it.
+        self.assertIn(
+            "canonical linkage check step 1 defines for"
+            " `qa.linear.verify_ticket_binding`",
+            text,
+        )
+        # The canonical source is the PR body's template-mandated
+        # first-line ticket link; arbitrary description URLs are
+        # documented as rejected.
+        self.assertIn("first-line ticket link", text)
+        self.assertIn("NEVER satisfies the check", text)
+
+    def test_linear_attachments_are_supplementary_never_required(self) -> None:
+        text = self.reference_text
+        self.assertIn("Linear-side attachments/links are NOT required", text)
+        self.assertIn("supplementary corroboration", text)
+        # The old contract's two halves - a mandatory Linear-side check
+        # the managed projections cannot satisfy, and step 6's unordered
+        # attachments-first either/or - must stay gone: either phrase
+        # reappearing re-opens the contradiction.
+        self.assertNotIn("attachments/links include THIS pull request", text)
+        self.assertNotIn("appear in the ticket's attachments/links", text)
 
 
 class ReviewerRequestPlanTests(unittest.TestCase):

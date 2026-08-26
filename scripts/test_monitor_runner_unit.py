@@ -2004,28 +2004,34 @@ class RepositoryClassCapabilityTests(unittest.TestCase):
         handback_only = frozenset(
             (monitor_runner._QA_TARGET_GITHUB_HANDBACK,)
         )
+        # admin#1495 r20 F3: the probe consumes the launch extract's
+        # routing tuple; a remote-authorizing launch preserves the r19
+        # F3 matrix below exactly (the local-only bound is pinned in
+        # LinearWritePathAuthorizationTests).
+        remote = {"issue_tracker_write_path": "environment_tool"}
         # the F3 escape's arming half: a mapped TARGETLESS launch probes
         # github+linear; an unmapped-Keeper one probes github.
         self.assertEqual(
-            required("keeper-dating/matchmaking", empty),
+            required("keeper-dating/matchmaking", empty, remote),
             frozenset({"github", "linear"}),
         )
         self.assertEqual(
-            required("keeper-dating/algo", empty), frozenset({"github"})
+            required("keeper-dating/algo", empty, remote),
+            frozenset({"github"}),
         )
         # only a non-Keeper or unresolved binding truly skips.
-        self.assertEqual(required("someone-else/sandbox", empty), empty)
-        self.assertEqual(required(None, empty), empty)
+        self.assertEqual(required("someone-else/sandbox", empty, remote), empty)
+        self.assertEqual(required(None, empty, remote), empty)
         # the manifest half survives unchanged for non-Keeper bindings
         # with resolved targets (finding 3825265272).
         self.assertEqual(
-            required("someone-else/sandbox", review_only),
+            required("someone-else/sandbox", review_only, remote),
             frozenset({"github"}),
         )
         # the class floor never shrinks a manifest requirement, and a
         # mapped github-only manifest still probes linear.
         self.assertEqual(
-            required("keeper-dating/matchmaking", handback_only),
+            required("keeper-dating/matchmaking", handback_only, remote),
             frozenset({"github", "linear"}),
         )
 
@@ -2063,6 +2069,12 @@ class RepositoryClassCapabilityTests(unittest.TestCase):
                     runner._child_capability_probe(
                         {
                             "monitor_cli": {},
+                            # admin#1495 r20 F3: a remote write path
+                            # keeps the class floor armed - the block
+                            # below must come from the bare surface,
+                            # never from a local-only routing bound.
+                            "session_environment": "managed",
+                            "issue_tracker_write_path": "environment_tool",
                             "handoff_operations": {
                                 "qa": [],
                                 "review_roundtrip": [],
@@ -2094,6 +2106,185 @@ class RepositoryClassCapabilityTests(unittest.TestCase):
                 }
             )
         self.assertEqual(runner.target_manifest, frozenset())
+
+
+class LinearWritePathAuthorizationTests(unittest.TestCase):
+    """admin#1495 r20 F3: the launch routing tuple bounds the slice's
+    Linear surface. The probe derives its linear requirement from the
+    ACTUAL launch operations plus write path (never map membership
+    alone), and the terminal ceiling rejects remote Linear families the
+    launch never authorized - a local-to-remote transition replans at a
+    NEW slice behind a fresh capability reprobe."""
+
+    _G = "gaaaaaaaaaaaa"
+    _GITHUB_PAIR = [
+        f"qa.github.replace_assignees:{_G}",
+        f"qa.github.verify_assignees:{_G}",
+    ]
+    _REMOTE_CHAIN = [
+        f"qa.linear.verify_ticket_binding:{_G}",
+        f"qa.linear.assign_ticket:{_G}",
+        f"qa.linear.verify_ticket_assignee:{_G}",
+        f"qa.linear.set_ticket_state:{_G}",
+        f"qa.linear.verify_ticket_state:{_G}",
+    ]
+    _LOCAL_RECORD = [f"qa.linear.record_unavailable:{_G}"]
+
+    @staticmethod
+    def _launch(qa_ops, write_path):
+        extract = {
+            "session_environment": "managed",
+            "handoff_operations": {
+                "qa": list(qa_ops),
+                "review_roundtrip": [],
+            },
+        }
+        if write_path is not None:
+            extract["issue_tracker_write_path"] = write_path
+        return extract
+
+    def test_local_record_families_restate_the_leaf(self) -> None:
+        # the runner-side local/remote split restates handoff_decision's
+        # service:"local" mints - pinned against the leaf's family union
+        # so the restatement cannot drift, and the remote complement is
+        # exactly the full canonical chain.
+        import handoff_targets
+
+        self.assertLessEqual(
+            monitor_runner._LINEAR_LOCAL_RECORD_FAMILIES,
+            handoff_targets.QA_LINEAR_OPERATION_FAMILIES,
+        )
+        self.assertEqual(
+            monitor_runner._LINEAR_REMOTE_FAMILIES,
+            handoff_targets.QA_LINEAR_LEG_SHAPES[0],
+        )
+
+    def test_authorized_remote_linear_matrix(self) -> None:
+        authorized = monitor_runner._launch_authorized_remote_linear
+        full_remote = monitor_runner._LINEAR_REMOTE_FAMILIES
+        chain_families = frozenset(
+            monitor_runner._operation_family(op)
+            for op in self._REMOTE_CHAIN
+        )
+        for label, qa_ops, write_path, expected in (
+            # none is local-only, whatever the plan claims
+            ("none-local-record", self._GITHUB_PAIR + self._LOCAL_RECORD,
+             "none", frozenset()),
+            ("none-targetless", [], "none", frozenset()),
+            ("none-forged-remote-plan", self._REMOTE_CHAIN, "none",
+             frozenset()),
+            # a missing tuple authorizes nothing (fail closed; real full
+            # states always carry it - the validator requires the pair)
+            ("missing-tuple", self._REMOTE_CHAIN, None, frozenset()),
+            # remote paths authorize exactly the planned remote leg
+            ("environment-tool-chain",
+             self._GITHUB_PAIR + self._REMOTE_CHAIN, "environment_tool",
+             chain_families),
+            ("local-api-chain", self._REMOTE_CHAIN, "local_api",
+             chain_families),
+            # a hand-broken local-only leg on a remote path still
+            # authorizes nothing - the actual operations bound the slice
+            ("environment-tool-local-leg",
+             self._GITHUB_PAIR + self._LOCAL_RECORD, "environment_tool",
+             frozenset()),
+            # targetless on a remote path: the class-mintable surface
+            # (the r19 F3 mid-slice-minting case stays armed)
+            ("environment-tool-targetless", [], "environment_tool",
+             full_remote),
+        ):
+            with self.subTest(label=label):
+                self.assertEqual(
+                    authorized(self._launch(qa_ops, write_path)), expected
+                )
+
+    def test_local_record_launch_probes_github_without_linear(self) -> None:
+        # the finding's probe half: a mapped launch whose frozen plan
+        # carries only the local qa.linear.record_unavailable leg (write
+        # path none) keeps the github class floor and drops linear - the
+        # manifest still plans the Linear leg (the coverage floor is
+        # untouched), so the drop comes from the write-path bound alone.
+        launch = self._launch(
+            self._GITHUB_PAIR + self._LOCAL_RECORD, "none"
+        )
+        manifest = monitor_runner._qa_target_manifest(
+            "keeper-dating/matchmaking", launch
+        )
+        self.assertIn(monitor_runner._QA_TARGET_LINEAR_QA, manifest)
+        self.assertEqual(
+            monitor_runner._probe_required_capabilities(
+                "keeper-dating/matchmaking", manifest, launch
+            ),
+            frozenset({"github"}),
+        )
+        # the same launch on a remote write path probes both (r19 F3
+        # unchanged where remote Linear is actually authorized)
+        remote_launch = self._launch(
+            self._GITHUB_PAIR + self._REMOTE_CHAIN, "environment_tool"
+        )
+        self.assertEqual(
+            monitor_runner._probe_required_capabilities(
+                "keeper-dating/matchmaking",
+                monitor_runner._qa_target_manifest(
+                    "keeper-dating/matchmaking", remote_launch
+                ),
+                remote_launch,
+            ),
+            frozenset({"github", "linear"}),
+        )
+        # write_path none targetless: github stays per the class floor
+        self.assertEqual(
+            monitor_runner._probe_required_capabilities(
+                "keeper-dating/matchmaking",
+                frozenset(),
+                self._launch([], "none"),
+            ),
+            frozenset({"github"}),
+        )
+
+    def test_ceiling_rejects_only_unauthorized_remote_families(self) -> None:
+        ceiling = monitor_runner._linear_leg_ceiling_violation
+
+        def candidate(qa_ops):
+            return {"handoff_operations": {"qa": list(qa_ops)}}
+
+        none_launch = self._launch(
+            self._GITHUB_PAIR + self._LOCAL_RECORD, "none"
+        )
+        # the r20 F3 escape shape: local record leg replaced by the full
+        # remote chain - rejected, naming the remedy
+        violation = ceiling(
+            none_launch, candidate(self._GITHUB_PAIR + self._REMOTE_CHAIN)
+        )
+        self.assertIsNotNone(violation)
+        self.assertIn("never authorized", violation)
+        self.assertIn("NEW slice", violation)
+        # the authorized local leg itself passes (local records need no
+        # authorization), as does the exact planned remote chain on a
+        # remote path, and the legitimate runtime-outage DOWNGRADE
+        remote_launch = self._launch(
+            self._GITHUB_PAIR + self._REMOTE_CHAIN, "environment_tool"
+        )
+        for label, launch, cand in (
+            ("local-leg-kept", none_launch,
+             candidate(self._GITHUB_PAIR + self._LOCAL_RECORD)),
+            ("planned-chain-kept", remote_launch,
+             candidate(self._GITHUB_PAIR + self._REMOTE_CHAIN)),
+            ("runtime-downgrade", remote_launch,
+             candidate(self._GITHUB_PAIR + self._LOCAL_RECORD)),
+            ("no-linear-leg", none_launch, candidate(self._GITHUB_PAIR)),
+        ):
+            with self.subTest(label=label):
+                self.assertIsNone(ceiling(launch, cand))
+        # an assign-chain/state-outage launch never authorized the state
+        # mutation pair - a candidate carrying the full chain rejects
+        outage_launch = self._launch(
+            self._REMOTE_CHAIN[:3]
+            + [f"qa.linear.record_state_unavailable:{self._G}"],
+            "environment_tool",
+        )
+        violation = ceiling(outage_launch, candidate(self._REMOTE_CHAIN))
+        self.assertIsNotNone(violation)
+        self.assertIn("qa.linear.set_ticket_state", violation)
 
 
 class R15RunnerCorrectnessTests(unittest.TestCase):
@@ -2628,6 +2819,198 @@ class ResultVariantClassificationTests(unittest.TestCase):
                     self.assertEqual(detail, want_signature)
 
 
+class ApiErrorStatusClassificationTests(unittest.TestCase):
+    """admin#1495 r20 F4: Claude 2.1.226 reports quota exhaustion as
+    api_error_status:429 on the final result while the prose misses the
+    contextual matcher - the structured field classifies as the
+    no-charge ladder for BOTH exit paths, ahead of any free-text
+    matching; the prose alone in model text still never ladders (the
+    false-positive direction the contextual matcher exists to avoid),
+    and non-429 statuses change nothing."""
+
+    _PROSE = "You've reached your Fable 5 limit"
+
+    def test_final_result_429_takes_the_ladder_on_both_exits(self) -> None:
+        for exit_code in (0, 1):
+            with self.subTest(exit_code=exit_code):
+                action, detail = monitor_runner.classify_child_failure(
+                    exit_code,
+                    [],
+                    False,
+                    result_text=self._PROSE,
+                    result_is_error=True,
+                    result_subtype="success",
+                    api_error_status=429,
+                )
+                self.assertEqual(
+                    (action, detail),
+                    ("ladder", "monitor-child:rate_limited"),
+                )
+
+    def test_non_429_status_keeps_the_existing_classification(self) -> None:
+        for exit_code, expected in (
+            (0, "monitor-child:exit_0"),
+            (1, "monitor-child:exit_1"),
+        ):
+            with self.subTest(exit_code=exit_code):
+                action, detail = monitor_runner.classify_child_failure(
+                    exit_code,
+                    [],
+                    False,
+                    result_text="upstream returned an internal error",
+                    result_is_error=True,
+                    result_subtype="success",
+                    api_error_status=500,
+                )
+                self.assertEqual((action, detail), ("charge", expected))
+        # a structured error variant keeps its subtype signature too
+        action, detail = monitor_runner.classify_child_failure(
+            1,
+            [],
+            False,
+            result_is_error=True,
+            result_subtype="error_during_execution",
+            result_errors=["execution died"],
+            api_error_status=500,
+        )
+        self.assertEqual(
+            (action, detail),
+            ("charge", "monitor-child:result_error_during_execution"),
+        )
+
+    def test_quota_prose_in_model_text_alone_never_ladders(self) -> None:
+        # the exact observed prose carries no contextual marker - it
+        # must stay treatable as ordinary model text (a child merely
+        # QUOTING the message must not enter the no-charge ladder), so
+        # only the structured field classifies.
+        self.assertIsNone(monitor_runner.rate_limit_offset(self._PROSE))
+        for exit_code, expected in (
+            (0, "monitor-child:exit_0"),
+            (1, "monitor-child:exit_1"),
+        ):
+            with self.subTest(exit_code=exit_code):
+                action, detail = monitor_runner.classify_child_failure(
+                    exit_code,
+                    [],
+                    False,
+                    result_text=self._PROSE,
+                    result_is_error=True,
+                    result_subtype="success",
+                )
+                self.assertEqual((action, detail), ("charge", expected))
+
+    def test_deterministic_auth_block_still_outranks_429(self) -> None:
+        # a child that produced a final result passed auth, so a joint
+        # auth marker is forged-or-stale input - it fails toward the
+        # human block, never an unattended ladder loop.
+        action, _ = monitor_runner.classify_child_failure(
+            1,
+            ["authentication_error: token has expired"],
+            False,
+            api_error_status=429,
+        )
+        self.assertEqual(action, "block")
+
+
+class DrainChildApiErrorStatusTests(unittest.TestCase):
+    """admin#1495 r20 F4: _drain_child retains the type-validated
+    api_error_status from the authoritative FINAL result only.
+    Standalone informational rate_limit_event stream records are not
+    protocol facts - a successful final result after one stays a
+    success, and non-int statuses are ignored."""
+
+    def _drain(self, events: list) -> dict:
+        import json
+        import subprocess as sp
+        import time as _time
+
+        payload = "\n".join(json.dumps(event) for event in events)
+        proc = sp.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import os, sys;"
+                " sys.stdout.write(os.environ['DRAIN_FIXTURE_STREAM'])",
+            ],
+            stdout=sp.PIPE,
+            stderr=sp.PIPE,
+            env={**os.environ, "DRAIN_FIXTURE_STREAM": payload + "\n"},
+            start_new_session=True,
+        )
+
+        def _cleanup() -> None:
+            if proc.poll() is None:
+                proc.kill()
+            for pipe in (proc.stdout, proc.stderr):
+                if pipe is not None:
+                    pipe.close()
+
+        self.addCleanup(_cleanup)
+        return monitor_runner._drain_child(
+            proc, idle_timeout=30.0, deadline=_time.monotonic() + 120.0
+        )
+
+    _INIT = {
+        "type": "system",
+        "subtype": "init",
+        "model": "claude-opus-5",
+        "session_id": "sid-drain-1",
+    }
+    # the exact 2.1.226 quota-exhaustion final result
+    _QUOTA_RESULT = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": True,
+        "result": "You've reached your Fable 5 limit",
+        "api_error_status": 429,
+    }
+    # the exact standalone informational record shape - never parsed as
+    # protocol, so its payload grants and classifies nothing
+    _RATE_LIMIT_EVENT = {
+        "type": "rate_limit_event",
+        "rate_limit": {"status": "allowed_warning", "resets_at": 1767225600},
+    }
+
+    def test_final_result_status_is_retained_type_validated(self) -> None:
+        drained = self._drain([self._INIT, self._QUOTA_RESULT])
+        self.assertEqual(drained["outcome"], "clean")
+        protocol = drained["protocol"]
+        self.assertEqual(protocol["api_error_status"], 429)
+        self.assertIs(protocol["result_is_error"], True)
+        self.assertEqual(protocol["result_subtype"], "success")
+        self.assertEqual(
+            protocol["result_text"], "You've reached your Fable 5 limit"
+        )
+
+    def test_non_int_statuses_are_ignored(self) -> None:
+        for bad_status in ("429", True, None, 429.0, [429]):
+            with self.subTest(bad_status=bad_status):
+                result = dict(self._QUOTA_RESULT)
+                result["api_error_status"] = bad_status
+                drained = self._drain([self._INIT, result])
+                self.assertIsNone(drained["protocol"]["api_error_status"])
+
+    def test_rate_limit_event_followed_by_success_stays_success(self) -> None:
+        drained = self._drain(
+            [
+                self._INIT,
+                self._RATE_LIMIT_EVENT,
+                {"type": "result", "subtype": "success", "result": "{}"},
+            ]
+        )
+        self.assertEqual(drained["outcome"], "clean")
+        self.assertEqual(drained["exit_code"], 0)
+        protocol = drained["protocol"]
+        # the informational record retained nothing and perturbed
+        # nothing: no status, no error flag, the final result intact -
+        # so the tick proceeds to verdict parsing exactly as before.
+        self.assertIsNone(protocol["api_error_status"])
+        self.assertIsNone(protocol["result_is_error"])
+        self.assertEqual(protocol["result_subtype"], "success")
+        self.assertEqual(protocol["result_text"], "{}")
+        self.assertEqual(protocol["session_id"], "sid-drain-1")
+
+
 class WrapperStageWriteTests(unittest.TestCase):
     """algo#1216 r17 F1 (sibling site): a short os.write on the wrapper
     restage would exec a PREFIX of the trusted wrapper source."""
@@ -2740,13 +3123,19 @@ if __name__ == "__main__":  # pragma: no cover
 class TrustedControlDriftTests(unittest.TestCase):
     """admin#1495 r15 F1/F10/F19: the launch-vs-candidate trusted-control
     comparison — trail prefix + sensitive-append ban, frozen AC capture
-    and ticket, frozen model-binding identity with append-only histories."""
+    and ticket, frozen model-binding identity with append-only histories.
+    admin#1495 r20 F3 adds the frozen routing tuple (session_environment
+    + issue_tracker.write_path)."""
 
     def _launch(self) -> dict:
         return {
             "decision_audit_trail": ["branch-established:x@" + "a" * 40, "note:one"],
             "acceptance_criteria_capture": {"digest": "d" * 16, "source_revision": "r1"},
             "validated_ticket": {"identifier": "ADM-953", "provider_id": "p1"},
+            # admin#1495 r20 F3: a local-only routing tuple - the shape
+            # whose upgrade the freeze exists to reject.
+            "session_environment": "managed",
+            "issue_tracker_write_path": "none",
             "model_runtime": {
                 "codex": {"model": "gpt-5.6-sol", "gate_status": "ready",
                           "post_invocation": [{"at": "t1"}]},
@@ -2803,6 +3192,34 @@ class TrustedControlDriftTests(unittest.TestCase):
             with self.subTest(label=label):
                 self.assertIsNotNone(self._drift(mutate))
 
+    def test_routing_tuple_frozen(self) -> None:
+        # admin#1495 r20 F3: the resolved routing tuple is launch
+        # authorization. The exact attempted-upgrade escape - a
+        # write_path:none launch whose candidate flips its own write
+        # path to a remote one - is trusted-control drift, as is any
+        # other rewrite of either half (including dropping the key).
+        for label, mutate in (
+            ("write-path-upgrade", lambda c: c.__setitem__(
+                "issue_tracker_write_path", "environment_tool")),
+            ("write-path-removed", lambda c: c.__setitem__(
+                "issue_tracker_write_path", None)),
+            ("environment-flip", lambda c: c.__setitem__(
+                "session_environment", "local")),
+        ):
+            with self.subTest(label=label):
+                self.assertIsNotNone(self._drift(mutate))
+        self.assertIn(
+            "issue_tracker_write_path",
+            self._drift(
+                lambda c: c.__setitem__(
+                    "issue_tracker_write_path", "environment_tool"
+                )
+            ),
+        )
+        # the untouched tuple stays drift-free (covered again by the
+        # benign-append case above, pinned here for the exact keys)
+        self.assertIsNone(self._drift(lambda c: None))
+
     def test_binding_identity_frozen_history_prefix(self) -> None:
         for label, mutate in (
             ("gate-flip", lambda c: c["model_runtime"]["claude_reviewer"].__setitem__("gate_status", "blocked")),
@@ -2843,21 +3260,26 @@ class QaManifestViolationTests(unittest.TestCase):
             "handoff_results": {"qa": results if results is not None else {o: "complete" for o in ops}},
         }
 
-    def _launch(self, ops=None):
+    def _launch(self, ops=None, write_path="environment_tool"):
         # r17 F7: the launch extract whose write-ahead plan records the
         # resolved targets; default = the FULL resolved mapped plan.
+        # admin#1495 r20 F3: carries the resolved routing tuple the
+        # Linear-leg ceiling derives authorization from (the schema
+        # extract exposes it for every real launch).
         return {
+            "session_environment": "managed",
+            "issue_tracker_write_path": write_path,
             "handoff_operations": {
                 "qa": list(self.FULL if ops is None else ops),
                 "review_roundtrip": [],
-            }
+            },
         }
 
-    def _violation(self, ops, launch_ops=None, **kw):
+    def _violation(self, ops, launch_ops=None, write_path="environment_tool", **kw):
         runner = _runner("claude-opus-5", None)
         return runner._qa_manifest_violation(
             "Keeper-Dating/matchmaking",
-            self._launch(launch_ops),
+            self._launch(launch_ops, write_path),
             self._extract(ops, **kw),
         )
 
@@ -2907,6 +3329,46 @@ class QaManifestViolationTests(unittest.TestCase):
             "Keeper-Dating/matchmaking", self._launch([]),
             self._extract(self.FULL[:1])))
         self.assertIsNone(self._violation([], status="idle"))
+
+    def test_remote_chain_over_local_launch_rejects(self) -> None:
+        # admin#1495 r20 F3, the exact escape at the terminal gate: the
+        # launch's frozen plan carried the local record_unavailable leg
+        # (write_path none); the candidate replaces it with the FULL
+        # remote Linear chain - a canonical shape, so the r15 F17
+        # coverage audit passes it, and the untouched routing tuple
+        # raises no trusted-control drift. The launch-authorized
+        # operation set is the Linear-leg ceiling: this rejects.
+        outage_plan = [
+            "qa.github.replace_assignees:gaaaaaaaaaaaa",
+            "qa.github.verify_assignees:gaaaaaaaaaaaa",
+            "qa.linear.record_unavailable:gaaaaaaaaaaaa",
+        ]
+        violation = self._violation(
+            self.FULL, launch_ops=outage_plan, write_path="none"
+        )
+        self.assertIsNotNone(violation)
+        self.assertIn("never authorized", violation)
+        # a hand-broken launch pairing the local-only leg with a remote
+        # write path still authorizes nothing remote - the ACTUAL launch
+        # operations bound the slice, not the path alone.
+        self.assertIsNotNone(
+            self._violation(self.FULL, launch_ops=outage_plan)
+        )
+        # a targetless write_path:none launch has an EMPTY manifest (the
+        # coverage audit skips entirely), so the ceiling is the one gate
+        # standing between it and a mid-slice-minted remote chain.
+        targetless_violation = self._violation(
+            self.FULL, launch_ops=[], write_path="none"
+        )
+        self.assertIsNotNone(targetless_violation)
+        self.assertIn("never authorized", targetless_violation)
+        # while an environment_tool targetless launch keeps the r19 F3
+        # class-minting allowance (its probe armed linear at launch).
+        self.assertIsNone(self._violation(self.FULL, launch_ops=[]))
+        # the authorized shapes stay accepted: the planned remote chain
+        # on a remote path (test_complete_manifest_passes) and the
+        # runtime-outage DOWNGRADE (test_outage_shapes_pass) - the
+        # ceiling rejects only the upgrade direction.
 
     # test_manifest_table_matches_the_planner (r15 F17) was REPLACED by
     # HandoffTargetLeafParityTests below (admin#1495 r19 F7): it compared

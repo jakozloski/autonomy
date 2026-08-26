@@ -281,6 +281,15 @@ if mode != "no_init":
         init["session_id"] = os.environ.get("FAKE_SID", "fake-sid-1")
     print(json.dumps(init), flush=True)
 
+if os.environ.get("FAKE_EMIT_RATE_LIMIT_EVENT") == "1":
+    # admin#1495 r20 F4: a standalone informational rate_limit_event
+    # stream record - never terminal-classifying, so the run must stay
+    # on its normal course to the final result.
+    print(json.dumps({
+        "type": "rate_limit_event",
+        "rate_limit": {"status": "allowed_warning", "resets_at": 1767225600},
+    }), flush=True)
+
 if mode == "die_late":
     pass  # falls through to normal candidate/verdict production; exits 7 at the end
 if mode == "sleep":
@@ -559,6 +568,17 @@ if os.environ.get("FAKE_RESET_HANDOFFS") == "1":
     )
 if os.environ.get("FAKE_ROLL_HANDOFFS") == "1":
     text = text.replace(":g0123456789ab", ":gba9876543210")
+flip_write_path = os.environ.get("FAKE_FLIP_WRITE_PATH")
+if flip_write_path:
+    # admin#1495 r20 F3: the candidate rewrites its own resolved Linear
+    # write path (the launch value is whatever the state carried) - the
+    # frozen routing tuple must reject this as a trusted-control
+    # rewrite whatever else the candidate contains.
+    text = re.sub(
+        r'(    write_path: ")[a-z_]+(")',
+        lambda m: m.group(1) + flip_write_path + m.group(2),
+        text, count=1,
+    )
 if os.environ.get("FAKE_UPPERCASE_FINGERPRINT") == "1":
     # admin#1495 r17 F9: the candidate re-encodes the (content-correct)
     # fingerprint in uppercase - the runner's recompute emits lowercase,
@@ -669,6 +689,18 @@ elif mode == "error_variant":
         "is_error": True,
         "errors": ["execution failed while running a tool"],
     }), flush=True)
+elif mode == "fable_limit_429":
+    # admin#1495 r20 F4: Claude 2.1.226 quota exhaustion - the final
+    # result carries the structured api_error_status while the prose
+    # misses the contextual matcher ON PURPOSE (ordinary model text must
+    # never ladder). FAKE_EXIT selects the exit path so both classify
+    # sites are pinned.
+    print(json.dumps({
+        "type": "result", "subtype": "success", "is_error": True,
+        "result": "You've reached your Fable 5 limit",
+        "api_error_status": 429,
+    }), flush=True)
+    sys.exit(int(os.environ.get("FAKE_EXIT", "0")))
 else:
     print(json.dumps({"type": "result", "result": json.dumps(verdict)}), flush=True)
 sys.exit(7 if mode == "die_late" else 0)
@@ -3081,6 +3113,116 @@ class MonitorRunnerE2ETests(unittest.TestCase):
             )
         )
 
+    def test_linear_leg_ceiling_follows_the_launch_authorization(self) -> None:
+        # admin#1495 r20 F3 (direct construction for the same
+        # containment-gate reason as the audits above): the launch's
+        # authorized operation set is the Linear-leg CEILING as well as
+        # the floor. The exact escape: a write_path:none launch planning
+        # the local record_unavailable leg accepted a candidate carrying
+        # the full remote Linear chain - a canonical shape, so the
+        # coverage audit passed it, and the untouched routing tuple
+        # raised no trusted-control drift.
+        mr = self._runner_module()
+        runner = self._direct_runner(mr)
+        chain = [
+            "qa.linear.verify_ticket_binding:g0123456789ab",
+            "qa.linear.assign_ticket:g0123456789ab",
+            "qa.linear.verify_ticket_assignee:g0123456789ab",
+            "qa.linear.set_ticket_state:g0123456789ab",
+            "qa.linear.verify_ticket_state:g0123456789ab",
+        ]
+
+        def routed(qa_ops, write_path):
+            return {
+                **self._launch_extract(qa_ops),
+                "session_environment": "managed",
+                "issue_tracker_write_path": write_path,
+            }
+
+        def candidate(qa_ops):
+            return {
+                "handoff_status_by_kind": {"qa": "complete"},
+                "handoff_operations": {"qa": list(qa_ops)},
+                "handoff_results": {"qa": {op: "complete" for op in qa_ops}},
+            }
+
+        local_launch = routed(self._HANDBACK_OPS + self._LINEAR_OPS, "none")
+        escaped = runner._qa_manifest_violation(
+            "Keeper-Dating/matchmaking", local_launch,
+            candidate(self._HANDBACK_OPS + chain),
+        )
+        self.assertIsNotNone(escaped)
+        self.assertIn("never authorized", escaped)
+        # the authorized local record leg itself still commits
+        self.assertIsNone(
+            runner._qa_manifest_violation(
+                "Keeper-Dating/matchmaking", local_launch,
+                candidate(self._HANDBACK_OPS + self._LINEAR_OPS),
+            )
+        )
+        # environment_tool launch + matching remote chain = accepted,
+        # with the launch's exact operation IDs and families preserved
+        # through terminal verification (the happy path).
+        remote_launch = routed(
+            self._HANDBACK_OPS + chain, "environment_tool"
+        )
+        accepted = candidate(self._HANDBACK_OPS + chain)
+        self.assertIsNone(
+            runner._qa_manifest_violation(
+                "Keeper-Dating/matchmaking", remote_launch, accepted
+            )
+        )
+        self.assertEqual(
+            sorted(accepted["handoff_operations"]["qa"]),
+            sorted(remote_launch["handoff_operations"]["qa"]),
+        )
+        # the attempted upgrade (launch none -> candidate flips its own
+        # write path) is trusted-control drift before the ceiling even
+        # runs.
+        upgraded = {
+            **local_launch, "issue_tracker_write_path": "environment_tool"
+        }
+        drift = mr._trusted_control_drift(local_launch, upgraded)
+        self.assertIsNotNone(drift)
+        self.assertIn("issue_tracker_write_path", drift)
+        # and the real schema-CLI extract exposes the tuple the freeze
+        # and the authorization consume - the e2e fixture template
+        # routes managed + environment_tool.
+        launch_extract = runner.schema.extract(runner.state_path)
+        self.assertEqual(launch_extract["session_environment"], "managed")
+        self.assertEqual(
+            launch_extract["issue_tracker_write_path"], "environment_tool"
+        )
+
+    def test_candidate_write_path_flip_is_trusted_control_drift(self) -> None:
+        # admin#1495 r20 F3 (the attempted-upgrade escape, end to end):
+        # the launch routes write_path none; the child's candidate flips
+        # it to environment_tool - rewriting its own authorization. The
+        # frozen routing tuple rejects it as a trusted-control rewrite
+        # BEFORE any acceptance math, and canonical keeps the launch
+        # routing.
+        self._mutate_state(
+            '    write_path: "environment_tool"', '    write_path: "none"'
+        )
+        completed = self._run(
+            budget="900", timeout=90, wait_scale="0.02",
+            env_extra={"FAKE_FLIP_WRITE_PATH": "environment_tool"},
+        )
+        self.assertEqual(
+            completed.returncode, 5, completed.stdout + completed.stderr
+        )
+        extract = self._extract()
+        signatures = [
+            f["signature"] for f in extract["monitor_cli"]["child_failures"]
+        ]
+        self.assertEqual(
+            signatures.count("monitor-child:trusted_control_rewrite"), 3,
+            signatures,
+        )
+        self.assertEqual(extract["issue_tracker_write_path"], "none")
+        self.assertEqual(extract["session_environment"], "managed")
+        self.assertEqual(extract["counters"]["monitor_poll_ticks"], 0)
+
     def test_bare_vm_capability_probe_blocks_mapped_runs(self) -> None:
         # admin#1495 finding 3825265272 (re-eval-named closure): a mapped
         # run whose resolved user-scope settings carry no permissions and
@@ -3890,6 +4032,64 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         ]
         self.assertNotIn("monitor-child:no_verdict", signatures)
         self.assertNotIn("monitor-child:exit_0", signatures)
+
+    def _assert_429_ladder(self, fake_exit: str) -> None:
+        # admin#1495 r20 F4 (exact repro): Claude 2.1.226 reports quota
+        # exhaustion as api_error_status:429 on the final result while
+        # the prose ("You've reached your Fable 5 limit") misses the
+        # contextual matcher - repeated ordinary quota exhaustion must
+        # ride the no-charge ladder, never consume the failure budget as
+        # charge/exit_0 or charge/exit_1.
+        completed = self._run(
+            mode="fable_limit_429", budget="900", timeout=90,
+            wait_scale="0.02", max_ticks="2",
+            env_extra={"FAKE_EXIT": fake_exit},
+        )
+        self.assertEqual(
+            completed.returncode, 0, completed.stdout + completed.stderr
+        )
+        summary = self._summary(completed)
+        self.assertEqual(summary["runner_outcome"], "slice_exhausted")
+        self.assertEqual(len(self._argv_calls()), 2, "ladder should retry")
+        extract = self._extract()
+        signatures = [
+            f["signature"] for f in extract["monitor_cli"]["child_failures"]
+        ]
+        self.assertEqual(
+            signatures, [], "a 429 final result must not charge the budget"
+        )
+
+    def test_final_result_429_takes_the_ladder_on_exit_0(self) -> None:
+        self._assert_429_ladder("0")
+
+    def test_final_result_429_takes_the_ladder_on_exit_1(self) -> None:
+        self._assert_429_ladder("1")
+
+    def test_rate_limit_event_then_success_commits(self) -> None:
+        # admin#1495 r20 F4: a standalone informational rate_limit_event
+        # stream record without a 429 final result is NOT terminal-
+        # classifying - the successful final result that follows commits
+        # the tick exactly like the plain ok flow (success precedence).
+        completed = self._run(
+            env_extra={"FAKE_EMIT_RATE_LIMIT_EVENT": "1"}
+        )
+        summary = self._summary(completed)
+        self.assertEqual(
+            summary["runner_outcome"], "slice_exhausted", completed.stderr
+        )
+        self.assertEqual(summary["ticks_completed"], 1)
+        self.assertEqual(summary["child_session_id"], "fake-sid-1")
+        extract = self._extract()
+        signatures = [
+            f["signature"] for f in extract["monitor_cli"]["child_failures"]
+        ]
+        self.assertIn("monitor-child:success", signatures)
+        self.assertEqual(
+            [s for s in signatures if s != "monitor-child:success"],
+            [],
+            "an informational rate_limit_event must neither classify nor"
+            " charge",
+        )
 
     def test_work_cap_overrun_terminal_is_rejected(self) -> None:
         # algo#1216 finding 3813491642 (exact repro): a candidate advancing

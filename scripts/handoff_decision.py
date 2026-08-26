@@ -740,8 +740,18 @@ def _approved_qa_operations(
         # tracker mutation, the executor RESOLVES the identifier through
         # the authorized path (the broker is identifier-keyed) and
         # confirms the broker-resolved ticket is the validated one: its
-        # true provider id equals expected_ticket_provider_id and the
-        # ticket links THIS PR, at fetch time. A mismatch fails this read-only operation, and the
+        # true provider id equals expected_ticket_provider_id, and the
+        # canonical linkage check holds (admin#1495 r20 F2; the single
+        # definition lives in monitor-exit-handoffs.md's QA handoff step
+        # 1): the freshly fetched PR body's first-line ticket link - the
+        # body fetched for exactly the expected_repository and
+        # expected_pull_request_number below, so the payload carries the
+        # complete source fingerprint and a strict executor needs no
+        # side-channel - names ticket_identifier. Linear-side
+        # attachments/links are never required (the pinned managed
+        # get_issue/get_issue_with_context projections return no
+        # attachment URLs); arbitrary description URLs never count. A
+        # mismatch fails this read-only operation, and the
         # dependency cascade renders every Linear mutation below it
         # skipped_dependency — a stale or re-keyed provider ID can never
         # reach an unrelated ticket.

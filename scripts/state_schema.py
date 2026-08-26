@@ -4256,6 +4256,15 @@ def monitor_extract(text: str) -> dict[str, Any]:
         "validated_ticket": None,
         "pr_number": None,
         "bot_grace_window_seconds": None,
+        # admin#1495 r20 F3: the resolved routing tuple
+        # (resolved_conventions.session_environment +
+        # resolved_conventions.issue_tracker.write_path) joins the
+        # trusted-control surface - the runner freezes it between launch
+        # and candidate (a child rewriting its own write path upgrades
+        # its own authorization) and derives the slice's remote-Linear
+        # authorization from the launch value.
+        "session_environment": None,
+        "issue_tracker_write_path": None,
     }
     try:
         state, _ = parse_state_text(text)
@@ -4304,6 +4313,16 @@ def monitor_extract(text: str) -> dict[str, Any]:
         and declared_grace > 0
     ):
         extract["bot_grace_window_seconds"] = declared_grace
+    if isinstance(conventions, dict):
+        environment = conventions.get("session_environment")
+        if isinstance(environment, str):
+            extract["session_environment"] = environment
+        tracker = conventions.get("issue_tracker")
+        tracker_write_path = (
+            tracker.get("write_path") if isinstance(tracker, dict) else None
+        )
+        if isinstance(tracker_write_path, str):
+            extract["issue_tracker_write_path"] = tracker_write_path
     for counter in ("monitor_iterations", "monitor_poll_ticks"):
         value = state.get(counter)
         if isinstance(value, int) and not isinstance(value, bool):

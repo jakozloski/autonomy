@@ -146,6 +146,13 @@ def _trusted_control_drift(
     * the acceptance-criteria capture (the launch-authorized scope) and
       the validated ticket are frozen — re-authorization is a human
       action between slices, never a child edit;
+    * the resolved routing tuple (session_environment +
+      issue_tracker.write_path) is frozen - admin#1495 r20 F3: the launch
+      write path bounds what the slice may do, so a candidate flipping
+      its own write path (none -> environment_tool) rewrites its own
+      authorization; a local-to-remote Linear transition happens at a
+      NEW slice launch behind a fresh capability reprobe, never under
+      the child;
     * model-binding identity is frozen per leg, while each leg's
       post_invocation history and the top-level escalation_invocations
       grow append-only (launch lists stay exact prefixes).
@@ -163,7 +170,14 @@ def _trusted_control_drift(
                 "decision_audit_trail append forges a runner/human-owned"
                 f" record class ({appended.split(':', 1)[0]}:)"
             )
-    for frozen_key in ("acceptance_criteria_capture", "validated_ticket"):
+    for frozen_key in (
+        "acceptance_criteria_capture",
+        "validated_ticket",
+        # admin#1495 r20 F3: the routing tuple is trusted control - see
+        # the docstring bullet above.
+        "session_environment",
+        "issue_tracker_write_path",
+    ):
         if launch.get(frozen_key) != candidate.get(frozen_key):
             return f"{frozen_key} changed under the child"
     launch_runtime = launch.get("model_runtime")
@@ -343,6 +357,30 @@ _QA_TARGET_SOURCE_KINDS = ("qa", "review_roundtrip")
 _HANDBACK_TARGET_FAMILIES = handoff_targets.HANDBACK_OPERATION_FAMILIES
 _REVIEW_TARGET_FAMILIES = handoff_targets.REVIEWER_OPERATION_FAMILIES
 
+# admin#1495 r20 F3: the Linear half of the resolved routing tuple.
+# local_api and environment_tool are the REMOTE-writing paths -
+# handoff_decision routes real tracker mutations through the managed
+# environment tool or the local API key - while none is local-only: the
+# planner then mints exactly the local qa.linear.record_unavailable
+# record, so no remote Linear operation is authorized for the slice.
+# The tuple is frozen per slice by _trusted_control_drift, so the LAUNCH
+# write path bounds what the slice may ever do; the capability preflight
+# and the terminal Linear-leg ceiling both derive from it.
+_REMOTE_LINEAR_WRITE_PATHS = frozenset(("environment_tool", "local_api"))
+# The service:"local" record families the planner mints WITHOUT any
+# remote Linear write (qa.linear.record_unavailable for write_path none,
+# qa.linear.record_state_unavailable for an unresolved QA state) -
+# restated from handoff_decision.py's local mints; membership in the
+# leaf's family union is pinned by test_monitor_runner_unit's
+# LinearWritePathAuthorizationTests, so the restatement cannot drift
+# silently.
+_LINEAR_LOCAL_RECORD_FAMILIES = frozenset(
+    ("qa.linear.record_unavailable", "qa.linear.record_state_unavailable")
+)
+_LINEAR_REMOTE_FAMILIES = frozenset(
+    handoff_targets.QA_LINEAR_OPERATION_FAMILIES - _LINEAR_LOCAL_RECORD_FAMILIES
+)
+
 
 def _operation_family(op_id: str) -> str:
     """Family segment of a generation-scoped operation id. The schema CLI
@@ -469,10 +507,16 @@ def _qa_manifest_coverage_violation(
     when reviewers are routed, so the FAMILY manifest never requires
     them - their coverage is enforced ID-exact by the companion
     _reviewer_floor_violation (admin#1495 r19 F8), which the terminal
-    gate runs alongside this audit. Identity inputs beyond the family
-    manifest (Linear provider ids) are live-service facts the executor
-    re-verifies at postcondition time; this gate closes the
-    omitted-effect hole, not identity forgery."""
+    gate runs alongside this audit. The Linear leg alone DOES get a
+    ceiling - the launch-authorized remote surface, enforced by the
+    companion _linear_leg_ceiling_violation (admin#1495 r20 F3), which
+    the terminal gate also runs alongside: any canonical shape passes
+    HERE, so without the ceiling a write_path:none launch's local
+    record_unavailable leg could be replaced by the full remote chain.
+    Identity inputs beyond the family manifest (Linear provider ids)
+    are live-service facts the executor re-verifies at postcondition
+    time; this gate closes the omitted-effect hole, not identity
+    forgery."""
 
     if not manifest:
         return None
@@ -528,6 +572,46 @@ def _qa_manifest_coverage_violation(
     if unrecorded:
         return f"qa operations without recorded results: {unrecorded[:3]}"
     return None
+
+
+def _linear_leg_ceiling_violation(
+    launch_extract: dict[str, Any], candidate_extract: dict[str, Any]
+) -> str | None:
+    """admin#1495 r20 F3: the launch's authorized operation set is the
+    Linear-leg CEILING as well as (via the coverage audit) the floor. A
+    terminal candidate may record a remote qa.linear.* family only when
+    the launch authorized it - the coverage audit accepts ANY canonical
+    leg shape, which let a write_path:none launch's local
+    record_unavailable leg be replaced by the full remote Linear chain
+    (the r20 F3 escape: no trusted-control drift when the frozen tuple
+    is untouched, no coverage violation because the full chain is
+    canonical). Local record families need no authorization (they are
+    service:"local" outcomes), and downgrades stay legitimate - a
+    launch-planned remote chain may still terminate as a documented
+    runtime-outage record - so only the UPGRADE direction rejects,
+    directing the child to replan at a NEW slice, where the capability
+    preflight reprobes linear from the new launch's plan. Derived from
+    the runner-owned LAUNCH extract only (the _qa_target_manifest trust
+    rule), and status-independent: an unauthorized remote plan is the
+    violation whatever the aggregate claims."""
+
+    recorded_remote = (
+        _qa_linear_families(candidate_extract) - _LINEAR_LOCAL_RECORD_FAMILIES
+    )
+    unauthorized = sorted(
+        recorded_remote - _launch_authorized_remote_linear(launch_extract)
+    )
+    if not unauthorized:
+        return None
+    return (
+        f"qa Linear leg records remote operations {unauthorized[:3]} the"
+        " launch never authorized (launch write_path"
+        f" {launch_extract.get('issue_tracker_write_path')!r}, planned"
+        f" Linear families {sorted(_qa_linear_families(launch_extract))[:3]})"
+        " - a local-to-remote Linear transition replans at a NEW slice"
+        " behind a fresh capability reprobe, never inside the slice"
+        " (admin#1495 r20 F3)"
+    )
 
 
 def _launch_reviewer_floor(
@@ -655,7 +739,11 @@ def _manifest_required_capabilities(manifest: frozenset[str]) -> frozenset[str]:
     """admin#1495 r16 F3: the child capability families the manifest's
     planned target families exercise - github when ANY github family is
     planned (handback or reviewer requests), linear only when the Linear
-    QA leg is planned. Always a subset of REQUIRED_CHILD_CAPABILITIES."""
+    QA leg is planned. Always a subset of REQUIRED_CHILD_CAPABILITIES.
+    The manifest cannot see WHICH Linear families are planned, so its
+    linear half is an over-approximation for a local-record-only leg -
+    _probe_required_capabilities bounds it by the launch write-path
+    authorization (admin#1495 r20 F3)."""
 
     required: set[str] = set()
     if manifest & frozenset(
@@ -665,6 +753,56 @@ def _manifest_required_capabilities(manifest: frozenset[str]) -> frozenset[str]:
     if _QA_TARGET_LINEAR_QA in manifest:
         required.add("linear")
     return frozenset(required)
+
+
+def _qa_linear_families(extract: dict[str, Any]) -> frozenset[str]:
+    """The qa.linear.* operation families an extract's qa plan carries -
+    applied to the runner-owned LAUNCH extract to derive the authorized
+    Linear surface, and to the candidate extract to audit the recorded
+    one (admin#1495 r20 F3)."""
+
+    ops = (extract.get("handoff_operations") or {}).get("qa") or []
+    return frozenset(
+        family
+        for family in (
+            _operation_family(op_id)
+            for op_id in ops
+            if isinstance(op_id, str)
+        )
+        if family.startswith("qa.linear.")
+    )
+
+
+def _launch_authorized_remote_linear(
+    launch_extract: dict[str, Any],
+) -> frozenset[str]:
+    """admin#1495 r20 F3: the REMOTE qa.linear.* families the launch
+    authorizes this slice to execute - the write path decides, then the
+    frozen plan narrows:
+
+    * write_path none (or missing/local-only) authorizes NOTHING remote,
+      whatever the plan claims - the planner mints only the local
+      record_unavailable leg there, and the tuple is frozen per slice,
+      so a local-to-remote transition needs a NEW slice behind a fresh
+      capability reprobe;
+    * a remote-writing write_path with a planned Linear leg authorizes
+      exactly that leg's remote families (the launch's actual authorized
+      operation set - a plan carrying only the local record families
+      authorizes no remote family even on a remote path);
+    * a remote-writing write_path with NO planned Linear leg (targetless
+      launch) authorizes the full class-mintable remote surface - the
+      r19 F3 mid-slice-minting case the class-floor probe arms for.
+    """
+
+    if (
+        launch_extract.get("issue_tracker_write_path")
+        not in _REMOTE_LINEAR_WRITE_PATHS
+    ):
+        return frozenset()
+    planned = _qa_linear_families(launch_extract)
+    if planned:
+        return planned - _LINEAR_LOCAL_RECORD_FAMILIES
+    return _LINEAR_REMOTE_FAMILIES
 
 
 def _repository_class_capabilities(bound_repo: object) -> frozenset[str]:
@@ -679,7 +817,13 @@ def _repository_class_capabilities(bound_repo: object) -> frozenset[str]:
     skip entirely, a child could then resolve GitHub/Linear work during
     the same slice, record those handoffs failed, and still pass the
     launch-derived missing-handoff and coverage gates because failed
-    aggregates are terminal-compatible."""
+    aggregates are terminal-compatible.
+
+    Deliberately a pure CLASS statement - admin#1495 r20 F3 bounds its
+    linear half by the launch write-path authorization at
+    _probe_required_capabilities (the class CAN mint Linear work
+    mid-slice, but only a launch whose frozen write path authorizes
+    remote Linear can ever execute it within the slice)."""
 
     if not isinstance(bound_repo, str) or not bound_repo:
         return frozenset()
@@ -692,7 +836,9 @@ def _repository_class_capabilities(bound_repo: object) -> frozenset[str]:
 
 
 def _probe_required_capabilities(
-    bound_repo: object, manifest: frozenset[str]
+    bound_repo: object,
+    manifest: frozenset[str],
+    launch_extract: dict[str, Any],
 ) -> frozenset[str]:
     """admin#1495 r19 F3: the capability preflight's REQUIRED set - the
     launch-resolved manifest's families UNIONED with the
@@ -704,11 +850,27 @@ def _probe_required_capabilities(
     preserving the documented idle-run liveness trade-off for it (see
     _child_capability_probe). The terminal gates keep consuming the
     launch-resolved manifest alone as their floor - the class floor
-    arms the preflight, never the coverage audit."""
+    arms the preflight, never the coverage audit.
 
-    return _manifest_required_capabilities(
+    admin#1495 r20 F3: linear is required only when the launch actually
+    authorizes remote Linear for this slice - the ACTUAL launch
+    operations plus write path decide, not map membership alone. A
+    mapped launch whose Linear leg is only the local
+    record_unavailable/record_state_unavailable families, or whose
+    write_path is none, cannot execute (or legitimately record) any
+    remote Linear operation within the slice: the routing tuple is
+    frozen by _trusted_control_drift and the terminal Linear-leg
+    ceiling rejects unauthorized remote families, so a local-to-remote
+    transition replans at a NEW slice, where this preflight reprobes
+    linear from the new launch. The github requirement is untouched -
+    the r19 F3 Keeper class floor keeps it armed."""
+
+    required = _manifest_required_capabilities(
         manifest
     ) | _repository_class_capabilities(bound_repo)
+    if not _launch_authorized_remote_linear(launch_extract):
+        required = required - frozenset(("linear",))
+    return required
 
 
 # algo#1216 r18 F3 / admin#1495 r14 F9: authorization is resolved from
@@ -2240,6 +2402,7 @@ def _drain_child(
         "result_subtype": None,
         "result_is_error": None,
         "result_errors": [],
+        "api_error_status": None,
     }
     recent_lines: list[str] = []
     stderr_tail: list[str] = []
@@ -2282,7 +2445,18 @@ def _drain_child(
                 # so an error result classifies as itself instead of
                 # falling through to a generic no_verdict; the text stays
                 # optional, and errors[] is retained byte-bounded and
-                # publication-sanitized.
+                # publication-sanitized. admin#1495 r20 F4: Claude
+                # 2.1.226 additionally exposes api_error_status (429 on
+                # quota exhaustion) on the FINAL result - retained
+                # type-validated below, because the accompanying prose
+                # ("You've reached your Fable 5 limit") deliberately
+                # misses the contextual free-text matcher. Only this
+                # final-result field is authoritative: standalone
+                # informational `rate_limit_event` stream records are
+                # NOT parsed and never classify - they fall through to
+                # recent_lines like any other non-protocol record, so a
+                # warning event followed by a successful result stays a
+                # success.
                 protocol["result_subtype"] = (
                     event.get("subtype")
                     if isinstance(event.get("subtype"), str)
@@ -2295,6 +2469,11 @@ def _drain_child(
                 )
                 if isinstance(event.get("result"), str):
                     protocol["result_text"] = event["result"]
+                api_status = event.get("api_error_status")
+                if isinstance(api_status, int) and not isinstance(
+                    api_status, bool
+                ):
+                    protocol["api_error_status"] = api_status
                 raw_errors = event.get("errors")
                 if isinstance(raw_errors, list):
                     protocol["result_errors"] = [
@@ -2479,6 +2658,7 @@ def classify_child_failure(
     result_is_error: bool | None = None,
     result_subtype: str | None = None,
     result_errors: list[str] | None = None,
+    api_error_status: int | None = None,
 ) -> tuple[str, str]:
     """Phase-aware classification (F4): ('block'|'ladder'|'charge'|'fresh_session', signature).
 
@@ -2486,6 +2666,15 @@ def classify_child_failure(
       signatures) BLOCK with an actionable reason.
     - A resume-target-not-found error clears the stale session and retries
       fresh — not a failure at all.
+    - admin#1495 r20 F4: a FINAL result carrying the structured
+      api_error_status 429 (Claude 2.1.226's quota-exhaustion shape) is
+      the rate-limit ladder for BOTH exit paths, classified ahead of any
+      free-text matching - its prose ("You've reached your Fable 5
+      limit") deliberately misses the contextual matcher, so without the
+      structured field it charged the budget as exit_0/exit_1. The prose
+      in ordinary model text alone (no 429) still never ladders - that
+      is the false-positive direction the contextual matcher exists to
+      avoid - and a non-429 status changes nothing here.
     - Rate/overload noise is liveness-class: ladder wait, no budget charge.
     - Everything else is an unknown-outcome charge.
     """
@@ -2512,6 +2701,13 @@ def classify_child_failure(
         return ("block", "claude CLI binary could not be executed — install or fix PATH")
     if _has_auth_signature(joined):
         return ("block", "claude CLI authentication failure — re-authenticate the owner route")
+    # admin#1495 r20 F4: the authoritative final result's structured 429
+    # outranks every free-text scan below (the deterministic setup BLOCKS
+    # above still win: a child that produced a final result passed auth,
+    # so a joint auth marker is forged-or-stale input and fails toward
+    # the human block, never an unattended ladder loop).
+    if api_error_status == 429:
+        return ("ladder", "monitor-child:rate_limited")
     if resumed and resume_loss_offset(lowered) is not None:
         return ("fresh_session", "monitor-child:resume_not_found")
     if rate_limit_offset(joined) is not None:
@@ -3632,6 +3828,7 @@ class Runner:
                     result_is_error=True,
                     result_subtype=protocol_meta.get("result_subtype"),
                     result_errors=protocol_meta.get("result_errors"),
+                    api_error_status=protocol_meta.get("api_error_status"),
                 )
                 if action == "block":
                     self._clear_in_flight(fresh)
@@ -3670,6 +3867,9 @@ class Runner:
                     ),
                     result_errors=drained.get("protocol", {}).get(
                         "result_errors"
+                    ),
+                    api_error_status=drained.get("protocol", {}).get(
+                        "api_error_status"
                     ),
                 )
                 if action == "block":
@@ -4042,7 +4242,14 @@ class Runner:
         surface must not block a run that will execute no Keeper
         handoffs - survives for exactly that class, whose mid-slice
         resolved targets are preflighted at the next slice while the
-        terminal gates recompute the floor per candidate.
+        terminal gates recompute the floor per candidate. admin#1495
+        r20 F3 bounds the linear half by the launch's own write-path
+        authorization: a mapped launch whose frozen routing tuple is
+        local-only (write_path none, or a Linear leg of only the local
+        record families) probes github without linear - the tuple
+        freeze and the terminal Linear-leg ceiling make remote Linear
+        unreachable within the slice, and the local-to-remote
+        transition reprobes at its new slice's launch.
         (algo#1216 r18 F5 removed the former "read-only scheduled run"
         justification: every reachable monitor child is write-capable,
         so no read-only cohort exists to preserve.)
@@ -4089,7 +4296,9 @@ class Runner:
         # launch on a non-Keeper or unresolved binding skips (no planned
         # surface, no class-mintable surface to prove).
         self.target_manifest = _qa_target_manifest(bound, extract)
-        required = _probe_required_capabilities(bound, self.target_manifest)
+        required = _probe_required_capabilities(
+            bound, self.target_manifest, extract
+        )
         if not required:
             return
         # admin#1495 r17 F5: the sanitized child env is resolved FIRST -
@@ -4876,19 +5085,29 @@ class Runner:
         second, ID-exact floor across qa and review_roundtrip - the
         family manifest alone let a reviewer-only launch reach terminal
         on an assignee replacement while omitting every planned
-        reviewer identity and verification. The coverage rules live in
-        the module-level _qa_manifest_coverage_violation and
-        _reviewer_floor_violation so tests can pin the shapes directly
-        (reviewer-only included)."""
+        reviewer identity and verification. admin#1495 r20 F3: the
+        launch-authorized remote Linear surface is additionally a
+        CEILING - floor first (coverage), then the ceiling, so a
+        candidate that swaps the authorized local record_unavailable
+        leg for the full remote chain rejects even though the chain is
+        a canonical shape. The coverage rules live in the module-level
+        _qa_manifest_coverage_violation, _reviewer_floor_violation, and
+        _linear_leg_ceiling_violation so tests can pin the shapes
+        directly (reviewer-only included)."""
 
         reviewer_violation = _reviewer_floor_violation(
             launch_extract, candidate_extract
         )
         if reviewer_violation is not None:
             return reviewer_violation
-        return _qa_manifest_coverage_violation(
+        coverage_violation = _qa_manifest_coverage_violation(
             _qa_target_manifest(bound_repo, launch_extract),
             candidate_extract,
+        )
+        if coverage_violation is not None:
+            return coverage_violation
+        return _linear_leg_ceiling_violation(
+            launch_extract, candidate_extract
         )
 
     def _stale_classification_reason(

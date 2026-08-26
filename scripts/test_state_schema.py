@@ -5590,6 +5590,40 @@ class MonitorBlockedEvidenceTests(unittest.TestCase):
         self.assertEqual(extract["state"], VALID, extract["errors"])
         self.assertIs(extract["blocked_evidence_present"], True)
 
+    def test_monitor_extract_carries_the_routing_tuple(self) -> None:
+        # admin#1495 r20 F3: the resolved routing tuple
+        # (session_environment + issue_tracker.write_path) joins the
+        # trusted-control surface - the runner freezes it between launch
+        # and candidate and derives the slice's remote-Linear
+        # authorization from the launch value, so the extract (the
+        # trusted read) must expose both halves.
+        extract = monitor_extract(FULL_STATE)
+        self.assertEqual(extract["state"], VALID, extract["errors"])
+        self.assertEqual(extract["session_environment"], "managed")
+        self.assertEqual(
+            extract["issue_tracker_write_path"], "environment_tool"
+        )
+        local_only = _mutate(
+            FULL_STATE,
+            '    write_path: "environment_tool"',
+            '    write_path: "none"',
+        )
+        self.assertEqual(
+            monitor_extract(local_only)["issue_tracker_write_path"], "none"
+        )
+        # structurally absent halves stay None - the extract never
+        # invents a value, and the runner's consumers fail closed on
+        # None (no remote authorization).
+        stripped = _mutate(
+            FULL_STATE,
+            '  session_environment: "managed"\n  issue_tracker:\n'
+            '    write_path: "environment_tool"\n',
+            "",
+        )
+        stripped_extract = monitor_extract(stripped)
+        self.assertIsNone(stripped_extract["session_environment"])
+        self.assertIsNone(stripped_extract["issue_tracker_write_path"])
+
     def test_monitor_extract_propagates_taint_findings(self) -> None:
         # R6-F5: the runner consumes taint through this extract; dropping it
         # let a write-capable child launch on flagged state. Findings are
