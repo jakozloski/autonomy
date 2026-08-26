@@ -1970,9 +1970,11 @@ _SANITIZED_SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/home
 def _resolve_system_binary(name: str) -> str:
     """mm#3551 finding 3806719679: resolve a bare command against the
     sanitized system PATH (user-writable ambient PATH entries excluded).
-    Falls back to the bare name when nothing matches — the subsequent probe
-    or spawn then fails loudly with the real cause instead of silently
-    resolving through a writable directory."""
+    mm#3551 dawid-r7 F8: when nothing matches this fails CLOSED with a
+    structured RunnerExit(5) naming the sanctioned fixes - the bare-name
+    fallback the old wording described was rejected by admin#1495 finding
+    3807823288, because a later spawn would resolve that bare name through
+    the ambient PATH, the exact hole this resolver exists to close."""
 
     import shutil as shutil_module
 
@@ -3024,9 +3026,24 @@ class Runner:
         # algo#1216 finding 3806594992 / mm#3551 finding 3806719734:
         # canonical state is child-writable between ticks — its reads get
         # the same FIFO-safe bounded treatment as candidates.
-        return _read_regular_file(
-            self.state_path, MAX_CANDIDATE_BYTES
-        ).decode("utf-8")
+        # mm#3551 dawid-r7 F10: and the same over-ceiling outcome, adapted
+        # to the surface. An oversized CANDIDATE is discarded as a charged
+        # retry; these bytes instead feed commit_block's splice-and-rewrite,
+        # where a silently truncated read would REWRITE canonical state as
+        # its own prefix - so an over-ceiling canonical read fails closed,
+        # never truncates.
+        raw = _read_regular_file(self.state_path, MAX_CANDIDATE_BYTES)
+        if len(raw) > MAX_CANDIDATE_BYTES:
+            raise RunnerExit(
+                5,
+                "blocked",
+                f"canonical state {self.state_path.name} exceeds the"
+                f" {MAX_CANDIDATE_BYTES}-byte read ceiling - the runner"
+                " never splices a truncated read back over the full file"
+                " (the state file is untouched); a human must shrink or"
+                " repair it, then resume",
+            )
+        return raw.decode("utf-8")
 
     def current_block(self, extract: dict[str, Any]) -> dict[str, Any]:
         block = extract.get("monitor_cli")
@@ -4890,6 +4907,12 @@ class Runner:
                 self.SIDECAR_RETENTION_LIMIT
             )
             if still_exceeded:
+                # mm#3551 dawid-r7 F9: state-and-safety.md has no dedicated
+                # retention/deletion procedure - the rule that actually
+                # exists is the failed-candidate bullet under "Human
+                # roundtrip and handoff semantics", so the pointer names it
+                # (and its steps) instead of implying a section that is not
+                # there.
                 raise RunnerExit(
                     5,
                     "blocked",
@@ -4897,7 +4920,12 @@ class Runner:
                     " sidecars remain after bounded batch compaction —"
                     " compacted deletions are durable progress, so"
                     " re-running the gate continues from here; reconcile"
-                    " and delete the remainder per state-and-safety.md"
+                    " the remainder per state-and-safety.md's"
+                    " failed-candidate rule (Human roundtrip and handoff"
+                    " semantics): verify each sidecar's recorded intents"
+                    " against their remote postconditions, record terminal"
+                    " results in canonical state, then delete the"
+                    " reconciled sidecar(s) and re-run"
                     " (bound enforced per batch: limit + 1 enumerated,"
                     " each parse under the byte ceiling)",
                 )

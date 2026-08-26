@@ -422,6 +422,15 @@ class SidecarGateTests(unittest.TestCase):
             runner._gate_sidecars({"handoff_results": {}})
         self.assertEqual(caught.exception.code, 5)
         self.assertIn("bounded batch compaction", caught.exception.reason)
+        # mm#3551 dawid-r7 F9: the operator pointer names the rule that
+        # actually exists - pinned on BOTH sides, so a renamed anchor in
+        # state-and-safety.md or a re-vagued runner message fails here.
+        anchor = "Human roundtrip and handoff semantics"
+        self.assertIn(anchor, caught.exception.reason)
+        reference = (
+            SCRIPTS.parent / "references" / "state-and-safety.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn(anchor, reference)
         self.assertEqual(
             len(stub.queued), 0, "exactly the bounded batch is parsed"
         )
@@ -4145,3 +4154,101 @@ class QuarantineArtifactGlobTests(unittest.TestCase):
                 for glob in GITIGNORE_ARTIFACT_GLOBS
             )
         )
+
+
+class SystemBinaryResolutionTests(unittest.TestCase):
+    """mm#3551 dawid-r7 F6: direct pins for _resolve_system_binary - the
+    guard that closed mm#3551 finding 3806719679 (ambient-PATH exclusion)
+    and admin#1495 finding 3807823288 (fail closed, never the bare-name
+    fallback). Every other test bypasses it through MONITOR_RUNNER_BIN_*
+    overrides or os.sep paths, so before these a revert to plain
+    ``shutil.which(name)`` failed nothing in either test file."""
+
+    def test_ambient_only_binary_is_not_found(self) -> None:
+        # A real executable that exists ONLY on the ambient PATH must not
+        # resolve: sanitized resolution never consults os.environ["PATH"].
+        scratch = Path(tempfile.mkdtemp(prefix="unit-ambient-bin-"))
+        self.addCleanup(shutil.rmtree, scratch, ignore_errors=True)
+        name = f"mrunit_ambient_only_{os.getpid()}"
+        binary = scratch / name
+        binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        binary.chmod(0o755)
+        ambient = str(scratch) + os.pathsep + os.environ.get("PATH", "")
+        with mock.patch.dict(os.environ, {"PATH": ambient}):
+            # Precondition guard: the fixture IS ambient-resolvable, so the
+            # block below can only come from the resolver excluding the
+            # ambient PATH - never from a broken fixture.
+            self.assertEqual(shutil.which(name), str(binary))
+            with self.assertRaises(RunnerExit) as caught:
+                monitor_runner._resolve_system_binary(name)
+        self.assertEqual(caught.exception.code, 5)
+        self.assertEqual(caught.exception.outcome, "blocked")
+
+    def test_sanitized_system_binary_resolves(self) -> None:
+        # The pass-through side: a binary that really lives on the
+        # sanitized system dirs resolves to an absolute path inside them.
+        with mock.patch.dict(os.environ):
+            os.environ.pop("MONITOR_RUNNER_BIN_PS", None)
+            found = monitor_runner._resolve_system_binary("ps")
+        self.assertTrue(os.path.isabs(found))
+        self.assertEqual(Path(found).name, "ps")
+        self.assertIn(
+            str(Path(found).parent),
+            monitor_runner._SANITIZED_SYSTEM_PATH.split(os.pathsep),
+        )
+
+    def test_missing_binary_fails_closed_naming_the_fixes(self) -> None:
+        # No silent bare-name fallback: a name absent from the sanitized
+        # dirs raises the structured block naming both sanctioned fixes.
+        name = f"mrunit_absent_{os.getpid()}"
+        with self.assertRaises(RunnerExit) as caught:
+            monitor_runner._resolve_system_binary(name)
+        self.assertEqual(caught.exception.code, 5)
+        self.assertEqual(caught.exception.outcome, "blocked")
+        self.assertIn(repr(name), caught.exception.reason)
+        self.assertIn(
+            f"MONITOR_RUNNER_BIN_{name.upper()}", caught.exception.reason
+        )
+
+
+class CanonicalReadCeilingTests(unittest.TestCase):
+    """mm#3551 dawid-r7 F10: the canonical-state read feeds commit_block's
+    splice-and-rewrite, so an over-ceiling file must fail closed as
+    blocked - never be silently truncated to its first MAX_CANDIDATE_BYTES
+    and rewritten as its own prefix. (An oversized CANDIDATE is discarded
+    as a charged retry; canonical state cannot be discarded.)"""
+
+    def _runner_with_state_bytes(self, payload: bytes) -> Runner:
+        tmp = Path(tempfile.mkdtemp(prefix="unit-canonical-ceiling-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        state = tmp / "state.md"
+        state.write_bytes(payload)
+        args = argparse.Namespace(
+            state_file=str(state),
+            skill_dir=str(SCRIPTS.parent),
+            claude_bin="/opt/homebrew/bin/claude",
+            schema_cli=str(SCRIPTS / "state_schema.py"),
+            slice_budget=100.0,
+            wait_scale=1.0,
+            acknowledge_taint=None,
+        )
+        runner = Runner(args)
+        _HELPER_RUNNERS.append(runner)
+        return runner
+
+    def test_over_ceiling_canonical_state_blocks_never_truncates(self) -> None:
+        ceiling = monitor_runner.MAX_CANDIDATE_BYTES
+        runner = self._runner_with_state_bytes(b"a" * (ceiling + 1))
+        with self.assertRaises(RunnerExit) as caught:
+            runner.read_text()
+        self.assertEqual(caught.exception.code, 5)
+        self.assertEqual(caught.exception.outcome, "blocked")
+        self.assertIn(runner.state_path.name, caught.exception.reason)
+        self.assertIn(str(ceiling), caught.exception.reason)
+
+    def test_state_exactly_at_the_ceiling_reads_complete(self) -> None:
+        # The pass-through boundary: at the ceiling nothing is truncated,
+        # so every byte must come back.
+        ceiling = monitor_runner.MAX_CANDIDATE_BYTES
+        runner = self._runner_with_state_bytes(b"b" * ceiling)
+        self.assertEqual(len(runner.read_text()), ceiling)

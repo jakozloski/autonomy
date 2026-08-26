@@ -1930,6 +1930,119 @@ class EntryPointScanTests(unittest.TestCase):
             )
             link.unlink()
 
+    def test_cursor_load_root_alias_is_enumerated_with_blob_triggers(
+        self,
+    ) -> None:
+        # mm#3551 dawid-r7 F2: the .cursor/skills/autonomy alias is a load
+        # root too - absent stays legal (only matchmaking carries it), a
+        # present root must resolve to the canonical package exactly like
+        # the .claude one, and when present the CI filters must match its
+        # BARE blob path on both events (the admin#1495 r14 F8 rule:
+        # "root/**" never matches the symlink blob, so a retarget would
+        # slide past CI).
+        from validate_package import _validate_entry_points
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            (repo / ".git").mkdir(parents=True)
+            package = repo / ".agents" / "skills" / "autonomy"
+            package.mkdir(parents=True)
+            (package / "SKILL.md").write_text("# pkg\n", encoding="utf-8")
+            workflows = repo / ".github" / "workflows"
+            workflows.mkdir(parents=True)
+            wf = workflows / "skill-package-checks.yml"
+
+            def wf_write(*paths):
+                # the commands filter is required unconditionally whenever
+                # the workflow exists (finding 3816225750), on BOTH events
+                block = (
+                    '      - ".cursor/commands/autonomous-*.md"\n'
+                    + "".join(f'      - "{p}"\n' for p in paths)
+                )
+                wf.write_text(
+                    "on:\n  pull_request:\n    paths:\n" + block
+                    + "  push:\n    paths:\n" + block,
+                    encoding="utf-8",
+                )
+
+            # absent passes: no .cursor/skills/autonomy and no trigger
+            wf_write(".agents/skills/**")
+            self.assertEqual(_validate_entry_points(package), [])
+
+            cursor_skills = repo / ".cursor" / "skills"
+            cursor_skills.mkdir(parents=True)
+            link = cursor_skills / "autonomy"
+            link.symlink_to(
+                Path("..") / ".." / ".agents" / "skills" / "autonomy"
+            )
+            # present and correct, exact bare path: clean
+            wf_write(".agents/skills/**", ".cursor/skills/autonomy")
+            self.assertEqual(_validate_entry_points(package), [])
+            # ancestor glob covers descendants AND the bare blob: clean
+            wf_write(".agents/skills/**", ".cursor/skills/**")
+            self.assertEqual(_validate_entry_points(package), [])
+            # "root/**" alone: _covers_path is satisfied but the bare
+            # symlink blob is unmatched - the retarget hole stays open
+            wf_write(".agents/skills/**", ".cursor/skills/autonomy/**")
+            errors = _validate_entry_points(package)
+            self.assertTrue(
+                any(
+                    "bare symlink path .cursor/skills/autonomy" in e
+                    and "dawid-r7 F2" in e
+                    for e in errors
+                ),
+                errors,
+            )
+            # missing entirely: the structural coverage error names it
+            wf_write(".agents/skills/**")
+            errors = _validate_entry_points(package)
+            self.assertTrue(
+                any(
+                    ".cursor/skills/autonomy" in e
+                    and "symlink-only change" in e
+                    for e in errors
+                ),
+                errors,
+            )
+            # the blob demand is deliberately scoped to the .cursor alias:
+            # a .claude symlink root covered only by "root/**" keeps its
+            # shipped _covers_path contract (finding 3822586140) - pin the
+            # asymmetry so widening it is a conscious cross-repo change
+            link.unlink()
+            claude_skills = repo / ".claude" / "skills"
+            claude_skills.mkdir(parents=True)
+            claude_link = claude_skills / "autonomy"
+            claude_link.symlink_to(
+                Path("..") / ".." / ".agents" / "skills" / "autonomy"
+            )
+            wf_write(".agents/skills/**", ".claude/skills/autonomy/**")
+            self.assertEqual(_validate_entry_points(package), [])
+            claude_link.unlink()
+            # retargeted: error, same resolution rule as the .claude root
+            other = repo / "elsewhere"
+            other.mkdir()
+            link.symlink_to(Path("..") / ".." / "elsewhere")
+            wf_write(".agents/skills/**", ".cursor/skills/autonomy")
+            errors = _validate_entry_points(package)
+            self.assertTrue(
+                any(
+                    "does not resolve to the validated package" in e
+                    for e in errors
+                ),
+                errors,
+            )
+            # dangling: error
+            link.unlink()
+            link.symlink_to(Path("..") / ".." / "missing-target")
+            errors = _validate_entry_points(package)
+            self.assertTrue(
+                any(
+                    "does not resolve to the validated package" in e
+                    for e in errors
+                ),
+                errors,
+            )
+
     def test_legacy_workflow_roots_and_event_filters(self) -> None:
         # admin#1495 r13 F10 + r13 F13: existing autonomous-workflow roots
         # must visibly delegate (HTML comments do not count) and be covered

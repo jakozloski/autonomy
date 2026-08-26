@@ -2042,16 +2042,25 @@ def _validate_entry_points(package_dir: Path) -> list[str]:
                                 " gate (admin#1495 r14 F11)"
                             )
             # admin#1495 finding 3822586140: the SYMLINK load roots are
-            # entry points too. Whichever of the two known roots is the
+            # entry points too. Whichever of the known roots is the
             # real package directory, every OTHER root that exists must be
             # a link resolving exactly to it — a retargeted, dangling, or
             # regular-file alias silently changes (or breaks) the package
             # a client loads, and a symlink-only change must not escape
             # this guard or its CI triggers.
             package_real = package_dir.resolve()
+            cursor_load_root = candidate / ".cursor" / "skills" / "autonomy"
             load_roots = (
                 candidate / ".claude" / "skills" / "autonomy",
                 candidate / ".agents" / "skills" / "autonomy",
+                # mm#3551 dawid-r7 F2: the Cursor discovery surface loads
+                # the package through this alias too (matchmaking is the
+                # only repo that carries it). Absent stays legal - when
+                # present it obeys the same resolution rule as the pair
+                # above, PLUS the r14 F8 bare-blob CI-trigger rule below,
+                # which is scoped to this alias-only root on purpose (see
+                # the comment at that check).
+                cursor_load_root,
             )
             workflow = (
                 candidate / ".github" / "workflows" / "skill-package-checks.yml"
@@ -2083,6 +2092,30 @@ def _validate_entry_points(package_dir: Path) -> list[str]:
                                     " would bypass this guard, and a"
                                     " comment-only mention does not count"
                                     " (findings 3822586140 / r13 F13)"
+                                )
+                            # mm#3551 dawid-r7 F2, mirroring the admin#1495
+                            # r14 F8 symlink-blob rule: a symlink load root
+                            # changes as its own bare blob path, which
+                            # "root/**" never matches in GitHub's filter,
+                            # so a retarget would slide past CI. Scoped to
+                            # the alias-only .cursor root: the
+                            # .claude/.agents pair keeps the _covers_path
+                            # contract it shipped with (finding 3822586140)
+                            # because tightening those two would change the
+                            # CI contract of every host repository, beyond
+                            # this finding's scope.
+                            elif root == cursor_load_root and not (
+                                _covers_symlink_blob(structural, rel)
+                            ):
+                                errors.append(
+                                    f"skill-package-checks.yml {event}"
+                                    " paths do not match the bare symlink"
+                                    f" path {rel} - \"{rel}/**\" never"
+                                    " matches the symlink blob itself, so"
+                                    " a retarget bypasses CI; add the"
+                                    " exact path or an ancestor glob"
+                                    " (mm#3551 dawid-r7 F2, per admin#1495"
+                                    " r14 F8)"
                                 )
                     continue
                 errors.append(
