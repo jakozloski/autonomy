@@ -4306,6 +4306,69 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         self.assertIsNotNone(block["last_completed_attempt_id"])
         self.assertIsNone(block["liveness"], "ladder rung must still clear")
 
+    def test_retry_then_terminal_commit_clears_liveness_debt(self) -> None:
+        # admin#1495 r18 F1: a terminal tick after a laddered retry
+        # returned from run() before the loop's continue-path
+        # _clear_liveness_ladder(), so the final paused state was
+        # schema-valid yet still carried the persisted rung as live retry
+        # debt. The finalize write now clears the rung for terminal and
+        # blocked outcomes; revert that and the liveness assertion below
+        # fails.
+        completed = self._run(
+            mode="rate_then_ok", budget="900", timeout=90,
+            wait_scale="0.02", max_ticks="2",
+            env_extra={"FAKE_OUTCOME": "terminal"},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        summary = self._summary(completed)
+        self.assertEqual(summary["runner_outcome"], "terminal")
+        self.assertEqual(summary["ticks_completed"], 1)
+        self.assertEqual(
+            len(self._argv_calls()), 2, "one laddered retry then terminal"
+        )
+        extract = self._extract()
+        self.assertEqual(extract["state"], "valid", extract["errors"])
+        self.assertEqual(extract["monitor_status"], "paused")
+        block = extract["monitor_cli"]
+        # The fold-in must not clobber its finalize-write siblings: the
+        # session/attempt continuity the repro observed stays committed.
+        self.assertEqual(block["child_session_id"], "fake-sid-1")
+        self.assertIsNotNone(block["last_completed_attempt_id"])
+        self.assertIsNone(
+            block["liveness"], "a terminal commit must not carry retry debt"
+        )
+
+    def test_retry_then_blocked_commit_clears_liveness_debt(self) -> None:
+        # admin#1495 r18 F1 second leg: the same ordering hole for a
+        # blocked outcome - the early return skipped the ladder clear, so
+        # the blocked state kept rung + next_retry_at, and the resume
+        # after the human resolved the blocker would sleep out a stale
+        # deadline that belonged to the pre-block retry.
+        self._mutate_state(
+            "attempt_log: {}", 'attempt_log:\n  "human:deploy-hold": 1'
+        )
+        completed = self._run(
+            mode="rate_then_ok", budget="900", timeout=90,
+            wait_scale="0.02", max_ticks="2",
+            env_extra={"FAKE_OUTCOME": "blocked"},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        summary = self._summary(completed)
+        self.assertEqual(summary["runner_outcome"], "blocked")
+        self.assertEqual(summary["ticks_completed"], 1)
+        self.assertEqual(
+            len(self._argv_calls()), 2, "one laddered retry then blocked"
+        )
+        extract = self._extract()
+        self.assertEqual(extract["state"], "valid", extract["errors"])
+        self.assertEqual(extract["monitor_status"], "blocked")
+        block = extract["monitor_cli"]
+        self.assertEqual(block["child_session_id"], "fake-sid-1")
+        self.assertIsNotNone(block["last_completed_attempt_id"])
+        self.assertIsNone(
+            block["liveness"], "a blocked commit must not carry retry debt"
+        )
+
     def test_resume_honors_persisted_ladder_deadline_across_slices(self) -> None:
         # algo#1216 finding 3807740769 (admin 3807823260 / mm 3808151933):
         # WIRING pin for _resume_liveness_wait — a fresh runner invocation

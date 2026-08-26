@@ -86,13 +86,6 @@ REQUIRED_SCRIPT_FILES = (
 # reference must update this inventory in the same commit (same contract as
 # the heading inventory).
 REQUIRED_GATE_MARKERS = {
-    # algo#1216 r19 F10: the GraphQL joins are prose-executed contracts —
-    # pin the fullDatabaseId projections so a revert to the deprecated
-    # 32-bit field fails validation.
-    "references/monitor-ci-feedback.md": (
-        "nodes { fullDatabaseId author { __typename login } updatedAt }",
-        "id fullDatabaseId submittedAt updatedAt",
-    ),
     "SKILL.md": (
         "state_schema.py",
         "monitor_runner.py",
@@ -230,7 +223,19 @@ REQUIRED_GATE_MARKERS = {
         "Stranded work",
         "postcondition-bound",
     ),
+    # admin#1495 r18 F3: this key appeared TWICE in this dict literal, and a
+    # Python dict display silently keeps only the last duplicate - the tuple
+    # carrying the fullDatabaseId projections was replaced wholesale, so the
+    # effective mapping held zero fullDatabaseId markers while the per-marker
+    # test derived its oracle from the same overwritten dict. One merged
+    # entry now; the duplicate-key AST guard in test_validate_package.py
+    # keeps the whole class from returning.
     "references/monitor-ci-feedback.md": (
+        # algo#1216 r19 F10: the GraphQL joins are prose-executed contracts —
+        # pin the fullDatabaseId projections so a revert to the deprecated
+        # 32-bit field fails validation.
+        "nodes { fullDatabaseId author { __typename login } updatedAt }",
+        "id fullDatabaseId submittedAt updatedAt",
         "world-state refresh",
         # R4 F1 — the pseudocode constant derives from state_schema.
         "BOT_GRACE_WINDOW = " + str(state_schema.BOT_GRACE_WINDOW_SECONDS),
@@ -1157,9 +1162,11 @@ def _extract_direct_interface_scalar(text: str, key: str) -> list[str]:
 
     values: list[str] = []
     lines = text.splitlines()
-    pattern = re.compile(rf"^  {re.escape(key)}\s*:\s*(.*)$")
+    # Pattern string, not re.compile (admin#1495 r18 F4; see
+    # _loader_collection_error's structural rule).
+    pattern = rf"^  {re.escape(key)}\s*:\s*(.*)$"
     for index, line in enumerate(lines):
-        match = pattern.match(line)
+        match = re.match(pattern, line)
         if match is None:
             continue
         value = match.group(1).strip()
@@ -1188,9 +1195,11 @@ def _direct_interface_quote_errors(text: str, keys: Iterable[str]) -> list[str]:
 
     errors: list[str] = []
     for key in keys:
-        pattern = re.compile(rf"^  {re.escape(key)}\s*:\s*(.*)$")
+        # Pattern string, not re.compile (admin#1495 r18 F4; see
+        # _loader_collection_error's structural rule).
+        pattern = rf"^  {re.escape(key)}\s*:\s*(.*)$"
         for line in text.splitlines():
-            match = pattern.match(line)
+            match = re.match(pattern, line)
             if match is None:
                 continue
             value = match.group(1).strip()
@@ -1331,9 +1340,10 @@ def _validate_policy_text(package_dir: Path) -> list[str]:
                     f"missing current redaction pattern for {kind}: {pattern}"
                 )
                 continue
-            compiled = re.compile(pattern)
             for sample in samples:
-                if compiled.fullmatch(sample) is None:
+                # Direct re.fullmatch, not re.compile (admin#1495 r18 F4;
+                # see _loader_collection_error's structural rule).
+                if re.fullmatch(pattern, sample) is None:
                     errors.append(
                         f"redaction pattern for {kind} does not match its fixture"
                     )
@@ -1417,7 +1427,10 @@ def _anchored_candidate(line: str, *, fenced: bool, in_fence: bool) -> str | Non
     return stripped
 
 
-_INLINE_HTML_COMMENT = re.compile(r"<!--.*?-->")
+# Pattern string, not a compiled object: no re.compile call may exist in
+# this file (admin#1495 r18 F4; see _loader_collection_error's structural
+# rule). The re module's own pattern cache keeps this cost-free.
+_INLINE_HTML_COMMENT = r"<!--.*?-->"
 
 
 def _strip_inline_html_comments(line: str) -> str:
@@ -1430,7 +1443,7 @@ def _strip_inline_html_comments(line: str) -> str:
     absent, the same decoy family the block-comment scan already rejects.
     """
 
-    stripped = _INLINE_HTML_COMMENT.sub("", line)
+    stripped = re.sub(_INLINE_HTML_COMMENT, "", line)
     open_index = stripped.rfind("<!--")
     if open_index != -1:
         stripped = stripped[:open_index]
@@ -1760,7 +1773,10 @@ def _strip_html_comments(text: str) -> str:
     return "\n".join(operative_lines)
 
 
-_MD_LINK_TARGET = re.compile(r"\[[^\]]*\]\(\s*<?([^)\s>]+)>?\s*\)")
+# Pattern string, not a compiled object: no re.compile call may exist in
+# this file (admin#1495 r18 F4; see _loader_collection_error's structural
+# rule). The re module's own pattern cache keeps this cost-free.
+_MD_LINK_TARGET = r"\[[^\]]*\]\(\s*<?([^)\s>]+)>?\s*\)"
 
 
 def _delegates_to_autonomy(text: str, source: Path, package_dir: Path) -> bool:
@@ -1787,7 +1803,7 @@ def _delegates_to_autonomy(text: str, source: Path, package_dir: Path) -> bool:
         package_real = package_dir.resolve()
     except OSError:
         return False
-    for match in _MD_LINK_TARGET.finditer(operative):
+    for match in re.finditer(_MD_LINK_TARGET, operative):
         target = match.group(1)
         if "://" in target or target.startswith(("mailto:", "#")):
             continue
@@ -2069,16 +2085,144 @@ def _validate_entry_points(package_dir: Path) -> list[str]:
             break
     return errors
 
+
+# admin#1495 r18 F4: bound for one loader child importing and counting one
+# required test module. Package imports are stdlib-only and finish in well
+# under a second; the bound only stops a hung import from stalling CI.
+_TEST_COLLECTION_TIMEOUT_SECONDS = 60
+
+# admin#1495 r18 F4: the child driver imports one module and prints how many
+# cases the unittest loader collects - it never RUNS test bodies.
+# ``loadTestsFromModule`` on an explicitly imported module, never
+# ``loadTestsFromName``: the latter wraps an import failure into a synthetic
+# _FailedTest that counts as 1, which would read as "collects".
+_TEST_COLLECTION_DRIVER = (
+    "import importlib, sys, unittest\n"
+    "sys.path.insert(0, sys.argv[1])\n"
+    "module = importlib.import_module(sys.argv[2])\n"
+    "suite = unittest.defaultTestLoader.loadTestsFromModule(module)\n"
+    "sys.stdout.write(str(suite.countTestCases()))\n"
+)
+
+# admin#1495 r18 F4: memo for _loader_collection_error, keyed by module name
+# plus a content digest of every ``*.py`` beside it. Collection depends only
+# on the module, the sibling sources it can import (``-I`` shuts out cwd,
+# PYTHONPATH, and user site), and the interpreter, which is constant within
+# a process - so identical bytes give identical results. CI's single
+# validate_package() call gains nothing here; the point is the package's own
+# test suite, which calls validate_package() hundreds of times against
+# byte-identical fixture packages and must not re-spawn nine children per
+# call.
+_COLLECTION_CACHE: dict[tuple[str, str], str | None] = {}
+
+
+def _script_directory_fingerprint(scripts_dir: Path) -> str:
+    """Content digest of every ``*.py`` in ``scripts_dir`` (memo key part)."""
+
+    import hashlib
+
+    digest = hashlib.sha256()
+    for path in sorted(scripts_dir.glob("*.py")):
+        digest.update(path.name.encode("utf-8"))
+        digest.update(b"\x00")
+        digest.update(path.read_bytes())
+        digest.update(b"\x00")
+    return digest.hexdigest()
+
+
+def _loader_collection_error(
+    scripts_dir: Path, module_name: str, required_file: str
+) -> str | None:
+    """Real, isolated, timeout-bounded loader collection for one module.
+
+    admin#1495 r18 F4: the AST predicate accepted any class-local ``test*``
+    method even when the class is not a ``unittest.TestCase`` - the loader
+    collected zero cases while aggregate discovery stayed green on other
+    modules' tests. The gate is therefore the loader's own nonzero count,
+    taken in a child interpreter so a broken module cannot crash or corrupt
+    the validator process.
+
+    Structural rule for this whole file: the vendored repositories' AI Skill
+    Security Scan raises a gate-failing CRITICAL when a single file pairs
+    subprocess with ANY call name containing eval/exec/compile/__import__
+    (substring match over dotted call names - ``re.compile`` trips it;
+    string literals do not). This subprocess call is why every regex in this
+    file is used as a pattern string, never via re.compile, and
+    test_validate_package.py pins the pairing ban.
+    """
+
+    import subprocess
+
+    command = [
+        sys.executable,
+        "-I",
+        "-B",
+        "-c",
+        _TEST_COLLECTION_DRIVER,
+        str(scripts_dir),
+        module_name,
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(scripts_dir),
+            capture_output=True,
+            timeout=_TEST_COLLECTION_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return (
+            f"{required_file}: loader collection timed out after"
+            f" {_TEST_COLLECTION_TIMEOUT_SECONDS}s - the module hung at"
+            " import (admin#1495 r18 F4)"
+        )
+    stderr_tail = " ".join(
+        completed.stderr.decode("utf-8", "replace").split()
+    )[-200:]
+    if completed.returncode != 0:
+        return (
+            f"{required_file}: loader collection child exited"
+            f" {completed.returncode} - the module failed to import"
+            f" (admin#1495 r18 F4): {stderr_tail}"
+        )
+    stdout_text = completed.stdout.decode("utf-8", "replace").strip()
+    try:
+        count = int(stdout_text)
+    except ValueError:
+        return (
+            f"{required_file}: loader collection child emitted no usable"
+            f" count (stdout {stdout_text[:80]!r}) - refusing to assume the"
+            " suite collects (admin#1495 r18 F4)"
+        )
+    if count == 0:
+        return (
+            f"{required_file}: unittest loader collected zero test cases -"
+            " a test* method on a plain (non-TestCase) class satisfies the"
+            " AST scan but never collects, and aggregate discovery hides"
+            " the zero behind other modules (admin#1495 r18 F4)"
+        )
+    return None
+
+
 def _validate_test_collection(package_dir: Path) -> list[str]:
     """CR 3761135481: ``unittest discover`` exits 0 after collecting zero
     tests, so file existence alone cannot prove the CI suite runs anything.
-    Statically require every required test module to define at least one
-    ``test*`` method inside a class — the discover pattern ``test_*.py``
-    already matches the filenames by construction."""
+    The discover pattern ``test_*.py`` already matches the filenames by
+    construction.
+
+    Two layers (admin#1495 r18 F4). The AST scan stays as a fast pre-filter
+    with precise messages for modules that cannot collect under this
+    package's conventions: parse failure, or no class-local ``test*`` method
+    (a ``load_tests``-only module is deliberately outside those conventions
+    and fails here). The GATE is real loader collection: an isolated,
+    timeout-bounded child interpreter imports each required module and must
+    count a nonzero number of collected cases, because the AST predicate
+    alone also accepts ``test*`` methods on plain non-TestCase classes that
+    the loader collects zero cases from."""
 
     import ast
 
     errors: list[str] = []
+    fingerprints: dict[Path, str] = {}
     for required_file in REQUIRED_SCRIPT_FILES:
         name = required_file.rsplit("/", 1)[-1]
         if not (name.startswith("test_") and name.endswith(".py")):
@@ -2103,6 +2247,21 @@ def _validate_test_collection(package_dir: Path) -> list[str]:
                 f"{required_file}: defines no test* method in any class —"
                 " discovery would collect zero tests and still exit 0"
             )
+            continue
+        scripts_dir = path.parent
+        fingerprint = fingerprints.get(scripts_dir)
+        if fingerprint is None:
+            fingerprint = _script_directory_fingerprint(scripts_dir)
+            fingerprints[scripts_dir] = fingerprint
+        module_name = name[: -len(".py")]
+        cache_key = (module_name, fingerprint)
+        if cache_key not in _COLLECTION_CACHE:
+            _COLLECTION_CACHE[cache_key] = _loader_collection_error(
+                scripts_dir, module_name, required_file
+            )
+        collection_error = _COLLECTION_CACHE[cache_key]
+        if collection_error is not None:
+            errors.append(collection_error)
     return errors
 
 

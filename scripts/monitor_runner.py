@@ -5383,6 +5383,17 @@ class Runner:
         block["owner_model"] = self.owner_model
         block["last_completed_attempt_id"] = attempt_id
         block["in_flight"] = None
+        # admin#1495 r18 F1: a terminal or blocked commit is the run's LAST
+        # write - the loop returns on these outcomes before its
+        # continue-path _clear_liveness_ladder(), so a rung persisted by
+        # _persist_liveness() would ride current_block(fresh) into the
+        # final state as live retry debt (and a later resume of a resolved
+        # block would sleep out the stale deadline). Clear it here, inside
+        # this same single finalize write - never a second post-commit
+        # write. Only the runner clears it, and only at finalization:
+        # child candidates legitimately carry the rung until this splice.
+        if outcome in ("terminal", "blocked"):
+            block["liveness"] = None
         # Still the R6-F6 snapshot: splice from the bytes validated above,
         # never from a re-read of the (unlocked) candidate file.
         finalized = splice_monitor_cli(candidate_text, block)
@@ -5483,7 +5494,12 @@ class Runner:
             os.close(stage_fd)
 
     def _clear_liveness_ladder(self) -> None:
-        """End-of-ladder cleanup after a non-retry outcome.
+        """End-of-ladder cleanup after a continue outcome.
+
+        admin#1495 r18 F1: this loop-side clear runs only while the runner
+        keeps ticking - a terminal or blocked result returns from run()
+        before reaching it, so those outcomes clear the rung inside
+        _verify_and_commit's single finalize write instead.
 
         Finding 3807740774: rebuild from a FRESH extract — the run loop's
         pre-tick extract predates the tick's own commit, and reusing it
