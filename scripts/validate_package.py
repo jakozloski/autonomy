@@ -164,8 +164,12 @@ REQUIRED_GATE_MARKERS = {
         # R2 round-2 finding 3737466493: without the child's wait, a smoke
         # child exiting nonzero after benign output read as clean/0 — the
         # canonical wiring must pass child_wait so the gate observes the
-        # real return code.
-        "supervise_stream(stdout_pipe, stderr_pipe, kill_callback, child_wait",
+        # real return code. mm#3551 dawid-r8 F2: the pin now extends
+        # through child_pgid - the prose templates ARE the production
+        # callers, and an anchor stopping at child_wait let a template
+        # drop the group kwarg (leader-only kill regression) unnoticed.
+        "supervise_stream(stdout_pipe, stderr_pipe, kill_callback,"
+        " child_wait, child_pgid=pgid",
         "verify_frozen_selection()",
         "attempts are per-invocation and reset each round",
     ),
@@ -1783,6 +1787,24 @@ def _strip_html_comments(text: str) -> str:
     return "\n".join(operative_lines)
 
 
+def _strip_fenced_code_blocks(text: str) -> str:
+    """Remove fenced code blocks - delimiters and contents - so delegation
+    checks see only operative Markdown (mm#3551 dawid-r8 F12): a decoy
+    link inside a fence renders as literal text, never as a link, yet
+    satisfied the r14 F10 link parse. Classification comes from
+    _iter_fence_state (this validator's single fence tracker, both
+    CommonMark families), and the pass runs BEFORE HTML-comment
+    stripping for the R6-F16 reason: inside a fence, comment syntax is
+    literal content, so fenced text must never reach the comment pass.
+    Fail direction: this pass only ever WITHHOLDS text from the link
+    scan (an unclosed fence withholds the tail; the tracker's one
+    documented divergence classifies MORE as fenced), so a mis-parse
+    can fail a real delegation loudly, never admit a fenced decoy."""
+
+    rows, _ends_open = _scan_fence_states(text)
+    return "\n".join(line for line, state in rows if state is False)
+
+
 # Pattern string, not a compiled object: no re.compile call may exist in
 # this file (admin#1495 r18 F4; see _loader_collection_error's structural
 # rule). The re module's own pattern cache keeps this cost-free.
@@ -1790,9 +1812,10 @@ _MD_LINK_TARGET = r"\[[^\]]*\]\(\s*<?([^)\s>]+)>?\s*\)"
 
 
 def _delegates_to_autonomy(text: str, source: Path, package_dir: Path) -> bool:
-    """True when ``text``'s operative Markdown (HTML comments stripped)
-    contains a STRUCTURALLY PARSED link whose target resolves to the
-    canonical package (admin#1495 r14 F10). The r13 predicate accepted
+    """True when ``text``'s operative Markdown (fenced code blocks,
+    then HTML comments, stripped - mm#3551 dawid-r8 F12) contains a
+    STRUCTURALLY PARSED link whose target resolves to the canonical
+    package (admin#1495 r14 F10). The r13 predicate accepted
     any substring mention, so ``../evil-autonomy/SKILL.md`` (a suffix
     lookalike) and prose that NAMES the path while refusing to follow it
     ("Do not follow ../autonomy/SKILL.md; run the legacy workflow") both
@@ -1804,10 +1827,11 @@ def _delegates_to_autonomy(text: str, source: Path, package_dir: Path) -> bool:
     ``../autonomy/SKILL.md`` a superseded root carries and the
     repo-rooted ``../../.agents/skills/autonomy/SKILL.md`` the command
     pointers carry. Bare-path mentions, prefix/suffix lookalikes,
-    negated prose, and commented links (still stripped, finding
-    3813789192) all fail."""
+    negated prose, commented links (still stripped, finding
+    3813789192), and fence-parked decoy links (mm#3551 dawid-r8 F12)
+    all fail."""
 
-    operative = _strip_html_comments(text)
+    operative = _strip_html_comments(_strip_fenced_code_blocks(text))
     try:
         source_dir = source.parent.resolve()
         package_real = package_dir.resolve()
@@ -1870,6 +1894,34 @@ def _validate_entry_points(package_dir: Path) -> list[str]:
                             " remove it (finding 3813789192; HTML comments"
                             " do not count)"
                         )
+            # mm#3551 dawid-r8 F6: `.claude/commands` carries the same
+            # autonomy command aliases one root over - R7 F2's
+            # partial-coverage class. Each existing alias must delegate
+            # under exactly the `.cursor` rule above; absent aliases
+            # stay legal.
+            claude_commands_dir = candidate / ".claude" / "commands"
+            claude_command_aliases = (
+                sorted(claude_commands_dir.glob("autonomous-*.md"))
+                if claude_commands_dir.is_dir()
+                else []
+            )
+            for entry in claude_command_aliases:
+                try:
+                    content = entry.read_text(encoding="utf-8")
+                except OSError:
+                    errors.append(
+                        f"unreadable legacy entry point: {entry}"
+                    )
+                    continue
+                if not _delegates_to_autonomy(content, entry, package_dir):
+                    errors.append(
+                        "legacy autonomy entry point does not delegate"
+                        f" to the canonical package: {entry} - make it"
+                        " a thin pointer at the autonomy skill or"
+                        " remove it (mm#3551 dawid-r8 F6, per finding"
+                        " 3813789192; HTML comments and fenced code"
+                        " blocks do not count)"
+                    )
             # admin#1495 finding 3816225750 / algo r13 F5: the trigger
             # wiring is required UNCONDITIONALLY whenever the workflow
             # exists — gating it on .cursor/commands presence meant the
@@ -1909,6 +1961,30 @@ def _validate_entry_points(package_dir: Path) -> list[str]:
                                 " wrong key, or a wrong indent does not"
                                 " count (findings 3816225750 / r13 F5;"
                                 " admin#1495 r12 F20 / r13 F13)"
+                            )
+                # mm#3551 dawid-r8 F6: when `.claude/commands` autonomy
+                # aliases exist, both event filters must cover their
+                # glob too - an alias-only edit otherwise never reruns
+                # the delegation scan above. Absent aliases stay legal
+                # (the presence-gated shape of the r13 F10 legacy-root
+                # demand below, not the unconditional `.cursor` demand),
+                # so finding 3816225750's first-addition window applies
+                # to this surface: a repo's very first alias lands
+                # unflagged until the next validator run reports it.
+                if claude_command_aliases:
+                    claude_glob = ".claude/commands/autonomous-*.md"
+                    for event, paths in event_paths.items():
+                        if (
+                            not _covers_path(paths, claude_glob)
+                            and claude_glob not in paths
+                        ):
+                            errors.append(
+                                f"skill-package-checks.yml {event} paths"
+                                f" do not include {claude_glob} under"
+                                f" structural on.{event}.paths - a YAML"
+                                " comment, a wrong key, or a wrong"
+                                " indent does not count (mm#3551"
+                                " dawid-r8 F6)"
                             )
             else:
                 workflow_text = ""

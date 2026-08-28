@@ -2004,8 +2004,10 @@ def _resolve_system_binary(name: str) -> str:
 
 
 def process_fingerprint(pid: int) -> str | None:
-    # R6-F8: a denied/hung ps is a fingerprint failure, not a runner crash —
-    # None already routes the launch into the structured spawn-failure path.
+    # R6-F8: a denied, hung, or missing ps is a fingerprint failure, not a
+    # runner crash - None already routes the launch into the structured
+    # spawn-failure path (run_tick's R4-4 arm: close stdin before GO,
+    # bounded reap, charged retry).
     try:
         completed = subprocess.run(
             [_resolve_system_binary("ps"), "-o", "lstart=", "-p", str(pid)],
@@ -2013,7 +2015,14 @@ def process_fingerprint(pid: int) -> str | None:
             text=True,
             timeout=10,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired, RunnerExit):
+        # mm#3551 dawid-r8 F4: a ps-less host degrades here by design - the
+        # resolver's fail-closed RunnerExit is for launch-critical
+        # resolution, and these paths document None/{} degradation. This
+        # catch also closes r7 F11's window: a RunnerExit escaping here
+        # after the wrapper spawn skipped the R4-4 no-GO close-and-reap arm
+        # at the call site, exiting the slice with the spawned wrapper
+        # unreconciled.
         return None
     value = completed.stdout.strip()
     return value or None
@@ -2033,7 +2042,10 @@ def _descendant_snapshot(root_pid: int) -> dict[int, dict[str, Any]]:
     namespace, available only on Linux hosts. Failures here return the
     facts gathered so far (empty on total failure): the snapshot only
     ADDS coverage on top of the fail-closed group gate, so a snapshot
-    error must not convert a provable group answer into a block.
+    error must not convert a provable group answer into a block. That
+    includes ``ps`` itself being unresolvable (dawid-r8 F4): the
+    resolver's fail-closed RunnerExit degrades to the same empty answer
+    instead of escaping the live drain loop mid-supervision.
 
     algo#1216 finding 3816160128: every snapshotted pid carries its
     ``lstart`` start-time fingerprint (the same identity source
@@ -2049,7 +2061,10 @@ def _descendant_snapshot(root_pid: int) -> dict[int, dict[str, Any]]:
             text=True,
             timeout=10,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired, RunnerExit):
+        # mm#3551 dawid-r8 F4: a ps-less host degrades here by design - the
+        # resolver's fail-closed RunnerExit is for launch-critical
+        # resolution, and these paths document None/{} degradation.
         return {}
     if completed.returncode != 0:
         return {}
@@ -2087,8 +2102,8 @@ def _group_member_identities(pgid: int) -> dict[int, dict[str, Any]]:
     from this tick's child. Captured members join the descendant snapshot
     with their fingerprints, which is what lets the extinction gate use
     identity-validated per-pid kills instead of a raw post-reap killpg.
-    Failures return empty: this only ADDS coverage on top of the
-    fail-closed gate.
+    Failures return empty, an unresolvable ``ps`` included (dawid-r8
+    F4): this only ADDS coverage on top of the fail-closed gate.
     """
 
     try:
@@ -2098,7 +2113,10 @@ def _group_member_identities(pgid: int) -> dict[int, dict[str, Any]]:
             text=True,
             timeout=10,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired, RunnerExit):
+        # mm#3551 dawid-r8 F4: a ps-less host degrades here by design - the
+        # resolver's fail-closed RunnerExit is for launch-critical
+        # resolution, and these paths document None/{} degradation.
         return {}
     if completed.returncode not in (0, 1):
         return {}

@@ -353,9 +353,10 @@ def handoff_operation_id_valid(kind: str, operation_id: str) -> bool:
     Generation-scoped kinds (qa/review_roundtrip/reviewer_request) require a
     ``family(:identity)?:g<12-hex>`` id whose family the kind mints, arity
     enforced. ``pr_artifacts`` requires a head-bound
-    ``(ci-evidence|qa-rehearsal):<git-object-id>`` id. Callers gate on
-    ALLOWED_HANDOFF_KINDS first, so an unlisted kind never reaches here; the
-    closing ``False`` is a fail-closed backstop, not a reachable branch.
+    ``(ci-evidence|qa-rehearsal|deferred-work):<git-object-id>`` id. Callers
+    gate on ALLOWED_HANDOFF_KINDS first, so an unlisted kind never reaches
+    here; the closing ``False`` is a fail-closed backstop, not a reachable
+    branch.
     """
 
     vocabulary = HANDOFF_KIND_GENERATION_VOCABULARY.get(kind)

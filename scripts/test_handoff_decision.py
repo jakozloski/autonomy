@@ -1799,6 +1799,11 @@ class HandoffDecisionTest(unittest.TestCase):
             ),
             plan["errors"],
         )
+        # mm#3551 dawid-r8 F22: the rejection precedes the generation
+        # digest and every operation mint - a malformed holder can never
+        # be baked into (or silently dropped from) a minted plan.
+        self.assertEqual(plan["operations"], [])
+        self.assertEqual(plan["call_plan"], [])
 
     def test_roundtrip_sorts_deduplicates_and_excludes_actor(self) -> None:
         request = {
@@ -4184,6 +4189,13 @@ class QaPlanVersionRolloutTests(unittest.TestCase):
             "write_path": "environment_tool",
             "qa_assignee_provider_id": LINEAR_QA_ASSIGNEE["provider_id"],
             "qa_state_provider_id": LINEAR_QA_STATE_WEB["provider_id"],
+            # mm#3551 dawid-r8 follow-through (worker-flagged): the r19 F9
+            # field was missing here, so the premise assert held for TWO
+            # reasons and the plan_version ablation this mirror exists to
+            # catch was blind - exactly the drift the comment above warns
+            # about. This fixture's state carries a provider id, so the
+            # current fold hashes the name slot as None.
+            "qa_state_name": None,
             "code_reviewers": [],
         }
         canonical = json.dumps(
@@ -4279,3 +4291,291 @@ class QaStateNameGenerationTests(unittest.TestCase):
             self._request({"provider_id": "st-1", "name": "Preview QA v2"})
         )
         self.assertEqual(with_name, renamed)
+
+
+class UnmappedGenerationTrackerScopeTests(unittest.TestCase):
+    """mm#3551 dawid-r8 F7: the unmapped QA path never reads
+    ``issue_tracker`` (``_approved_qa_operations`` returns before its
+    tracker leg), yet the digest folded tracker fields unconditionally -
+    an unrelated Linear change rolled the generation, re-minted the
+    qa.github.* IDs, pruned the prior target's terminal records as
+    history, and re-executed unchanged GitHub mutations. Tracker slots
+    now fold as None for unmapped repositories; mapped plans keep
+    digesting them because their consumer reads every one."""
+
+    UNMAPPED = {"nameWithOwner": "Keeper-Dating/algo"}
+    TRACKER_A = {
+        "ticket_identifier": "AI-1111",
+        "ticket_provider_id": "linear-ticket-ai-1111",
+        "write_path": "environment_tool",
+        "qa_assignee": {"provider_id": "qa-user-1"},
+        "qa_state": {"name": "Vercel Preview QA"},
+    }
+    TRACKER_B = {
+        "ticket_identifier": "AI-2222",
+        "ticket_provider_id": "linear-ticket-ai-2222",
+        "write_path": "local_api",
+        "qa_assignee": {"provider_id": "qa-user-2"},
+        "qa_state": {"name": "Renamed QA Lane"},
+    }
+
+    def _request(
+        self,
+        repository: dict[str, object],
+        issue_tracker: dict[str, object] | None,
+        operation_results: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        request: dict[str, object] = {
+            "scenario": "approved_qa",
+            "repository": repository,
+            "pull_request_number": PR_NUMBER,
+            "authenticated_actor": "jakozloski",
+            "existing_assignees": ["jakozloski"],
+            "code_reviewers": ["michal-janicki"],
+            "ball_holder": "michal-janicki",
+        }
+        if issue_tracker is not None:
+            request["issue_tracker"] = dict(issue_tracker)
+        if operation_results is not None:
+            request["operation_results"] = operation_results
+        return request
+
+    def test_unmapped_generation_ignores_tracker_fields(self) -> None:
+        # The finding's exact scenario: an unrelated Linear change (every
+        # tracker slot re-keyed or renamed at once) on an unmapped
+        # repository leaves the generation untouched.
+        no_tracker = qa_generation(self._request(self.UNMAPPED, None))
+        tracker_a = qa_generation(self._request(self.UNMAPPED, self.TRACKER_A))
+        tracker_b = qa_generation(self._request(self.UNMAPPED, self.TRACKER_B))
+        self.assertEqual(no_tracker, tracker_a)
+        self.assertEqual(tracker_a, tracker_b)
+
+    def test_unmapped_digest_folds_tracker_slots_as_none(self) -> None:
+        # Migration pin, mirroring QaPlanVersionRolloutTests.OLD_G: the
+        # tracker slots stay IN the unmapped payload folded as None (they
+        # do not vanish), so an unmapped request that never carried
+        # issue_tracker keeps its pre-F7 digest and never re-mints on
+        # upgrade. When a field is added to qa_generation, add it here
+        # too.
+        payload = {
+            "plan_version": 2,
+            "nameWithOwner": "Keeper-Dating/algo",
+            "pull_request_number": PR_NUMBER,
+            "github_login": "michal-janicki",
+            "ticket_identifier": None,
+            "ticket_provider_id": None,
+            "write_path": None,
+            "qa_assignee_provider_id": None,
+            "qa_state_provider_id": None,
+            "qa_state_name": None,
+            "code_reviewers": ["michal-janicki"],
+        }
+        canonical = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), default=str
+        )
+        expected = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+        self.assertEqual(
+            qa_generation(self._request(self.UNMAPPED, self.TRACKER_A)),
+            expected,
+        )
+
+    def test_mapped_generation_still_rolls_on_each_tracker_field(self) -> None:
+        # The mapped consumer reads every tracker slot, so each remains a
+        # plan target that moves the digest on its own.
+        reference = qa_generation(self._request(REPOSITORY, self.TRACKER_A))
+        variants: dict[str, dict[str, object]] = {
+            "ticket_identifier": {
+                **self.TRACKER_A,
+                "ticket_identifier": "AI-2222",
+            },
+            "ticket_provider_id": {
+                **self.TRACKER_A,
+                "ticket_provider_id": "linear-ticket-ai-2222",
+            },
+            "write_path": {**self.TRACKER_A, "write_path": "local_api"},
+            "qa_assignee_provider_id": {
+                **self.TRACKER_A,
+                "qa_assignee": {"provider_id": "qa-user-2"},
+            },
+            "qa_state_name": {
+                **self.TRACKER_A,
+                "qa_state": {"name": "Renamed QA Lane"},
+            },
+            "qa_state_provider_id": {
+                **self.TRACKER_A,
+                "qa_state": {
+                    "provider_id": "st-1",
+                    "name": "Vercel Preview QA",
+                },
+            },
+        }
+        for slot, tracker in variants.items():
+            with self.subTest(slot=slot):
+                self.assertNotEqual(
+                    reference,
+                    qa_generation(self._request(REPOSITORY, tracker)),
+                    "a mapped tracker change must roll the generation",
+                )
+
+    def test_unmapped_completed_ledger_survives_unrelated_tracker_change(
+        self,
+    ) -> None:
+        # End to end: the completed GitHub ledger stays satisfied across
+        # the Linear change - no re-mint, no prune, zero calls - where
+        # the unconditional fold re-executed every mutation.
+        first = plan_handoff(self._request(self.UNMAPPED, self.TRACKER_A))
+        self.assertEqual(first["state"], "pending", first.get("errors"))
+        ledger = {
+            operation["id"]: operation_result("complete")
+            for operation in first["operations"]
+        }
+        replan = plan_handoff(
+            self._request(self.UNMAPPED, self.TRACKER_B, ledger)
+        )
+        self.assertEqual(replan["state"], "complete", replan)
+        self.assertEqual(replan["call_plan"], [])
+        self.assertEqual(replan["warnings"], [])
+
+    @property
+    def PRE_F7_G(self) -> str:
+        # The pre-upgrade digest an unmapped plan minted while tracker
+        # fields still leaked in: byte-identical canonicalization over
+        # the current payload with TRACKER_A folded (the OLD_G
+        # convention). The premise assert keeps this mirror honest: if
+        # the slots ever leak back in, the two digests collapse and the
+        # migration tests fail here, not vacuously downstream.
+        payload = {
+            "plan_version": 2,
+            "nameWithOwner": "Keeper-Dating/algo",
+            "pull_request_number": PR_NUMBER,
+            "github_login": "michal-janicki",
+            "ticket_identifier": "AI-1111",
+            "ticket_provider_id": "linear-ticket-ai-1111",
+            "write_path": "environment_tool",
+            "qa_assignee_provider_id": "qa-user-1",
+            "qa_state_provider_id": None,
+            "qa_state_name": "name:Vercel Preview QA",
+            "code_reviewers": ["michal-janicki"],
+        }
+        canonical = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), default=str
+        )
+        old = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+        assert old != qa_generation(
+            self._request(self.UNMAPPED, self.TRACKER_A)
+        ), "tracker fields have leaked back into the unmapped digest"
+        return old
+
+    def test_pre_upgrade_unmapped_terminal_ledger_prunes_as_history(
+        self,
+    ) -> None:
+        # One-time upgrade turnover for the cohort that DID carry tracker
+        # fields: the old generation's terminal records are prior-target
+        # history (pruned with a warning), never unknown-ID errors.
+        old_g = self.PRE_F7_G
+        plan = plan_handoff(
+            self._request(
+                self.UNMAPPED,
+                self.TRACKER_A,
+                {
+                    f"qa.github.request_review:michal-janicki:g{old_g}": (
+                        operation_result("complete")
+                    ),
+                    f"qa.github.replace_assignees:g{old_g}": (
+                        operation_result("complete")
+                    ),
+                },
+            )
+        )
+        self.assertEqual(plan["state"], "pending", plan)
+        self.assertTrue(
+            any(
+                "prior-target terminal QA record" in warning
+                for warning in plan["warnings"]
+            ),
+            plan["warnings"],
+        )
+
+    def test_pre_upgrade_unmapped_in_flight_ledger_fails_closed(self) -> None:
+        # An in-flight pre-upgrade record marks a mutation that may
+        # already have fired remotely: blocked with the recovery named,
+        # exactly like every other generation turnover.
+        plan = plan_handoff(
+            self._request(
+                self.UNMAPPED,
+                self.TRACKER_A,
+                {
+                    f"qa.github.replace_assignees:g{self.PRE_F7_G}": {
+                        "status": "pending",
+                        "attempts": 1,
+                        "started_at": TIMESTAMP,
+                    }
+                },
+            )
+        )
+        self.assertEqual(plan["state"], "blocked", plan)
+        self.assertTrue(
+            any("still in flight" in error for error in plan["errors"]),
+            plan["errors"],
+        )
+
+
+class BallHolderResolutionParityTests(unittest.TestCase):
+    """mm#3551 dawid-r8 F22: the digest's handback slot and
+    ``_approved_qa_operations``' github_login resolve identically on
+    every plan-minting request; the supplied-but-malformed holder is the
+    one documented divergence, unreachable in a minted plan because the
+    builder error-returns before the digest runs."""
+
+    _OMIT: object = object()
+
+    def _request(
+        self, repository: dict[str, object], ball_holder: object
+    ) -> dict[str, object]:
+        request: dict[str, object] = {
+            "scenario": "approved_qa",
+            "repository": repository,
+            "pull_request_number": PR_NUMBER,
+            "authenticated_actor": "jakozloski",
+            "existing_assignees": ["jakozloski"],
+            "code_reviewers": ["michal-janicki"],
+        }
+        if ball_holder is not self._OMIT:
+            request["ball_holder"] = ball_holder
+        return request
+
+    def test_malformed_holder_folds_as_none_in_the_digest(self) -> None:
+        # The divergence's digest side: a malformed holder folds exactly
+        # like an absent one (the malformed-segments rule), while the
+        # builder side rejects it before any plan mints - pinned in
+        # test_unmapped_invalid_ball_holder_blocks.
+        unmapped = {"nameWithOwner": "Keeper-Dating/algo"}
+        self.assertEqual(
+            qa_generation(self._request(unmapped, "not a login!")),
+            qa_generation(self._request(unmapped, self._OMIT)),
+        )
+
+    def test_digest_tracks_the_builder_resolution_on_minting_requests(
+        self,
+    ) -> None:
+        # Owner wins in both resolutions: a mapped ball_holder is inert
+        # in the digest AND absent from the planned assignee.
+        mapped_with_holder = self._request(REPOSITORY, "michal-janicki")
+        self.assertEqual(
+            qa_generation(mapped_with_holder),
+            qa_generation(self._request(REPOSITORY, self._OMIT)),
+        )
+        plan = plan_handoff(mapped_with_holder)
+        self.assertEqual(plan["state"], "pending", plan.get("errors"))
+        replace = next(
+            operation
+            for operation in plan["operations"]
+            if operation["action"] == "replace_pull_request_assignees"
+        )
+        self.assertEqual(replace["payload"]["assignees"], ["tjkeeper"])
+        # An unmapped plan keys on its validated holder in both places.
+        unmapped = {"nameWithOwner": "Keeper-Dating/algo"}
+        self.assertNotEqual(
+            qa_generation(self._request(unmapped, "alice")),
+            qa_generation(self._request(unmapped, "bob")),
+        )

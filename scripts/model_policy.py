@@ -2819,8 +2819,23 @@ def waiver_gate_resolution(
             "waiver-named fallback is below its lineage's floor - a waiver"
             " may cross lineages, never authorize a downgrade"
         )
+    # mm#3551 dawid-r8 F8: the decision can round-trip through persisted
+    # state, so rehydration re-verifies the EFFORT contract exactly like
+    # the model floor - SKILL.md authorizes a waiver only at max effort,
+    # and any-non-empty accepted an effort:"low" tamper as ready. Both
+    # Claude legs pin the same canonical constants the gate itself uses.
     if not isinstance(effort, str) or not effort:
         errors.append("waiver decision effort must be a non-empty string")
+    elif binding is not None:
+        canonical_effort = (
+            BASE_EFFORT if binding[0] == "claude" else REVIEWER_EFFORT
+        )
+        if effort != canonical_effort:
+            errors.append(
+                "waiver decision effort must be the canonical"
+                f" {canonical_effort!r} - a waiver authorizes the named"
+                " fallback at max effort only, never a downgraded tier"
+            )
     if errors:
         return {"state": "invalid", "errors": errors}
     leg_name = binding[0]

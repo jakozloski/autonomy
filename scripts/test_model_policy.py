@@ -2789,6 +2789,32 @@ class WaiverGateResolutionTests(unittest.TestCase):
             "attempts": 1,
         }
 
+    def test_downgraded_effort_decision_fails_closed_on_rehydration(self) -> None:
+        # mm#3551 dawid-r8 F8: the decision round-trips through persisted
+        # state, and any-non-empty effort let a hand-edited effort:"low"
+        # decision with a matching observation land ready - contradicting
+        # the max-effort waiver contract. Rehydration now re-verifies the
+        # canonical effort exactly like the model floor.
+        from model_policy import waiver_gate_resolution
+
+        for leg in ("claude", "claude_reviewer"):
+            with self.subTest(leg=leg):
+                decision = dict(self._waived_decision(leg))
+                decision["effort"] = "low"
+                observation = self._observation(
+                    leg, decision["model"]
+                )
+                observation["effort"] = "low"
+                result = waiver_gate_resolution(decision, observation)
+                self.assertEqual(result.get("state"), "invalid", result)
+                self.assertTrue(
+                    any(
+                        "max effort only" in error
+                        for error in result.get("errors", [])
+                    ),
+                    result,
+                )
+
     @staticmethod
     def _runtime_with(leg: str, record: dict) -> dict:
         # The persisted-contract shape MonitorOrchestratorBindingTests

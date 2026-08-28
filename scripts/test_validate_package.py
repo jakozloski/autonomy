@@ -333,6 +333,34 @@ class ValidatePackageTests(unittest.TestCase):
                 finally:
                     target.write_text("# package fixture\n", encoding="utf-8")
 
+    def test_license_blanked_or_missing_is_rejected(self) -> None:
+        # mm#3551 dawid-r8 F21: the LICENSE check (admin#1495 r15 F12) had
+        # no failing-fixture coverage - only the real package's passing
+        # side ran, via the validator run. Pin both failure branches: a
+        # blanked notice-free LICENSE and a missing one. Marker oracles
+        # are literals on purpose.
+        license_path = self.package.root / "LICENSE"
+        license_path.write_text("", encoding="utf-8")
+        errors = validate_package(self.package.root)
+        for marker in (
+            "MIT License",
+            "Permission is hereby granted, free of charge",
+        ):
+            self.assertTrue(
+                any(
+                    f"LICENSE: does not carry the MIT notice ({marker!r}"
+                    in error
+                    for error in errors
+                ),
+                errors,
+            )
+        license_path.unlink()
+        errors = validate_package(self.package.root)
+        self.assertTrue(
+            any(error.startswith("LICENSE: missing") for error in errors),
+            errors,
+        )
+
     def test_missing_gate_marker_is_rejected_per_file_and_marker(self) -> None:
         for relative_path, markers in REQUIRED_GATE_MARKERS.items():
             for marker in markers:
@@ -1784,6 +1812,91 @@ class EntryPointScanTests(unittest.TestCase):
             legacy.unlink()
             self.assertEqual(_validate_entry_points(package), [])
 
+    def test_claude_command_aliases_delegate_and_gate_ci_paths(self) -> None:
+        # mm#3551 dawid-r8 F6: `.claude/commands/autonomous-*.md` aliases
+        # are the same discovery surface one command root over (R7 F2's
+        # partial-coverage class). A prose-only alias must fail exactly
+        # like a `.cursor` one; while any alias exists the CI filters
+        # must cover the glob on BOTH events; absent aliases stay legal,
+        # including for the CI demand.
+        from validate_package import _validate_entry_points
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            (repo / ".git").mkdir(parents=True)
+            package = repo / ".agents" / "skills" / "autonomy"
+            package.mkdir(parents=True)
+            workflows = repo / ".github" / "workflows"
+            workflows.mkdir(parents=True)
+            wf = workflows / "skill-package-checks.yml"
+            base_block = (
+                '      - ".agents/skills/**"\n'
+                '      - ".cursor/commands/autonomous-*.md"\n'
+            )
+            wf.write_text(
+                "on:\n  pull_request:\n    paths:\n" + base_block
+                + "  push:\n    paths:\n" + base_block,
+                encoding="utf-8",
+            )
+            # absent aliases: no delegation demand, no CI-filter demand
+            self.assertEqual(_validate_entry_points(package), [])
+            commands = repo / ".claude" / "commands"
+            commands.mkdir(parents=True)
+            alias = commands / "autonomous-feature.md"
+            # prose-only mention - the exact class the structural link
+            # parser exists to catch
+            alias.write_text(
+                "Superseded by the autonomy skill at"
+                " .agents/skills/autonomy/SKILL.md.\n",
+                encoding="utf-8",
+            )
+            errors = _validate_entry_points(package)
+            self.assertTrue(
+                any(
+                    "dawid-r8 F6" in error
+                    and "does not delegate" in error
+                    and str(alias) in error
+                    for error in errors
+                ),
+                errors,
+            )
+            # delegating alias, filters still missing the glob: exactly
+            # the two per-event CI errors remain
+            alias.write_text(
+                "Delegate: read [the autonomy skill]"
+                "(../../.agents/skills/autonomy/SKILL.md) and follow it.\n",
+                encoding="utf-8",
+            )
+            errors = _validate_entry_points(package)
+            self.assertEqual(len(errors), 2, errors)
+            self.assertEqual(
+                sum(
+                    ".claude/commands/autonomous-*.md" in error
+                    and "dawid-r8 F6" in error
+                    for error in errors
+                ),
+                2,
+                errors,
+            )
+            # glob present on both events: clean
+            covered_block = base_block + (
+                '      - ".claude/commands/autonomous-*.md"\n'
+            )
+            wf.write_text(
+                "on:\n  pull_request:\n    paths:\n" + covered_block
+                + "  push:\n    paths:\n" + covered_block,
+                encoding="utf-8",
+            )
+            self.assertEqual(_validate_entry_points(package), [])
+            # removing the alias removes the CI demand with it
+            wf.write_text(
+                "on:\n  pull_request:\n    paths:\n" + base_block
+                + "  push:\n    paths:\n" + base_block,
+                encoding="utf-8",
+            )
+            alias.unlink()
+            self.assertEqual(_validate_entry_points(package), [])
+
     def test_trigger_and_delegation_checks_are_structural(self) -> None:
         # admin#1495 r12 F20: raw substring checks accepted a YAML comment,
         # a push-only trigger, a wrong key, or a wrong indent as the
@@ -2195,6 +2308,54 @@ class EntryPointScanTests(unittest.TestCase):
                     self.assertFalse(
                         _delegates_to_autonomy(text, source, package)
                     )
+
+    def test_delegation_ignores_links_inside_fenced_code_blocks(self) -> None:
+        # mm#3551 dawid-r8 F12: _delegates_to_autonomy stripped HTML
+        # comments but not fenced code blocks, so a decoy link inside a
+        # fence - rendered as literal text, never as a link - satisfied
+        # delegation. Fences of both CommonMark families are display
+        # content now, exactly like comments; a real link outside a
+        # fence must keep passing with a fenced decoy beside it.
+        from validate_package import _delegates_to_autonomy
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            package = repo / ".agents" / "skills" / "autonomy"
+            package.mkdir(parents=True)
+            legacy = repo / ".agents" / "skills" / "autonomous-workflow"
+            legacy.mkdir(parents=True)
+            source = legacy / "SKILL.md"
+            fence_only_shapes = {
+                "backtick": (
+                    "Run the legacy flow.\n"
+                    "```md\n"
+                    "[decoy](../autonomy/SKILL.md)\n"
+                    "```\n"
+                ),
+                "tilde": (
+                    "Run the legacy flow.\n"
+                    "~~~\n"
+                    "[decoy](../autonomy/SKILL.md)\n"
+                    "~~~\n"
+                ),
+                "unclosed": (
+                    "Run the legacy flow.\n"
+                    "```\n"
+                    "[decoy](../autonomy/SKILL.md)\n"
+                ),
+            }
+            for label, text in fence_only_shapes.items():
+                with self.subTest(shape=label):
+                    self.assertFalse(
+                        _delegates_to_autonomy(text, source, package)
+                    )
+            self.assertTrue(_delegates_to_autonomy(
+                "```\n"
+                "[decoy](../autonomy/SKILL.md)\n"
+                "```\n"
+                "Invoke the [`autonomy`](../autonomy/SKILL.md) skill.\n",
+                source, package,
+            ))
 
     def test_legacy_root_sibling_relative_link_is_accepted(self) -> None:
         # r13 F10 end to end: a superseded root whose ONLY delegation is the

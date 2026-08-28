@@ -316,7 +316,10 @@ def qa_generation(request: dict[str, Any]) -> str:
     so the plan re-mints as one atomic unit when any target changes.
     Malformed segments hash as ``None`` — the planner's own validation
     rejects them separately; this digest only has to CHANGE when a target
-    changes.
+    changes.  Tracker fields are folded for Linear-mapped repositories
+    only: the unmapped path plans no tracker leg and never reads
+    ``issue_tracker``, so an unrelated tracker change must never re-mint
+    an unmapped plan's GitHub operations (mm#3551 dawid-r8 F7).
 
     ``plan_version`` is a plan-SHAPE component (post-fix review F1 of R2
     round-3 finding 3774514905): inserting ``verify_ticket_binding`` into
@@ -342,13 +345,34 @@ def qa_generation(request: dict[str, Any]) -> str:
     # target — the mapped QA owner, else the request's validated
     # ball_holder (the universal handback's assignee). Mapped digests stay
     # byte-identical to pre-F2; unmapped plans key on their ball holder.
-    # Mirrors _approved_qa_operations' resolution exactly.
+    # mm#3551 dawid-r8 F22: mirrors _approved_qa_operations' resolution
+    # for every request that mints a plan - owner wins, else a validated
+    # holder, else None (holder absent). The one divergence is deliberate:
+    # a SUPPLIED-but-malformed holder error-returns in the builder before
+    # this digest ever runs, so here it folds as None under the
+    # malformed-segments rule above instead of restating that validation
+    # in a second place.
     handback_login = owner["github_login"] if owner else None
     if handback_login is None:
         raw_holder = request.get("ball_holder")
         if isinstance(raw_holder, str) and GITHUB_LOGIN.fullmatch(raw_holder):
             handback_login = raw_holder
-    tracker = request.get("issue_tracker")
+    # mm#3551 dawid-r8 F7: tracker fields are plan targets ONLY for a
+    # mapped repository - the unmapped path in _approved_qa_operations
+    # returns before ever reading issue_tracker (no Linear leg is
+    # planned), so unmapped plans fold every tracker slot as None. An
+    # unrelated Linear change (a re-keyed ticket, a renamed QA state)
+    # must not roll an unmapped generation, re-mint its qa.github.* IDs,
+    # and re-execute unchanged GitHub mutations. Migration: mapped
+    # digests and tracker-less unmapped digests are byte-identical to
+    # pre-F7 (the slots stay in the payload, folded as None), so only an
+    # unmapped plan whose request DID carry tracker fields re-mints -
+    # ONCE, on upgrade - and its old generation's terminal records take
+    # the documented prior-target path in plan_handoff's QA sweep
+    # (pruned as history with a warning; an in-flight record still fails
+    # closed with the recovery named). Self-healing, and the last
+    # tracker-driven re-mint that cohort can ever see.
+    tracker = request.get("issue_tracker") if owner is not None else None
     tracker = tracker if isinstance(tracker, dict) else {}
     qa_assignee = tracker.get("qa_assignee")
     qa_assignee = qa_assignee if isinstance(qa_assignee, dict) else {}

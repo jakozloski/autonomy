@@ -22,6 +22,8 @@ from __future__ import annotations
 import builtins
 import importlib
 import symtable
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -97,6 +99,56 @@ class TestNoUndefinedModuleGlobals(unittest.TestCase):
         )
         self.assertIn("os", used)
         self.assertEqual(declared, set())
+
+    def test_undefined_globals_and_the_failure_loop_can_fail(self) -> None:
+        # mm#3551 dawid-r8 F11: the can't-fail test above stopped at
+        # _global_name_uses - _undefined_globals' set arithmetic and the
+        # package-wide failure loop were never exercised. Run both
+        # against real imported modules: one referencing a global its
+        # module never defines must be reported, a defined-everything
+        # sibling must not be, and the failure loop itself must be
+        # provably able to fail on the former and pass on the latter.
+        global PACKAGE_SCRIPTS_DIR
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            broken = tmp_dir / "synthetic_broken_global_mm3551.py"
+            broken.write_text(
+                "def kills():\n    return missing_helper()\n",
+                encoding="utf-8",
+            )
+            clean = tmp_dir / "synthetic_clean_global_mm3551.py"
+            clean.write_text(
+                "LIMIT = 3\n\n\ndef reads():\n    return LIMIT\n",
+                encoding="utf-8",
+            )
+            sys.path.insert(0, str(tmp_dir))
+            saved_dir = PACKAGE_SCRIPTS_DIR
+            PACKAGE_SCRIPTS_DIR = tmp_dir
+            try:
+                importlib.invalidate_caches()
+                self.assertEqual(
+                    _undefined_globals(broken.stem, broken),
+                    {"missing_helper"},
+                )
+                self.assertEqual(
+                    _undefined_globals(clean.stem, clean), set()
+                )
+                # the failure loop must reach its append and fail...
+                with self.assertRaises(AssertionError) as caught:
+                    self.test_every_package_module_resolves_every_global()
+                self.assertIn(
+                    "synthetic_broken_global_mm3551.py: missing_helper",
+                    str(caught.exception),
+                )
+                # ...and pass once only the defined-everything module
+                # remains.
+                broken.unlink()
+                self.test_every_package_module_resolves_every_global()
+            finally:
+                PACKAGE_SCRIPTS_DIR = saved_dir
+                sys.path.remove(str(tmp_dir))
+                sys.modules.pop(broken.stem, None)
+                sys.modules.pop(clean.stem, None)
 
     def test_global_statement_assignments_are_not_false_positives(self) -> None:
         used, declared = _global_name_uses(

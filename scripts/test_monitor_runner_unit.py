@@ -16,8 +16,11 @@ integration test can reach:
     ``_scratch_refusal`` (the operator-facing fail-closed message), pure
     functions with no child to observe.
 
-This file spawns no child process and names no dynamic-dispatch call, so it
-does not trip the skill scanner and needs no split.
+This file names no dynamic-dispatch call and pairs no code-execution token
+with child spawning, so it does not trip the skill scanner and needs no
+split (mm#3551 dawid-r8: the earlier "spawns no child process" claim was
+stale - fake-ps fixture scripts do run; what matters to the scanner is the
+pairing, which stays absent).
 """
 
 from __future__ import annotations
@@ -4208,6 +4211,51 @@ class SystemBinaryResolutionTests(unittest.TestCase):
         self.assertIn(repr(name), caught.exception.reason)
         self.assertIn(
             f"MONITOR_RUNNER_BIN_{name.upper()}", caught.exception.reason
+        )
+
+
+class BestEffortPsDegradationTests(unittest.TestCase):
+    """mm#3551 dawid-r8 F4: the resolver's fail-closed RunnerExit must not
+    escape the three best-effort ps helpers - a ps-less host degrades to
+    the documented None/{} on paths built to degrade (fingerprinting, and
+    the drain loop's snapshot accumulation), while the fail-closed
+    inspectors keep raising. Closes r7 F11's concrete trigger: a
+    RunnerExit out of process_fingerprint after the wrapper spawn
+    bypassed run_tick's R4-4 no-GO close-stdin-and-reap arm, stranding a
+    paused wrapper."""
+
+    def _make_ps_unresolvable(self) -> None:
+        # The REAL resolver raise, not a mocked one: no operator override
+        # and an empty sanitized PATH. The precondition guard proves the
+        # degraded values below can only come from each helper's own
+        # RunnerExit catch - and that launch-critical resolution itself
+        # still fails closed on the same host.
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("MONITOR_RUNNER_BIN_PS", None)
+        empty = Path(tempfile.mkdtemp(prefix="unit-ps-less-"))
+        self.addCleanup(shutil.rmtree, empty, ignore_errors=True)
+        sanitized = mock.patch.object(
+            monitor_runner, "_SANITIZED_SYSTEM_PATH", str(empty)
+        )
+        sanitized.start()
+        self.addCleanup(sanitized.stop)
+        with self.assertRaises(RunnerExit):
+            monitor_runner._resolve_system_binary("ps")
+
+    def test_process_fingerprint_degrades_to_none_without_ps(self) -> None:
+        self._make_ps_unresolvable()
+        self.assertIsNone(monitor_runner.process_fingerprint(os.getpid()))
+
+    def test_descendant_snapshot_degrades_to_empty_without_ps(self) -> None:
+        self._make_ps_unresolvable()
+        self.assertEqual(monitor_runner._descendant_snapshot(os.getpid()), {})
+
+    def test_group_member_identities_degrades_to_empty_without_ps(self) -> None:
+        self._make_ps_unresolvable()
+        self.assertEqual(
+            monitor_runner._group_member_identities(os.getpgrp()), {}
         )
 
 
