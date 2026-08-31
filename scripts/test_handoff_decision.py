@@ -44,6 +44,10 @@ QA_G = qa_generation(
         "repository": REPOSITORY,
         "pull_request_number": PR_NUMBER,
         "issue_tracker": {
+            # dawid-r9 F3: the digest folds tracker sub-fields unless the
+            # type is linear (the consumer's read condition), so the
+            # derivation input carries the type like every plan fixture.
+            "type": "linear",
             "qa_assignee": LINEAR_QA_ASSIGNEE,
             "qa_state": LINEAR_QA_STATE_WEB,
             "ticket_identifier": "WEB-8877",
@@ -4270,6 +4274,10 @@ class QaStateNameGenerationTests(unittest.TestCase):
             "authenticated_actor": "jakozloski",
             "code_reviewers": [],
             "issue_tracker": {
+                # dawid-r9 F3: name-only state renames are plan targets
+                # only on the linear branch — the digest folds untyped
+                # trackers, so the fixture carries the consumer's type.
+                "type": "linear",
                 "ticket_identifier": "WEB-1234",
                 "ticket_provider_id": "abc",
                 "write_path": "local_api",
@@ -4299,9 +4307,14 @@ class UnmappedGenerationTrackerScopeTests(unittest.TestCase):
     tracker leg), yet the digest folded tracker fields unconditionally -
     an unrelated Linear change rolled the generation, re-minted the
     qa.github.* IDs, pruned the prior target's terminal records as
-    history, and re-executed unchanged GitHub mutations. Tracker slots
-    now fold as None for unmapped repositories; mapped plans keep
-    digesting them because their consumer reads every one."""
+    history, and re-executed unchanged GitHub mutations. dawid-r9 F3:
+    the same defect recurred one branch deeper — every tracker sub-field
+    read in ``_approved_qa_operations`` sits inside its
+    ``tracker_type == "linear"`` branch, so a MAPPED plan with a
+    non-linear or absent type consumes none of them either. Tracker
+    slots now fold as None unless the repository is mapped AND the
+    tracker type is linear — the exact condition under which the
+    consumer reads them."""
 
     UNMAPPED = {"nameWithOwner": "Keeper-Dating/algo"}
     TRACKER_A = {
@@ -4379,43 +4392,107 @@ class UnmappedGenerationTrackerScopeTests(unittest.TestCase):
             expected,
         )
 
-    def test_mapped_generation_still_rolls_on_each_tracker_field(self) -> None:
-        # The mapped consumer reads every tracker slot, so each remains a
-        # plan target that moves the digest on its own.
-        reference = qa_generation(self._request(REPOSITORY, self.TRACKER_A))
+    def test_mapped_linear_generation_rolls_on_each_tracker_field(self) -> None:
+        # The consumer reads tracker sub-fields only inside its
+        # tracker_type == "linear" branch, so each is a plan target —
+        # moving the digest on its own — exactly when the fixture carries
+        # that type. The "type" variant pins the flip itself: leaving the
+        # linear branch changes the minted operation set, so it must roll
+        # even though every sub-field stays byte-identical.
+        linear_a = {"type": "linear", **self.TRACKER_A}
+        reference = qa_generation(self._request(REPOSITORY, linear_a))
         variants: dict[str, dict[str, object]] = {
             "ticket_identifier": {
-                **self.TRACKER_A,
+                **linear_a,
                 "ticket_identifier": "AI-2222",
             },
             "ticket_provider_id": {
-                **self.TRACKER_A,
+                **linear_a,
                 "ticket_provider_id": "linear-ticket-ai-2222",
             },
-            "write_path": {**self.TRACKER_A, "write_path": "local_api"},
+            "write_path": {**linear_a, "write_path": "local_api"},
             "qa_assignee_provider_id": {
-                **self.TRACKER_A,
+                **linear_a,
                 "qa_assignee": {"provider_id": "qa-user-2"},
             },
             "qa_state_name": {
-                **self.TRACKER_A,
+                **linear_a,
                 "qa_state": {"name": "Renamed QA Lane"},
             },
             "qa_state_provider_id": {
-                **self.TRACKER_A,
+                **linear_a,
                 "qa_state": {
                     "provider_id": "st-1",
                     "name": "Vercel Preview QA",
                 },
             },
+            "type": {**linear_a, "type": "none"},
         }
         for slot, tracker in variants.items():
             with self.subTest(slot=slot):
                 self.assertNotEqual(
                     reference,
                     qa_generation(self._request(REPOSITORY, tracker)),
-                    "a mapped tracker change must roll the generation",
+                    "a mapped linear tracker change must roll the generation",
                 )
+
+    def test_mapped_nonlinear_generation_ignores_tracker_subfields(
+        self,
+    ) -> None:
+        # dawid-r9 F3's exact scenario: a mapped repository whose tracker
+        # is non-linear (or untyped — the consumer defaults absent to
+        # "none") consumes no tracker sub-field, so re-keying every slot
+        # at once must leave the generation untouched, and each such
+        # digest must equal the tracker-less one (the slots fold as None,
+        # they do not vanish).
+        no_tracker = qa_generation(self._request(REPOSITORY, None))
+        for tracker_type in (None, "none", "github", "jira"):
+            with self.subTest(tracker_type=tracker_type):
+                tag = (
+                    {} if tracker_type is None else {"type": tracker_type}
+                )
+                tracker_a = qa_generation(
+                    self._request(REPOSITORY, {**tag, **self.TRACKER_A})
+                )
+                tracker_b = qa_generation(
+                    self._request(REPOSITORY, {**tag, **self.TRACKER_B})
+                )
+                self.assertEqual(no_tracker, tracker_a)
+                self.assertEqual(tracker_a, tracker_b)
+
+    def test_mapped_completed_ledger_survives_nonlinear_tracker_change(
+        self,
+    ) -> None:
+        # End to end on the mapped path (consumer parity, not just digest
+        # parity): with a "none"-typed tracker the plan mints GitHub
+        # operations only, and a completed ledger stays satisfied across
+        # a full tracker re-key — no re-mint, no prune, zero calls —
+        # where the mapped-only fold re-executed every mutation.
+        first = plan_handoff(
+            self._request(REPOSITORY, {"type": "none", **self.TRACKER_A})
+        )
+        self.assertEqual(first["state"], "pending", first.get("errors"))
+        self.assertEqual(
+            [
+                operation["id"]
+                for operation in first["operations"]
+                if not operation["id"].startswith("qa.github.")
+            ],
+            [],
+            "a non-linear tracker must plan no Linear leg",
+        )
+        ledger = {
+            operation["id"]: operation_result("complete")
+            for operation in first["operations"]
+        }
+        replan = plan_handoff(
+            self._request(
+                REPOSITORY, {"type": "none", **self.TRACKER_B}, ledger
+            )
+        )
+        self.assertEqual(replan["state"], "complete", replan)
+        self.assertEqual(replan["call_plan"], [])
+        self.assertEqual(replan["warnings"], [])
 
     def test_unmapped_completed_ledger_survives_unrelated_tracker_change(
         self,
@@ -4506,6 +4583,97 @@ class UnmappedGenerationTrackerScopeTests(unittest.TestCase):
                 self.TRACKER_A,
                 {
                     f"qa.github.replace_assignees:g{self.PRE_F7_G}": {
+                        "status": "pending",
+                        "attempts": 1,
+                        "started_at": TIMESTAMP,
+                    }
+                },
+            )
+        )
+        self.assertEqual(plan["state"], "blocked", plan)
+        self.assertTrue(
+            any("still in flight" in error for error in plan["errors"]),
+            plan["errors"],
+        )
+
+    NONLINEAR_A = {"type": "github", **TRACKER_A}
+
+    @property
+    def PRE_F3_G(self) -> str:
+        # dawid-r9 F3's upgrade cohort: the digest a MAPPED plan minted
+        # for a non-linear tracker while its sub-fields still leaked in
+        # (pre-F3 the fold was gated on mapped alone). Byte-identical
+        # canonicalization with NONLINEAR_A's fields hashed raw, the
+        # PRE_F7_G convention. The premise assert keeps the mirror
+        # honest: if mapped non-linear sub-fields ever leak back into
+        # the digest, the two collapse and the transition tests fail
+        # here, not vacuously downstream.
+        payload = {
+            "plan_version": 2,
+            "nameWithOwner": REPOSITORY["nameWithOwner"],
+            "pull_request_number": PR_NUMBER,
+            "github_login": "tjkeeper",
+            "ticket_identifier": "AI-1111",
+            "ticket_provider_id": "linear-ticket-ai-1111",
+            "write_path": "environment_tool",
+            "qa_assignee_provider_id": "qa-user-1",
+            "qa_state_provider_id": None,
+            "qa_state_name": "name:Vercel Preview QA",
+            "code_reviewers": ["michal-janicki"],
+        }
+        canonical = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), default=str
+        )
+        old = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+        assert old != qa_generation(
+            self._request(REPOSITORY, self.NONLINEAR_A)
+        ), "tracker sub-fields have leaked back into the mapped non-linear digest"
+        return old
+
+    def test_pre_upgrade_mapped_nonlinear_terminal_ledger_prunes_as_history(
+        self,
+    ) -> None:
+        # One-time upgrade turnover for the mapped cohort whose
+        # non-linear tracker DID carry sub-fields: old-generation
+        # terminal records are prior-target history (pruned with a
+        # warning), never unknown-ID errors — same path the unmapped
+        # cohort pins above.
+        old_g = self.PRE_F3_G
+        plan = plan_handoff(
+            self._request(
+                REPOSITORY,
+                self.NONLINEAR_A,
+                {
+                    f"qa.github.request_review:michal-janicki:g{old_g}": (
+                        operation_result("complete")
+                    ),
+                    f"qa.github.replace_assignees:g{old_g}": (
+                        operation_result("complete")
+                    ),
+                },
+            )
+        )
+        self.assertEqual(plan["state"], "pending", plan)
+        self.assertTrue(
+            any(
+                "prior-target terminal QA record" in warning
+                for warning in plan["warnings"]
+            ),
+            plan["warnings"],
+        )
+
+    def test_pre_upgrade_mapped_nonlinear_in_flight_ledger_fails_closed(
+        self,
+    ) -> None:
+        # An in-flight pre-upgrade record on the mapped non-linear
+        # cohort fails closed with the recovery named, exactly like the
+        # unmapped turnover.
+        plan = plan_handoff(
+            self._request(
+                REPOSITORY,
+                self.NONLINEAR_A,
+                {
+                    f"qa.github.replace_assignees:g{self.PRE_F3_G}": {
                         "status": "pending",
                         "attempts": 1,
                         "started_at": TIMESTAMP,

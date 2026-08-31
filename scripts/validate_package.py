@@ -194,6 +194,15 @@ REQUIRED_GATE_MARKERS = {
         'merge_readiness.dependencies: "hazard_documented"',
         "posts the `### Deploy order`",
         "return to the caller",
+        # mm#3551 dawid-r9 F4: the fingerprint-refresh bullet is the sole
+        # instruction keeping post-4b fix pushes from the runner's
+        # reject-and-charge loop (dawid-r8 F3) — a prose-only fix in a
+        # template file needs the same anti-regeneration pin as its code
+        # siblings, or a regeneration deletes the bullet unnoticed.
+        "**Classification fingerprint refreshed?** ALWAYS, on every fix"
+        " push",
+        "persist the fingerprint (with any changed selectors) BEFORE"
+        " submitting a terminal candidate",
     ),
     "references/state-and-safety.md": (
         "Resume trust model",
@@ -202,6 +211,17 @@ REQUIRED_GATE_MARKERS = {
         # reset-path clear, and the stale-reset clamp.
         "max_runtime_seconds="
         + str(model_policy.PER_ATTEMPT_CEILING_SECONDS),
+        # mm#3551 dawid-r9 F2: the child_pgid group-kill kwarg is pinned in
+        # EVERY file carrying a supervise_stream call template, not only
+        # phases-1-5.md — the templates ARE the production callers, and an
+        # unpinned file lets a regeneration drop the group kwarg here
+        # (leader-only kill regression) while the pinned sibling stays green.
+        "supervise_stream(..., child_pgid=pgid, idle_timeout_seconds="
+        + str(model_policy.MONITOR_CHILD_IDLE_TIMEOUT_SECONDS)
+        + ")",
+        "supervise_stream(..., child_pgid=pgid, max_runtime_seconds="
+        + str(model_policy.PER_ATTEMPT_CEILING_SECONDS)
+        + ")",
         "persist `next_retry_at`",
         "hold_started_at",
         "`next_retry_at`, and phase-specific blocked status fields",
@@ -362,6 +382,12 @@ REQUIRED_GATE_MARKERS = {
         # never run. The resume router's monitor bullet must carry the
         # same precondition Phase 5 enforces.
         "then re-enter the monitor",
+        # mm#3551 dawid-r9 F2: same child_pgid pin as phases-1-5.md and
+        # state-and-safety.md — all three files carry production
+        # supervise_stream call templates, and each needs its own anchor
+        # (a marker in one file cannot see a kwarg dropped from another).
+        "supervise_stream(stdout_pipe, stderr_pipe, kill_callback,"
+        " child_wait, child_pgid=pgid, idle_timeout_seconds=60",
     ),
 }
 

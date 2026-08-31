@@ -1546,9 +1546,11 @@ class _Validator:
         # advertised key is validated where declared. watch_timeout_seconds
         # and poll_chunk_seconds are genuine overrides with hard bounds
         # (the poll chunk must never exceed the 60s progress contract);
-        # the liveness pair is IMMUTABLE — supervise_stream call sites pin
-        # the canonical 180s idle kill and 2700s attempt ceiling
-        # (PER_ATTEMPT_CEILING_SECONDS in scripts/model_policy.py, the
+        # the liveness pair is IMMUTABLE — the reference docs'
+        # supervise_stream call templates pin the canonical 180s idle kill
+        # and 2700s attempt ceiling (the templates ARE the production
+        # callers, no .py call site exists — state-and-safety.md;
+        # PER_ATTEMPT_CEILING_SECONDS in scripts/model_policy.py is the
         # canonical side of this boundary), so a declared override would
         # be silently dishonored; it is rejected instead.
         if isinstance(constants, dict):

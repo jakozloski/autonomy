@@ -316,10 +316,14 @@ def qa_generation(request: dict[str, Any]) -> str:
     so the plan re-mints as one atomic unit when any target changes.
     Malformed segments hash as ``None`` — the planner's own validation
     rejects them separately; this digest only has to CHANGE when a target
-    changes.  Tracker fields are folded for Linear-mapped repositories
-    only: the unmapped path plans no tracker leg and never reads
-    ``issue_tracker``, so an unrelated tracker change must never re-mint
-    an unmapped plan's GitHub operations (mm#3551 dawid-r8 F7).
+    changes.  Tracker sub-fields are folded as ``None`` unless the
+    repository is QA-owner-mapped AND ``issue_tracker.type`` is
+    ``"linear"`` — the only condition under which
+    ``_approved_qa_operations`` reads them (the unmapped path returns
+    before reading ``issue_tracker``; a mapped non-linear tracker plans
+    no Linear leg).  An unrelated tracker change must never re-mint a
+    plan whose operations it cannot alter (mm#3551 dawid-r8 F7,
+    dawid-r9 F3).
 
     ``plan_version`` is a plan-SHAPE component (post-fix review F1 of R2
     round-3 finding 3774514905): inserting ``verify_ticket_binding`` into
@@ -357,23 +361,31 @@ def qa_generation(request: dict[str, Any]) -> str:
         raw_holder = request.get("ball_holder")
         if isinstance(raw_holder, str) and GITHUB_LOGIN.fullmatch(raw_holder):
             handback_login = raw_holder
-    # mm#3551 dawid-r8 F7: tracker fields are plan targets ONLY for a
-    # mapped repository - the unmapped path in _approved_qa_operations
-    # returns before ever reading issue_tracker (no Linear leg is
-    # planned), so unmapped plans fold every tracker slot as None. An
-    # unrelated Linear change (a re-keyed ticket, a renamed QA state)
-    # must not roll an unmapped generation, re-mint its qa.github.* IDs,
-    # and re-execute unchanged GitHub mutations. Migration: mapped
-    # digests and tracker-less unmapped digests are byte-identical to
-    # pre-F7 (the slots stay in the payload, folded as None), so only an
-    # unmapped plan whose request DID carry tracker fields re-mints -
-    # ONCE, on upgrade - and its old generation's terminal records take
-    # the documented prior-target path in plan_handoff's QA sweep
-    # (pruned as history with a warning; an in-flight record still fails
-    # closed with the recovery named). Self-healing, and the last
-    # tracker-driven re-mint that cohort can ever see.
+    # mm#3551 dawid-r8 F7 + dawid-r9 F3: tracker sub-fields are plan
+    # targets ONLY when _approved_qa_operations can read them, which is
+    # mapped AND tracker type "linear" - the unmapped path returns before
+    # ever reading issue_tracker, and a mapped plan with a non-linear or
+    # absent type plans no Linear leg either (every sub-field read sits
+    # inside its `tracker_type == "linear"` branch; widen this gate if a
+    # github/jira leg ever consumes them). All other plans fold every
+    # tracker slot as None: an unrelated tracker change (a re-keyed
+    # ticket, a renamed QA state) must not roll their generation, re-mint
+    # qa.github.* IDs, and re-execute unchanged GitHub mutations. A type
+    # flip linear<->other rolls whenever sub-fields are present - correct,
+    # since the flip changes the minted operation set. Migration:
+    # mapped-linear digests and tracker-less digests are byte-identical to
+    # pre-F7 (the slots stay in the payload, folded as None), so only a
+    # plan whose request carried tracker fields no consumer read (unmapped
+    # pre-F7, mapped non-linear pre-F3) re-mints - ONCE, on upgrade - and
+    # its old generation's terminal records take the documented
+    # prior-target path in plan_handoff's QA sweep (pruned as history with
+    # a warning; an in-flight record still fails closed with the recovery
+    # named). Self-healing, and the last tracker-driven re-mint those
+    # cohorts can ever see.
     tracker = request.get("issue_tracker") if owner is not None else None
     tracker = tracker if isinstance(tracker, dict) else {}
+    if tracker.get("type") != "linear":
+        tracker = {}
     qa_assignee = tracker.get("qa_assignee")
     qa_assignee = qa_assignee if isinstance(qa_assignee, dict) else {}
     qa_state = tracker.get("qa_state")
