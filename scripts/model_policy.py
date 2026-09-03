@@ -42,7 +42,7 @@ Expected input shape::
       "claude_reviewer": {
         "installed": true,
         "version": "2.1.170 (Claude Code)",
-        "opus_access": "available",
+        "fable_access": "available",
         "zero_data_retention": "compatible",
         "environment": {
           "CLAUDE_CODE_SUBAGENT_MODEL": null,
@@ -103,10 +103,10 @@ escalation voice.  ``claude_reviewer`` is the reviewer leg — the always-runs
 structured review and every Claude review fallback: the Claude reviewer next
 to the mandatory Phase 2 Codex verdict (Phase 4 Codex participation is
 tiered — Small and skill-only passes are Claude-only by design).  The
-separation is the point: the model that writes the code is not a model that
-approves it — under the nominal configuration; a reviewer degradation or an
-explicit same-lineage waiver collapses the Claude legs onto one lineage, and
-Codex then remains the independent cross-model verdict.
+reviewer is a distinct leg, not a distinct lineage: both Claude legs run the
+fable/mythos family — never Opus or any lower tier — every review voice runs
+in a fresh read-only context that never judges its own output, and Codex
+remains the standing cross-vendor verdict on what the base wrote.
 
 The reviewer leg degrades instead of gating.  An availability-class reviewer
 failure (CLI missing/too old, access, entitlement, provider policy, ZDR) with
@@ -114,7 +114,7 @@ no explicit waiver does not block: when the base leg is ``ready``, the
 aggregate rewrites the reviewer decision to state ``degraded`` — every Claude
 review voice falls back to the selected base model in a fresh read-only
 context, and the run continues with the degradation recorded (Claude review
-is no longer cross-lineage from the base for that run).  Malformed reviewer
+no longer runs on an independently landed leg for that run).  Malformed reviewer
 observations still block — garbage input is corrected, never degraded around
 — an unverified observation ("unknown" access/ZDR) blocks until probed, and
 an explicit reviewer waiver still preempts auto-degradation.
@@ -136,16 +136,13 @@ helper selects the newest eligible model at or above each floor: for Codex,
 live-catalog models named ``gpt-<version>[-variant]`` that support the
 required effort, excluding down-tier variants such as ``-mini``; for the base
 leg, ``fable``/``mythos``-family entries in the optional
-``claude.observed_models`` list; for the reviewer leg, ``opus``-family entries
-in ``claude_reviewer.observed_models``.  Upgrades are automatic and reported
-under each decision's ``selection`` key; anything below a floor still blocks,
-and no path proposes a downgrade.  Each Claude leg forwards only along its own
-lineage: a newer Opus never advances the base, and a newer Fable never
-advances the reviewer.
-
-A context-window variant suffix (``claude-opus-5[1m]``) denotes the same model
-version as its bare slug.  It is accepted wherever the bare slug is, and is
-never treated as either a downgrade or an upgrade.
+``claude.observed_models`` list; for the reviewer leg, ``fable``/``mythos``-
+family entries in ``claude_reviewer.observed_models`` at or above its own
+higher floor.  Upgrades are automatic and reported under each decision's
+``selection`` key; anything below a floor still blocks, and no path proposes
+a downgrade.  The Claude legs forward independently: each selects from its
+own leg's observed list against its own floor, and neither selection ever
+advances the other.
 
 ``max`` is the pin for this workflow's single-problem voices: the deepest
 non-delegating reasoning tier the floor model exposes (the depth axis runs
@@ -179,7 +176,12 @@ from state_schema import normalize_iso_timestamp
 # post_invocation history list; the wait verdict payload is
 # {reset_at, wait_until, clamped, reset_elapsed} (wait_until_reset removed);
 # the no-usable-reset streak is decided here from the fed records.
-SCHEMA_VERSION = 6
+# Version 7: the reviewer leg re-lineages onto fable/mythos (floor Claude
+# Fable 5.1 at max) — Opus is no longer selectable anywhere; the reviewer
+# observation key is ``fable_access`` (was ``opus_access``), reviewer failure
+# codes are ``fable_*``, and waivers substitute WITHIN the fable/mythos
+# lineage at or above the leg's own floor (never the leg's own floor primary).
+SCHEMA_VERSION = 7
 
 CODEX_MODEL = "gpt-5.6-sol"  # floor: newest eligible catalog model >= this wins
 CODEX_FLOOR_VERSION = (5, 6)
@@ -216,10 +218,10 @@ BASE_EFFORT = "max"
 
 # Reviewer Claude leg: the always-runs structured review and every Claude
 # review fallback — one of the two reviewers, next to the Codex verdict.
-# Gating — a failure here blocks.
-REVIEWER_MODEL = "claude-opus-5"  # floor: newest observed opus >= this wins
-REVIEWER_FLOOR_VERSION = (5,)
-REVIEWER_MODEL_ALIAS = "opus"
+# Availability failures degrade onto the ready base; malformed input blocks.
+REVIEWER_MODEL = "claude-fable-5-1"  # floor: newest observed fable/mythos >= this wins
+REVIEWER_FLOOR_VERSION = (5, 1)
+REVIEWER_MODEL_ALIAS = "fable"
 REVIEWER_EFFORT = "max"
 
 MIN_CLAUDE_VERSION = (2, 1, 170)
@@ -247,13 +249,6 @@ _SEMVER = re.compile(
 
 _GPT_SLUG = re.compile(
     r"gpt-(?P<major>\d+)(?:\.(?P<minor>\d+))?(?:-(?P<variant>[a-z0-9-]+))?"
-)
-
-# A trailing ``[1m]``-style suffix selects a context-window variant of the same
-# model version.  It is captured so the variant can be recognised as equal, not
-# ranked above or below the bare slug.
-_OPUS_SLUG = re.compile(
-    r"claude-opus-(?P<version>\d+(?:-\d+)*)(?P<variant>\[[0-9a-z]+\])?"
 )
 
 _FABLE_SLUG = re.compile(
@@ -1379,21 +1374,22 @@ def _zdr_failures(label: str) -> dict[Any, tuple[str, str]]:
 _BASE_ACCESS_FAILURES = _access_failures("fable", "Claude Fable 5")
 _BASE_ZDR_FAILURES = _zdr_failures("Claude Fable 5")
 
-_REVIEWER_ACCESS_FAILURES = _access_failures("opus", "Claude Opus 5")
-_REVIEWER_ZDR_FAILURES = _zdr_failures("Claude Opus 5")
+_REVIEWER_ACCESS_FAILURES = _access_failures("fable", "Claude Fable 5.1")
+_REVIEWER_ZDR_FAILURES = _zdr_failures("Claude Fable 5.1")
 
 # Observed-unavailability reason codes the reviewer leg may degrade around.
 # The *_unverified codes are deliberately absent: an unprobed observation
 # blocks until it is probed — auto-degrading on "unknown" would let a caller
-# skip the reviewer without ever checking whether Opus was available.
+# skip the reviewer without ever checking whether its Fable access was
+# available.
 _DEGRADABLE_OBSERVED_FAILURES = frozenset(
     (
         "cli_missing",
         "version_unparseable",
         "cli_too_old",
-        "opus_unavailable",
-        "opus_entitlement_denied",
-        "opus_provider_policy_denied",
+        "fable_unavailable",
+        "fable_entitlement_denied",
+        "fable_provider_policy_denied",
         "zdr_incompatible",
     )
 )
@@ -2164,22 +2160,6 @@ def _claude_leg_base(version: Any, spec: _ClaudeLegSpec) -> dict[str, Any]:
     }
 
 
-def _reviewer_floor_variant(slug: Any) -> bool:
-    """True when ``slug`` is the reviewer floor, or a context-window variant.
-
-    ``claude-opus-5[1m]`` is the same model version as ``claude-opus-5`` with a
-    larger context window, so it is accepted anywhere the bare slug is.
-    """
-
-    if not isinstance(slug, str):
-        return False
-    match = _OPUS_SLUG.fullmatch(slug)
-    if match is None:
-        return False
-    version = tuple(int(part) for part in match.group("version").split("-"))
-    return version == REVIEWER_FLOOR_VERSION
-
-
 def _never_floor_variant(slug: Any) -> bool:
     """The fable lineage has no context-window variant slugs to equate."""
 
@@ -2187,12 +2167,13 @@ def _never_floor_variant(slug: Any) -> bool:
 
 
 def _select_reviewer_model(observed_models: Any) -> tuple[str, str]:
-    """Return the newest observed opus model at or above the reviewer floor.
+    """Return the newest observed fable/mythos model at or above the reviewer floor.
 
-    Falls back to the floor when nothing newer is observed.  A ``[1m]``-style
-    context-window suffix marks the same version, so it never outranks the bare
-    slug; ties prefer the bare slug (the standard-cost default), then
-    lexicographic order — deterministic by construction.
+    Falls back to the floor when nothing newer is observed.  The reviewer
+    shares the base leg's lineage but selects from its OWN observed list
+    against its OWN (higher) floor.  Ties on version prefer the ``fable``
+    family (generally available), then lexicographic order — deterministic by
+    construction.
     """
 
     if not isinstance(observed_models, list):
@@ -2202,22 +2183,19 @@ def _select_reviewer_model(observed_models: Any) -> tuple[str, str]:
     for item in observed_models:
         if not isinstance(item, str):
             continue
-        match = _OPUS_SLUG.fullmatch(item)
+        match = _FABLE_SLUG.fullmatch(item)
         if match is None:
             continue
         version = tuple(int(part) for part in match.group("version").split("-"))
         if version < REVIEWER_FLOOR_VERSION:
             continue
-        variant_rank = 0 if match.group("variant") else 1
-        key = (version, variant_rank, item)
+        family_rank = 1 if match.group("family") == "fable" else 0
+        key = (version, family_rank, item)
         if best is None or key > best[0]:
             best = (key, item)
 
     if best is None or best[1] == REVIEWER_MODEL:
         return REVIEWER_MODEL, "floor_model"
-    if _reviewer_floor_variant(best[1]):
-        # Same version as the floor, larger context window — not an upgrade.
-        return best[1], "floor_model_variant"
     return best[1], "newer_model_auto_selected"
 
 
@@ -2255,9 +2233,9 @@ def _select_base_model(observed_models: Any) -> tuple[str, str]:
 def _at_or_above_base_floor(slug: Any) -> bool:
     """True when ``slug`` is a fable/mythos model at or above the base floor.
 
-    A waiver may authorize a different lineage; it may not authorize a version
-    below a floor.  Nothing in this module proposes a downgrade, and an explicit
-    human waiver is not an exception to that.
+    A waiver may substitute a different fable/mythos model; it may not
+    authorize a version below a floor.  Nothing in this module proposes a
+    downgrade, and an explicit human waiver is not an exception to that.
     """
 
     if not isinstance(slug, str):
@@ -2270,16 +2248,16 @@ def _at_or_above_base_floor(slug: Any) -> bool:
 
 
 def _at_or_above_reviewer_floor(slug: Any) -> bool:
-    """True when ``slug`` is an opus model at or above the reviewer floor.
+    """True when ``slug`` is a fable/mythos model at or above the reviewer floor.
 
-    The same downgrade rule applies in this direction: a waiver may cross to
-    the opus lineage, never to a version below its floor.  A context-window
-    variant of an eligible version is accepted like its bare slug.
+    The reviewer floor sits above the base floor within the same lineage; the
+    same downgrade rule applies: a waiver may substitute a different
+    fable/mythos model, never a version below this floor.
     """
 
     if not isinstance(slug, str):
         return False
-    match = _OPUS_SLUG.fullmatch(slug)
+    match = _FABLE_SLUG.fullmatch(slug)
     if match is None:
         return False
     version = tuple(int(part) for part in match.group("version").split("-"))
@@ -2329,6 +2307,9 @@ def _waive_or_block_claude(
             or fallback.get("explicitly_authorized") is not True
             or not isinstance(fallback_model, str)
             or not spec.fallback_at_or_above_floor(fallback_model)
+            # Naming the leg's own floor primary is not a substitute for
+            # restoring access to it.
+            or fallback_model == spec.floor_model
             or not isinstance(observed_models, list)
             or not all(isinstance(model, str) for model in observed_models)
             or fallback_model not in observed_models
@@ -2408,9 +2389,10 @@ def _block_claude_input(
 def _evaluate_claude_leg(raw: Any, spec: _ClaudeLegSpec) -> dict[str, Any]:
     """Evaluate one gating Claude leg and choose Agent or explicit CLI.
 
-    Both legs are gating: any failure blocks unless an explicit waiver names an
-    observed model from the other leg's lineage at or above that lineage's
-    floor, at max effort.  A ``waived`` decision is pre-invocation - the
+    Any failure blocks unless an explicit waiver names a different observed
+    fable/mythos model at or above the leg's own floor, at max effort (an
+    unwaived reviewer availability block is then rewritten by the aggregate
+    as a recorded degradation).  A ``waived`` decision is pre-invocation - the
     persisted gate lands only through ``waiver_gate_resolution`` consuming
     the named fallback's real invocation (admin#1495 r17 F4).
     """
@@ -2605,13 +2587,14 @@ _BASE_LEG = _ClaudeLegSpec(
     variant_note="",
     above_floor_note=" (auto-selected above the Fable 5 floor)",
     named_fallback_reason=(
-        "An explicit waiver requires an observed named Opus fallback"
+        "An explicit waiver requires an observed named Fable or Mythos fallback"
     ),
     fallback_requirement=(
-        "The waived fallback must be an available, explicitly authorized "
-        "Claude Opus model at or above the Opus 5 floor, at max effort"
+        "The waived fallback must be a different available, explicitly "
+        "authorized Claude Fable or Mythos model at or above the Fable 5 "
+        "floor, at max effort"
     ),
-    fallback_at_or_above_floor=_at_or_above_reviewer_floor,
+    fallback_at_or_above_floor=_at_or_above_base_floor,
     restore_action="request_explicit_waiver_or_restore_fable_access",
     ready_code="base_ready",
     agent_action="invoke_base_agent",
@@ -2624,23 +2607,24 @@ _REVIEWER_LEG = _ClaudeLegSpec(
     floor_model=REVIEWER_MODEL,
     alias=REVIEWER_MODEL_ALIAS,
     effort=REVIEWER_EFFORT,
-    access_key="opus_access",
-    invalid_access_code="invalid_opus_access",
+    access_key="fable_access",
+    invalid_access_code="invalid_fable_access",
     access_failures=_REVIEWER_ACCESS_FAILURES,
     zdr_failures=_REVIEWER_ZDR_FAILURES,
     select=_select_reviewer_model,
-    floor_variant=_reviewer_floor_variant,
-    variant_note=" (context-window variant of the Opus 5 floor)",
-    above_floor_note=" (auto-selected above the Opus 5 floor)",
+    floor_variant=_never_floor_variant,
+    variant_note="",
+    above_floor_note=" (auto-selected above the Fable 5.1 floor)",
     named_fallback_reason=(
         "An explicit waiver requires an observed named Fable or Mythos fallback"
     ),
     fallback_requirement=(
-        "The waived fallback must be an available, explicitly authorized "
-        "Claude Fable or Mythos model at or above the Fable 5 floor, at max effort"
+        "The waived fallback must be a different available, explicitly "
+        "authorized Claude Fable or Mythos model at or above the Fable 5.1 "
+        "floor, at max effort"
     ),
-    fallback_at_or_above_floor=_at_or_above_base_floor,
-    restore_action="request_explicit_waiver_or_restore_opus_access",
+    fallback_at_or_above_floor=_at_or_above_reviewer_floor,
+    restore_action="request_explicit_waiver_or_restore_fable_access",
     ready_code="reviewer_ready",
     agent_action="invoke_reviewer_agent",
     cli_action="invoke_explicit_reviewer_cli",
@@ -2655,7 +2639,7 @@ def evaluate_claude(raw: Any) -> dict[str, Any]:
 
 
 def evaluate_claude_reviewer(raw: Any) -> dict[str, Any]:
-    """Evaluate the reviewer Opus/max leg — the standing Claude review voice."""
+    """Evaluate the reviewer Fable/max leg — the standing Claude review voice."""
 
     return _evaluate_claude_leg(raw, _REVIEWER_LEG)
 
@@ -2669,12 +2653,12 @@ def _degrade_reviewer_to_base(
     ``_waive_or_block_claude`` marks them ``degradable_to_base``), and only a
     ``ready`` base hosts the fallback: the degraded voice reuses exactly the
     execution decision the base leg already proved out, under the same
-    read-only review boundary.  A ``waived`` base never hosts it — that would
-    put one substitute model on both sides of every review discussion, which
-    is the cross-model property this gate exists to protect.  Degradation is
-    a recorded state, not a silent repair: the caller logs it in the Decision
-    Audit Trail, because for this run Claude review is no longer
-    cross-lineage from the base.
+    read-only review boundary.  A ``waived`` base never hosts it — stacking
+    every review voice on an explicitly waived substitute would leave no
+    independently landed Claude leg at all.  Degradation is a recorded state,
+    not a silent repair: the caller logs it in the Decision Audit Trail,
+    because for this run Claude review no longer runs on an independently
+    landed leg.
     """
 
     degraded = dict(reviewer)
@@ -2686,8 +2670,8 @@ def _degrade_reviewer_to_base(
             "reason": (
                 f"{reviewer['reason']}; every Claude review voice falls back"
                 f" to the selected base model ({base['model']}) in a fresh"
-                " read-only context — Claude review is no longer"
-                " cross-lineage from the base for this run"
+                " read-only context — Claude review no longer runs on an"
+                " independently landed leg for this run"
             ),
             "degradation": {
                 "reason_code": reviewer["reason_code"],
@@ -2722,11 +2706,11 @@ def _degrade_reviewer_to_base(
 # admin#1495 r17 F4: the waiver transition's per-leg bindings - the decision's
 # ``role`` names the leg in policy vocabulary ("base"/"reviewer"), the
 # persisted contract keys the same legs "claude"/"claude_reviewer", and a
-# waiver crosses to the OTHER lineage, so the floor re-check runs against
-# that lineage's floor.
+# waiver substitutes WITHIN the fable/mythos lineage, so the floor re-check
+# runs against the leg's own floor.
 _WAIVER_ROLE_BINDINGS: dict[str, tuple[str, Callable[[Any], bool]]] = {
-    "base": ("claude", _at_or_above_reviewer_floor),
-    "reviewer": ("claude_reviewer", _at_or_above_base_floor),
+    "base": ("claude", _at_or_above_base_floor),
+    "reviewer": ("claude_reviewer", _at_or_above_reviewer_floor),
 }
 
 
@@ -2764,9 +2748,8 @@ def waiver_gate_resolution(
     the waiver decision as evidence under ``policy_decision.waiver``,
     beside the consumed observation (``policy_decision.fallback_invocation``)
     and this transition's verdict (``policy_decision.resolution``);
-    ``policy_decision.selection`` carries the waiver's selection - the
-    cross-floor evidence shape the monitor binder requires before a
-    ``ready`` leg may bind on the other lineage's model.
+    ``policy_decision.selection`` carries the waiver's selection as retained
+    evidence of the substitute route.
 
     An unusable decision record - not a granted waiver, or an inconsistent
     or below-floor fallback name (the decision may round-trip through
@@ -2816,8 +2799,8 @@ def waiver_gate_resolution(
         )
     elif binding is not None and not binding[1](model):
         errors.append(
-            "waiver-named fallback is below its lineage's floor - a waiver"
-            " may cross lineages, never authorize a downgrade"
+            "waiver-named fallback is below the leg's floor - a waiver"
+            " may substitute within the lineage, never authorize a downgrade"
         )
     # mm#3551 dawid-r8 F8: the decision can round-trip through persisted
     # state, so rehydration re-verifies the EFFORT contract exactly like
@@ -2954,32 +2937,16 @@ def monitor_orchestrator_binding(
             "errors": ["model_runtime must be a JSON object"],
         }
 
-    def _selection_evidence(leg: dict, model: str) -> bool:
-        # R2 round-2 finding 3737466436: cross-lineage tolerance without
-        # evidence let a hand-edited swap (opus on the base leg, fable on
-        # the reviewer leg) silently invert which lineage owns the
-        # session. A cross-floor model is legitimate only when the leg's
-        # own persisted policy_decision records it as the selection — the
-        # shape every waiver/degradation writer produces (admin#1495 r17
-        # F4: waiver_gate_resolution is the waived legs' writer).
-        decision = leg.get("policy_decision")
-        selection = (
-            decision.get("selection") if isinstance(decision, dict) else None
-        )
-        selected = (
-            selection.get("selected_model")
-            if isinstance(selection, dict)
-            else None
-        )
-        return selected == model
+    def _landed_leg(leg: Any, own_floor: Any) -> str | None:
+        """Return the leg's model when its gate landed ready above its floor.
 
-    def _landed_leg(leg: Any, own_floor: Any, other_floor: Any) -> str | None:
-        """Return the leg's model when its gate landed ready above a floor.
-
-        The leg's OWN floor needs no evidence; the other lineage's floor
-        (a waived/degraded substitute) is accepted only with the leg's own
-        recorded selection evidence. Anything below both floors is
-        untrusted garbage regardless of evidence.
+        R2 round-2 finding 3737466436, re-scoped for the single-lineage
+        policy: state is untrusted, so every landed model is re-checked
+        against its leg's OWN floor. Waivers substitute within the
+        fable/mythos lineage at or above that same floor, so every
+        legitimate writer lands own-floor models — a hand-edited record
+        naming anything else (an Opus slug, a below-floor version) never
+        binds an owner.
         """
 
         if not isinstance(leg, dict):
@@ -2991,19 +2958,13 @@ def monitor_orchestrator_binding(
             return None
         if own_floor(model):
             return model
-        if other_floor(model) and _selection_evidence(leg, model):
-            return model
         return None
 
     base_model = _landed_leg(
-        model_runtime.get("claude"),
-        _at_or_above_base_floor,
-        _at_or_above_reviewer_floor,
+        model_runtime.get("claude"), _at_or_above_base_floor
     )
     reviewer_model = _landed_leg(
-        model_runtime.get("claude_reviewer"),
-        _at_or_above_reviewer_floor,
-        _at_or_above_base_floor,
+        model_runtime.get("claude_reviewer"), _at_or_above_reviewer_floor
     )
     base_leg = model_runtime.get("claude")
     # references/monitor-exit-handoffs.md makes a confirmed write-capable
@@ -3131,8 +3092,8 @@ def monitor_orchestrator_binding(
         # recompute cross-checks, so every pinned child stays on the
         # frozen Claude selection). Like reviewer ownership it needs the
         # host-verified write-capable base worker path; unlike a live
-        # Opus session, a Codex session cannot truthfully demote to the
-        # base lineage's inline role, so without that path there is no
+        # Claude reviewer-leg session, a Codex session cannot demote to
+        # the base lineage's inline role, so without that path there is no
         # compliant write actor and the binding fails closed.
         if not base_write_verified:
             return {

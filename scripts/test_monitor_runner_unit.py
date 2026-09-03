@@ -130,7 +130,7 @@ class LaunchSnapshotClearingTests(unittest.TestCase):
         )
         runner = Runner(args)
         _HELPER_RUNNERS.append(runner)
-        runner.owner_model = "claude-opus-5"
+        runner.owner_model = "claude-fable-5-1"
         runner.owner_effort = None
         return runner
 
@@ -824,7 +824,7 @@ class ChildEnvAllowlistTests(unittest.TestCase):
         # algo#1216 finding 3792942221 (in-package half): the child env is
         # allowlist-built — an unrelated ambient variable provably reached
         # the child under the old denylist.
-        runner = _runner("claude-opus-5", None)
+        runner = _runner("claude-fable-5-1", None)
         with mock.patch.dict(os.environ, {
             "AMBIENT_SENTINEL_XYZ": "leak",
             "PATH": os.environ.get("PATH", "/usr/bin"),
@@ -860,7 +860,7 @@ class ChildEnvAllowlistTests(unittest.TestCase):
         # child's OWN session auth (CLAUDE_CODE_OAUTH_TOKEN — Keeper VMs
         # run an OAuth-only contract) must — stripping it left the child
         # unauthenticated. Exact names either way.
-        runner = _runner("claude-opus-5", None)
+        runner = _runner("claude-fable-5-1", None)
         with mock.patch.dict(os.environ, {
             "CLAUDE_CODE_OAUTH_TOKEN": "secret-token",
             "CLAUDE_ACCOUNT_TOKENS_JSON": "{\"bundle\": true}",
@@ -899,7 +899,7 @@ class WrapperStagingTests(unittest.TestCase):
     module-loading machinery)."""
 
     def test_runner_pins_wrapper_bytes_and_stages_outside_the_worktree(self) -> None:
-        runner = _runner("claude-opus-5", "max")
+        runner = _runner("claude-fable-5-1", "max")
         source = SCRIPTS / "monitor_child_wrapper.py"
         self.assertEqual(runner.wrapper_source, source.read_bytes())
         self.assertTrue(runner.wrapper_stage_path.exists())
@@ -922,9 +922,9 @@ class ChildCommandThreadingTests(unittest.TestCase):
         # the threading has been dropped.
         sentinel = "unit-sentinel-effort"
         self.assertNotEqual(sentinel, REVIEWER_EFFORT)
-        command = _runner("claude-opus-5", sentinel)._child_command(None)
+        command = _runner("claude-fable-5-1", sentinel)._child_command(None)
         self.assertIn("--model", command)
-        self.assertEqual(command[command.index("--model") + 1], "claude-opus-5")
+        self.assertEqual(command[command.index("--model") + 1], "claude-fable-5-1")
         self.assertIn("--effort", command)
         self.assertEqual(command[command.index("--effort") + 1], sentinel)
 
@@ -937,16 +937,16 @@ class ChildCommandThreadingTests(unittest.TestCase):
         self.assertEqual(command[command.index("--effort") + 1], REVIEWER_EFFORT)
 
     def test_resume_id_is_threaded_into_the_child_command(self) -> None:
-        command = _runner("claude-opus-5", "max")._child_command("sid-42")
+        command = _runner("claude-fable-5-1", "max")._child_command("sid-42")
         self.assertIn("--resume", command)
         self.assertEqual(command[command.index("--resume") + 1], "sid-42")
 
     def test_absent_resume_id_omits_the_resume_flag(self) -> None:
-        command = _runner("claude-opus-5", "max")._child_command(None)
+        command = _runner("claude-fable-5-1", "max")._child_command(None)
         self.assertNotIn("--resume", command)
 
     def test_child_command_starts_with_the_pinned_binary(self) -> None:
-        command = _runner("claude-opus-5", "max")._child_command(None)
+        command = _runner("claude-fable-5-1", "max")._child_command(None)
         # admin#1495 finding 3807823238 / mm#3551 finding 3808151945: hosts
         # legitimately resolve the binary to an absolute path — pin the
         # BASENAME, not the literal bare name.
@@ -972,10 +972,10 @@ class BindOwnerProducerTests(unittest.TestCase):
         runner._bind_owner(
             {},
             None,
-            binding_provider=self._binding(model="claude-opus-5", effort=sentinel),
+            binding_provider=self._binding(model="claude-fable-5-1", effort=sentinel),
         )
         # Both fields come from the binding, overwriting the constructor decoys.
-        self.assertEqual(runner.owner_model, "claude-opus-5")
+        self.assertEqual(runner.owner_model, "claude-fable-5-1")
         self.assertEqual(runner.owner_effort, sentinel)
 
     def test_unbound_binding_exits_suspect_state(self) -> None:
@@ -1101,7 +1101,7 @@ class LaunchChildIsolationTests(unittest.TestCase):
     child spawns and the file's no-child-process property holds."""
 
     def test_wrapper_child_boots_under_the_isolated_interpreter(self) -> None:
-        runner = _runner("claude-opus-5", "max")
+        runner = _runner("claude-fable-5-1", "max")
         with mock.patch("monitor_runner.subprocess.Popen") as popen:
             popen.return_value = mock.Mock()
             runner.launch_child("the-prompt", None, 100.0)
@@ -1170,7 +1170,7 @@ class ResumeLivenessWaitTests(unittest.TestCase):
         }
 
     def _wait_with(self, extract: dict, now_script: list, remaining: float):
-        runner = _runner("claude-opus-5", None)
+        runner = _runner("claude-fable-5-1", None)
         runner.remaining = lambda: remaining
         sleeps: list[float] = []
         _ScriptedDatetime.script = list(now_script)
@@ -1216,7 +1216,7 @@ class RestageWrapperTests(unittest.TestCase):
         # rewrite into an arbitrary same-UID target. _restage_wrapper
         # unlinks the planted NAME and recreates with O_EXCL|O_NOFOLLOW;
         # revert it to write_bytes and the victim assertion fails.
-        runner = _runner("claude-opus-5", None)
+        runner = _runner("claude-fable-5-1", None)
         with tempfile.TemporaryDirectory() as tmp:
             victim = Path(tmp) / "victim-state.md"
             victim.write_bytes(b"KEEP")
@@ -1946,7 +1946,7 @@ class CapabilityGrammarTests(unittest.TestCase):
         # (and r19 F3: the mapped binding arms the class half even
         # without it); r17 F5: the managed seam points at an absent file
         # so a real host-managed policy cannot leak into the fixture.
-        runner = _runner("claude-opus-5", None)
+        runner = _runner("claude-fable-5-1", None)
         runner.repository_hint = "keeper-dating/matchmaking"
         with tempfile.TemporaryDirectory() as tmp:
             settings = Path(tmp) / "settings.json"
@@ -2057,7 +2057,7 @@ class RepositoryClassCapabilityTests(unittest.TestCase):
         # launches over a bare surface - the probe blocks first, with
         # the launch still targetless (the persisted manifest stays
         # empty, proving the block came from the class floor).
-        runner = _runner("claude-opus-5", None)
+        runner = _runner("claude-fable-5-1", None)
         runner.repository_hint = "keeper-dating/matchmaking"
         with tempfile.TemporaryDirectory() as tmp:
             settings = Path(tmp) / "settings.json"
@@ -2104,7 +2104,7 @@ class RepositoryClassCapabilityTests(unittest.TestCase):
         # one class whose repository can mint no Keeper handoff surface:
         # the probe returns before resolving settings or spawning any
         # subprocess (the side_effect would explode otherwise).
-        runner = _runner("claude-opus-5", None)
+        runner = _runner("claude-fable-5-1", None)
         runner.repository_hint = "someone-else/sandbox"
         with mock.patch.object(
             monitor_runner.subprocess,
@@ -2356,7 +2356,7 @@ class R15RunnerCorrectnessTests(unittest.TestCase):
         import time as _time
         from datetime import datetime, timedelta, timezone
 
-        runner = _runner("claude-opus-5", None)
+        runner = _runner("claude-fable-5-1", None)
         runner.wait_scale = 0.001
         runner.remaining = lambda: 100000.0
         # far-future OFFSET-form deadline: pre-fix the offset form was
@@ -2394,7 +2394,7 @@ class ContainmentRefusalDecisionTests(unittest.TestCase):
     def _decide(
         self, record: str, repository: str | None, attested: bool
     ) -> str | None:
-        runner = _runner("claude-opus-5", None)
+        runner = _runner("claude-fable-5-1", None)
         # repository=None must mean TRULY unbound: _bound_repository falls
         # back to the live origin hint, which on a Keeper CI checkout
         # resolves to the Keeper repository under test and (correctly)
@@ -2475,7 +2475,7 @@ class OriginTrustTests(unittest.TestCase):
         class FakeRunner:
             repository_hint = "keeper-dating/other"
             repository_probe = "resolved"
-            owner_model = "claude-opus-5"
+            owner_model = "claude-fable-5-1"
             failures: list = []
 
         block = {
@@ -2965,7 +2965,7 @@ class DrainChildApiErrorStatusTests(unittest.TestCase):
     _INIT = {
         "type": "system",
         "subtype": "init",
-        "model": "claude-opus-5",
+        "model": "claude-fable-5-1",
         "session_id": "sid-drain-1",
     }
     # the exact 2.1.226 quota-exhaustion final result
@@ -3028,7 +3028,7 @@ class WrapperStageWriteTests(unittest.TestCase):
     restage would exec a PREFIX of the trusted wrapper source."""
 
     def test_wrapper_restage_survives_short_writes(self) -> None:
-        runner = _runner("claude-opus-5", "max")
+        runner = _runner("claude-fable-5-1", "max")
         real_write = os.write
         with mock.patch.object(
             monitor_runner.os,
@@ -3153,7 +3153,7 @@ class TrustedControlDriftTests(unittest.TestCase):
                           "post_invocation": [{"at": "t1"}]},
                 "claude": {"model": "claude-fable-5", "gate_status": "ready",
                            "post_invocation": []},
-                "claude_reviewer": {"model": "claude-opus-5", "gate_status": "ready",
+                "claude_reviewer": {"model": "claude-fable-5-1", "gate_status": "ready",
                                     "post_invocation": []},
                 "escalation_invocations": [],
             },
@@ -3288,7 +3288,7 @@ class QaManifestViolationTests(unittest.TestCase):
         }
 
     def _violation(self, ops, launch_ops=None, write_path="environment_tool", **kw):
-        runner = _runner("claude-opus-5", None)
+        runner = _runner("claude-fable-5-1", None)
         return runner._qa_manifest_violation(
             "Keeper-Dating/matchmaking",
             self._launch(launch_ops, write_path),
@@ -3336,7 +3336,7 @@ class QaManifestViolationTests(unittest.TestCase):
         # audit skips whatever the candidate claims (the launch, not the
         # candidate's own operations, is the trusted input); idle
         # aggregates stay owned by the planned-QA gate.
-        runner = _runner("claude-opus-5", None)
+        runner = _runner("claude-fable-5-1", None)
         self.assertIsNone(runner._qa_manifest_violation(
             "Keeper-Dating/matchmaking", self._launch([]),
             self._extract(self.FULL[:1])))
@@ -3575,7 +3575,7 @@ class ReviewerFloorTests(unittest.TestCase):
         # family-coverage audit, for the exact substitution shape; a
         # floor-satisfying reviewer-only candidate still falls through
         # to the audit and passes clean.
-        runner = _runner("claude-opus-5", None)
+        runner = _runner("claude-fable-5-1", None)
         launch = self._extract(self._QA_REVIEWERS)
         self.assertIn(
             "reviewer operations differ",
@@ -4045,7 +4045,7 @@ class RecoveryContainmentRecordTests(unittest.TestCase):
         proc = sp.Popen([_sys.executable, "-c", "pass"], start_new_session=True)
         pgid = os.getpgid(proc.pid)
         proc.wait(timeout=10)  # dead, reaped: the group id is gone
-        runner = _runner("claude-opus-5", None)
+        runner = _runner("claude-fable-5-1", None)
         in_flight = {
             "child_pid": proc.pid,
             "child_pgid": pgid,
@@ -4095,7 +4095,7 @@ class ContainmentRemovalObservabilityTests(unittest.TestCase):
 
     def test_extinguish_propagates_unreadable_final_read(self) -> None:
         cg = self._containment_dir()
-        runner = _runner("claude-opus-5", None)
+        runner = _runner("claude-fable-5-1", None)
         runner.attempt_containment = monitor_runner.AttemptContainment(cg)
         (cg / "cgroup.procs").unlink()  # unreadable membership
         with self.assertRaises(RunnerExit):
@@ -4107,7 +4107,7 @@ class ContainmentRemovalObservabilityTests(unittest.TestCase):
         cg = self._containment_dir()
         (cg / "cgroup.procs").write_text("")
         (cg / "extra-file").write_text("x")  # rmdir will fail
-        runner = _runner("claude-opus-5", None)
+        runner = _runner("claude-fable-5-1", None)
         runner.attempt_containment = monitor_runner.AttemptContainment(cg)
         self.assertTrue(runner._extinguish_containment())
         self.assertIsNotNone(
