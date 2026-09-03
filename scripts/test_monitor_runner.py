@@ -75,7 +75,7 @@ resolved_conventions:
       gate_status: "ready"
       host_agent_selection_verified: true
     claude_reviewer:
-      model: "claude-opus-5"
+      model: "claude-fable-5-1"
       gate_status: "ready"
     plan_verdict:
       verdict: "approved"
@@ -273,7 +273,7 @@ attempt_id = attempt_match.group(1) if attempt_match else "missing"
 tick_ordinal = int(ordinal_match.group(1)) if ordinal_match else 0
 
 model = "claude-fable-5" if mode == "wrong_model" else os.environ.get(
-    "FAKE_MODEL", "claude-opus-5"
+    "FAKE_MODEL", "claude-fable-5-1"
 )
 if mode != "no_init":
     init = {"type": "system", "subtype": "init", "model": model}
@@ -1044,7 +1044,7 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         first = calls[0]
         self.assertIn("--model", first)
-        self.assertEqual(first[first.index("--model") + 1], "claude-opus-5")
+        self.assertEqual(first[first.index("--model") + 1], "claude-fable-5-1")
         # opus L2: the child's effort comes from the BINDING, not a module
         # default — one source for the per-lineage effort.
         self.assertIn("--effort", first)
@@ -1620,7 +1620,7 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         stray = self.state.parent / (self.state.name + ".attempt-" + "cd" * 16 + ".md")
         stray.write_text("stray", encoding="utf-8")
         extract = runner.schema.extract(runner.state_path)
-        runner.owner_model = "claude-opus-5"
+        runner.owner_model = "claude-fable-5-1"
         block = runner.current_block(extract)
         block["in_flight"] = {"attempt_id": attempt}
         extract["monitor_cli"] = block
@@ -2403,7 +2403,7 @@ class MonitorRunnerE2ETests(unittest.TestCase):
             "monitor_cli:\n"
             "  schema_version: 1\n"
             '  child_session_id: "fake-sid-1"\n'
-            '  owner_model: "claude-opus-5"\n'
+            '  owner_model: "claude-fable-5-1"\n'
             "  last_completed_attempt_id: null\n"
             "  child_failures: []\n"
             "  in_flight:\n"
@@ -4355,7 +4355,7 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         self._with_ownership(
             "monitor_ownership:\n"
             '  lineage: "reviewer"\n'
-            '  model: "claude-opus-5"\n'
+            '  model: "claude-fable-5-1"\n'
             '  bound_at: "2026-08-06T12:00:00+00:00"\n'
             '  reason_code: "orchestrator_on_reviewer"'
         )
@@ -4369,7 +4369,7 @@ class MonitorRunnerE2ETests(unittest.TestCase):
             '  model: "claude-fable-5"\n'
             '  bound_at: "2026-08-06T12:00:00+00:00"\n'
             '  reason_code: "orchestrator_continuity"\n'
-            '  pending_owner: "claude-opus-5"'
+            '  pending_owner: "claude-fable-5-1"'
         )
         completed = self._run(budget="365")
         self.assertEqual(self._summary(completed)["ticks_completed"], 1)

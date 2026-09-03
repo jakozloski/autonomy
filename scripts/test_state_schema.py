@@ -3392,7 +3392,7 @@ class ModelRuntimeShapeTests(unittest.TestCase):
                         "policy_decision": {},
                     },
                     "claude_reviewer": {
-                        "model": "claude-opus-5",
+                        "model": "claude-fable-5-1",
                         "effort": "max",
                         "subagent_override": None,
                         "effort_override": None,
@@ -4338,7 +4338,7 @@ class MonitorOwnershipTests(unittest.TestCase):
 
     WELL_FORMED = (
         '  lineage: "reviewer"\n'
-        '  model: "claude-opus-5"\n'
+        '  model: "claude-fable-5-1"\n'
         '  bound_at: "2026-08-04T11:55:00+00:00"\n'
         '  reason_code: "orchestrator_on_reviewer"'
     )
@@ -4354,7 +4354,7 @@ class MonitorOwnershipTests(unittest.TestCase):
     def test_missing_field_fails_closed(self) -> None:
         block = (
             '  lineage: "reviewer"\n'
-            '  model: "claude-opus-5"\n'
+            '  model: "claude-fable-5-1"\n'
             '  bound_at: "2026-08-04T11:55:00+00:00"'
         )
         result = evaluate_state_text(self._with_block(block))
@@ -4399,13 +4399,13 @@ class MonitorOwnershipTests(unittest.TestCase):
             '  model: "gpt-5.6-sol"\n'
             '  bound_at: "2026-08-04T11:55:00+00:00"\n'
             '  reason_code: "orchestrator_continuity"\n'
-            '  pending_owner: "claude-opus-5"'
+            '  pending_owner: "claude-fable-5-1"'
         )
         result = evaluate_state_text(self._with_block(block))
         self.assertEqual(result["state"], VALID, result["errors"])
 
     def test_empty_model_is_rejected(self) -> None:
-        block = self.WELL_FORMED.replace('"claude-opus-5"', '""')
+        block = self.WELL_FORMED.replace('"claude-fable-5-1"', '""')
         result = evaluate_state_text(self._with_block(block))
         self.assertEqual(result["state"], SUSPECT)
         self.assertTrue(
@@ -4454,7 +4454,7 @@ class MonitorOwnershipTests(unittest.TestCase):
             '  model: "claude-fable-5"\n'
             '  bound_at: "2026-08-04T11:55:00+00:00"\n'
             '  reason_code: "orchestrator_continuity"\n'
-            '  pending_owner: "claude-opus-5"'
+            '  pending_owner: "claude-fable-5-1"'
         )
         result = evaluate_state_text(self._with_block(block))
         self.assertEqual(result["state"], VALID, result["errors"])
@@ -4472,7 +4472,7 @@ class MonitorOwnershipTests(unittest.TestCase):
         # R6-F12: the "exactly when" contract enforced in BOTH directions —
         # a pending_owner on a non-continuity binding is write-only metadata
         # that can silently contradict the real owner.
-        block = self.WELL_FORMED + '\n  pending_owner: "claude-opus-5"'
+        block = self.WELL_FORMED + '\n  pending_owner: "claude-fable-5-1"'
         result = evaluate_state_text(self._with_block(block))
         self.assertEqual(result["state"], SUSPECT)
         self.assertTrue(
@@ -4624,7 +4624,7 @@ class MonitorCliBlockTests(unittest.TestCase):
     WELL_FORMED = (
         "  schema_version: 1\n"
         "  child_session_id: null\n"
-        '  owner_model: "claude-opus-5"\n'
+        '  owner_model: "claude-fable-5-1"\n'
         "  last_completed_attempt_id: null\n"
         "  child_failures: []\n"
         "  in_flight: null"
@@ -4763,7 +4763,7 @@ class MonitorCliBlockTests(unittest.TestCase):
         extract = monitor_extract(self._with_block(self.WELL_FORMED))
         self.assertEqual(extract["state"], VALID, extract["errors"])
         self.assertEqual(extract["counters"]["monitor_poll_ticks"], 0)
-        self.assertEqual(extract["monitor_cli"]["owner_model"], "claude-opus-5")
+        self.assertEqual(extract["monitor_cli"]["owner_model"], "claude-fable-5-1")
         self.assertIsNotNone(extract["digest"])
         self.assertEqual(extract["current_phase"], "plan")
 

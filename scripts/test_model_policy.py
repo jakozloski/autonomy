@@ -106,7 +106,7 @@ def valid_base(**overrides: object) -> dict:
             "agent_effort_selection": True,
             "agent_read_only_enforced": True,
         },
-        "observed_models": ["claude-fable-5", "claude-opus-5"],
+        "observed_models": ["claude-fable-5", "claude-mythos-5"],
         "explicit_waiver": False,
     }
     config.update(overrides)
@@ -117,7 +117,7 @@ def valid_reviewer(**overrides: object) -> dict:
     config = {
         "installed": True,
         "version": "2.1.170 (Claude Code)",
-        "opus_access": "available",
+        "fable_access": "available",
         "zero_data_retention": "compatible",
         "environment": {
             "CLAUDE_CODE_SUBAGENT_MODEL": None,
@@ -128,7 +128,7 @@ def valid_reviewer(**overrides: object) -> dict:
             "agent_effort_selection": True,
             "agent_read_only_enforced": True,
         },
-        "observed_models": ["claude-opus-5", "claude-fable-5"],
+        "observed_models": ["claude-fable-5-1", "claude-fable-5"],
         "explicit_waiver": False,
     }
     config.update(overrides)
@@ -150,7 +150,7 @@ def request(
 
 LEGS = (
     ("claude", "claude", valid_base, "fable_access"),
-    ("claude_reviewer", "claude_reviewer", valid_reviewer, "opus_access"),
+    ("claude_reviewer", "claude_reviewer", valid_reviewer, "fable_access"),
 )
 
 
@@ -161,7 +161,7 @@ def leg_request(key: str, config: dict) -> dict:
 
 
 class ModelPolicyTest(unittest.TestCase):
-    def test_ready_policy_pins_sol_max_fable_base_and_opus_reviewer(self) -> None:
+    def test_ready_policy_pins_sol_max_fable_base_and_fable_reviewer(self) -> None:
         result = evaluate_model_policy(request())
 
         self.assertEqual(result["state"], "ready")
@@ -196,7 +196,7 @@ class ModelPolicyTest(unittest.TestCase):
             result["claude"]["model"], result["claude_reviewer"]["model"]
         )
         self.assertEqual(BASE_MODEL_ALIAS, "fable")
-        self.assertEqual(REVIEWER_MODEL_ALIAS, "opus")
+        self.assertEqual(REVIEWER_MODEL_ALIAS, "fable")
 
     def test_codex_missing_cli_blocks_with_install_action(self) -> None:
         result = evaluate_model_policy(request(codex={"installed": False}))["codex"]
@@ -518,30 +518,30 @@ class ModelPolicyTest(unittest.TestCase):
                     f"base leg must report fable_* codes, got {result['reason_code']}",
                 )
 
-    def test_reviewer_opus_access_failures_degrade_observed_block_unverified(
+    def test_reviewer_fable_access_failures_degrade_observed_block_unverified(
         self,
     ) -> None:
         for access in ("unavailable", "entitlement_denied", "provider_policy_denied"):
             with self.subTest(access=access):
                 result = evaluate_model_policy(
-                    request(reviewer=valid_reviewer(opus_access=access))
+                    request(reviewer=valid_reviewer(fable_access=access))
                 )["claude_reviewer"]
                 self.assertEqual(result["state"], "degraded")
                 self.assertEqual(
                     result["reason_code"], "reviewer_degraded_to_base"
                 )
                 self.assertTrue(
-                    result["degradation"]["reason_code"].startswith("opus_"),
-                    "reviewer leg must report opus_* codes, got "
+                    result["degradation"]["reason_code"].startswith("fable_"),
+                    "reviewer leg must report fable_* codes, got "
                     f"{result['degradation']['reason_code']}",
                 )
 
         unverified = evaluate_model_policy(
-            request(reviewer=valid_reviewer(opus_access="unknown"))
+            request(reviewer=valid_reviewer(fable_access="unknown"))
         )["claude_reviewer"]
         self.assertEqual(unverified["state"], "blocked")
         self.assertTrue(unverified["waiver_required"])
-        self.assertEqual(unverified["reason_code"], "opus_access_unverified")
+        self.assertEqual(unverified["reason_code"], "fable_access_unverified")
 
     def test_claude_zdr_failures_gate_by_leg(self) -> None:
         for key, _, factory, _ in LEGS:
@@ -591,7 +591,7 @@ class ModelPolicyTest(unittest.TestCase):
 
         unavailable["explicit_waiver"] = True
         unavailable["waiver_fallback"] = {
-            "model": "claude-opus-5",
+            "model": "claude-mythos-5",
             "effort": "max",
             "available": True,
             "explicitly_authorized": True,
@@ -605,20 +605,23 @@ class ModelPolicyTest(unittest.TestCase):
         )
         self.assertEqual(waived["state"], "waived")
         self.assertTrue(waived["waiver_granted"])
-        self.assertEqual(waived["model"], "claude-opus-5")
+        self.assertEqual(waived["model"], "claude-mythos-5")
         self.assertEqual(waived["execution_path"], "explicit_cli")
 
     def test_reviewer_unavailability_degrades_and_waiver_still_preempts(
         self,
     ) -> None:
-        unavailable = valid_reviewer(opus_access="unavailable")
+        unavailable = valid_reviewer(
+            fable_access="unavailable",
+            observed_models=["claude-fable-5-1", "claude-fable-6"],
+        )
         degraded = evaluate_model_policy(request(reviewer=unavailable))[
             "claude_reviewer"
         ]
 
         unavailable["explicit_waiver"] = True
         unavailable["waiver_fallback"] = {
-            "model": "claude-fable-5",
+            "model": "claude-fable-6",
             "effort": "max",
             "available": True,
             "explicitly_authorized": True,
@@ -631,27 +634,29 @@ class ModelPolicyTest(unittest.TestCase):
         self.assertEqual(degraded["state"], "degraded")
         self.assertEqual(degraded["model"], BASE_MODEL)
         self.assertEqual(
-            degraded["degradation"]["reason_code"], "opus_unavailable"
+            degraded["degradation"]["reason_code"], "fable_unavailable"
         )
         self.assertEqual(waived["state"], "waived")
         self.assertTrue(waived["waiver_granted"])
-        self.assertEqual(waived["model"], "claude-fable-5")
+        self.assertEqual(waived["model"], "claude-fable-6")
         self.assertEqual(waived["execution_path"], "explicit_cli")
 
     def test_base_waiver_rejects_unobserved_or_malformed_fallback(self) -> None:
         for model in (
-            "claude-opus-",
-            "claude-opus-malicious",
-            "claude-opus-foo/bar",
-            # Fable is the base; naming its own lineage as the fallback is not
-            # a substitute for restoring access to it.
+            "claude-fable-",
+            "claude-fable-malicious",
+            "claude-fable-foo/bar",
+            # Naming the leg's own floor primary as its fallback is not a
+            # substitute for restoring access to it.
             "claude-fable-5",
-            "claude-fable-6",
-            "claude-mythos-5",
-            # A waiver may authorize the opus lineage; it may not authorize a
-            # version below the Opus 5 floor. No path proposes a downgrade.
-            "claude-opus-4-8",
-            "claude-opus-4-5",
+            # Opus — any version — is never an autonomy fallback: reviews and
+            # work stay on the fable/mythos lineage.
+            "claude-opus-5",
+            "claude-opus-6",
+            # A waiver substitutes within the fable/mythos lineage; it may not
+            # authorize a version below the floor. No path proposes a downgrade.
+            "claude-fable-4-5",
+            "claude-mythos-4",
         ):
             with self.subTest(model=model):
                 base = valid_base(
@@ -669,15 +674,15 @@ class ModelPolicyTest(unittest.TestCase):
                 self.assertEqual(result["state"], "blocked")
                 self.assertEqual(result["reason_code"], "invalid_named_fallback")
 
-    def test_base_waiver_accepts_a_context_window_variant_of_the_opus_floor(
+    def test_base_waiver_accepts_a_different_fable_lineage_model(
         self,
     ) -> None:
         base = valid_base(
             fable_access="unavailable",
             explicit_waiver=True,
-            observed_models=["claude-fable-5", "claude-opus-5[1m]"],
+            observed_models=["claude-fable-5", "claude-fable-6"],
             waiver_fallback={
-                "model": "claude-opus-5[1m]",
+                "model": "claude-fable-6",
                 "effort": "max",
                 "available": True,
                 "explicitly_authorized": True,
@@ -688,26 +693,30 @@ class ModelPolicyTest(unittest.TestCase):
         result = evaluate_model_policy(request(base=base))["claude"]
 
         self.assertEqual(result["state"], "waived")
-        self.assertEqual(result["model"], "claude-opus-5[1m]")
+        self.assertEqual(result["model"], "claude-fable-6")
 
     def test_reviewer_waiver_rejects_unobserved_or_malformed_fallback(self) -> None:
         for model in (
             "claude-fable-",
             "claude-fable-malicious",
             "claude-fable-foo/bar",
-            # Opus is the reviewer; naming it as its own fallback is not a
+            # Naming the reviewer's own floor primary as its fallback is not a
             # substitute for restoring access to it.
-            "claude-opus-4-8",
+            "claude-fable-5-1",
+            # Opus — any version — is never an autonomy fallback.
             "claude-opus-5",
-            # A waiver may authorize a different lineage; it may not authorize a
-            # version below a floor. No path in this module proposes a downgrade.
+            "claude-opus-6",
+            # A waiver substitutes within the fable/mythos lineage; it may not
+            # authorize a version below the reviewer's own 5.1 floor.
+            "claude-fable-5",
+            "claude-mythos-5",
             "claude-fable-1",
             "claude-fable-4-5",
             "claude-mythos-4",
         ):
             with self.subTest(model=model):
                 reviewer = valid_reviewer(
-                    opus_access="unavailable",
+                    fable_access="unavailable",
                     explicit_waiver=True,
                     waiver_fallback={
                         "model": model,
@@ -725,14 +734,12 @@ class ModelPolicyTest(unittest.TestCase):
 
     def test_missing_claude_cli_cannot_select_explicit_fallback(self) -> None:
         for key, fallback_model in (
-            ("claude", "claude-opus-5"),
-            ("claude_reviewer", "claude-fable-5"),
+            ("claude", "claude-mythos-5"),
+            ("claude_reviewer", "claude-fable-6"),
         ):
             with self.subTest(leg=key):
                 factory = valid_base if key == "claude" else valid_reviewer
-                access_field = (
-                    "fable_access" if key == "claude" else "opus_access"
-                )
+                access_field = "fable_access"
                 config = factory(
                     installed=False,
                     explicit_waiver=True,
@@ -787,7 +794,7 @@ class ModelPolicyTest(unittest.TestCase):
         result = evaluate_model_policy(request(reviewer=reviewer))["claude_reviewer"]
         self.assertEqual(result["execution_path"], "explicit_cli")
         model_flag = result["arguments"][result["arguments"].index("--model") + 1]
-        self.assertEqual(model_flag, "opus")
+        self.assertEqual(model_flag, "fable")
 
     def test_matching_base_override_keeps_agent_tool_path(self) -> None:
         for override in (None, "", "fable", "claude-fable-5"):
@@ -804,9 +811,9 @@ class ModelPolicyTest(unittest.TestCase):
                 self.assertEqual(result["effort"], "max")
 
     def test_matching_reviewer_override_keeps_agent_tool_path(self) -> None:
-        # The bare floor, its alias, and its context-window variant all name the
-        # same model version, so none of them is a conflicting override.
-        for override in (None, "", "opus", "claude-opus-5", "claude-opus-5[1m]"):
+        # The bare floor and its alias name the same model version, so neither
+        # is a conflicting override.
+        for override in (None, "", "fable", "claude-fable-5-1"):
             with self.subTest(override=override):
                 result = evaluate_model_policy(
                     request(
@@ -867,18 +874,19 @@ class ModelPolicyTest(unittest.TestCase):
                 self.assertEqual(result["execution_path"], "explicit_cli")
 
     def test_cross_family_override_is_never_equivalent(self) -> None:
-        """Same floor eligibility does not make cross-family slugs one override.
+        """Same floor eligibility does not make sibling slugs one override.
 
         Mythos sits at the base floor for SELECTION, but a Mythos override is a
-        different model than the selected Fable — and a Fable override is not
-        the Opus reviewer. Both directions must fall back to the explicit CLI.
+        different model than the selected Fable — and a below-floor or
+        sibling-family override is not the selected reviewer. Both directions
+        must fall back to the explicit CLI.
         """
 
         for leg_key, fixture, override in (
             ("claude", valid_base, "claude-mythos-5"),
             ("claude", valid_base, "mythos"),
+            ("claude_reviewer", valid_reviewer, "claude-mythos-5-1"),
             ("claude_reviewer", valid_reviewer, "claude-fable-5"),
-            ("claude_reviewer", valid_reviewer, "fable"),
         ):
             with self.subTest(leg=leg_key, override=override):
                 config = fixture(
@@ -1034,42 +1042,42 @@ class AutoForwardSelectionTest(unittest.TestCase):
         model_flag = result["arguments"][result["arguments"].index("--model") + 1]
         self.assertEqual(model_flag, "claude-fable-6")
 
-    def test_newer_opus_is_auto_selected_for_the_reviewer(self) -> None:
+    def test_newer_fable_is_auto_selected_for_the_reviewer(self) -> None:
         reviewer = valid_reviewer(
-            observed_models=["claude-opus-5", "claude-opus-6", "claude-fable-5"]
+            observed_models=["claude-fable-5-1", "claude-fable-6", "claude-fable-5"]
         )
 
         result = evaluate_model_policy(request(reviewer=reviewer))["claude_reviewer"]
 
         self.assertEqual(result["state"], "ready")
-        self.assertEqual(result["model"], "claude-opus-6")
-        self.assertIn("model=claude-opus-6", result["arguments"])
+        self.assertEqual(result["model"], "claude-fable-6")
+        self.assertIn("model=claude-fable-6", result["arguments"])
         self.assertEqual(result["selection"]["reason"], "newer_model_auto_selected")
 
-    def test_newer_opus_advances_the_reviewer_not_the_base(self) -> None:
-        """The two legs auto-forward independently along their own lineages."""
+    def test_reviewer_selection_never_advances_the_base(self) -> None:
+        """The two legs auto-forward independently, each from its own list."""
 
         result = evaluate_model_policy(
             request(
-                base=valid_base(observed_models=["claude-fable-5", "claude-opus-6"]),
-                reviewer=valid_reviewer(observed_models=["claude-opus-6"]),
+                base=valid_base(observed_models=["claude-fable-5"]),
+                reviewer=valid_reviewer(observed_models=["claude-fable-6"]),
             )
         )
 
         self.assertEqual(result["claude"]["model"], BASE_MODEL)
         self.assertEqual(result["claude"]["selection"]["reason"], "floor_model")
-        self.assertEqual(result["claude_reviewer"]["model"], "claude-opus-6")
+        self.assertEqual(result["claude_reviewer"]["model"], "claude-fable-6")
         self.assertEqual(
             result["claude_reviewer"]["selection"]["reason"],
             "newer_model_auto_selected",
         )
 
-    def test_newer_fable_advances_the_base_not_the_reviewer(self) -> None:
+    def test_newer_fable_in_the_base_list_never_advances_the_reviewer(self) -> None:
         result = evaluate_model_policy(
             request(
                 base=valid_base(observed_models=["claude-fable-6"]),
                 reviewer=valid_reviewer(
-                    observed_models=["claude-opus-5", "claude-fable-6"]
+                    observed_models=["claude-fable-5-1"]
                 ),
             )
         )
@@ -1089,26 +1097,6 @@ class AutoForwardSelectionTest(unittest.TestCase):
         result = evaluate_model_policy(request(base=base))
 
         self.assertEqual(result["claude"]["model"], "claude-fable-6")
-
-    def test_context_window_variant_is_the_same_version_not_an_upgrade(self) -> None:
-        only_variant = evaluate_model_policy(
-            request(reviewer=valid_reviewer(observed_models=["claude-opus-5[1m]"]))
-        )["claude_reviewer"]
-
-        self.assertEqual(only_variant["model"], "claude-opus-5[1m]")
-        self.assertEqual(only_variant["selection"]["reason"], "floor_model_variant")
-
-        # With both present the bare slug wins — the standard-cost default.
-        both = evaluate_model_policy(
-            request(
-                reviewer=valid_reviewer(
-                    observed_models=["claude-opus-5[1m]", "claude-opus-5"]
-                )
-            )
-        )["claude_reviewer"]
-
-        self.assertEqual(both["model"], REVIEWER_MODEL)
-        self.assertEqual(both["selection"]["reason"], "floor_model")
 
     def test_floor_override_conflicts_when_newer_model_selected(self) -> None:
         base = valid_base(
@@ -1145,8 +1133,10 @@ class AutoForwardSelectionTest(unittest.TestCase):
                 self.assertEqual(result["selection"]["reason"], "floor_model")
 
         reviewer_cases = (
-            ["claude-fable-6"],
-            ["claude-opus-4-8"],
+            # Opus — any version — is never selected for the reviewer, and
+            # claude-fable-5 sits below the reviewer's own 5.1 floor.
+            ["claude-opus-6"],
+            ["claude-fable-5"],
             ["claude-sonnet-5"],
             ["claude-haiku-4-5"],
         )
@@ -1178,8 +1168,8 @@ class GatingAggregateTest(unittest.TestCase):
         """An availability-class reviewer failure is a recorded degradation."""
 
         for field, value, reason_code in (
-            ("opus_access", "unavailable", "opus_unavailable"),
-            ("opus_access", "entitlement_denied", "opus_entitlement_denied"),
+            ("fable_access", "unavailable", "fable_unavailable"),
+            ("fable_access", "entitlement_denied", "fable_entitlement_denied"),
             ("zero_data_retention", "incompatible", "zdr_incompatible"),
             ("installed", False, "cli_missing"),
         ):
@@ -1213,7 +1203,7 @@ class GatingAggregateTest(unittest.TestCase):
         result = evaluate_model_policy(
             request(
                 base=valid_base(host_capabilities={}),
-                reviewer=valid_reviewer(opus_access="unavailable"),
+                reviewer=valid_reviewer(fable_access="unavailable"),
             )
         )
 
@@ -1232,7 +1222,7 @@ class GatingAggregateTest(unittest.TestCase):
         result = evaluate_model_policy(
             request(
                 base=valid_base(fable_access="unavailable"),
-                reviewer=valid_reviewer(opus_access="unavailable"),
+                reviewer=valid_reviewer(fable_access="unavailable"),
             )
         )
         self.assertEqual(result["state"], "blocked")
@@ -1242,7 +1232,7 @@ class GatingAggregateTest(unittest.TestCase):
             fable_access="unavailable",
             explicit_waiver=True,
             waiver_fallback={
-                "model": "claude-opus-5",
+                "model": "claude-mythos-5",
                 "effort": "max",
                 "available": True,
                 "explicitly_authorized": True,
@@ -1252,7 +1242,7 @@ class GatingAggregateTest(unittest.TestCase):
         result = evaluate_model_policy(
             request(
                 base=waived_base,
-                reviewer=valid_reviewer(opus_access="unavailable"),
+                reviewer=valid_reviewer(fable_access="unavailable"),
             )
         )
         self.assertEqual(result["state"], "blocked")
@@ -1264,9 +1254,9 @@ class GatingAggregateTest(unittest.TestCase):
 
         for overrides, reason_code in (
             ({"installed": "yes"}, "invalid_installed_status"),
-            ({"opus_access": "sometimes"}, "invalid_opus_access"),
+            ({"fable_access": "sometimes"}, "invalid_fable_access"),
             (
-                {"opus_access": "unavailable", "explicit_waiver": True},
+                {"fable_access": "unavailable", "explicit_waiver": True},
                 "named_fallback_required",
             ),
         ):
@@ -1284,10 +1274,11 @@ class GatingAggregateTest(unittest.TestCase):
         """An explicit waiver names the fallback; auto-degradation defers."""
 
         reviewer = valid_reviewer(
-            opus_access="unavailable",
+            fable_access="unavailable",
+            observed_models=["claude-fable-5-1", "claude-fable-6"],
             explicit_waiver=True,
             waiver_fallback={
-                "model": "claude-fable-5",
+                "model": "claude-fable-6",
                 "effort": "max",
                 "available": True,
                 "explicitly_authorized": True,
@@ -1318,7 +1309,7 @@ class GatingAggregateTest(unittest.TestCase):
             fable_access="unavailable",
             explicit_waiver=True,
             waiver_fallback={
-                "model": "claude-opus-5",
+                "model": "claude-mythos-5",
                 "effort": "max",
                 "available": True,
                 "explicitly_authorized": True,
@@ -2330,9 +2321,9 @@ class QuotaWaitBoundTests(unittest.TestCase):
         self.assertEqual(result["reason_code"], "invalid_quota_observation")
         self.assertEqual(result["next_action"], "correct_observation_input")
 
-    def test_schema_version_is_bumped_for_the_quota_contract(self) -> None:
+    def test_schema_version_is_bumped_for_the_contract_changes(self) -> None:
         result = evaluate_model_policy(request())
-        self.assertEqual(result["version"], 6)  # literal pin, not the constant
+        self.assertEqual(result["version"], 7)  # literal pin, not the constant
 
 
 class MonitorChildInvocationTests(unittest.TestCase):
@@ -2342,11 +2333,11 @@ class MonitorChildInvocationTests(unittest.TestCase):
 
     def test_first_launch_argv_is_exactly_the_working_tail(self) -> None:
         self.assertEqual(
-            monitor_child_arguments("claude-opus-5"),
+            monitor_child_arguments("claude-fable-5-1"),
             [
                 "-p",
                 "--model",
-                "claude-opus-5",
+                "claude-fable-5-1",
                 "--effort",
                 "max",
                 "--output-format",
@@ -2362,12 +2353,12 @@ class MonitorChildInvocationTests(unittest.TestCase):
         )
 
     def test_resume_argv_prepends_the_session(self) -> None:
-        arguments = monitor_child_arguments("claude-opus-5", resume_id="sid-1")
+        arguments = monitor_child_arguments("claude-fable-5-1", resume_id="sid-1")
         self.assertEqual(arguments[:2], ["--resume", "sid-1"])
-        self.assertEqual(arguments[2:], monitor_child_arguments("claude-opus-5"))
+        self.assertEqual(arguments[2:], monitor_child_arguments("claude-fable-5-1"))
 
     def test_working_tail_never_carries_the_read_only_clamp(self) -> None:
-        arguments = monitor_child_arguments("claude-opus-5")
+        arguments = monitor_child_arguments("claude-fable-5-1")
         self.assertNotIn("--permission-mode", arguments)
         self.assertNotIn("--allowedTools", arguments)
         # The child session must PERSIST — resume is the owner cache lineage.
@@ -2472,14 +2463,14 @@ class MonitorOrchestratorBindingTests(unittest.TestCase):
     def _runtime(
         reviewer_status: str = "ready",
         base_status: str = "ready",
-        reviewer_model: str = "claude-opus-5",
+        reviewer_model: str = "claude-fable-5-1",
         base_model: str = "claude-fable-5",
         base_write_verified: bool = True,
     ) -> dict:
         # The persisted shape from references/state-and-safety.md — each leg
-        # carries model + gate_status (policy_decision omitted for ON-FLOOR
-        # legs: the binding must not depend on it there; a CROSS-floor leg
-        # carries its selection evidence per the waiver contract). The base
+        # carries model + gate_status (the binding re-checks every landed
+        # model against its leg's own floor; waived substitutes land within
+        # the fable/mythos lineage, so no cross-floor evidence exists). The base
         # leg's host_agent_selection_verified flag is the write-capability
         # prerequisite reviewer ownership consumes.
         return {
@@ -2501,7 +2492,7 @@ class MonitorOrchestratorBindingTests(unittest.TestCase):
         self.assertEqual(binding["lineage"], "reviewer")
         # Literal pin: the owner is the reviewer leg's recorded selection,
         # never a re-derived or invented slug.
-        self.assertEqual(binding["model"], "claude-opus-5")
+        self.assertEqual(binding["model"], "claude-fable-5-1")
         self.assertEqual(binding["effort"], "max")
         self.assertEqual(binding["reason_code"], "orchestrator_on_reviewer")
         self.assertIsNone(binding["pending_owner"])
@@ -2540,18 +2531,18 @@ class MonitorOrchestratorBindingTests(unittest.TestCase):
                 self.assertEqual(binding["state"], "bound")
                 self.assertEqual(binding["lineage"], "base")
 
-    def test_opus_family_waived_base_still_hosts_the_monitor(self) -> None:
-        # The only base-waiver family the core allows is Opus — the base
-        # floor check accepts it WHEN the leg's own policy_decision records
-        # that model as its selection (the waiver evidence).
-        # admin#1495 r17 F4: the leg record now flows through the defined
+    def test_mythos_waived_base_still_hosts_the_monitor(self) -> None:
+        # A base waiver substitutes within the fable/mythos lineage; the
+        # landed mythos fallback passes the base leg's own floor re-check
+        # directly, with the waiver retained as policy_decision evidence.
+        # admin#1495 r17 F4: the leg record flows through the defined
         # transition (granted waiver + consumed fallback success) instead
         # of hand-supplying gate_status "ready".
         config = valid_base(
             fable_access="unavailable",
             explicit_waiver=True,
             waiver_fallback={
-                "model": "claude-opus-5",
+                "model": "claude-mythos-5",
                 "effort": "max",
                 "available": True,
                 "explicitly_authorized": True,
@@ -2565,7 +2556,7 @@ class MonitorOrchestratorBindingTests(unittest.TestCase):
             {
                 "leg": "claude",
                 "status": "success",
-                "model": "claude-opus-5",
+                "model": "claude-mythos-5",
                 "effort": "max",
                 "attempts": 1,
             },
@@ -2573,19 +2564,17 @@ class MonitorOrchestratorBindingTests(unittest.TestCase):
         binding = monitor_orchestrator_binding(runtime)
         self.assertEqual(binding["state"], "bound")
         self.assertEqual(binding["lineage"], "base")
-        self.assertEqual(binding["model"], "claude-opus-5")
+        self.assertEqual(binding["model"], "claude-mythos-5")
 
-    def test_cross_lineage_swap_without_waiver_evidence_fails_closed(
+    def test_hand_edited_off_lineage_or_below_floor_models_fail_closed(
         self,
     ) -> None:
-        # R2 round-2 finding 3737466436, empirically verified: a
-        # hand-edited record swapping the lineages (opus on the base leg,
-        # fable on the reviewer leg, both "ready", no policy_decision
-        # evidence) bound the BASE model as reviewer-lineage owner with no
-        # waiver consulted. A cross-lineage model is legitimate only when
-        # the leg's own persisted policy_decision records it as the
-        # selection; an unevidenced swap leaves no landed leg and fails
-        # closed.
+        # R2 round-2 finding 3737466436, re-scoped for the single-lineage
+        # policy: every landed model is re-checked against its leg's OWN
+        # floor. A hand-edited record putting an Opus slug on the base leg
+        # and a below-reviewer-floor fable on the reviewer leg leaves no
+        # landed leg at all and fails closed — no waiver evidence can
+        # legitimize an off-lineage or below-floor owner.
         binding = monitor_orchestrator_binding(
             self._runtime(
                 base_model="claude-opus-5", reviewer_model="claude-fable-5"
@@ -2648,7 +2637,7 @@ class MonitorOrchestratorBindingTests(unittest.TestCase):
         self.assertEqual(binding["model"], "gpt-5.6-sol")
         self.assertEqual(binding["effort"], "max")
         self.assertEqual(binding["reason_code"], "orchestrator_continuity")
-        self.assertEqual(binding["pending_owner"], "claude-opus-5")
+        self.assertEqual(binding["pending_owner"], "claude-fable-5-1")
 
     def test_unready_codex_leg_session_stays_unrecorded(self) -> None:
         runtime = self._runtime()
@@ -2677,7 +2666,7 @@ class MonitorOrchestratorBindingTests(unittest.TestCase):
         self.assertEqual(binding["state"], "invalid")
 
     def test_codex_controller_requires_verified_base_write_path(self) -> None:
-        # Unlike a live Opus session (which truthfully demotes to inline
+        # Unlike a live Claude reviewer-leg session (which demotes to inline
         # base-lineage work), a Codex session cannot take the Claude base
         # role — without a host-verified base worker path there is no
         # compliant write actor, so the binding fails closed.
@@ -2715,11 +2704,11 @@ class MonitorOrchestratorBindingTests(unittest.TestCase):
         self.assertEqual(binding["lineage"], "base")
         self.assertEqual(binding["model"], "claude-fable-5")
         self.assertEqual(binding["reason_code"], "orchestrator_continuity")
-        self.assertEqual(binding["pending_owner"], "claude-opus-5")
+        self.assertEqual(binding["pending_owner"], "claude-fable-5-1")
 
     def test_owner_session_binds_nominally_with_session_model(self) -> None:
         binding = monitor_orchestrator_binding(
-            self._runtime(), session_model="claude-opus-5"
+            self._runtime(), session_model="claude-fable-5-1"
         )
         self.assertEqual(binding["reason_code"], "orchestrator_on_reviewer")
         self.assertIsNone(binding["pending_owner"])
@@ -2744,11 +2733,11 @@ class MonitorOrchestratorBindingTests(unittest.TestCase):
         # nominal no-write-path demotion.
         binding = monitor_orchestrator_binding(
             self._runtime(base_write_verified=False),
-            session_model="claude-opus-5",
+            session_model="claude-fable-5-1",
         )
         self.assertEqual(binding["state"], "bound")
         self.assertEqual(binding["lineage"], "base")
-        self.assertEqual(binding["model"], "claude-opus-5")
+        self.assertEqual(binding["model"], "claude-fable-5-1")
         self.assertEqual(binding["reason_code"], "orchestrator_continuity")
         self.assertEqual(binding["pending_owner"], "claude-fable-5")
 
@@ -2765,10 +2754,13 @@ class WaiverGateResolutionTests(unittest.TestCase):
     def _waived_decision(leg: str) -> dict:
         if leg == "claude":
             config = valid_base(fable_access="unavailable")
-            fallback_model = "claude-opus-5"
+            fallback_model = "claude-mythos-5"
         else:
-            config = valid_reviewer(opus_access="unavailable")
-            fallback_model = "claude-fable-5"
+            config = valid_reviewer(
+                fable_access="unavailable",
+                observed_models=["claude-fable-5-1", "claude-fable-6"],
+            )
+            fallback_model = "claude-fable-6"
         config["explicit_waiver"] = True
         config["waiver_fallback"] = {
             "model": fallback_model,
@@ -2831,7 +2823,7 @@ class WaiverGateResolutionTests(unittest.TestCase):
                 "host_agent_selection_verified": True,
             },
             "claude_reviewer": {
-                "model": "claude-opus-5",
+                "model": "claude-fable-5-1",
                 "gate_status": "blocked",
             },
         }
@@ -2844,20 +2836,20 @@ class WaiverGateResolutionTests(unittest.TestCase):
         from state_schema import validate_model_runtime_shape
 
         decision = self._waived_decision("claude")
-        observation = self._observation("claude", "claude-opus-5")
+        observation = self._observation("claude", "claude-mythos-5")
         record = waiver_gate_resolution(decision, observation)
         self.assertEqual(record["gate_status"], "ready")
-        self.assertEqual(record["model"], "claude-opus-5")
+        self.assertEqual(record["model"], "claude-mythos-5")
         self.assertEqual(record["effort"], "max")
         # The waiver decision is retained as evidence, never discarded.
         self.assertEqual(record["policy_decision"]["waiver"], decision)
         self.assertEqual(
             record["policy_decision"]["fallback_invocation"], observation
         )
-        # The cross-floor evidence shape the monitor binder reads.
+        # The substitute-selection evidence retained by the transition.
         self.assertEqual(
             record["policy_decision"]["selection"]["selected_model"],
-            "claude-opus-5",
+            "claude-mythos-5",
         )
         self.assertEqual(
             record["policy_decision"]["resolution"]["reason_code"],
@@ -2868,7 +2860,7 @@ class WaiverGateResolutionTests(unittest.TestCase):
         binding = monitor_orchestrator_binding(runtime)
         self.assertEqual(binding["state"], "bound")
         self.assertEqual(binding["lineage"], "base")
-        self.assertEqual(binding["model"], "claude-opus-5")
+        self.assertEqual(binding["model"], "claude-mythos-5")
 
     def test_base_fallback_failure_lands_blocked_and_never_binds(self) -> None:
         from state_schema import validate_model_runtime_shape
@@ -2876,7 +2868,7 @@ class WaiverGateResolutionTests(unittest.TestCase):
         decision = self._waived_decision("claude")
         record = waiver_gate_resolution(
             decision,
-            self._observation("claude", "claude-opus-5", status="error"),
+            self._observation("claude", "claude-mythos-5", status="error"),
         )
         self.assertEqual(record["gate_status"], "blocked")
         resolution = record["policy_decision"]["resolution"]
@@ -2900,10 +2892,10 @@ class WaiverGateResolutionTests(unittest.TestCase):
         from state_schema import validate_model_runtime_shape
 
         decision = self._waived_decision("claude_reviewer")
-        observation = self._observation("claude_reviewer", "claude-fable-5")
+        observation = self._observation("claude_reviewer", "claude-fable-6")
         record = waiver_gate_resolution(decision, observation)
         self.assertEqual(record["gate_status"], "ready")
-        self.assertEqual(record["model"], "claude-fable-5")
+        self.assertEqual(record["model"], "claude-fable-6")
         self.assertEqual(record["policy_decision"]["waiver"], decision)
         self.assertEqual(
             record["policy_decision"]["fallback_invocation"], observation
@@ -2916,7 +2908,7 @@ class WaiverGateResolutionTests(unittest.TestCase):
         binding = monitor_orchestrator_binding(runtime)
         self.assertEqual(binding["state"], "bound")
         self.assertEqual(binding["lineage"], "reviewer")
-        self.assertEqual(binding["model"], "claude-fable-5")
+        self.assertEqual(binding["model"], "claude-fable-6")
 
     def test_reviewer_fallback_failure_lands_blocked_monitor_on_base(
         self,
@@ -2927,7 +2919,7 @@ class WaiverGateResolutionTests(unittest.TestCase):
         record = waiver_gate_resolution(
             decision,
             self._observation(
-                "claude_reviewer", "claude-fable-5", status="timeout"
+                "claude_reviewer", "claude-fable-6", status="timeout"
             ),
         )
         self.assertEqual(record["gate_status"], "blocked")
@@ -2944,14 +2936,13 @@ class WaiverGateResolutionTests(unittest.TestCase):
 
     def test_success_for_a_different_model_never_lands_ready(self) -> None:
         # A success observation proves only the route it ran: a sibling
-        # slug, the other lineage, or even a context-window variant of the
-        # waiver-named model (same version, DIFFERENT invocation route)
-        # fails closed as a mismatch, never opens the gate.
+        # slug, another lineage-family member, or an Opus slug fails
+        # closed as a mismatch, never opens the gate.
         decision = self._waived_decision("claude")
         for wrong_model in (
-            "claude-opus-5[1m]",
-            "claude-opus-6",
+            "claude-mythos-5-1",
             "claude-fable-5",
+            "claude-opus-5",
             "gpt-5.6-sol",
         ):
             with self.subTest(model=wrong_model):
@@ -2966,8 +2957,8 @@ class WaiverGateResolutionTests(unittest.TestCase):
 
     def test_wrong_leg_effort_or_route_failure_is_a_mismatch(self) -> None:
         decision = self._waived_decision("claude")
-        cross_leg = self._observation("claude_reviewer", "claude-opus-5")
-        wrong_effort = self._observation("claude", "claude-opus-5")
+        cross_leg = self._observation("claude_reviewer", "claude-mythos-5")
+        wrong_effort = self._observation("claude", "claude-mythos-5")
         wrong_effort["effort"] = "xhigh"
         # Identity precedes outcome - a failure on another route is a
         # mismatch, never this waiver's recorded invocation failure.
@@ -2987,7 +2978,7 @@ class WaiverGateResolutionTests(unittest.TestCase):
         from state_schema import validate_model_runtime_shape
 
         decision = self._waived_decision("claude")
-        missing_field = self._observation("claude", "claude-opus-5")
+        missing_field = self._observation("claude", "claude-mythos-5")
         del missing_field["status"]
         for garbage in (None, [], "success", 7, {}, missing_field):
             with self.subTest(garbage=garbage):
@@ -3021,7 +3012,7 @@ class WaiverGateResolutionTests(unittest.TestCase):
         for garbage in (None, [], "waived", 7, ready):
             with self.subTest(garbage=garbage):
                 result = waiver_gate_resolution(
-                    garbage, self._observation("claude", "claude-opus-5")
+                    garbage, self._observation("claude", "claude-mythos-5")
                 )
                 self.assertEqual(result["state"], "invalid")
                 self.assertTrue(result["errors"])
@@ -3049,9 +3040,9 @@ class WaiverGateResolutionTests(unittest.TestCase):
 
     def test_inconsistent_decision_naming_two_models_is_invalid(self) -> None:
         decision = self._waived_decision("claude")
-        decision["fallback_model"] = "claude-opus-6"
+        decision["fallback_model"] = "claude-mythos-6"
         result = waiver_gate_resolution(
-            decision, self._observation("claude", "claude-opus-5")
+            decision, self._observation("claude", "claude-mythos-5")
         )
         self.assertEqual(result["state"], "invalid")
 
