@@ -659,7 +659,7 @@ BUILTIN_EXPECTED_HEADINGS: Mapping[str, tuple[str, ...]] = {
         "## Non-Negotiable Invariants",
         "## Mandatory Model Policy",
         "### Claude base: Fable 5 at max",
-        "### Claude reviewer: Fable 5.1 at max",
+        "### Claude reviewer: Fable 5.1",
         "### Codex voices: GPT-6 Astra at max/ultra",
         "## Authorization and Entry Routing",
         "## Project Profile and State",

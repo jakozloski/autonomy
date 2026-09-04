@@ -168,12 +168,12 @@ Review the implementation before creating or updating the PR. (For PR takeovers,
 **Tool selection is mandatory with fallback chain:**
 
 1. **gstack `/review` adapter** (primary, when gstack available and `change_type != skill_only`):
-   - Run structured checklist review (Claude pass — always runs)
+   - Run the standing structured review on Astra at the task-shape tier (the Claude reviewer supplement below is optional and recorded)
    - Auto-scale adversarial review based on diff size — counted as added + removed lines summed from `git diff --numstat "$REVIEW_BASE"..HEAD` (both columns, all files; the same count defines the `large_diff` trigger):
-     - **Small (<50 lines):** Claude structured review only. No multi-model for small diffs. **Review-response fixes never tier Small** — any pass whose scope is commits made to address review findings uses at least the Medium tier regardless of line count (see Review-Fix Integrity in merge-readiness.md).
-     - **Medium (50-199 lines):** + Codex adversarial challenge (if `command -v codex` succeeds) OR a reviewer-model adversarial subagent (fallback)
-     - **Large (200+ lines):** + Codex structured review (if available) + **fresh-base adversarial pass** (trigger `large_diff`) + Codex adversarial challenge (if available). If Codex is unavailable, run the reviewer structured review + the fresh-base adversarial pass + one more reviewer adversarial subagent pass instead. If the fresh-base escalation cannot run, substitute a reviewer adversarial subagent pass and record the degradation in this pass's `notes`.
-   - Every Codex invocation in this adapter runs the policy-selected model (floor GPT-6 Astra) at the task-shape tier — `max` for focused diffs, `ultra` for large multi-component reviews — `codex exec` via `-m <selected>` plus the canonical `-s read-only` sandbox pin, `codex review` via `-c 'model="<selected>"'` (it rejects `-m` and exposes no sandbox flag), both with `-c 'model_reasoning_effort="max"'` (see Model Configuration); Claude review passes run on the recorded reviewer-leg decision (floor Fable 5.1, or its recorded fallback) and fresh-base escalation passes on the selected base model (floor Fable 5)
+     - **Small (<50 lines):** Astra focused review at `max`. No multi-model for small diffs. **Review-response fixes never tier Small** — any pass whose scope is commits made to address review findings uses at least the Medium tier regardless of line count (see Review-Fix Integrity in merge-readiness.md).
+     - **Medium (50-199 lines):** Astra focused review at `max` + the optional Claude reviewer supplement (start `high`, `max` for difficult passes; record the tier and the run/skip choice)
+     - **Large (200+ lines):** Astra broad review at `ultra` — the LEAD validates every finding (concrete failing scenario or demonstrated code path) and checks interactions across components before ledger entry — + **fresh-base adversarial pass** (trigger `large_diff`) + the optional Claude reviewer supplement. If Codex is unavailable at review time, run the Claude reviewer structured review at `max` + the fresh-base adversarial pass + one more reviewer adversarial subagent pass instead. If the fresh-base escalation cannot run, substitute a reviewer adversarial subagent pass and record the degradation in this pass's `notes`.
+   - Every Codex invocation in this adapter runs the policy-selected model (floor GPT-6 Astra) at the task-shape tier — `max` for focused diffs, `ultra` for broad multi-component reviews, every `ultra` pass paired with the lead-validation step above — `codex exec` via `-m <selected>` plus the canonical `-s read-only` sandbox pin, `codex review` via `-c 'model="<selected>"'` (it rejects `-m` and exposes no sandbox flag), both with `-c 'model_reasoning_effort="max"'` (see Model Configuration); Claude review passes run on the recorded reviewer-leg decision (floor Fable 5.1, or its recorded fallback) and fresh-base escalation passes on the selected base model (floor Fable 5)
    - If `scope_frontend`: include design review lite (check for CSS/spacing/hierarchy issues in the diff)
    - Fix-First workflow: AUTO-FIX items applied automatically, ASK items fixed as recommended (autonomous mode)
    - Set `gstack_integration.review.status: "complete"` and `gstack_integration.review.tier: "small|medium|large"`
@@ -209,7 +209,7 @@ Compute from the session's review base — set `REVIEW_BASE = $(git merge-base o
 **Steps:**
 
 1. Invoke the review tool on the changes (diff against `$REVIEW_BASE`, the merge-base set above — never the moving base-branch ref)
-2. Read every finding from the review
+2. Read every finding from the review, validating each before acting: a finding counts only with a concrete failing scenario or a demonstrated code path — for parallel (`ultra`) output the lead performs the validation itself and checks interactions across components; more comments alone are not better review
 3. **For every issue found:**
    - If it's a real issue (bug, security, performance, readability, correctness) → **fix it now**
    - If it's a genuine false positive → note why and move on. When marking an issue as a false positive, you MUST include a one-sentence written justification explaining why. "Not relevant" or "minor" are not valid justifications.

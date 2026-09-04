@@ -62,8 +62,8 @@ Invoke with `/autonomy`, or ask for "solve this issue autonomously" / "take over
 The skill checks its model gates up front and blocks with a reason when one is unavailable, instead of quietly downgrading:
 
 - Claude Code `>= 2.1.170` with access to Claude Fable 5 (`claude-fable-5`) at `max` effort — the base leg that does the work
-- Claude Fable 5.1 (`claude-fable-5-1`) at `max` effort — the reviewer leg: the standing Claude review voice
-- Codex CLI `>= 0.144.0` with access to GPT-6 Astra at both `max` and `ultra` reasoning (`max` for difficult questions and focused debugging — the plan verdict, focused review passes; `ultra`, maximum reasoning plus automatic parallel delegation, for large code reviews, broad research, and feature builds across multiple components)
+- Claude Fable 5.1 (`claude-fable-5-1`) — the reviewer leg: an optional supplemental review voice (starts `high`, `max` permitted) plus the mandatory fallback and escalation seats at `max`
+- Codex CLI `>= 0.144.0` with access to GPT-6 Astra at both `max` and `ultra` reasoning (`max` for focused, difficult reviews and the plan verdict; `ultra`, maximum reasoning plus automatic parallel delegation, for broad PR reviews — with the lead validating every finding; `high`/`xhigh` for routine steps)
 - `gh` CLI authenticated for the target repository
 - Python 3 (standard library only) for the helper scripts
 
@@ -78,7 +78,7 @@ Because a run on a quietly-substituted model looks fine right up until the PR is
 Not out of the box. The cross-vendor gate is the point: the model that writes the code is not the model that approves it. If you want a Claude-only variant anyway, the gates live in two places, the "Mandatory Model Policy" section of `SKILL.md` and `scripts/model_policy.py`. `scripts/test_model_policy.py` pins the expected decisions, so change both together and the tests will tell you what you missed.
 
 **Which model does what?**
-Fable 5 is the base: it writes the plan and the code, explores, and carries the delegated work. Two reviewers judge that work in every review discussion — Claude Fable 5.1 at `max` in a fresh read-only context (the structured review and every Claude review fallback) and GPT-6 Astra (the plan verdict and diff review — `max` on focused passes, `ultra` on large ones). When a discussion stalls or the two reviewers disagree, the escalation voice is one not already in that discussion — the Claude reviewer for a stalled plan review, a fresh read-only base-lineage context for a code-review dispute — rather than a rerun of one that already spoke.
+Fable 5 is the base: `max` for substantive implementation, architecture, and difficult debugging; `ultracode` — or `max` with delegated agents — when the work splits into independently implementable components. GPT-6 Astra is the standing reviewer: `ultra` for broad PR reviews, with the lead validating every finding and checking cross-component interactions, and `max` for focused, difficult reviews and investigating specific findings. Routine steps on either vendor may run `high`/`xhigh`. Claude Fable 5.1 adds an optional supplemental review pass — starting at `high` per [CodeRabbit's published pipeline results](https://www.coderabbit.ai/blog/fable-5-1-model-review) (low beat high there; medium and max were untested, so `max` stays permitted) — and staffs the review fallbacks and escalation seats at `max`. Every finding, from any voice, counts only with a concrete failing scenario or demonstrated code path. When a discussion stalls or reviewers disagree, the escalation voice is one not already in that discussion rather than a rerun of one that already spoke.
 
 **What does a run cost?**
 More than you'd guess from a chat session. A full issue-to-clean-PR cycle makes a lot of frontier-model calls: plan-review rounds, multi-pass self-review, the monitor loop. Keep issues small if cost matters.

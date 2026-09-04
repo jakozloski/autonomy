@@ -145,14 +145,17 @@ a downgrade.  The Claude legs forward independently: each selects from its
 own leg's observed list against its own floor, and neither selection ever
 advances the other.
 
-Effort follows task shape on both vendors.  ``max`` — the deepest
-non-delegating reasoning tier (the depth axis runs ``high -> xhigh ->
-max``) — is the focused tier: difficult questions, focused debugging, one
-plan verdict, one disputed finding.  ``ultra`` combines maximum reasoning
-with automatic delegation to parallel subagents (the breadth axis) and is
-the tier for large code reviews, broad research, and multi-component
-feature builds (the Claude-side breadth lever is the ``ultracode`` workflow
-mode; the Claude effort flag itself tops at ``max``).  The catalog gate
+Effort follows task shape on both vendors, across five tiers.  Fable
+``max``: substantive implementation, architecture, difficult debugging.
+Fable ``ultracode`` — or ``max`` with delegated agents: work that splits
+into independently implementable components.  Astra ``ultra``: broad PR
+reviews, with the lead validating every finding and checking interactions
+across components.  Astra ``max``: focused, difficult reviews and
+investigating specific findings (the plan verdict is one).  ``high`` or
+``xhigh``: routine work — never a mandatory gate voice.  Review findings
+are evidence, not volume: each one counts only with a concrete failing
+scenario or a demonstrated code path, and the lead validates
+parallel-review output before it enters the ledger.  The catalog gate
 therefore requires the selected Codex model to support BOTH ``max`` and
 ``ultra``.
 """
@@ -195,15 +198,22 @@ SCHEMA_VERSION = 8
 CODEX_MODEL = "gpt-6-astra"  # floor: newest eligible catalog model >= this wins
 CODEX_FLOOR_VERSION = (6, 0)
 CODEX_EFFORT = "max"  # focused tier: deepest non-delegating reasoning
-# Breadth tier by task shape: large code reviews, broad research, and
-# multi-component feature builds run ultra (maximum reasoning + automatic
-# parallel delegation); difficult questions and focused debugging stay on
-# CODEX_EFFORT. The Claude-side breadth lever is the ultracode workflow
-# mode (the Claude effort flag itself tops at max).
+# Breadth tier by task shape: broad PR reviews run ultra (maximum
+# reasoning + automatic parallel delegation) with the LEAD validating every
+# finding and checking cross-component interactions; focused, difficult
+# reviews and specific-finding investigations stay on CODEX_EFFORT. The
+# Claude-side breadth lever for independently implementable components is
+# the ultracode workflow mode — or max with delegated agents (the Claude
+# effort flag itself tops at max).
 CODEX_BREADTH_EFFORT = "ultra"
 CLAUDE_BREADTH_MODE = "ultracode"
-# Catalog eligibility requires every tier the workflow may run.
+# Catalog eligibility requires every tier the mandatory voices may run.
 CODEX_REQUIRED_EFFORTS = (CODEX_EFFORT, CODEX_BREADTH_EFFORT)
+# Routine-work tier on either vendor: mechanical, low-ambiguity steps may
+# run high (or xhigh on Codex). Never a mandatory gate voice — the plan
+# verdict, standing reviews, and escalation seats keep their pinned tiers,
+# so ROUTINE_EFFORTS deliberately stays out of CODEX_REQUIRED_EFFORTS.
+ROUTINE_EFFORTS = ("high", "xhigh")
 MIN_CODEX_VERSION = (0, 144, 0)
 CODEX_MAX_ATTEMPTS = 2  # immediate same-config retries before backoff pacing kicks in
 # Escalating wait-and-retry ladder for liveness-class failures (timeout /
@@ -240,7 +250,13 @@ BASE_EFFORT = "max"
 REVIEWER_MODEL = "claude-fable-5-1"  # floor: newest observed fable/mythos >= this wins
 REVIEWER_FLOOR_VERSION = (5, 1)
 REVIEWER_MODEL_ALIAS = "fable"
-REVIEWER_EFFORT = "max"
+REVIEWER_EFFORT = "max"  # mandatory reviewer seats: fallbacks, escalation, monitor
+# The OPTIONAL supplemental review pass starts lower and may run max for
+# difficult or focused passes: CodeRabbit's published Fable 5.1 review
+# pipeline found low beat high (medium and max untested) — evidence for a
+# cheaper starting point, never for banning max.
+# https://www.coderabbit.ai/blog/fable-5-1-model-review
+REVIEWER_SUPPLEMENT_STARTING_EFFORT = "high"
 
 MIN_CLAUDE_VERSION = (2, 1, 170)
 CLAUDE_READ_ONLY_ALLOWED_TOOLS = ("Read", "Glob", "Grep")
