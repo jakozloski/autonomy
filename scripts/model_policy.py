@@ -13,8 +13,8 @@ Expected input shape::
         "version": "codex-cli 0.144.0",
         "live_catalog": {
           "models": [{
-            "slug": "gpt-5.6-sol",
-            "supported_reasoning_levels": [{"effort": "max"}]
+            "slug": "gpt-6-astra",
+            "supported_reasoning_levels": [{"effort": "max"}, {"effort": "ultra"}]
           }]
         },
         "first_real_invocation": {"status": "success", "attempts": 1,
@@ -133,8 +133,9 @@ observation, with the waiver decision retained as evidence under
 
 Model selection is floor-based, not pinned.  From the observed facts the
 helper selects the newest eligible model at or above each floor: for Codex,
-live-catalog models named ``gpt-<version>[-variant]`` that support the
-required effort, excluding down-tier variants such as ``-mini``; for the base
+live-catalog models named ``gpt-<version>[-variant]`` that support every
+required effort tier (``max`` and ``ultra``), excluding down-tier variants
+such as ``-mini``; for the base
 leg, ``fable``/``mythos``-family entries in the optional
 ``claude.observed_models`` list; for the reviewer leg, ``fable``/``mythos``-
 family entries in ``claude_reviewer.observed_models`` at or above its own
@@ -144,12 +145,16 @@ a downgrade.  The Claude legs forward independently: each selects from its
 own leg's observed list against its own floor, and neither selection ever
 advances the other.
 
-``max`` is the pin for this workflow's single-problem voices: the deepest
-non-delegating reasoning tier the floor model exposes (the depth axis runs
-``high -> xhigh -> max``).  ``ultra`` is not a deeper rung on that axis — it
-combines maximum reasoning with automatic delegation to parallel subagents
-(the breadth axis), buys nothing on an indivisible review, and is
-deliberately not part of this gate.
+Effort follows task shape on both vendors.  ``max`` — the deepest
+non-delegating reasoning tier (the depth axis runs ``high -> xhigh ->
+max``) — is the focused tier: difficult questions, focused debugging, one
+plan verdict, one disputed finding.  ``ultra`` combines maximum reasoning
+with automatic delegation to parallel subagents (the breadth axis) and is
+the tier for large code reviews, broad research, and multi-component
+feature builds (the Claude-side breadth lever is the ``ultracode`` workflow
+mode; the Claude effort flag itself tops at ``max``).  The catalog gate
+therefore requires the selected Codex model to support BOTH ``max`` and
+``ultra``.
 """
 
 from __future__ import annotations
@@ -181,11 +186,24 @@ from state_schema import normalize_iso_timestamp
 # observation key is ``fable_access`` (was ``opus_access``), reviewer failure
 # codes are ``fable_*``, and waivers substitute WITHIN the fable/mythos
 # lineage at or above the leg's own floor (never the leg's own floor primary).
-SCHEMA_VERSION = 7
+# Version 8: the Codex floor moves to gpt-6-astra (6, 0) with the -astra
+# lineage breaking selection ties; catalog eligibility requires BOTH max and
+# ultra reasoning; effort is tiered by task shape (max focused / ultra
+# breadth, ultracode as the Claude-side breadth mode).
+SCHEMA_VERSION = 8
 
-CODEX_MODEL = "gpt-5.6-sol"  # floor: newest eligible catalog model >= this wins
-CODEX_FLOOR_VERSION = (5, 6)
-CODEX_EFFORT = "max"  # deepest non-delegating tier on the floor model; never ultra
+CODEX_MODEL = "gpt-6-astra"  # floor: newest eligible catalog model >= this wins
+CODEX_FLOOR_VERSION = (6, 0)
+CODEX_EFFORT = "max"  # focused tier: deepest non-delegating reasoning
+# Breadth tier by task shape: large code reviews, broad research, and
+# multi-component feature builds run ultra (maximum reasoning + automatic
+# parallel delegation); difficult questions and focused debugging stay on
+# CODEX_EFFORT. The Claude-side breadth lever is the ultracode workflow
+# mode (the Claude effort flag itself tops at max).
+CODEX_BREADTH_EFFORT = "ultra"
+CLAUDE_BREADTH_MODE = "ultracode"
+# Catalog eligibility requires every tier the workflow may run.
+CODEX_REQUIRED_EFFORTS = (CODEX_EFFORT, CODEX_BREADTH_EFFORT)
 MIN_CODEX_VERSION = (0, 144, 0)
 CODEX_MAX_ATTEMPTS = 2  # immediate same-config retries before backoff pacing kicks in
 # Escalating wait-and-retry ladder for liveness-class failures (timeout /
@@ -1226,7 +1244,8 @@ def verify_frozen_selection(
             "reason_code": "frozen_model_ineligible",
             "reason": (
                 f"The frozen model {frozen_model} is no longer present in the live "
-                f"catalog with {CODEX_EFFORT} reasoning"
+                f"catalog with the required {CODEX_EFFORT}+{CODEX_BREADTH_EFFORT}"
+                " reasoning"
             ),
             "next_action": "start_new_workflow_entry_preflight",
         }
@@ -1494,13 +1513,19 @@ def _block_codex(
 
 
 def _supports_required_effort(model: dict[str, Any]) -> bool:
+    """True when the catalog entry lists every tier the workflow may run.
+
+    ``max`` (focused) alone is not enough: breadth-shaped passes run
+    ``ultra``, and a model that cannot is a silent-degradation trap.
+    """
+
     levels = model.get("supported_reasoning_levels")
     if not isinstance(levels, list):
         return False
-    return any(
-        isinstance(level, dict) and level.get("effort") == CODEX_EFFORT
-        for level in levels
-    )
+    supported = {
+        level.get("effort") for level in levels if isinstance(level, dict)
+    }
+    return all(effort in supported for effort in CODEX_REQUIRED_EFFORTS)
 
 
 def _slug_meets_floor_policy(slug: str) -> bool:
@@ -1555,8 +1580,8 @@ def _select_codex_model(catalog: Any) -> str | None:
     Eligibility: GPT-family slug, version >= the floor, required effort
     supported, and no down-tier variant token.  At exactly the floor version
     only the known floor slug qualifies (same-version siblings are not proven
-    upgrades).  Ties at newer versions prefer the ``-sol`` lineage, then bare
-    slugs, then lexicographic order — deterministic by construction.
+    upgrades).  Ties at newer versions prefer the ``-astra`` lineage, then
+    bare slugs, then lexicographic order — deterministic by construction.
     """
 
     if not isinstance(catalog, dict):
@@ -1579,7 +1604,7 @@ def _select_codex_model(catalog: Any) -> str | None:
         match = _GPT_SLUG.fullmatch(slug)
         version = (int(match.group("major")), int(match.group("minor") or 0))
         variant = match.group("variant") or ""
-        variant_rank = 2 if variant == "sol" else 1 if variant == "" else 0
+        variant_rank = 2 if variant == "astra" else 1 if variant == "" else 0
         key = (version, variant_rank, slug)
         if best is None or key > best[0]:
             best = (key, slug)
@@ -1622,7 +1647,8 @@ def evaluate_codex(raw: Any) -> dict[str, Any]:
             decision,
             "live_catalog_missing_capability",
             "The live Codex catalog lacks an eligible model at or above "
-            f"GPT-5.6 Sol with {CODEX_EFFORT} reasoning",
+            f"GPT-6 Astra with {CODEX_EFFORT} and {CODEX_BREADTH_EFFORT}"
+            " reasoning",
             "request_access_or_refresh_live_catalog",
         )
     decision["live_catalog_verified"] = True

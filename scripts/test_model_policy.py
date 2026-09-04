@@ -50,19 +50,20 @@ from model_policy import (
 )
 
 
-def live_catalog(*, include_sol: bool = True, include_required_effort: bool = True) -> dict:
+def live_catalog(*, include_astra: bool = True, include_required_effort: bool = True) -> dict:
     models = [
         {
             "slug": "gpt-5.5-codex",
             "supported_reasoning_levels": [{"effort": "xhigh"}],
         }
     ]
-    if include_sol:
-        # ultra stays present (delegation breadth) and xhigh stays present (a
-        # sub-max depth tier): neither ever satisfies the required-effort gate.
-        levels = [{"effort": "high"}, {"effort": "xhigh"}, {"effort": "ultra"}]
+    if include_astra:
+        # high/xhigh alone never satisfy the gate: eligibility requires BOTH
+        # max (the focused tier) and ultra (the breadth tier).
+        levels = [{"effort": "high"}, {"effort": "xhigh"}]
         if include_required_effort:
             levels.append({"effort": CODEX_EFFORT})
+            levels.append({"effort": "ultra"})
         models.append(
             {
                 "slug": CODEX_MODEL,
@@ -229,9 +230,9 @@ class ModelPolicyTest(unittest.TestCase):
         self.assertEqual(result["claude"]["reason_code"], "cli_too_old")
         self.assertEqual(result["claude_reviewer"]["reason_code"], "cli_too_old")
 
-    def test_codex_live_catalog_missing_sol_blocks(self) -> None:
+    def test_codex_live_catalog_missing_astra_blocks(self) -> None:
         codex = valid_codex()
-        codex["live_catalog"] = live_catalog(include_sol=False)
+        codex["live_catalog"] = live_catalog(include_astra=False)
 
         result = evaluate_model_policy(request(codex=codex))["codex"]
 
@@ -295,14 +296,17 @@ class ModelPolicyTest(unittest.TestCase):
         codex["live_catalog"]["models"].append(
             {
                 "slug": "gpt-9.9-sol",
-                "supported_reasoning_levels": [{"effort": "max"}],
+                "supported_reasoning_levels": [
+                    {"effort": "max"},
+                    {"effort": "ultra"},
+                ],
             }
         )
         result = evaluate_model_policy(request(codex=codex))["codex"]
 
         self.assertEqual(result["model"], "gpt-9.9-sol")
         self.assertIn("gpt-9.9-sol", result["reason"])
-        self.assertNotIn("GPT-5.6 Sol", result["reason"])
+        self.assertNotIn("GPT-6 Astra", result["reason"])
 
     def test_codex_quota_exhaustion_blocks_until_reset_or_access_change(self) -> None:
         result = evaluate_model_policy(
@@ -449,7 +453,7 @@ class ModelPolicyTest(unittest.TestCase):
         cases = [
             {"installed": False},
             {**valid_codex(), "version": "0.143.0"},
-            {**valid_codex(), "live_catalog": live_catalog(include_sol=False)},
+            {**valid_codex(), "live_catalog": live_catalog(include_astra=False)},
             valid_codex(status="entitlement_denied"),
             valid_codex(status="quota_exhausted"),
             valid_codex(status="timeout", attempts=1),
@@ -948,13 +952,15 @@ class AutoForwardSelectionTest(unittest.TestCase):
         self.assertEqual(result["selection"]["floor_model"], CODEX_MODEL)
 
     def test_newer_codex_model_is_auto_selected(self) -> None:
-        codex = self.codex_with(self.model("gpt-5.7", "high", CODEX_EFFORT))
+        codex = self.codex_with(
+            self.model("gpt-6.1", "high", CODEX_EFFORT, "ultra")
+        )
 
         result = evaluate_model_policy(request(codex=codex))["codex"]
 
         self.assertEqual(result["state"], "ready")
-        self.assertEqual(result["model"], "gpt-5.7")
-        self.assertEqual(result["arguments"][:2], ["-m", "gpt-5.7"])
+        self.assertEqual(result["model"], "gpt-6.1")
+        self.assertEqual(result["arguments"][:2], ["-m", "gpt-6.1"])
         self.assertEqual(result["selection"]["reason"], "newer_model_auto_selected")
 
     def test_generated_codex_arguments_pin_the_read_only_sandbox(self) -> None:
@@ -971,29 +977,30 @@ class AutoForwardSelectionTest(unittest.TestCase):
         self.assertIn("-s", arguments)
         self.assertEqual(arguments[arguments.index("-s") + 1], "read-only")
 
-    def test_newest_version_wins_and_sol_lineage_breaks_ties(self) -> None:
+    def test_newest_version_wins_and_astra_lineage_breaks_ties(self) -> None:
         codex = self.codex_with(
-            self.model("gpt-5.7", CODEX_EFFORT),
-            self.model("gpt-5.7-sol", CODEX_EFFORT),
-            self.model("gpt-6", CODEX_EFFORT),
+            self.model("gpt-6.1", CODEX_EFFORT, "ultra"),
+            self.model("gpt-6.1-astra", CODEX_EFFORT, "ultra"),
+            self.model("gpt-7", CODEX_EFFORT, "ultra"),
         )
         result = evaluate_model_policy(request(codex=codex))["codex"]
-        self.assertEqual(result["model"], "gpt-6")
+        self.assertEqual(result["model"], "gpt-7")
 
         codex = self.codex_with(
-            self.model("gpt-5.7", CODEX_EFFORT),
-            self.model("gpt-5.7-sol", CODEX_EFFORT),
+            self.model("gpt-6.1", CODEX_EFFORT, "ultra"),
+            self.model("gpt-6.1-astra", CODEX_EFFORT, "ultra"),
         )
         result = evaluate_model_policy(request(codex=codex))["codex"]
-        self.assertEqual(result["model"], "gpt-5.7-sol")
+        self.assertEqual(result["model"], "gpt-6.1-astra")
 
     def test_down_tier_variants_and_missing_required_effort_are_not_upgrades(self) -> None:
         codex = self.codex_with(
-            self.model("gpt-6-mini", CODEX_EFFORT),
-            self.model("gpt-6-nano", CODEX_EFFORT),
-            # ultra adds delegation, not depth, and xhigh sits below max:
-            # neither ever satisfies the required-effort gate.
+            self.model("gpt-7-mini", CODEX_EFFORT, "ultra"),
+            self.model("gpt-7-nano", CODEX_EFFORT, "ultra"),
+            # Missing either required tier disqualifies: no max (depth) …
             self.model("gpt-7", "high", "xhigh", "ultra"),
+            # … and no ultra (breadth) both leave the floor selected.
+            self.model("gpt-8", CODEX_EFFORT),
         )
 
         result = evaluate_model_policy(request(codex=codex))["codex"]
@@ -1002,7 +1009,7 @@ class AutoForwardSelectionTest(unittest.TestCase):
         self.assertEqual(result["selection"]["reason"], "floor_model")
 
     def test_same_version_sibling_is_not_an_upgrade(self) -> None:
-        codex = self.codex_with(self.model("gpt-5.6", CODEX_EFFORT))
+        codex = self.codex_with(self.model("gpt-6", CODEX_EFFORT, "ultra"))
 
         result = evaluate_model_policy(request(codex=codex))["codex"]
 
@@ -1012,9 +1019,10 @@ class AutoForwardSelectionTest(unittest.TestCase):
         codex = valid_codex()
         codex["live_catalog"] = {
             "models": [
-                self.model("gpt-5.5", CODEX_EFFORT),
-                self.model("gpt-6-mini", CODEX_EFFORT),
+                self.model("gpt-5.9", CODEX_EFFORT, "ultra"),
+                self.model("gpt-7-mini", CODEX_EFFORT, "ultra"),
                 self.model("gpt-7", "high", "xhigh", "ultra"),
+                self.model("gpt-8", CODEX_EFFORT),
             ]
         }
 
@@ -1794,7 +1802,7 @@ class FrozenSelectionTests(unittest.TestCase):
     def test_newer_catalog_model_is_not_adopted_mid_run(self) -> None:
         catalog = live_catalog()
         catalog["models"].append(
-            {"slug": "gpt-5.7-sol", "supported_reasoning_levels": [{"effort": CODEX_EFFORT}]}
+            {"slug": "gpt-6.1-astra", "supported_reasoning_levels": [{"effort": CODEX_EFFORT}]}
         )
         descriptor = self.descriptor()
 
@@ -1808,7 +1816,7 @@ class FrozenSelectionTests(unittest.TestCase):
         descriptor = self.descriptor()
 
         result = verify_frozen_selection(
-            CODEX_MODEL, descriptor, live_catalog(include_sol=False), descriptor
+            CODEX_MODEL, descriptor, live_catalog(include_astra=False), descriptor
         )
 
         self.assertEqual(result["state"], "blocked")
@@ -2058,11 +2066,14 @@ class BlockingBranchCoverageTests(unittest.TestCase):
         catalog["models"].extend(
             {
                 "slug": slug,
-                "supported_reasoning_levels": [{"effort": CODEX_EFFORT}],
+                "supported_reasoning_levels": [
+                    {"effort": CODEX_EFFORT},
+                    {"effort": "ultra"},
+                ],
             }
-            for slug in ("gpt-5.4", "gpt-5.6-mini", "gpt-4o-mini")
+            for slug in ("gpt-5.9", "gpt-7-mini", "gpt-4o-mini")
         )
-        for slug in ("gpt-5.4", "gpt-5.6-mini", "gpt-4o-mini"):
+        for slug in ("gpt-5.9", "gpt-7-mini", "gpt-4o-mini"):
             with self.subTest(slug=slug):
                 self.assertFalse(_codex_model_is_eligible(slug, catalog))
         self.assertTrue(_codex_model_is_eligible(CODEX_MODEL, catalog))
@@ -2323,7 +2334,7 @@ class QuotaWaitBoundTests(unittest.TestCase):
 
     def test_schema_version_is_bumped_for_the_contract_changes(self) -> None:
         result = evaluate_model_policy(request())
-        self.assertEqual(result["version"], 7)  # literal pin, not the constant
+        self.assertEqual(result["version"], 8)  # literal pin, not the constant
 
 
 class MonitorChildInvocationTests(unittest.TestCase):
@@ -2474,7 +2485,7 @@ class MonitorOrchestratorBindingTests(unittest.TestCase):
         # leg's host_agent_selection_verified flag is the write-capability
         # prerequisite reviewer ownership consumes.
         return {
-            "codex": {"model": "gpt-5.6-sol", "effort": "max", "gate_status": "ready"},
+            "codex": {"model": "gpt-6-astra", "effort": "max", "gate_status": "ready"},
             "claude": {
                 "model": base_model,
                 "gate_status": base_status,
@@ -2630,11 +2641,11 @@ class MonitorOrchestratorBindingTests(unittest.TestCase):
         # nominal Claude owner rides in pending_owner, exactly the target
         # the runner's recompute cross-checks.
         binding = monitor_orchestrator_binding(
-            self._runtime(), session_model="gpt-5.6-sol"
+            self._runtime(), session_model="gpt-6-astra"
         )
         self.assertEqual(binding["state"], "bound")
         self.assertEqual(binding["lineage"], "codex")
-        self.assertEqual(binding["model"], "gpt-5.6-sol")
+        self.assertEqual(binding["model"], "gpt-6-astra")
         self.assertEqual(binding["effort"], "max")
         self.assertEqual(binding["reason_code"], "orchestrator_continuity")
         self.assertEqual(binding["pending_owner"], "claude-fable-5-1")
@@ -2643,7 +2654,7 @@ class MonitorOrchestratorBindingTests(unittest.TestCase):
         runtime = self._runtime()
         runtime["codex"]["gate_status"] = "blocked"
         binding = monitor_orchestrator_binding(
-            runtime, session_model="gpt-5.6-sol"
+            runtime, session_model="gpt-6-astra"
         )
         self.assertEqual(binding["state"], "invalid")
 
@@ -2651,7 +2662,7 @@ class MonitorOrchestratorBindingTests(unittest.TestCase):
         # Only the EXACT recorded selection continues — a different GPT
         # slug (newer, older, variant) matches no landed leg.
         binding = monitor_orchestrator_binding(
-            self._runtime(), session_model="gpt-5.7-sol"
+            self._runtime(), session_model="gpt-6.1-astra"
         )
         self.assertEqual(binding["state"], "invalid")
 
@@ -2659,9 +2670,9 @@ class MonitorOrchestratorBindingTests(unittest.TestCase):
         # State is untrusted: a hand-edited codex leg naming an excluded
         # down-tier variant must not continue even at gate_status ready.
         runtime = self._runtime()
-        runtime["codex"]["model"] = "gpt-5.6-sol-mini"
+        runtime["codex"]["model"] = "gpt-6-astra-mini"
         binding = monitor_orchestrator_binding(
-            runtime, session_model="gpt-5.6-sol-mini"
+            runtime, session_model="gpt-6-astra-mini"
         )
         self.assertEqual(binding["state"], "invalid")
 
@@ -2672,7 +2683,7 @@ class MonitorOrchestratorBindingTests(unittest.TestCase):
         # compliant write actor, so the binding fails closed.
         binding = monitor_orchestrator_binding(
             self._runtime(base_write_verified=False),
-            session_model="gpt-5.6-sol",
+            session_model="gpt-6-astra",
         )
         self.assertEqual(binding["state"], "invalid")
         self.assertTrue(
@@ -2813,7 +2824,7 @@ class WaiverGateResolutionTests(unittest.TestCase):
         # consumes, with the transitioned record standing in for its leg.
         runtime = {
             "codex": {
-                "model": "gpt-5.6-sol",
+                "model": "gpt-6-astra",
                 "effort": "max",
                 "gate_status": "ready",
             },
@@ -2943,7 +2954,7 @@ class WaiverGateResolutionTests(unittest.TestCase):
             "claude-mythos-5-1",
             "claude-fable-5",
             "claude-opus-5",
-            "gpt-5.6-sol",
+            "gpt-6-astra",
         ):
             with self.subTest(model=wrong_model):
                 record = waiver_gate_resolution(

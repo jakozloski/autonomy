@@ -68,7 +68,7 @@ resolved_conventions:
     bot_grace_window_seconds: 1
   model_runtime:
     codex:
-      model: "gpt-5.6-sol"
+      model: "gpt-6-astra"
       gate_status: "ready"
     claude:
       model: "claude-fable-5"
@@ -80,7 +80,7 @@ resolved_conventions:
     plan_verdict:
       verdict: "approved"
       plan_digest: "445ac4fb28ee087ce33bbb1f6cf8c2052bd39250583a1738954d31094101de5f"
-      model: "gpt-5.6-sol"
+      model: "gpt-6-astra"
       invocation: "codex-plan-01"
 validated_ticket:
   tracker_type: null

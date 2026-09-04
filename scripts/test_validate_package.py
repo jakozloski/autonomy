@@ -1405,7 +1405,7 @@ class ValidatePackageTests(unittest.TestCase):
     def test_both_exact_codex_flag_forms_are_required(self) -> None:
         skill_path = self.package.root / "SKILL.md"
         skill_path.write_text(
-            _valid_skill_text().replace(EXEC_MODEL_FLAGS, "-m gpt-5.6-sol"),
+            _valid_skill_text().replace(EXEC_MODEL_FLAGS, "-m gpt-6-astra"),
             encoding="utf-8",
         )
 

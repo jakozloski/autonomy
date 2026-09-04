@@ -414,7 +414,7 @@ gstack skills have their own preambles, setup gates, AskUserQuestion calls, and 
 - **Never run in adapters**: update checks (`gstack-update-check`), telemetry (`gstack-analytics`), install scripts, browser-open flows, `gstack-config`, `gstack-review-log`, or AskUserQuestion prompts
 - **Auto-resolve ASK items** with "fix as recommended" (autonomous mode)
 - Adapter status is logged to `gstack_integration.*` (informational only — `phases.*` remains authoritative)
-- **Graceful degradation**: if an adapter's capability gate fails or execution errors, set `gstack_integration.{skill}.status = "skipped"`, fall back to existing behavior, and continue. **Exception:** Phase 2 still requires the mandatory GPT-5.6 Sol plan gate from the core model policy; an adapter failure cannot downgrade or bypass that gate.
+- **Graceful degradation**: if an adapter's capability gate fails or execution errors, set `gstack_integration.{skill}.status = "skipped"`, fall back to existing behavior, and continue. **Exception:** Phase 2 still requires the mandatory GPT-6 Astra plan gate from the core model policy; an adapter failure cannot downgrade or bypass that gate.
 
 ### Security Model (Autonomous Mode)
 

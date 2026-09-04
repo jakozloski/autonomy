@@ -3149,7 +3149,7 @@ class TrustedControlDriftTests(unittest.TestCase):
             "session_environment": "managed",
             "issue_tracker_write_path": "none",
             "model_runtime": {
-                "codex": {"model": "gpt-5.6-sol", "gate_status": "ready",
+                "codex": {"model": "gpt-6-astra", "gate_status": "ready",
                           "post_invocation": [{"at": "t1"}]},
                 "claude": {"model": "claude-fable-5", "gate_status": "ready",
                            "post_invocation": []},
