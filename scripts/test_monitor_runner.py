@@ -3003,20 +3003,28 @@ class MonitorRunnerE2ETests(unittest.TestCase):
             qa_extract(github_pair + linear_outage),
         )
         self.assertIsNotNone(no_linear_leg_violation)
-        # Pass-2 review F3 (2026-09 surface-gate re-land): the diagnostic
-        # must name BOTH legitimate no-Linear-leg causes — unmapped
-        # binding and surface-suppressed plan — so a revert to the
-        # misleading single-cause wording goes red.
+        # Pass-2 review F3 + CodeRabbit round 1 (2026-09 surface-gate
+        # re-land): the diagnostic is manifest-grounded, and the pins
+        # cover BOTH the primary clause and the cause enumeration's
+        # newest member ("no validated Linear tracker at launch") — a
+        # revert to any narrower cause list drops that substring and
+        # goes red.
         self.assertIn("planner-impossible output here", no_linear_leg_violation)
         self.assertIn(
             "launch manifest authorizes no Linear leg", no_linear_leg_violation
         )
+        self.assertIn(
+            "no validated Linear tracker at launch", no_linear_leg_violation
+        )
         # Pass-3 review F2 (2026-09 surface-gate re-land): the
         # suppressed-MAPPED pairing — a mapped repository whose launch
-        # resolved handback targets but NO Linear leg is exactly the
-        # surface-suppressed plan shape, and it must impose no Linear
+        # resolved handback targets but NO Linear leg (the shape a
+        # surface-suppressed plan produces, as do the other
+        # no-Linear-leg launches the runner docstring at
+        # _qa_manifest_coverage_violation names) must impose no Linear
         # floor: the github pair alone is its complete plan, while
-        # recorded Linear ops reject with the dual-cause diagnostic.
+        # recorded Linear ops reject with the manifest-grounded
+        # diagnostic.
         # Uniquely guards the AUDIT-layer variant of the
         # mapped-implies-linear mistake — a mapped-keyed conditional
         # re-added inside _qa_manifest_coverage_violation's Linear
@@ -3037,6 +3045,9 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         self.assertIn("planner-impossible output here", suppressed_mapped_linear)
         self.assertIn(
             "launch manifest authorizes no Linear leg", suppressed_mapped_linear
+        )
+        self.assertIn(
+            "no validated Linear tracker at launch", suppressed_mapped_linear
         )
         self.assertIsNotNone(
             runner._qa_manifest_violation(
