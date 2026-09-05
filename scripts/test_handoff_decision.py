@@ -44,10 +44,12 @@ QA_G = qa_generation(
         "repository": REPOSITORY,
         "pull_request_number": PR_NUMBER,
         "issue_tracker": {
-            # dawid-r9 F3: the digest folds tracker sub-fields unless the
-            # type is linear (the consumer's read condition), so the
-            # derivation input carries the type like every plan fixture.
+            # dawid-r9 F3 (+ the v3 validated gate): the digest folds
+            # tracker sub-fields unless the type is linear AND the ticket
+            # is validated (the consumer's read condition), so the
+            # derivation input carries both like every plan fixture.
             "type": "linear",
+            "ticket_validated": True,
             "qa_assignee": LINEAR_QA_ASSIGNEE,
             "qa_state": LINEAR_QA_STATE_WEB,
             "ticket_identifier": "WEB-8877",
@@ -4144,6 +4146,385 @@ class ReviewerRequestPlanTests(unittest.TestCase):
         self.assertEqual(replace["payload"]["assignees"], ["motykadaw"])
 
 
+class QaSurfaceGateTests(unittest.TestCase):
+    """User correction 2026-08-25 (WEB-9971/mm#3934), re-landed 2026-09:
+    ``qa_surface_present: false`` suppresses the mapped QA-owner assignee
+    and every tracker leg — ownership routes to the request ball_holder,
+    the plan surfaces an advisory warning, and the digest mirrors the
+    resolution through the consumer-exact fold (no flag key): identical
+    minted operations share a digest across the flag, and a suppressed
+    digest is invariant across every tracker input the suppressed
+    builder never reads."""
+
+    def _request(self, **overrides: object) -> dict[str, object]:
+        request: dict[str, object] = {
+            "scenario": "approved_qa",
+            "repository": REPOSITORY,
+            "pull_request_number": PR_NUMBER,
+            "authenticated_actor": "jakozloski",
+            "existing_assignees": ["jakozloski"],
+            "code_reviewers": ["motykadaw"],
+            "issue_tracker": {
+                "type": "linear",
+                "ticket_validated": True,
+                "qa_assignee": LINEAR_QA_ASSIGNEE,
+                "qa_state": LINEAR_QA_STATE_WEB,
+                "ticket_identifier": "WEB-8877",
+                "ticket_provider_id": "linear-ticket-web-8877",
+                "write_path": "environment_tool",
+            },
+        }
+        request.update(overrides)
+        return request
+
+    def test_surface_false_routes_ball_holder_and_skips_linear(self) -> None:
+        plan = plan_handoff(
+            self._request(qa_surface_present=False, ball_holder="motykadaw")
+        )
+        self.assertEqual(plan["errors"], [])
+        self.assertEqual(plan["state"], "pending")
+        self.assertEqual(plan["targets"]["assignees"], ["motykadaw"])
+        self.assertIsNone(plan["targets"]["linear_assignee"])
+        operation_ids = [op["id"] for op in plan["operations"]]
+        self.assertFalse(
+            any(op_id.startswith("qa.linear.") for op_id in operation_ids)
+        )
+        replace = next(
+            op
+            for op in plan["operations"]
+            if op["action"] == "replace_pull_request_assignees"
+        )
+        self.assertEqual(replace["payload"]["assignees"], ["motykadaw"])
+        self.assertTrue(
+            any("qa_surface_present is false" in w for w in plan["warnings"])
+        )
+        # Phase-4 review F3 (2026-09 re-land): in a Keeper repository the
+        # suppressed first clean exit is the ONLY moment the post-R2
+        # reviewer request runs, so "reviewer requests plan unchanged"
+        # must be pinned — a suppression that drops the reviewer loop
+        # silently never requests the human reviewer.
+        self.assertEqual(plan["targets"]["reviewers"], ["motykadaw"])
+        self.assertTrue(
+            any(
+                op_id.startswith("qa.github.request_review:motykadaw:g")
+                for op_id in operation_ids
+            )
+        )
+
+    def test_surface_default_keeps_mapped_owner_and_linear_legs(self) -> None:
+        plan = plan_handoff(self._request())
+        self.assertEqual(plan["state"], "pending", plan.get("errors"))
+        self.assertEqual(plan["targets"]["assignees"], ["tjkeeper"])
+        operation_ids = [op["id"] for op in plan["operations"]]
+        self.assertTrue(
+            any(op_id.startswith("qa.linear.") for op_id in operation_ids)
+        )
+
+    def test_surface_false_re_mints_the_generation(self) -> None:
+        # Validated fixture: the tracker fold moves the digest even with
+        # the same handback login as the mapped owner.
+        suppressed = qa_generation(
+            self._request(qa_surface_present=False, ball_holder="tjkeeper")
+        )
+        self.assertNotEqual(suppressed, qa_generation(self._request()))
+
+    def test_surface_non_boolean_blocks(self) -> None:
+        plan = plan_handoff(self._request(qa_surface_present="no"))
+        self.assertEqual(plan["state"], "blocked")
+        self.assertTrue(
+            any("must be a boolean" in error for error in plan["errors"])
+        )
+
+    def test_surface_false_with_no_targets_is_idle(self) -> None:
+        plan = plan_handoff(
+            self._request(qa_surface_present=False, code_reviewers=[])
+        )
+        self.assertEqual(plan["state"], "idle")
+        self.assertIn("qa_surface_present is false", plan["reason"] or "")
+
+    def test_surface_false_reuses_ball_holder_validation(self) -> None:
+        plan = plan_handoff(
+            self._request(qa_surface_present=False, ball_holder="not a login!")
+        )
+        self.assertEqual(plan["state"], "blocked")
+        self.assertTrue(
+            any("ball_holder" in error for error in plan["errors"])
+        )
+
+    def test_suppressed_digest_equals_trackerless_suppressed(self) -> None:
+        with_tracker = qa_generation(
+            self._request(qa_surface_present=False, ball_holder="motykadaw")
+        )
+        request = self._request(
+            qa_surface_present=False, ball_holder="motykadaw"
+        )
+        del request["issue_tracker"]
+        self.assertEqual(with_tracker, qa_generation(request))
+
+    def test_suppressed_digest_invariant_across_tracker_inputs(self) -> None:
+        reference = qa_generation(
+            self._request(qa_surface_present=False, ball_holder="motykadaw")
+        )
+        variants: list[dict[str, object]] = [
+            {"ticket_validated": False},
+            {
+                "ticket_identifier": "WEB-9999",
+                "ticket_provider_id": "linear-ticket-web-9999",
+            },
+            {"write_path": "local_api"},
+            {"qa_assignee": {"provider_id": "someone-else"}},
+        ]
+        for delta in variants:
+            request = self._request(
+                qa_surface_present=False, ball_holder="motykadaw"
+            )
+            tracker = dict(request["issue_tracker"])
+            tracker.update(delta)
+            request["issue_tracker"] = tracker
+            with self.subTest(delta=sorted(delta)):
+                self.assertEqual(reference, qa_generation(request))
+
+    def test_flag_inert_on_unmapped_digests(self) -> None:
+        base = self._request(ball_holder="motykadaw")
+        base["repository"] = {"nameWithOwner": "Keeper-Dating/algo"}
+        absent = qa_generation(base)
+        self.assertEqual(
+            absent, qa_generation({**base, "qa_surface_present": True})
+        )
+        self.assertEqual(
+            absent, qa_generation({**base, "qa_surface_present": False})
+        )
+
+    def test_identical_operation_plans_share_digest_nonlinear(self) -> None:
+        # Round-1 F2: mapped repository, non-linear tracker, holder ==
+        # mapped owner — both flag values mint the identical GitHub pair,
+        # so the digest must not move and a completed ledger is reused.
+        base = self._request(ball_holder="tjkeeper", code_reviewers=[])
+        base["issue_tracker"] = {"type": "none"}
+        self.assertEqual(
+            qa_generation(base),
+            qa_generation({**base, "qa_surface_present": False}),
+        )
+        first = plan_handoff(base)
+        self.assertEqual(first["state"], "pending", first.get("errors"))
+        ledger = {
+            op["id"]: operation_result("complete")
+            for op in first["operations"]
+        }
+        replan = plan_handoff(
+            {**base, "qa_surface_present": False, "operation_results": ledger}
+        )
+        self.assertEqual(replan["state"], "complete", replan)
+        self.assertEqual(replan["call_plan"], [])
+
+    def test_exempt_unvalidated_flip_reuses_completed_ledger(self) -> None:
+        # Round-2 residual: the exempt-unvalidated builder returns the
+        # GitHub-only plan before reading write_path, so the flag flip
+        # must keep the digest and never requeue the completed pair.
+        base = self._request(ball_holder="tjkeeper", code_reviewers=[])
+        base["issue_tracker"] = {
+            "type": "linear",
+            "ticket_required": False,
+            "ticket_validated": False,
+            "ticket_exemption_reason": "branch matches chore/*",
+            "write_path": "environment_tool",
+        }
+        self.assertEqual(
+            qa_generation(base),
+            qa_generation({**base, "qa_surface_present": False}),
+        )
+        first = plan_handoff(base)
+        self.assertEqual(first["state"], "pending", first.get("errors"))
+        self.assertEqual(
+            [
+                op["id"]
+                for op in first["operations"]
+                if not op["id"].startswith("qa.github.")
+            ],
+            [],
+        )
+        ledger = {
+            op["id"]: operation_result("complete")
+            for op in first["operations"]
+        }
+        replan = plan_handoff(
+            {**base, "qa_surface_present": False, "operation_results": ledger}
+        )
+        self.assertEqual(replan["state"], "complete", replan)
+        self.assertEqual(replan["call_plan"], [])
+
+    def test_suppressed_pending_record_resumes_verify_before_retry(
+        self,
+    ) -> None:
+        # Round-3 P2: tracker changes under unchanged suppression (a
+        # validation flip AND a ticket re-key here) keep the generation,
+        # so a pending record resumes postcondition-first instead of
+        # tripping the in-flight prior-target guard.
+        base = self._request(
+            qa_surface_present=False,
+            ball_holder="motykadaw",
+            code_reviewers=[],
+        )
+        first = plan_handoff(base)
+        self.assertEqual(first["state"], "pending", first.get("errors"))
+        first_op = first["operations"][0]
+        pending_record: dict[str, object] = {
+            "status": "pending",
+            "attempts": 1,
+            "started_at": TIMESTAMP,
+        }
+        # r13 F4: an assignee-replacement write-ahead record must carry
+        # the observed precondition; mirror the planner's own payload.
+        if "precondition" in first_op["payload"]:
+            pending_record["precondition"] = first_op["payload"]["precondition"]
+        resumed = self._request(
+            qa_surface_present=False,
+            ball_holder="motykadaw",
+            code_reviewers=[],
+            operation_results={first_op["id"]: pending_record},
+        )
+        tracker = dict(resumed["issue_tracker"])
+        tracker["ticket_validated"] = False
+        tracker["ticket_identifier"] = "WEB-9999"
+        resumed["issue_tracker"] = tracker
+        plan = plan_handoff(resumed)
+        self.assertEqual(
+            plan["state"], "resume_verification_required", plan.get("errors")
+        )
+        self.assertEqual(plan["call_plan"][0]["action"], "verify_before_retry")
+
+    def test_validated_flip_moves_digest_envtool_and_nonepath(self) -> None:
+        # A validated tracker's legs vanish under suppression, so the
+        # digest must move — through the qa-user slot on the
+        # environment_tool path and the write_path fold on the "none"
+        # path (the raw string "none" folds to null).
+        env = self._request(code_reviewers=[])
+        self.assertNotEqual(
+            qa_generation(env),
+            qa_generation(
+                {**env, "qa_surface_present": False, "ball_holder": "tjkeeper"}
+            ),
+        )
+        nonepath = self._request(code_reviewers=[])
+        nonepath["issue_tracker"] = {
+            "type": "linear",
+            "ticket_validated": True,
+            "ticket_identifier": "WEB-8877",
+            "ticket_provider_id": "linear-ticket-web-8877",
+            "write_path": "none",
+        }
+        self.assertNotEqual(
+            qa_generation(nonepath),
+            qa_generation(
+                {
+                    **nonepath,
+                    "qa_surface_present": False,
+                    "ball_holder": "tjkeeper",
+                }
+            ),
+        )
+
+    def test_targetless_suppression_prunes_terminal_history_to_idle(
+        self,
+    ) -> None:
+        # Round-1 F3: a suppressed, targetless replan over an
+        # all-terminal qa ledger prunes the prior-generation history and
+        # stays idle instead of mis-blocking with the unmapped message.
+        first = plan_handoff(self._request(code_reviewers=[]))
+        self.assertEqual(first["state"], "pending", first.get("errors"))
+        ledger = {
+            op["id"]: operation_result("complete")
+            for op in first["operations"]
+        }
+        replan = plan_handoff(
+            self._request(
+                qa_surface_present=False,
+                code_reviewers=[],
+                operation_results=ledger,
+            )
+        )
+        self.assertEqual(replan["state"], "idle", replan)
+        self.assertTrue(
+            any(
+                "prior-target terminal QA record" in warning
+                for warning in replan["warnings"]
+            )
+        )
+
+    def test_targetless_suppression_foreign_record_fails_closed(
+        self,
+    ) -> None:
+        # Phase-4 review F6 (2026-09 re-land): a fabricated non-family ID
+        # in the ledger must keep the fail-closed block — pruning it as
+        # history would launder exactly the record class the family
+        # grammar exists to reject.
+        replan = plan_handoff(
+            self._request(
+                qa_surface_present=False,
+                code_reviewers=[],
+                operation_results={
+                    "bogus.qa.done": operation_result("complete")
+                },
+            )
+        )
+        self.assertEqual(replan["state"], "blocked", replan)
+        self.assertTrue(
+            any("outside the qa families" in e for e in replan["errors"])
+        )
+
+    def test_suppressed_mapped_missing_holder_warns_about_holder(
+        self,
+    ) -> None:
+        # Phase-4 review F7 (2026-09 re-land): a suppressed MAPPED plan
+        # with reviewers but no ball_holder must not claim the repository
+        # is unmapped — the actionable omission is the ball_holder input.
+        plan = plan_handoff(self._request(qa_surface_present=False))
+        self.assertEqual(plan["state"], "pending", plan.get("errors"))
+        self.assertEqual(plan["targets"]["assignees"], [])
+        self.assertTrue(
+            any(
+                "suppressed path routes ownership" in w
+                for w in plan["warnings"]
+            )
+        )
+        self.assertFalse(
+            any("unmapped repository" in w for w in plan["warnings"])
+        )
+
+    def test_targetless_suppression_in_flight_record_fails_closed(
+        self,
+    ) -> None:
+        first = plan_handoff(self._request(code_reviewers=[]))
+        pending_id = first["operations"][0]["id"]
+        replan = plan_handoff(
+            self._request(
+                qa_surface_present=False,
+                code_reviewers=[],
+                operation_results={
+                    pending_id: {
+                        "status": "pending",
+                        "attempts": 1,
+                        "started_at": TIMESTAMP,
+                    }
+                },
+            )
+        )
+        self.assertEqual(replan["state"], "blocked", replan)
+        self.assertTrue(
+            any("still in flight" in error for error in replan["errors"])
+        )
+        # Pass-2 review F2: pin the targetless branch's own recovery
+        # wording — "retiring the prior targets" — so a revert to the
+        # sweep's "planning the current targets" (wrong here: no targets
+        # resolve) goes red instead of shipping green.
+        self.assertTrue(
+            any(
+                "retiring the prior targets" in error
+                for error in replan["errors"]
+            )
+        )
+
+
 class QaPlanVersionRolloutTests(unittest.TestCase):
     """Post-fix review F1: inserting the binding op changed the plan SHAPE
     without changing the targets, so a pre-upgrade ledger kept its digest
@@ -4212,14 +4593,46 @@ class QaPlanVersionRolloutTests(unittest.TestCase):
         assert old != QA_G, "plan_version no longer changes the digest"
         return old
 
+    @property
+    def REAL_V2_G(self) -> str:
+        # The REAL pre-upgrade v2 digest for this validated fixture —
+        # OLD_G above deliberately omits the version key (the ablation
+        # mirror), so the migration tests key their stale ledgers HERE
+        # to exercise the promised v2 -> v3 turnover (2026-09 re-land
+        # plan-review round-5 detail 2).
+        payload = {
+            "plan_version": 2,
+            "nameWithOwner": "Keeper-Dating/matchmaking",
+            "pull_request_number": PR_NUMBER,
+            "github_login": "tjkeeper",
+            "ticket_identifier": "WEB-8877",
+            "ticket_provider_id": "linear-ticket-web-8877",
+            "write_path": "environment_tool",
+            "qa_assignee_provider_id": LINEAR_QA_ASSIGNEE["provider_id"],
+            "qa_state_provider_id": LINEAR_QA_STATE_WEB["provider_id"],
+            "qa_state_name": None,
+            "code_reviewers": [],
+        }
+        canonical = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), default=str
+        )
+        old = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+        assert old != QA_G, "the v2 cohort no longer re-mints under v3"
+        return old
+
+    def test_version_component_alone_moves_the_digest(self) -> None:
+        # OLD_G's premise assert IS the ablation pin — touching the
+        # property runs it against the current payload-minus-version.
+        self.assertNotEqual(self.OLD_G, QA_G)
+
     def test_pre_upgrade_terminal_ledger_prunes_with_warning(self) -> None:
         plan = plan_handoff(
             self._request(
                 {
-                    f"qa.github.replace_assignees:g{self.OLD_G}": operation_result(
+                    f"qa.github.replace_assignees:g{self.REAL_V2_G}": operation_result(
                         "complete"
                     ),
-                    f"qa.github.verify_assignees:g{self.OLD_G}": operation_result(
+                    f"qa.github.verify_assignees:g{self.REAL_V2_G}": operation_result(
                         "complete"
                     ),
                 }
@@ -4240,10 +4653,10 @@ class QaPlanVersionRolloutTests(unittest.TestCase):
         plan = plan_handoff(
             self._request(
                 {
-                    f"qa.github.replace_assignees:g{self.OLD_G}": operation_result(
+                    f"qa.github.replace_assignees:g{self.REAL_V2_G}": operation_result(
                         "complete"
                     ),
-                    f"qa.linear.assign_ticket:g{self.OLD_G}": {
+                    f"qa.linear.assign_ticket:g{self.REAL_V2_G}": {
                         "status": "pending",
                         "attempts": 1,
                         "started_at": TIMESTAMP,
@@ -4278,6 +4691,7 @@ class QaStateNameGenerationTests(unittest.TestCase):
                 # only on the linear branch — the digest folds untyped
                 # trackers, so the fixture carries the consumer's type.
                 "type": "linear",
+                "ticket_validated": True,
                 "ticket_identifier": "WEB-1234",
                 "ticket_provider_id": "abc",
                 "write_path": "local_api",
@@ -4318,6 +4732,7 @@ class UnmappedGenerationTrackerScopeTests(unittest.TestCase):
 
     UNMAPPED = {"nameWithOwner": "Keeper-Dating/algo"}
     TRACKER_A = {
+        "ticket_validated": True,
         "ticket_identifier": "AI-1111",
         "ticket_provider_id": "linear-ticket-ai-1111",
         "write_path": "environment_tool",
@@ -4325,6 +4740,7 @@ class UnmappedGenerationTrackerScopeTests(unittest.TestCase):
         "qa_state": {"name": "Vercel Preview QA"},
     }
     TRACKER_B = {
+        "ticket_validated": True,
         "ticket_identifier": "AI-2222",
         "ticket_provider_id": "linear-ticket-ai-2222",
         "write_path": "local_api",
@@ -4371,7 +4787,7 @@ class UnmappedGenerationTrackerScopeTests(unittest.TestCase):
         # upgrade. When a field is added to qa_generation, add it here
         # too.
         payload = {
-            "plan_version": 2,
+            "plan_version": 3,
             "nameWithOwner": "Keeper-Dating/algo",
             "pull_request_number": PR_NUMBER,
             "github_login": "michal-janicki",
@@ -4522,7 +4938,7 @@ class UnmappedGenerationTrackerScopeTests(unittest.TestCase):
         # the slots ever leak back in, the two digests collapse and the
         # migration tests fail here, not vacuously downstream.
         payload = {
-            "plan_version": 2,
+            "plan_version": 3,
             "nameWithOwner": "Keeper-Dating/algo",
             "pull_request_number": PR_NUMBER,
             "github_login": "michal-janicki",
@@ -4609,7 +5025,7 @@ class UnmappedGenerationTrackerScopeTests(unittest.TestCase):
         # the digest, the two collapse and the transition tests fail
         # here, not vacuously downstream.
         payload = {
-            "plan_version": 2,
+            "plan_version": 3,
             "nameWithOwner": REPOSITORY["nameWithOwner"],
             "pull_request_number": PR_NUMBER,
             "github_login": "tjkeeper",
