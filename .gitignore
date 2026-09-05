@@ -10,3 +10,8 @@ __pycache__/
 .claude/workflow-state.local.failed-candidate-*.md
 .claude/workflow-state.local.failed-candidate-*.md.q*
 .cursor/workflow-state.local.md
+.cursor/workflow-state.local.md.monitor.lock
+.cursor/workflow-state.local.md.attempt-*
+.cursor/workflow-state.local.md.tmp-*
+.cursor/workflow-state.local.failed-candidate-*.md
+.cursor/workflow-state.local.failed-candidate-*.md.q*
