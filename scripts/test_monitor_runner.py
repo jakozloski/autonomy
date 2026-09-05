@@ -3005,14 +3005,14 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         self.assertIsNotNone(no_linear_leg_violation)
         # Pass-2 review F3 + CodeRabbit round 1 (2026-09 surface-gate
         # re-land): the diagnostic is manifest-grounded, and the pins
-        # cover BOTH the primary clause and the cause enumeration's
-        # newest member ("no validated Linear tracker at launch") — a
-        # revert to any narrower cause list drops that substring and
-        # goes red.
+        # cover the primary clause AND every enumerated cause — any
+        # narrower cause list drops a pinned substring and goes red.
         self.assertIn("planner-impossible output here", no_linear_leg_violation)
         self.assertIn(
             "launch manifest authorizes no Linear leg", no_linear_leg_violation
         )
+        self.assertIn("unmapped binding", no_linear_leg_violation)
+        self.assertIn("surface suppression", no_linear_leg_violation)
         self.assertIn(
             "no validated Linear tracker at launch", no_linear_leg_violation
         )
@@ -3046,6 +3046,8 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         self.assertIn(
             "launch manifest authorizes no Linear leg", suppressed_mapped_linear
         )
+        self.assertIn("unmapped binding", suppressed_mapped_linear)
+        self.assertIn("surface suppression", suppressed_mapped_linear)
         self.assertIn(
             "no validated Linear tracker at launch", suppressed_mapped_linear
         )
