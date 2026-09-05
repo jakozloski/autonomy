@@ -333,6 +333,20 @@ def qa_generation(request: dict[str, Any]) -> str:
     re-mints the IDs instead, so pre-upgrade ledgers take the DOCUMENTED
     prior-generation path: terminal records pruned with a warning, an
     in-flight record failing closed with the recovery named.
+
+    v3 (user correction 2026-08-25, WEB-9971/mm#3934): the mapped
+    QA-owner assignee and tracker legs are SURFACE-gated —
+    ``qa_surface_present: false`` suppresses them and routes ownership
+    to the validated ball holder — and the tracker fold now sits on the
+    builder's EXACT read condition one branch deeper than dawid-r9 F3:
+    sub-fields hash raw only for a mapped, linear, VALIDATED,
+    unsuppressed request (exempt-unvalidated returns the GitHub-only
+    plan before reading them; required-unvalidated errors and never
+    mints; a suppressed builder nulls the owner before any tracker
+    read). A suppressed digest is therefore invariant across every
+    tracker input, and identical-operation plans share a digest across
+    the flag. The fold change re-mints the exempt-unvalidated cohort by
+    necessity, so v3 makes the rollover atomic.
     """
 
     repository = request.get("repository")
@@ -356,7 +370,16 @@ def qa_generation(request: dict[str, Any]) -> str:
     # this digest ever runs, so here it folds as None under the
     # malformed-segments rule above instead of restating that validation
     # in a second place.
-    handback_login = owner["github_login"] if owner else None
+    # User correction 2026-08-25 (WEB-9971/mm#3934): suppression nulls
+    # the owner in the builder before any tracker read, so the digest
+    # mirrors that resolution here (dawid-r8 F22): the handback slot
+    # falls to the validated ball_holder and the tracker slots fold
+    # below. Only a literal False suppresses; the builder type-validates
+    # before minting.
+    surface_suppressed = request.get("qa_surface_present", True) is False
+    handback_login = (
+        owner["github_login"] if owner and not surface_suppressed else None
+    )
     if handback_login is None:
         raw_holder = request.get("ball_holder")
         if isinstance(raw_holder, str) and GITHUB_LOGIN.fullmatch(raw_holder):
@@ -382,9 +405,21 @@ def qa_generation(request: dict[str, Any]) -> str:
     # a warning; an in-flight record still fails closed with the recovery
     # named). Self-healing, and the last tracker-driven re-mint those
     # cohorts can ever see.
-    tracker = request.get("issue_tracker") if owner is not None else None
+    tracker = (
+        request.get("issue_tracker")
+        if owner is not None and not surface_suppressed
+        else None
+    )
     tracker = tracker if isinstance(tracker, dict) else {}
     if tracker.get("type") != "linear":
+        tracker = {}
+    # v3 fold (see the docstring): every tracker sub-field read also
+    # sits inside the builder's VALIDATED branch, so an unvalidated
+    # tracker folds like an unread one — exempt-unvalidated plans keep
+    # one digest across the surface flag (identical minted operations),
+    # and a suppressed digest cannot be rolled by ticket refreshes,
+    # write-path changes, or validation flips it never reads.
+    if tracker.get("ticket_validated") is not True:
         tracker = {}
     qa_assignee = tracker.get("qa_assignee")
     qa_assignee = qa_assignee if isinstance(qa_assignee, dict) else {}
@@ -416,7 +451,13 @@ def qa_generation(request: dict[str, Any]) -> str:
     # Normalized exactly like the operation ids (casefolded, deduped,
     # sorted) so raw-case spelling differences never re-mint a plan.
     payload = {
-        "plan_version": 2,
+        # v3 (2026-09 re-land): the consumer-exact fold above re-mints
+        # the exempt-unvalidated cohort by necessity, so the version bump
+        # makes the rollover ATOMIC through the documented
+        # prior-generation path; a ledger persisted under v2 migrates
+        # through a NONTERMINAL candidate at a slice boundary (the
+        # runner's reviewer floor is ID-exact by design).
+        "plan_version": 3,
         "nameWithOwner": name_with_owner,
         "pull_request_number": pull_request_number,
         "github_login": handback_login,
@@ -465,6 +506,23 @@ def _approved_qa_operations(
     # requests still plan and the ownership transfer is skipped with a
     # warning. The resolved login fills qa_generation's github_login slot
     # (mirrored there), so mapped digests are byte-identical to pre-F2.
+    # User correction 2026-08-25 (WEB-9971/mm#3934): preview QA of an
+    # un-previewable diff is process noise for the QA owner. A literal
+    # False suppresses the mapped QA-owner assignee and every tracker
+    # leg — ownership routes to the request ball_holder — and the type
+    # is validated BEFORE the generation digest runs (the documented
+    # supplied-but-malformed divergence, same convention as ball_holder).
+    qa_surface = request.get("qa_surface_present", True)
+    if not isinstance(qa_surface, bool):
+        return (
+            {"assignees": [], "reviewers": [], "linear_assignee": None},
+            [],
+            ["qa_surface_present must be a boolean when supplied"],
+            [],
+        )
+    surface_suppressed_owner = owner is not None and qa_surface is False
+    if qa_surface is False:
+        owner = None
     github_login: str | None
     if owner is not None:
         github_login = owner["github_login"]
@@ -563,6 +621,12 @@ def _approved_qa_operations(
         "linear_assignee": None,
     }
     advisory_warnings: list[str] = []
+    if surface_suppressed_owner:
+        advisory_warnings.append(
+            "qa_surface_present is false — mapped QA-owner assignee and"
+            " tracker legs skipped; ownership routes to the request"
+            " ball_holder and the ticket stays with the implementer"
+        )
     operations = []
     reviewer_verification_ids: list[str] = []
     previous_operation_id: str | None = None
@@ -1893,21 +1957,76 @@ def plan_handoff(request: Any) -> dict[str, Any]:
             )
         )
         extra_warnings.extend(qa_advisory_warnings)
-        if owner is None and not operations and not errors:
+        surface_suppressed = request.get("qa_surface_present", True) is False
+        if (owner is None or surface_suppressed) and not operations and not errors:
             results, result_errors = _operation_results(request)
-            state_errors = list(result_errors)
-            if results:
-                state_errors.append(
-                    "unmapped repositories with no handback targets have"
-                    " no operations to resume"
+            if result_errors:
+                return _blocked(scenario, *result_errors)
+            # 2026-09 re-land plan-review F3: a targetless plan over a
+            # ledger of qa-family PRIOR-generation records classifies
+            # exactly like the sweep below — terminal history prunes
+            # with the warning and the answer stays idle (the caller
+            # leaves the persisted ledger untouched on idle); an
+            # in-flight qa-family record marks a mutation that may
+            # already have fired and fails closed; anything outside the
+            # qa families keeps the fail-closed block.
+            prunable: list[str] = []
+            in_flight: list[str] = []
+            foreign: list[str] = []
+            for operation_id, record in results.items():
+                if (
+                    not isinstance(operation_id, str)
+                    or parsed_generation_family(
+                        operation_id, QA_OPERATION_FAMILIES
+                    )
+                    is None
+                ):
+                    foreign.append(str(operation_id))
+                    continue
+                status = (
+                    record.get("status") if isinstance(record, dict) else None
                 )
-            if state_errors:
-                return _blocked(scenario, *state_errors)
-            return _idle(
-                scenario,
+                if status in ("complete", "failed", "skipped_dependency"):
+                    prunable.append(operation_id)
+                else:
+                    in_flight.append(operation_id)
+            if in_flight:
+                return _blocked(
+                    scenario,
+                    "prior-target QA operation(s) still in flight: "
+                    + ", ".join(sorted(in_flight))
+                    + " - verify each mutation's postcondition and record"
+                    " a terminal result before planning the current"
+                    " targets",
+                )
+            if foreign:
+                return _blocked(
+                    scenario,
+                    "no handback targets resolve, but persisted"
+                    " operation result(s) outside the qa families exist: "
+                    + ", ".join(sorted(foreign)[:3])
+                    + " - verify each prior mutation's postcondition"
+                    " before abandoning the handoff",
+                )
+            reason = (
                 "no handback targets resolved and repository.nameWithOwner"
-                " is not in the exact QA-owner map",
+                " is not in the exact QA-owner map"
+                if owner is None
+                else "no handback targets resolved and qa_surface_present"
+                " is false — the mapped QA-owner leg is suppressed for"
+                " non-previewable diffs"
             )
+            idle_plan = _idle(scenario, reason)
+            idle_plan.setdefault("warnings", [])
+            if prunable:
+                idle_plan["warnings"].append(
+                    "ignored "
+                    + str(len(prunable))
+                    + " prior-target terminal QA record(s): "
+                    + ", ".join(sorted(prunable))
+                )
+            idle_plan["warnings"].extend(extra_warnings)
+            return idle_plan
         if not errors and operations:
             # Target-digest-bound IDs make a ledger persisted for different
             # targets (another PR, a re-keyed ticket, a changed owner map or
