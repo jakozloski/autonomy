@@ -701,9 +701,18 @@ def _approved_qa_operations(
         )
     elif operations:
         # algo#1216 r16 F2: reviewer requests planned without an ownership
-        # transfer — surfaced, never silent.
+        # transfer — surfaced, never silent. Phase-4 review F7 (2026-09
+        # re-land): owner-nulling makes this branch reachable for a
+        # suppressed MAPPED repository too, where "unmapped" would point
+        # the operator at the owner map instead of the missing
+        # ball_holder input the suppressed path requires.
         advisory_warnings.append(
-            "no ball holder resolved for this unmapped repository —"
+            "no ball holder resolved — qa_surface_present is false and"
+            " the suppressed path routes ownership to the request"
+            " ball_holder — reviewer requests planned without an"
+            " assignee transfer"
+            if surface_suppressed_owner
+            else "no ball holder resolved for this unmapped repository —"
             " reviewer requests planned without an assignee transfer"
         )
     errors: list[str] = list(reviewer_errors)
@@ -1996,7 +2005,7 @@ def plan_handoff(request: Any) -> dict[str, Any]:
                     "prior-target QA operation(s) still in flight: "
                     + ", ".join(sorted(in_flight))
                     + " - verify each mutation's postcondition and record"
-                    " a terminal result before planning the current"
+                    " a terminal result before retiring the prior"
                     " targets",
                 )
             if foreign:

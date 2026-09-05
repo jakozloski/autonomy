@@ -4198,6 +4198,18 @@ class QaSurfaceGateTests(unittest.TestCase):
         self.assertTrue(
             any("qa_surface_present is false" in w for w in plan["warnings"])
         )
+        # Phase-4 review F3 (2026-09 re-land): in a Keeper repository the
+        # suppressed first clean exit is the ONLY moment the post-R2
+        # reviewer request runs, so "reviewer requests plan unchanged"
+        # must be pinned — a suppression that drops the reviewer loop
+        # silently never requests the human reviewer.
+        self.assertEqual(plan["targets"]["reviewers"], ["motykadaw"])
+        self.assertTrue(
+            any(
+                op_id.startswith("qa.github.request_review:motykadaw:g")
+                for op_id in operation_ids
+            )
+        )
 
     def test_surface_default_keeps_mapped_owner_and_linear_legs(self) -> None:
         plan = plan_handoff(self._request())
@@ -4437,6 +4449,46 @@ class QaSurfaceGateTests(unittest.TestCase):
                 "prior-target terminal QA record" in warning
                 for warning in replan["warnings"]
             )
+        )
+
+    def test_targetless_suppression_foreign_record_fails_closed(
+        self,
+    ) -> None:
+        # Phase-4 review F6 (2026-09 re-land): a fabricated non-family ID
+        # in the ledger must keep the fail-closed block — pruning it as
+        # history would launder exactly the record class the family
+        # grammar exists to reject.
+        replan = plan_handoff(
+            self._request(
+                qa_surface_present=False,
+                code_reviewers=[],
+                operation_results={
+                    "bogus.qa.done": operation_result("complete")
+                },
+            )
+        )
+        self.assertEqual(replan["state"], "blocked", replan)
+        self.assertTrue(
+            any("outside the qa families" in e for e in replan["errors"])
+        )
+
+    def test_suppressed_mapped_missing_holder_warns_about_holder(
+        self,
+    ) -> None:
+        # Phase-4 review F7 (2026-09 re-land): a suppressed MAPPED plan
+        # with reviewers but no ball_holder must not claim the repository
+        # is unmapped — the actionable omission is the ball_holder input.
+        plan = plan_handoff(self._request(qa_surface_present=False))
+        self.assertEqual(plan["state"], "pending", plan.get("errors"))
+        self.assertEqual(plan["targets"]["assignees"], [])
+        self.assertTrue(
+            any(
+                "suppressed path routes ownership" in w
+                for w in plan["warnings"]
+            )
+        )
+        self.assertFalse(
+            any("unmapped repository" in w for w in plan["warnings"])
         )
 
     def test_targetless_suppression_in_flight_record_fails_closed(
