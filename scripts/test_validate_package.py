@@ -23,6 +23,8 @@ from validate_package import (
     validate_package,
 )
 
+import model_policy  # tier-doctrine pin derivations (phase-4 F12)
+
 SCRIPTS = Path(__file__).resolve().parent
 
 
@@ -41,6 +43,12 @@ def _valid_skill_text() -> str:
             f"Use `codex review {REVIEW_MODEL_FLAGS}` for Codex review.",
             f"The codex floor model is {CODEX_FLOOR_MODEL}; newer eligible models auto-forward.",
             "Conductor owns orchestration; do not substitute the separate ultracode mode.",
+            "The optional supplemental review pass starts at `"
+            + model_policy.REVIEWER_SUPPLEMENT_STARTING_EFFORT
+            + "` and may move to max.",
+            "Routine tier: `" + "` / `".join(model_policy.ROUTINE_EFFORTS) + "`;"
+            " a breadth pass swaps the effort value to '\""
+            + model_policy.CODEX_BREADTH_EFFORT + "\"'.",
             *(
                 f"Gate marker: {marker}"
                 for marker in REQUIRED_GATE_MARKERS.get("SKILL.md", ())

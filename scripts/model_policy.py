@@ -99,10 +99,10 @@ Codex; the caller supplies the process handles and the kill callback.
 Three legs are evaluated.  The base and Codex legs are gating: a failure on
 either blocks the workflow.  ``claude`` is the base leg — the working side:
 the implementing lineage, explorers, delegated work, and the fresh-context
-escalation voice.  ``claude_reviewer`` is the reviewer leg — the always-runs
-structured review and every Claude review fallback: the Claude reviewer next
-to the mandatory Phase 2 Codex verdict (Phase 4 Codex participation is
-tiered — Small and skill-only passes are Claude-only by design).  The
+escalation voice.  ``claude_reviewer`` is the reviewer leg — the optional supplemental
+structured review and every Claude review fallback, next to the mandatory
+Codex verdicts (Astra is the standing Phase 4 review at every size tier;
+skill-only passes stay Claude-reviewed by design).  The
 reviewer is a distinct leg, not a distinct lineage: both Claude legs run the
 fable/mythos family — never Opus or any lower tier — every review voice runs
 in a fresh read-only context that never judges its own output, and Codex
@@ -145,14 +145,17 @@ a downgrade.  The Claude legs forward independently: each selects from its
 own leg's observed list against its own floor, and neither selection ever
 advances the other.
 
-Effort follows task shape on both vendors.  ``max`` — the deepest
-non-delegating reasoning tier (the depth axis runs ``high -> xhigh ->
-max``) — is the focused tier: difficult questions, focused debugging, one
-plan verdict, one disputed finding.  ``ultra`` combines maximum reasoning
-with automatic delegation to parallel subagents (the breadth axis) and is
-the tier for large code reviews, broad research, and multi-component
-feature builds (the Claude-side breadth lever is the ``ultracode`` workflow
-mode; the Claude effort flag itself tops at ``max``).  The catalog gate
+Effort follows task shape on both vendors, across five tiers.  Fable
+``max``: substantive implementation, architecture, difficult debugging.
+Fable ``ultracode`` — or ``max`` with delegated agents: work that splits
+into independently implementable components.  Astra ``ultra``: broad PR
+reviews, with the lead validating every finding and checking interactions
+across components.  Astra ``max``: focused, difficult reviews and
+investigating specific findings (the plan verdict is one).  ``high`` or
+``xhigh``: routine work — never a mandatory gate voice.  Review findings
+are evidence, not volume: each one counts only with a concrete failing
+scenario or a demonstrated code path, and the lead validates
+parallel-review output before it enters the ledger.  The catalog gate
 therefore requires the selected Codex model to support BOTH ``max`` and
 ``ultra``.
 """
@@ -188,22 +191,31 @@ from state_schema import normalize_iso_timestamp
 # lineage at or above the leg's own floor (never the leg's own floor primary).
 # Version 8: the Codex floor moves to gpt-6-astra (6, 0) with the -astra
 # lineage breaking selection ties; catalog eligibility requires BOTH max and
-# ultra reasoning; effort is tiered by task shape (max focused / ultra
-# breadth, ultracode as the Claude-side breadth mode).
+# ultra reasoning; effort is tiered by task shape — amended in place (same
+# I/O contract) to the five-tier table in the module docstring: Fable max /
+# Fable ultracode-or-max-with-agents / Astra ultra (lead-validated broad
+# reviews) / Astra max (focused) / high-xhigh routine.
 SCHEMA_VERSION = 8
 
 CODEX_MODEL = "gpt-6-astra"  # floor: newest eligible catalog model >= this wins
 CODEX_FLOOR_VERSION = (6, 0)
 CODEX_EFFORT = "max"  # focused tier: deepest non-delegating reasoning
-# Breadth tier by task shape: large code reviews, broad research, and
-# multi-component feature builds run ultra (maximum reasoning + automatic
-# parallel delegation); difficult questions and focused debugging stay on
-# CODEX_EFFORT. The Claude-side breadth lever is the ultracode workflow
-# mode (the Claude effort flag itself tops at max).
+# Breadth tier by task shape: broad PR reviews run ultra (maximum
+# reasoning + automatic parallel delegation) with the LEAD validating every
+# finding and checking cross-component interactions; focused, difficult
+# reviews and specific-finding investigations stay on CODEX_EFFORT. The
+# Claude-side breadth lever for independently implementable components is
+# the ultracode workflow mode — or max with delegated agents (the Claude
+# effort flag itself tops at max).
 CODEX_BREADTH_EFFORT = "ultra"
 CLAUDE_BREADTH_MODE = "ultracode"
-# Catalog eligibility requires every tier the workflow may run.
+# Catalog eligibility requires every tier the mandatory voices may run.
 CODEX_REQUIRED_EFFORTS = (CODEX_EFFORT, CODEX_BREADTH_EFFORT)
+# Routine-work tier on either vendor: mechanical, low-ambiguity steps may
+# run high (or xhigh on Codex). Never a mandatory gate voice — the plan
+# verdict, standing reviews, and escalation seats keep their pinned tiers,
+# so ROUTINE_EFFORTS deliberately stays out of CODEX_REQUIRED_EFFORTS.
+ROUTINE_EFFORTS = ("high", "xhigh")
 MIN_CODEX_VERSION = (0, 144, 0)
 CODEX_MAX_ATTEMPTS = 2  # immediate same-config retries before backoff pacing kicks in
 # Escalating wait-and-retry ladder for liveness-class failures (timeout /
@@ -234,13 +246,22 @@ BASE_FLOOR_VERSION = (5,)
 BASE_MODEL_ALIAS = "fable"
 BASE_EFFORT = "max"
 
-# Reviewer Claude leg: the always-runs structured review and every Claude
-# review fallback — one of the two reviewers, next to the Codex verdict.
+# Reviewer Claude leg: the optional supplemental structured review and
+# every Claude review fallback — mandatory seats (fallbacks, escalation,
+# monitor ownership) pin max, next to the standing Codex verdicts.
 # Availability failures degrade onto the ready base; malformed input blocks.
 REVIEWER_MODEL = "claude-fable-5-1"  # floor: newest observed fable/mythos >= this wins
 REVIEWER_FLOOR_VERSION = (5, 1)
 REVIEWER_MODEL_ALIAS = "fable"
-REVIEWER_EFFORT = "max"
+REVIEWER_EFFORT = "max"  # mandatory reviewer seats: fallbacks, escalation, monitor
+# The OPTIONAL supplemental review pass starts lower and may run max for
+# difficult or focused passes: CodeRabbit's published Fable 5.1 review
+# pipeline found low beat high (medium and max untested) — evidence that
+# cheaper starting tiers are viable, never that depth must start maxed and
+# never a max ban; high is the conservative one-rung reading of a result
+# that transfers only loosely across pipelines.
+# https://www.coderabbit.ai/blog/fable-5-1-model-review
+REVIEWER_SUPPLEMENT_STARTING_EFFORT = "high"
 
 MIN_CLAUDE_VERSION = (2, 1, 170)
 CLAUDE_READ_ONLY_ALLOWED_TOOLS = ("Read", "Glob", "Grep")

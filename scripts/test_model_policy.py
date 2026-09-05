@@ -199,6 +199,44 @@ class ModelPolicyTest(unittest.TestCase):
         self.assertEqual(BASE_MODEL_ALIAS, "fable")
         self.assertEqual(REVIEWER_MODEL_ALIAS, "fable")
 
+    def test_effort_tier_constants_pin_the_task_shape_doctrine(self) -> None:
+        from model_policy import (
+            CLAUDE_BREADTH_MODE,
+            CODEX_BREADTH_EFFORT,
+            CODEX_REQUIRED_EFFORTS,
+            REVIEWER_SUPPLEMENT_STARTING_EFFORT,
+            ROUTINE_EFFORTS,
+        )
+
+        self.assertEqual(CODEX_BREADTH_EFFORT, "ultra")
+        self.assertEqual(CLAUDE_BREADTH_MODE, "ultracode")
+        self.assertEqual(CODEX_REQUIRED_EFFORTS, ("max", "ultra"))
+        self.assertEqual(ROUTINE_EFFORTS, ("high", "xhigh"))
+        self.assertEqual(REVIEWER_SUPPLEMENT_STARTING_EFFORT, "high")
+        # Routine tiers never gate: the catalog requirement stays max+ultra.
+        for effort in ROUTINE_EFFORTS:
+            self.assertNotIn(effort, CODEX_REQUIRED_EFFORTS)
+
+    def test_supplemental_reviewer_cli_tail_supports_the_starting_tier(self) -> None:
+        # Plan-review round-2 finding 1: the recorded leg decision always
+        # emits --effort max, so the package must expose a real invocation
+        # route for the supplement's starting tier — the parameterized
+        # read-only CLI tail is that route.
+        from model_policy import (
+            REVIEWER_SUPPLEMENT_STARTING_EFFORT,
+            _explicit_cli_arguments,
+        )
+
+        arguments = _explicit_cli_arguments(
+            "claude-fable-5-1", REVIEWER_SUPPLEMENT_STARTING_EFFORT
+        )
+        self.assertEqual(arguments[arguments.index("--effort") + 1], "high")
+        self.assertEqual(
+            arguments[arguments.index("--model") + 1], "claude-fable-5-1"
+        )
+        self.assertIn("--permission-mode", arguments)
+        self.assertIn("--disallowedTools", arguments)
+
     def test_codex_missing_cli_blocks_with_install_action(self) -> None:
         result = evaluate_model_policy(request(codex={"installed": False}))["codex"]
 
