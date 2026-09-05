@@ -3008,7 +3008,9 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         # binding and surface-suppressed plan — so a revert to the
         # misleading single-cause wording goes red.
         self.assertIn("planner-impossible output here", no_linear_leg_violation)
-        self.assertIn("surface-suppressed plan", no_linear_leg_violation)
+        self.assertIn(
+            "launch manifest authorizes no Linear leg", no_linear_leg_violation
+        )
         # Pass-3 review F2 (2026-09 surface-gate re-land): the
         # suppressed-MAPPED pairing — a mapped repository whose launch
         # resolved handback targets but NO Linear leg is exactly the
@@ -3033,7 +3035,9 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         )
         self.assertIsNotNone(suppressed_mapped_linear)
         self.assertIn("planner-impossible output here", suppressed_mapped_linear)
-        self.assertIn("surface-suppressed plan", suppressed_mapped_linear)
+        self.assertIn(
+            "launch manifest authorizes no Linear leg", suppressed_mapped_linear
+        )
         self.assertIsNotNone(
             runner._qa_manifest_violation(
                 "Keeper-Dating/algo", algo_launch, qa_extract(github_pair[:1])

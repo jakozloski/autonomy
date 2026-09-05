@@ -204,7 +204,7 @@ Condition (c) is checked FIRST so that terminal exhaustion, `CHANGES_REQUESTED`,
     ```text
     ✅ WORKFLOW PAUSED — PR #<number> is clean and marked ready for review.
     All checks passing. Sanity VERIFICATION: unreplied=0 confirmed across 2 clean polls separated by BOT_GRACE_WINDOW.
-    Branch up to date. QA handoff recorded (assignee/reviewer + ticket → QA state; surface-suppressed: ownership → code reviewer, ticket unmoved). Awaiting human code-review approval. Re-run `/autonomy` to resume monitoring if needed.
+    Branch up to date. QA handoff recorded — <previewable surface: "assignee/reviewer + ticket → QA state" | surface-suppressed: "ownership → code reviewer, ticket unmoved">. Awaiting human code-review approval. Re-run `/autonomy` to resume monitoring if needed.
     ```
   - Append the same `⚠️ N R2 finding(s) dismissed as false positives (see thread replies).` line as condition (a) whenever the `finding_ledger` holds `false_positive` entries against R2-authored roots — this exit hands the PR to a human reviewer, so it is the one that most needs the dismissals visible.
   - **End the loop** (do NOT sleep and re-poll)

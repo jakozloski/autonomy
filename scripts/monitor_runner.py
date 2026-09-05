@@ -501,8 +501,9 @@ def _qa_manifest_coverage_violation(
     handback target resolved at launch that the candidate's terminal
     plan omits rejects here), a canonical Linear-leg shape exactly when
     the Linear leg is planned (and NO Linear operations when it is not:
-    the planner never mints a Linear leg for an unmapped repository
-    or a surface-suppressed plan),
+    the planner may omit a Linear leg for an unmapped repository, a
+    surface-suppressed plan, or a mapped request without a validated
+    Linear tracker),
     and a recorded result per operation. The manifest is a coverage
     floor, not a ceiling: reviewer request/verify operations mint only
     when reviewers are routed, so the FAMILY manifest never requires
@@ -564,8 +565,9 @@ def _qa_manifest_coverage_violation(
         return (
             "qa manifest plans no Linear leg for this launch -"
             f" recorded Linear operations {sorted(linear_families)} are"
-            " planner-impossible output here (unmapped binding, or a"
-            " surface-suppressed plan that mints no Linear leg)"
+            " planner-impossible output here: the launch manifest"
+            " authorizes no Linear leg (unmapped binding, surface"
+            " suppression, or no validated Linear tracker at launch)"
         )
     qa_results = (candidate_extract.get("handoff_results") or {}).get(
         "qa"
