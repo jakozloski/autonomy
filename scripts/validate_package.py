@@ -134,6 +134,13 @@ REQUIRED_GATE_MARKERS = {
         model_policy.REVIEWER_MODEL,
         ">= " + ".".join(str(part) for part in model_policy.MIN_CLAUDE_VERSION),
         ">= " + ".".join(str(part) for part in model_policy.MIN_CODEX_VERSION),
+        # Tier-doctrine derived pins (phase-4 review F12): the supplement's
+        # starting tier, the routine tiers, and the breadth effort must appear
+        # in the core exactly as the constants state them — a constant change
+        # fails validation until the prose catches up.
+        "starts at `" + model_policy.REVIEWER_SUPPLEMENT_STARTING_EFFORT + "`",
+        "`" + "` / `".join(model_policy.ROUTINE_EFFORTS) + "`",
+        '"' + model_policy.CODEX_BREADTH_EFFORT + '"',
     ),
     "references/phases-1-5.md": (
         "Red/green regression evidence (mandatory when",

@@ -99,10 +99,10 @@ Codex; the caller supplies the process handles and the kill callback.
 Three legs are evaluated.  The base and Codex legs are gating: a failure on
 either blocks the workflow.  ``claude`` is the base leg — the working side:
 the implementing lineage, explorers, delegated work, and the fresh-context
-escalation voice.  ``claude_reviewer`` is the reviewer leg — the always-runs
-structured review and every Claude review fallback: the Claude reviewer next
-to the mandatory Phase 2 Codex verdict (Phase 4 Codex participation is
-tiered — Small and skill-only passes are Claude-only by design).  The
+escalation voice.  ``claude_reviewer`` is the reviewer leg — the optional supplemental
+structured review and every Claude review fallback, next to the mandatory
+Codex verdicts (Astra is the standing Phase 4 review at every size tier;
+skill-only passes stay Claude-reviewed by design).  The
 reviewer is a distinct leg, not a distinct lineage: both Claude legs run the
 fable/mythos family — never Opus or any lower tier — every review voice runs
 in a fresh read-only context that never judges its own output, and Codex
@@ -191,8 +191,10 @@ from state_schema import normalize_iso_timestamp
 # lineage at or above the leg's own floor (never the leg's own floor primary).
 # Version 8: the Codex floor moves to gpt-6-astra (6, 0) with the -astra
 # lineage breaking selection ties; catalog eligibility requires BOTH max and
-# ultra reasoning; effort is tiered by task shape (max focused / ultra
-# breadth, ultracode as the Claude-side breadth mode).
+# ultra reasoning; effort is tiered by task shape — amended in place (same
+# I/O contract) to the five-tier table in the module docstring: Fable max /
+# Fable ultracode-or-max-with-agents / Astra ultra (lead-validated broad
+# reviews) / Astra max (focused) / high-xhigh routine.
 SCHEMA_VERSION = 8
 
 CODEX_MODEL = "gpt-6-astra"  # floor: newest eligible catalog model >= this wins
@@ -244,8 +246,9 @@ BASE_FLOOR_VERSION = (5,)
 BASE_MODEL_ALIAS = "fable"
 BASE_EFFORT = "max"
 
-# Reviewer Claude leg: the always-runs structured review and every Claude
-# review fallback — one of the two reviewers, next to the Codex verdict.
+# Reviewer Claude leg: the optional supplemental structured review and
+# every Claude review fallback — mandatory seats (fallbacks, escalation,
+# monitor ownership) pin max, next to the standing Codex verdicts.
 # Availability failures degrade onto the ready base; malformed input blocks.
 REVIEWER_MODEL = "claude-fable-5-1"  # floor: newest observed fable/mythos >= this wins
 REVIEWER_FLOOR_VERSION = (5, 1)
@@ -253,8 +256,10 @@ REVIEWER_MODEL_ALIAS = "fable"
 REVIEWER_EFFORT = "max"  # mandatory reviewer seats: fallbacks, escalation, monitor
 # The OPTIONAL supplemental review pass starts lower and may run max for
 # difficult or focused passes: CodeRabbit's published Fable 5.1 review
-# pipeline found low beat high (medium and max untested) — evidence for a
-# cheaper starting point, never for banning max.
+# pipeline found low beat high (medium and max untested) — evidence that
+# cheaper starting tiers are viable, never that depth must start maxed and
+# never a max ban; high is the conservative one-rung reading of a result
+# that transfers only loosely across pipelines.
 # https://www.coderabbit.ai/blog/fable-5-1-model-review
 REVIEWER_SUPPLEMENT_STARTING_EFFORT = "high"
 
