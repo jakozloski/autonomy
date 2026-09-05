@@ -3009,6 +3009,29 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         # misleading single-cause wording goes red.
         self.assertIn("planner-impossible output here", no_linear_leg_violation)
         self.assertIn("surface-suppressed plan", no_linear_leg_violation)
+        # Pass-3 review F2 (2026-09 surface-gate re-land): the
+        # suppressed-MAPPED pairing — a mapped repository whose launch
+        # resolved handback targets but NO Linear leg is exactly the
+        # surface-suppressed plan shape, and it must impose no Linear
+        # floor: the github pair alone is its complete plan, while
+        # recorded Linear ops reject with the dual-cause diagnostic.
+        # Guards the conditional class-derivation regression (re-adding
+        # r16 F3's mapped-implies-linear mistake) that every other
+        # fixture leaves green: matchmaking is otherwise only paired
+        # with a Linear-resolving launch or a targetless one.
+        self.assertIsNone(
+            runner._qa_manifest_violation(
+                "Keeper-Dating/matchmaking", algo_launch,
+                qa_extract(github_pair),
+            )
+        )
+        suppressed_mapped_linear = runner._qa_manifest_violation(
+            "Keeper-Dating/matchmaking", algo_launch,
+            qa_extract(github_pair + linear_outage),
+        )
+        self.assertIsNotNone(suppressed_mapped_linear)
+        self.assertIn("planner-impossible output here", suppressed_mapped_linear)
+        self.assertIn("surface-suppressed plan", suppressed_mapped_linear)
         self.assertIsNotNone(
             runner._qa_manifest_violation(
                 "Keeper-Dating/algo", algo_launch, qa_extract(github_pair[:1])
