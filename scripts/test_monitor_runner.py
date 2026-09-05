@@ -3017,8 +3017,11 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         # recorded Linear ops reject with the dual-cause diagnostic.
         # Guards the conditional class-derivation regression (re-adding
         # r16 F3's mapped-implies-linear mistake) that every other
-        # fixture leaves green: matchmaking is otherwise only paired
-        # with a Linear-resolving launch or a targetless one.
+        # fixture leaves green: the audit's other matchmaking pairings
+        # use a Linear-resolving or targetless launch, and the
+        # idle-rejection test's handback-only matchmaking rows exercise
+        # only manifest NON-EMPTINESS, which an extra Linear entry
+        # cannot flip.
         self.assertIsNone(
             runner._qa_manifest_violation(
                 "Keeper-Dating/matchmaking", algo_launch,
