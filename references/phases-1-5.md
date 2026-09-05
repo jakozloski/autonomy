@@ -50,7 +50,7 @@ CODEX_VERSION=$(codex --version 2>/dev/null | awk '{print $2}')
 # Query the refreshed/live catalog. Do NOT pass --bundled: frontier models are delivered by the live catalog and may not exist in the binary's bundled snapshot.
 # Capture the full catalog JSON — scripts/model_policy.py performs the eligibility
 # check and auto-forward selection (newest eligible model at or above the
-# gpt-5.6-sol floor with max support; -mini/-nano variants excluded). A helper
+# gpt-6-astra floor with max+ultra support; -mini/-nano variants excluded). A helper
 # result without an eligible model BLOCKs. Private per-run path — never a fixed /tmp name:
 CATALOG="$(mktemp -t codex-live-catalog.XXXXXX)" || BLOCK "Could not create a private temp file"; trap 'rm -f -- "$CATALOG"' EXIT
 codex debug models > "$CATALOG" || BLOCK "Could not read the live Codex catalog"
@@ -69,7 +69,7 @@ Entitlement denial, authentication failure, missing CLI, old CLI, or missing liv
 **Tool selection (capability-gated):**
 
 1. **gstack `/autoplan` adapter** (primary, when gstack available, `change_type != skill_only`, and the mandatory Codex preflight succeeds):
-   - All Codex calls run the policy-selected model (floor GPT-5.6 Sol) at `max` reasoning (flag form per subcommand — see Model Configuration); Claude review voices run on the recorded reviewer-leg decision — the selected reviewer model (floor Fable 5.1) or its recorded degraded/waived fallback lineage
+   - All Codex calls run the policy-selected model (floor GPT-6 Astra) at `max` reasoning, `ultra` on breadth-tier passes (flag form per subcommand — see Model Configuration); Claude review voices run on the recorded reviewer-leg decision — the selected reviewer model (floor Fable 5.1) or its recorded degraded/waived fallback lineage
    - Runs the full 4-phase review pipeline with dual voices (Claude subagent + Codex) and auto-decisions:
      - **CEO Review** (Phase 1): Strategy, scope, premises, 6-month regret test, competitive risk. Override mode: COMPLETE WITHIN AUTHORIZED BOUNDARY.
      - **Design Review** (Phase 2, conditional on `scope_frontend`): UX dimensions, design system compliance, 7-dimension rating. Skipped if no frontend scope.
@@ -93,7 +93,7 @@ Entitlement denial, authentication failure, missing CLI, old CLI, or missing liv
 
 2. **Direct Codex review** (when `/autoplan` is not selected):
    - Read the `codex-review` skill file from the discovered path above and follow its steps directly (do NOT invoke it as a slash command from inside this skill)
-   - Invoke Codex with `-m <selected-codex-model> -c 'model_reasoning_effort="max"' -s read-only` using the policy-selected model from state (floor `gpt-5.6-sol`; the codex-review skill uses `codex exec`, which accepts `-m`; on any `codex exec resume` place every flag BEFORE the `resume` subcommand — the CLI accepts none after it, so a trailing-flags resume silently drops the sandbox pin (admin#1495 r12 F10); the sandbox pin keeps a review voice from inheriting an ambient write-capable sandbox) — if its defaults ever differ, Model Configuration wins
+   - Invoke Codex with `-m <selected-codex-model> -c 'model_reasoning_effort="max"' -s read-only` using the policy-selected model from state (floor `gpt-6-astra`; the codex-review skill uses `codex exec`, which accepts `-m`; on any `codex exec resume` place every flag BEFORE the `resume` subcommand — the CLI accepts none after it, so a trailing-flags resume silently drops the sandbox pin (admin#1495 r12 F10); the sandbox pin keeps a review voice from inheriting an ambient write-capable sandbox) — if its defaults ever differ, Model Configuration wins
    - Codex and Claude iterate until Codex approves — no fixed working budget; this round policy overrides any round cap in the delegated codex-review skill. Log each round's open findings in the Decision Audit Trail
    - If Codex raises valid concerns, revise the plan
    - If Codex suggests something contradicting explicit user requirements or repo rules, skip with logged note
@@ -105,7 +105,7 @@ Entitlement denial, authentication failure, missing CLI, old CLI, or missing liv
 
 4. **BLOCK** — if the required Codex process fails, review stalls (two consecutive no-progress rounds), or a required Claude voice (base or reviewer) cannot run under the core policy. Set `phases.plan_review: "blocked"` in state. There is no round cap: rounds that keep resolving findings keep running until Codex approves.
 
-**Runtime failure handling:** Apply the core model failure matrix. Never silently proceed without the selected Codex model's approval (floor GPT-5.6 Sol).
+**Runtime failure handling:** Apply the core model failure matrix. Never silently proceed without the selected Codex model's approval (floor GPT-6 Astra).
 
 ---
 
@@ -173,7 +173,7 @@ Review the implementation before creating or updating the PR. (For PR takeovers,
      - **Small (<50 lines):** Claude structured review only. No multi-model for small diffs. **Review-response fixes never tier Small** — any pass whose scope is commits made to address review findings uses at least the Medium tier regardless of line count (see Review-Fix Integrity in merge-readiness.md).
      - **Medium (50-199 lines):** + Codex adversarial challenge (if `command -v codex` succeeds) OR a reviewer-model adversarial subagent (fallback)
      - **Large (200+ lines):** + Codex structured review (if available) + **fresh-base adversarial pass** (trigger `large_diff`) + Codex adversarial challenge (if available). If Codex is unavailable, run the reviewer structured review + the fresh-base adversarial pass + one more reviewer adversarial subagent pass instead. If the fresh-base escalation cannot run, substitute a reviewer adversarial subagent pass and record the degradation in this pass's `notes`.
-   - Every Codex invocation in this adapter runs the policy-selected model (floor GPT-5.6 Sol) at `max` reasoning — `codex exec` via `-m <selected>` plus the canonical `-s read-only` sandbox pin, `codex review` via `-c 'model="<selected>"'` (it rejects `-m` and exposes no sandbox flag), both with `-c 'model_reasoning_effort="max"'` (see Model Configuration); Claude review passes run on the recorded reviewer-leg decision (floor Fable 5.1, or its recorded fallback) and fresh-base escalation passes on the selected base model (floor Fable 5)
+   - Every Codex invocation in this adapter runs the policy-selected model (floor GPT-6 Astra) at the task-shape tier — `max` for focused diffs, `ultra` for large multi-component reviews — `codex exec` via `-m <selected>` plus the canonical `-s read-only` sandbox pin, `codex review` via `-c 'model="<selected>"'` (it rejects `-m` and exposes no sandbox flag), both with `-c 'model_reasoning_effort="max"'` (see Model Configuration); Claude review passes run on the recorded reviewer-leg decision (floor Fable 5.1, or its recorded fallback) and fresh-base escalation passes on the selected base model (floor Fable 5)
    - If `scope_frontend`: include design review lite (check for CSS/spacing/hierarchy issues in the diff)
    - Fix-First workflow: AUTO-FIX items applied automatically, ASK items fixed as recommended (autonomous mode)
    - Set `gstack_integration.review.status: "complete"` and `gstack_integration.review.tier: "small|medium|large"`

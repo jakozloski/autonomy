@@ -198,11 +198,11 @@ _PLAN_SECTION_DIGEST = plan_section_digest(_PLAN_BODY_SECTION.split("\n"))
 _MODEL_RUNTIME_VERDICT_BLOCK = (
     "  model_runtime:\n"
     "    codex:\n"
-    '      model: "gpt-5.6-sol"\n'
+    '      model: "gpt-6-astra"\n'
     "    plan_verdict:\n"
     '      verdict: "approved"\n'
     f'      plan_digest: "{_PLAN_SECTION_DIGEST[:16]}"\n'
-    '      model: "gpt-5.6-sol"\n'
+    '      model: "gpt-6-astra"\n'
     '      invocation: "codex-plan-01"'
 )
 
@@ -1173,7 +1173,7 @@ class ValueContractTests(unittest.TestCase):
         record_item = _mutate(
             FULL_STATE,
             "decision_audit_trail: []",
-            'decision_audit_trail:\n  - selected: "gpt-5.6-sol"',
+            'decision_audit_trail:\n  - selected: "gpt-6-astra"',
         )
         self.assertEqual(evaluate_state_text(record_item)["state"], SUSPECT)
 
@@ -3376,7 +3376,7 @@ class ModelRuntimeShapeTests(unittest.TestCase):
             validate_model_runtime_shape(
                 {
                     "codex": {
-                        "model": "gpt-5.6-sol",
+                        "model": "gpt-6-astra",
                         "effort": "max",
                         "live_catalog_verified_at": None,
                         "gate_status": "ready",
@@ -4396,7 +4396,7 @@ class MonitorOwnershipTests(unittest.TestCase):
         # Claude owner in pending_owner (continuity bindings require it).
         block = (
             '  lineage: "codex"\n'
-            '  model: "gpt-5.6-sol"\n'
+            '  model: "gpt-6-astra"\n'
             '  bound_at: "2026-08-04T11:55:00+00:00"\n'
             '  reason_code: "orchestrator_continuity"\n'
             '  pending_owner: "claude-fable-5-1"'
@@ -6088,7 +6088,7 @@ class PlanVerdictTests(unittest.TestCase):
             '    write_path: "environment_tool"\n'
             "  model_runtime:\n"
             "    codex:\n"
-            '      model: "gpt-5.6-sol"',
+            '      model: "gpt-6-astra"',
         )
         result = evaluate_state_text(text)
         self.assertEqual(result["state"], SUSPECT)
@@ -6130,7 +6130,7 @@ class PlanVerdictTests(unittest.TestCase):
             "    plan_verdict:\n"
             '      verdict: "approved"\n'
             f'      plan_digest: "{_PLAN_SECTION_DIGEST[:16]}"\n'
-            '      model: "gpt-5.6-sol"',
+            '      model: "gpt-6-astra"',
             "    plan_verdict:\n"
             '      verdict: "approved"\n'
             f'      plan_digest: "{_PLAN_SECTION_DIGEST[:16]}"\n'
@@ -6143,7 +6143,7 @@ class PlanVerdictTests(unittest.TestCase):
     def test_verdict_requires_the_frozen_codex_leg(self) -> None:
         text = _mutate(
             _with_plan_verdict(self._implementation_state()),
-            '    codex:\n      model: "gpt-5.6-sol"\n',
+            '    codex:\n      model: "gpt-6-astra"\n',
             "",
         )
         self._assert_binding_error(
@@ -6206,7 +6206,7 @@ class PlanVerdictTests(unittest.TestCase):
         base = {
             "verdict": "approved",
             "plan_digest": "abc123def456",
-            "model": "gpt-5.6-sol",
+            "model": "gpt-6-astra",
             "invocation": "codex-plan-01",
         }
         self.assertEqual(

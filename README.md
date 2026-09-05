@@ -2,14 +2,14 @@
 
 [![validate](https://github.com/jakozloski/autonomy/actions/workflows/validate.yml/badge.svg)](https://github.com/jakozloski/autonomy/actions/workflows/validate.yml)
 
-A skill for [Claude Code](https://claude.com/claude-code) and Codex that takes a GitHub issue to a merge-ready PR on its own. It reads the repository's conventions, plans, gets the plan approved by a second model (GPT-5.6 Sol), implements, reviews its own diff, opens the PR, and then keeps working CI failures and review feedback until the PR is clean. When it can't finish, it stops and tells you which gate failed instead of quietly shipping less.
+A skill for [Claude Code](https://claude.com/claude-code) and Codex that takes a GitHub issue to a merge-ready PR on its own. It reads the repository's conventions, plans, gets the plan approved by a second model (GPT-6 Astra), implements, reviews its own diff, opens the PR, and then keeps working CI failures and review feedback until the PR is clean. When it can't finish, it stops and tells you which gate failed instead of quietly shipping less.
 
 This is the workflow I run daily at Keeper. The published copy is identical to mine except for org-specific config, which ships as placeholders (see "Adapting to your org").
 
 ```
  DISCOVER      PLAN        PLAN REVIEW     IMPLEMENT     SELF-REVIEW    SHIP        MONITOR
 ┌─────────┐  ┌────────┐  ┌────────────┐  ┌──────────┐  ┌───────────┐  ┌────────┐  ┌─────────────┐
-│ repo    │─▶│ plan + │─▶│ GPT-5.6 Sol│─▶│ commit   │─▶│ reviews + │─▶│ PR w/  │─▶│ CI + bots + │
+│ repo    │─▶│ plan + │─▶│ GPT-6 Astra│─▶│ commit   │─▶│ reviews + │─▶│ PR w/  │─▶│ CI + bots + │
 │ conven- │  │ edge   │  │ must       │  │ per plan │  │ security  │  │evidence│  │ humans until│
 │ tions   │  │ cases  │  │ approve    │  │ item     │  │ gate      │  │        │  │ clean       │
 └─────────┘  └────────┘  └────────────┘  └──────────┘  └───────────┘  └────────┘  └─────────────┘
@@ -63,7 +63,7 @@ The skill checks its model gates up front and blocks with a reason when one is u
 
 - Claude Code `>= 2.1.170` with access to Claude Fable 5 (`claude-fable-5`) at `max` effort — the base leg that does the work
 - Claude Fable 5.1 (`claude-fable-5-1`) at `max` effort — the reviewer leg: the standing Claude review voice
-- Codex CLI `>= 0.144.0` with access to GPT-5.6 Sol at `max` reasoning (plan-review and code-review gates; `ultra` is a breadth mode reserved for tasks that genuinely decompose into independent parts, so the single-problem gates run depth-mode `max`)
+- Codex CLI `>= 0.144.0` with access to GPT-6 Astra at both `max` and `ultra` reasoning (`max` for difficult questions and focused debugging — the plan verdict, focused review passes; `ultra`, maximum reasoning plus automatic parallel delegation, for large code reviews, broad research, and feature builds across multiple components)
 - `gh` CLI authenticated for the target repository
 - Python 3 (standard library only) for the helper scripts
 
@@ -78,7 +78,7 @@ Because a run on a quietly-substituted model looks fine right up until the PR is
 Not out of the box. The cross-vendor gate is the point: the model that writes the code is not the model that approves it. If you want a Claude-only variant anyway, the gates live in two places, the "Mandatory Model Policy" section of `SKILL.md` and `scripts/model_policy.py`. `scripts/test_model_policy.py` pins the expected decisions, so change both together and the tests will tell you what you missed.
 
 **Which model does what?**
-Fable 5 is the base: it writes the plan and the code, explores, and carries the delegated work. Two reviewers judge that work in every review discussion — Claude Fable 5.1 at `max` in a fresh read-only context (the structured review and every Claude review fallback) and GPT-5.6 Sol at `max` (the plan verdict and diff review). When a discussion stalls or the two reviewers disagree, the escalation voice is one not already in that discussion — the Claude reviewer for a stalled plan review, a fresh read-only base-lineage context for a code-review dispute — rather than a rerun of one that already spoke.
+Fable 5 is the base: it writes the plan and the code, explores, and carries the delegated work. Two reviewers judge that work in every review discussion — Claude Fable 5.1 at `max` in a fresh read-only context (the structured review and every Claude review fallback) and GPT-6 Astra (the plan verdict and diff review — `max` on focused passes, `ultra` on large ones). When a discussion stalls or the two reviewers disagree, the escalation voice is one not already in that discussion — the Claude reviewer for a stalled plan review, a fresh read-only base-lineage context for a code-review dispute — rather than a rerun of one that already spoke.
 
 **What does a run cost?**
 More than you'd guess from a chat session. A full issue-to-clean-PR cycle makes a lot of frontier-model calls: plan-review rounds, multi-pass self-review, the monitor loop. Keep issues small if cost matters.
