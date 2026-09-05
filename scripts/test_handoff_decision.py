@@ -4513,6 +4513,16 @@ class QaSurfaceGateTests(unittest.TestCase):
         self.assertTrue(
             any("still in flight" in error for error in replan["errors"])
         )
+        # Pass-2 review F2: pin the targetless branch's own recovery
+        # wording — "retiring the prior targets" — so a revert to the
+        # sweep's "planning the current targets" (wrong here: no targets
+        # resolve) goes red instead of shipping green.
+        self.assertTrue(
+            any(
+                "retiring the prior targets" in error
+                for error in replan["errors"]
+            )
+        )
 
 
 class QaPlanVersionRolloutTests(unittest.TestCase):

@@ -2998,12 +2998,17 @@ class MonitorRunnerE2ETests(unittest.TestCase):
                 "Keeper-Dating/algo", algo_launch, qa_extract(github_pair)
             )
         )
-        self.assertIsNotNone(
-            runner._qa_manifest_violation(
-                "Keeper-Dating/algo", algo_launch,
-                qa_extract(github_pair + linear_outage),
-            )
+        no_linear_leg_violation = runner._qa_manifest_violation(
+            "Keeper-Dating/algo", algo_launch,
+            qa_extract(github_pair + linear_outage),
         )
+        self.assertIsNotNone(no_linear_leg_violation)
+        # Pass-2 review F3 (2026-09 surface-gate re-land): the diagnostic
+        # must name BOTH legitimate no-Linear-leg causes — unmapped
+        # binding and surface-suppressed plan — so a revert to the
+        # misleading single-cause wording goes red.
+        self.assertIn("planner-impossible output here", no_linear_leg_violation)
+        self.assertIn("surface-suppressed plan", no_linear_leg_violation)
         self.assertIsNotNone(
             runner._qa_manifest_violation(
                 "Keeper-Dating/algo", algo_launch, qa_extract(github_pair[:1])
