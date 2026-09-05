@@ -3015,13 +3015,12 @@ class MonitorRunnerE2ETests(unittest.TestCase):
         # surface-suppressed plan shape, and it must impose no Linear
         # floor: the github pair alone is its complete plan, while
         # recorded Linear ops reject with the dual-cause diagnostic.
-        # Guards the conditional class-derivation regression (re-adding
-        # r16 F3's mapped-implies-linear mistake) that every other
-        # fixture leaves green: the audit's other matchmaking pairings
-        # use a Linear-resolving or targetless launch, and the
-        # idle-rejection test's handback-only matchmaking rows exercise
-        # only manifest NON-EMPTINESS, which an extra Linear entry
-        # cannot flip.
+        # Uniquely guards the AUDIT-layer variant of the
+        # mapped-implies-linear mistake — a mapped-keyed conditional
+        # re-added inside _qa_manifest_coverage_violation's Linear
+        # branch, which no other fixture reaches; the derivation test
+        # above already pins _qa_target_manifest itself for this same
+        # handback-only matchmaking pairing.
         self.assertIsNone(
             runner._qa_manifest_violation(
                 "Keeper-Dating/matchmaking", algo_launch,
